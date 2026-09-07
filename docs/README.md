@@ -17,7 +17,7 @@ contract), testing status, and stability guarantees.
 | [common.md](./common.md) | `src/common` — errors, logging glue, digest, byte ranges | Implemented, tests passing |
 | [format.md](./format.md) | `src/format` — ZFile + LSMT readers, layer merge, fixture writers | Implemented, tests passing |
 | [source.md](./source.md) | `src/source` — blob sources: local, registry, switch/download, chunk cache, DART proxy | Implemented, tests passing |
-| [image.md](./image.md) | `src/image` — config.json parsing and read-only image assembly | Implemented, tests passing |
+| [image.md](./image.md) | `src/image` — config.json parsing and image assembly (read-only or with a writable upper) | Implemented, tests passing |
 | [ublk.md](./ublk.md) | `src/ublk` — ublk control plane, per-queue data plane, Elio bridge | Implemented, tests passing |
 | [supervisor.md](./supervisor.md) | `src/supervisor` — daemon, per-device child lifecycle, control protocol | Implemented, tests passing |
 | [binaries.md](./binaries.md) | `obd-supervisor`, `obd-device`, `obdctl`, `obd-mkimage` — usage and behavior | Implemented, tests passing |

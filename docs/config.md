@@ -1,0 +1,265 @@
+# Configuration Reference
+
+overlaybd-elio reads two configuration files, both compatible with the
+upstream overlaybd / overlaybd-snapshotter schemas:
+
+- the **global config** (`overlaybd.json`) — daemon-wide settings:
+  credentials, DART P2P proxy, download defaults, log level;
+- the **per-image config** (`config.json`) — written by the
+  overlaybd-snapshotter (or by hand), describing one image's blob
+  location and layers, plus the optional writable upper (ADR-0008).
+
+The parser entry points are `GlobalConfig` / `ImageConfig`
+(`src/image/config.hpp::GlobalConfig`, `src/image/config.hpp::ImageConfig`).
+
+**Compatibility rules (operator contract, changing them needs an ADR):**
+
+- **Unknown fields are ignored.** New upstream fields never break
+  parsing; older overlaybd-elio versions tolerate newer configs.
+- **Known fields keep their overlaybd-snapshotter meaning.** Field
+  names, types, units, and defaults below follow upstream overlaybd.
+- **Malformed JSON is fatal** for the file being parsed
+  (`obd::format_error`); a missing file is an IO error
+  (`obd::error`). A missing *credential* file is explicitly **not**
+  fatal — see below.
+- A field present with the wrong JSON type (e.g. a string where a bool
+  is expected) is a parse error, not a silent default.
+
+## Global config: `overlaybd.json`
+
+Top-level object; every section is optional.
+
+### `credentialConfig`
+
+Selects where registry credentials come from. **Only `mode = "file"` is
+honored**; any other mode is ignored (no inline or secret-store
+credential modes).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `mode` | string | `"file"` | Only `"file"` is honored. |
+| `path` | string | `"/opt/overlaybd/cred.json"` | Credential file location (see §Credential file). |
+
+### `p2pConfig` (DART proxy, ADR-0005)
+
+Optional P2P acceleration through an **external** DART proxy. When
+enabled, blob HTTP requests are rewritten as prefix-passthrough GETs:
+`http://<address>/<full upstream URL>`.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enable` | bool | `false` | Master switch for DART acceleration. |
+| `address` | string | `""` | `host:port[/prefix]`, e.g. `"localhost:19145/dart"`. An optional `scheme://` is stripped (DART speaks plain HTTP); the prefix defaults to `/dart` (`src/source/dart.cpp` address parsing). |
+
+At image-open time the proxy is probed with a short (1 s) reachability
+budget: if it is unreachable — or the address is malformed — the device
+logs a warning and falls back to direct registry reads. An
+enabled-but-unreachable proxy therefore delays startup by at most the
+probe budget, it never blocks the image.
+
+### `download`
+
+Global defaults for the background downloader, which pulls remote blobs
+into the per-layer directory so later opens are served locally. The
+per-image `download` section overrides these **per field** (see below).
+Defaults come from `src/source/downloader.hpp::DownloadConfig`:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enable` | bool | `false` | Start a background download after device open. |
+| `delay` | uint32 | `300` | Start delay in seconds after device open. |
+| `delayExtra` | uint32 | `30` | Plus a uniform random extra of 0..`delayExtra` seconds. |
+| `maxMBps` | uint32 | `100` | Throughput throttle, MiB/s. |
+| `tryCnt` | uint32 | `5` | Attempts before giving up (a failed sha256 verification discards the file and restarts). |
+| `blockSize` | uint32 | `262144` (256 KiB) | Download chunk size in bytes. |
+
+The downloader stages to `<dir>/.download` (sparse, resumable via
+`SEEK_HOLE`), verifies sha256 against the lower's `digest`, and
+atomically renames to `<dir>/overlaybd.commit` on success.
+
+### `logConfig`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `logLevel` | int | `1` | 0 = debug, 1 = info, 2 = warn, 3 = error. |
+
+### Recognized but not honored
+
+`cacheConfig`, `ioEngine`, and `prefetch` are parsed-tolerated (ignored
+as unknown sections) in the current version; see *Limitations & TODO* in
+`docs/architecture.md`.
+
+## Per-image config: `config.json`
+
+One file per device, passed to `obdctl create <id> <config.json>` and
+through to the `obd-device` child.
+
+### `repoBlobUrl`
+
+String, default `""`. The registry blob base URL for this repo, e.g.
+`"https://registry-1.docker.io/v2/library/redis/blobs"`. Each remote
+lower is fetched as `<repoBlobUrl>/<digest>`. **Required whenever at
+least one lower has no local blob** — opening an image with a remote
+lower and an empty `repoBlobUrl` fails with `EINVAL`.
+
+### `lowers` (required, non-empty)
+
+Array of layer objects, **bottom-up**: `lowers[0]` is the base layer.
+An image with no lowers is rejected.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `digest` | string | `""` | Content digest, `"sha256:<hex>"`. Used in the fetch URL and as the download integrity-check value (the `"sha256:"` prefix is stripped; other algorithms disable verification). |
+| `size` | uint64 | `0` | Blob size in bytes (informational for the reader). |
+| `dir` | string | `""` | Per-layer directory — the download cache location. |
+| `file` | string | `""` | Explicit local blob file; empty means the layer may be remote. |
+
+**Local probe order** — a lower is served locally when one of these
+exists as a regular file, in this order (`src/image/image_file.cpp::probe_local_blob`):
+
+1. `file` (explicit blob path);
+2. `<dir>/overlaybd.commit`;
+3. `<dir>/.commit`;
+4. `<dir>/overlaybd.sealed`.
+
+Otherwise the lower is fetched remotely through `repoBlobUrl`.
+
+### `upper` (optional; writable mode, ADR-0008)
+
+Object. When present with a non-empty `dir`, the device becomes
+**writable**: the sealed lowers are merged under a copy-on-write upper
+layer (`MergedWritable`). An absent `upper`, an empty object `{}`, or an
+empty `dir` keeps the device read-only.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `dir` | string | `""` | Directory holding the upper layer file; created if missing. Non-empty engages writable mode (`src/image/config.hpp::UpperConfig`). |
+| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` (unsealed in-place-edit LSMT); `"sparse"` → `<dir>/overlaybd.sparse` (fiemap sparse file). **Any other value is rejected** with `EINVAL`. |
+
+Durability note: the `lsmt` upper keeps its segment index in memory
+until `seal()`; unsealed data is not crash-durable (see *Limitations &
+TODO* in `docs/architecture.md`).
+
+### `download` (per-image overrides)
+
+Same fields as the global `download` section. Merged **over the global
+defaults per field**: only fields present in the image's section
+override; absent fields inherit the global value
+(`src/image/config.cpp::apply_download_json`).
+
+### `resultFile`
+
+String, default `""`. **Informational only** in the current version:
+parsed for compatibility, never written or acted upon.
+
+## Credential file
+
+Path from `credentialConfig.path` (default `/opt/overlaybd/cred.json`).
+Docker config-json style:
+
+```json
+{
+  "auths": {
+    "registry-1.docker.io": {
+      "auth": "dXNlcjpwYXNz"
+    },
+    "https://registry.example.com/v2": {
+      "username": "robot",
+      "password": "s3cret"
+    }
+  }
+}
+```
+
+Semantics (`src/source/credentials.cpp::CredentialStore`):
+
+- Each `auths` entry carries either `auth` (base64 of `user:pass`,
+  Docker-style) or explicit `username` / `password` fields.
+- Lookup is **longest-prefix matching**: entries are kept sorted
+  longest-key-first and the first key that prefixes the request URL
+  wins. Matching is tried against both the full URL and the URL with
+  its `scheme://` prefix stripped, so keys may be written with or
+  without the scheme. Empty keys never match.
+- **A missing or unreadable credential file is not fatal**: the open
+  logs a warning and pulls anonymously. A *malformed* credential file
+  is fatal (`obd::format_error`). An empty file or one without an
+  `auths` object yields an empty store (anonymous pull).
+
+## Complete examples
+
+### `overlaybd.json`
+
+```json
+{
+  "credentialConfig": {
+    "mode": "file",
+    "path": "/opt/overlaybd/cred.json"
+  },
+  "p2pConfig": {
+    "enable": true,
+    "address": "localhost:19145/dart"
+  },
+  "download": {
+    "enable": true,
+    "delay": 60,
+    "delayExtra": 30,
+    "maxMBps": 100,
+    "tryCnt": 5,
+    "blockSize": 262144
+  },
+  "logConfig": {
+    "logLevel": 1
+  }
+}
+```
+
+### Read-only `config.json`
+
+```json
+{
+  "repoBlobUrl": "https://registry.example.com/v2/demo/app/blobs",
+  "lowers": [
+    {
+      "digest": "sha256:1c6f2e48...a1",
+      "size": 7340032,
+      "dir": "/var/lib/overlaybd/io.containerd.snapshotter.v1.overlaybd/snapshots/12/block",
+      "file": ""
+    },
+    {
+      "digest": "sha256:99bd04c2...7e",
+      "size": 2097152,
+      "dir": "/var/lib/overlaybd/io.containerd.snapshotter.v1.overlaybd/snapshots/15/block",
+      "file": ""
+    }
+  ],
+  "download": {
+    "enable": true,
+    "maxMBps": 50
+  },
+  "resultFile": "/tmp/overlaybd.log"
+}
+```
+
+### Writable `config.json` (ADR-0008)
+
+```json
+{
+  "repoBlobUrl": "https://registry.example.com/v2/demo/app/blobs",
+  "lowers": [
+    {
+      "digest": "sha256:1c6f2e48...a1",
+      "size": 7340032,
+      "dir": "/var/lib/overlaybd/snapshots/12/block",
+      "file": "/var/lib/overlaybd/snapshots/12/block/overlaybd.commit"
+    }
+  ],
+  "upper": {
+    "dir": "/var/lib/overlaybd/snapshots/16/rw",
+    "type": "lsmt"
+  }
+}
+```
+
+This assembles one local lower plus a writable upper at
+`/var/lib/overlaybd/snapshots/16/rw/overlaybd.rw`
+(`"type": "sparse"` would use `overlaybd.sparse` instead).

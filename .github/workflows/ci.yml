@@ -1,0 +1,55 @@
+# CI for overlaybd-elio.
+#
+# Two jobs mirroring the local verify-trio (AGENTS.md):
+#   build-test      — configure, build, ctest. The ublk end-to-end tests
+#                     self-skip without privileges and a loaded ublk_drv;
+#                     that skip is by design, so no sudo anywhere here.
+#   docs governance — the documentation floor checks (scripts/check-docs.sh).
+# FetchContent (Elio, nlohmann/json, lz4, zstd, Catch2) needs network on
+# first configure, which GitHub-hosted runners provide.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: build-test
+    # ubuntu-latest (24.04): GCC 13, kernel headers >= 6.x with
+    # <linux/ublk_cmd.h>, recent liburing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            liburing-dev zlib1g-dev libssl-dev cmake ninja-build g++
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DOBD_BUILD_TESTS=ON
+          -DOBD_ENABLE_UBLK=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        # Privileged ublk E2E tests self-skip on unprivileged runners —
+        # intentionally not run under sudo (AGENTS.md).
+        run: ctest --test-dir build --output-on-failure
+
+  docs-governance:
+    name: docs governance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Documentation floor checks
+        run: bash scripts/check-docs.sh

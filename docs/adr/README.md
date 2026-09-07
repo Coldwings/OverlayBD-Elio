@@ -128,4 +128,5 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0004](./0004-per-device-process-isolation.md) | One isolated process per device | accepted |
 | [0005](./0005-dart-as-external-prefix-proxy.md) | DART integrates as an external prefix proxy | accepted |
 | [0006](./0006-ublk-ring-ownership-and-elio-bridge.md) | Queue rings belong to queue threads; Elio bridges by completion | accepted |
-| [0007](./0007-readonly-first-scope.md) | Read-only first: writable layers and TurboOCI are out of scope | accepted |
+| [0007](./0007-readonly-first-scope.md) | Read-only first: writable layers and TurboOCI are out of scope | superseded by ADR-0008 |
+| [0008](./0008-writable-upper-layers.md) | Writable upper layers: sparse file and in-place-edit LSMT-RW | accepted |
