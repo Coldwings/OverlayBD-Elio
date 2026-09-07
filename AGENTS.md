@@ -48,7 +48,6 @@ tests/integration/  end-to-end tests (mock registry; ublk tests self-skip withou
 docs/             official, git-tracked documentation (English)
 docs/adr/         Architecture Decision Records (legislative history)
 scripts/          governance and helper scripts (check-docs.sh)
-third_party/elio  Elio runtime (git submodule, pinned)
 cmake/            project CMake modules
 ```
 
@@ -107,9 +106,9 @@ Every module above is implemented with tests and a `docs/<module>.md`.
   strongly preferred). OpenSSL dev headers are required (via Elio TLS/HTTP).
   System packages: `liburing-dev`, `zlib1g-dev`; kernel headers >= 6.0 for
   `<linux/ublk_cmd.h>`.
-- Dependencies are vendored or fetched by CMake: Elio (submodule under
-  `third_party/elio`), nlohmann/json, lz4, Catch2 (tests). First configure
-  needs network access for FetchContent.
+- Dependencies are fetched by CMake FetchContent: Elio (pinned by commit in
+  the top-level `CMakeLists.txt`), nlohmann/json, lz4, zstd, Catch2 (tests).
+  First configure needs network access for FetchContent.
 - ublk end-to-end tests require root (or `CAP_SYS_ADMIN` in the right user
   namespace) and a loaded `ublk_drv`; they **self-skip** otherwise. Never
   make the default test run depend on privileged kernel state.
@@ -153,8 +152,9 @@ Every module above is implemented with tests and a `docs/<module>.md`.
 - Commit messages: concise English, imperative subject line, body explaining
   the why. Keep commits focused.
 - Never run destructive/irreversible git commands. Never commit build
-  directories (they are gitignored; keep it that way). `third_party/elio` is
-  a pinned submodule: bump it in a dedicated commit with a reason.
+  directories (they are gitignored; keep it that way). The Elio pin lives in
+  the top-level `CMakeLists.txt` (`FetchContent_Declare(elio ... GIT_TAG)`):
+  bump it in a dedicated commit with a reason.
 
 ## Safety
 

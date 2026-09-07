@@ -15,9 +15,12 @@ inline std::string base64_encode(std::string_view in) {
     out.reserve((in.size() + 2) / 3 * 4);
     size_t i = 0;
     for (; i + 3 <= in.size(); i += 3) {
-        const uint32_t v = (static_cast<uint32_t>(in[i]) << 16) |
-                           (static_cast<uint32_t>(in[i + 1]) << 8) |
-                           static_cast<uint32_t>(in[i + 2]);
+        const uint32_t v = (static_cast<uint32_t>(
+                                static_cast<uint8_t>(in[i])) << 16) |
+                           (static_cast<uint32_t>(
+                                static_cast<uint8_t>(in[i + 1])) << 8) |
+                           static_cast<uint32_t>(
+                               static_cast<uint8_t>(in[i + 2]));
         out.push_back(kAlphabet[(v >> 18) & 63]);
         out.push_back(kAlphabet[(v >> 12) & 63]);
         out.push_back(kAlphabet[(v >> 6) & 63]);
@@ -25,14 +28,16 @@ inline std::string base64_encode(std::string_view in) {
     }
     const size_t rem = in.size() - i;
     if (rem == 1) {
-        const uint32_t v = static_cast<uint32_t>(in[i]) << 16;
+        const uint32_t v =
+            static_cast<uint32_t>(static_cast<uint8_t>(in[i])) << 16;
         out.push_back(kAlphabet[(v >> 18) & 63]);
         out.push_back(kAlphabet[(v >> 12) & 63]);
         out.push_back('=');
         out.push_back('=');
     } else if (rem == 2) {
-        const uint32_t v = (static_cast<uint32_t>(in[i]) << 16) |
-                           (static_cast<uint32_t>(in[i + 1]) << 8);
+        const uint32_t v =
+            (static_cast<uint32_t>(static_cast<uint8_t>(in[i])) << 16) |
+            (static_cast<uint32_t>(static_cast<uint8_t>(in[i + 1])) << 8);
         out.push_back(kAlphabet[(v >> 18) & 63]);
         out.push_back(kAlphabet[(v >> 12) & 63]);
         out.push_back(kAlphabet[(v >> 6) & 63]);

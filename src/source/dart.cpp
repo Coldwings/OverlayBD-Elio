@@ -1,10 +1,17 @@
 // DART proxy integration. See dart.hpp.
 #include "source/dart.hpp"
 
+#include <elio/coro/with_timeout.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/net/tcp.hpp>
 
 namespace obd::source {
+
+namespace {
+/// Reachability probe budget (overlaybd probes the accelerate URL with a
+/// short timeout before deciding to use it).
+constexpr std::chrono::milliseconds kReachableProbeTimeout{1000};
+}  // namespace
 
 std::optional<DartProxyAddress> parse_dart_address(std::string_view address) {
     // Strip an optional scheme; DART speaks plain HTTP regardless.
@@ -43,15 +50,27 @@ std::string dart_prefixed_url(const DartProxyAddress& address,
 }
 
 elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address) {
-    try {
-        auto addrs = co_await elio::net::resolve_all(address.host,
-                                                     address.port);
-        if (addrs.empty()) co_return false;
-        auto stream = co_await elio::net::tcp_connect(addrs.front());
-        co_return stream.has_value();
-    } catch (const std::exception&) {
-        co_return false;
-    }
+    // Bounded probe (overlaybd check_accelerate_url semantics): a silent
+    // network (dropped SYNs) must fall back to direct reads quickly, not
+    // stall image open behind TCP retransmits.
+    auto probe = [&address](elio::coro::cancel_token token)
+        -> elio::coro::task<bool> {
+        try {
+            auto addrs = co_await elio::net::resolve_all(address.host,
+                                                         address.port);
+            if (addrs.empty()) co_return false;
+            // Cancellable connect: the token fires at the probe deadline so
+            // a silently-dropping network cannot stall image open.
+            auto stream = co_await elio::net::tcp_connect(addrs.front(),
+                                                          std::move(token));
+            co_return stream.has_value();
+        } catch (const std::exception&) {
+            co_return false;
+        }
+    };
+    auto outcome = co_await elio::with_timeout(kReachableProbeTimeout,
+                                               std::move(probe));
+    co_return outcome && *outcome;
 }
 
 }  // namespace obd::source

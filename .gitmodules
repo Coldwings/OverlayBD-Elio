@@ -1,3 +1,0 @@
-[submodule "third_party/elio"]
-	path = third_party/elio
-	url = https://github.com/Coldwings/Elio.git

@@ -22,8 +22,13 @@ option(OBD_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # ---------------------------------------------------------------------------
-# Third-party: Elio coroutine runtime (vendored as a git submodule)
+# Third-party: fetched dependencies
 # ---------------------------------------------------------------------------
+include(FetchContent)
+set(FETCHCONTENT_QUIET OFF)
+
+# Elio coroutine runtime, pinned by commit (network fetch; configure behind a
+# proxy with https_proxy if needed). Bump in a dedicated commit with a reason.
 set(ELIO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ELIO_BUILD_SANITIZER_TESTS OFF CACHE BOOL "" FORCE)
 set(ELIO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -31,13 +36,10 @@ set(ELIO_BUILD_TCP_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(ELIO_ENABLE_TLS ON CACHE BOOL "" FORCE)
 set(ELIO_ENABLE_HTTP ON CACHE BOOL "" FORCE)
 set(ELIO_ENABLE_HTTP2 OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/elio EXCLUDE_FROM_ALL)
-
-# ---------------------------------------------------------------------------
-# Third-party: fetched dependencies
-# ---------------------------------------------------------------------------
-include(FetchContent)
-set(FETCHCONTENT_QUIET OFF)
+FetchContent_Declare(elio
+    GIT_REPOSITORY https://github.com/Coldwings/Elio.git
+    GIT_TAG 7b65e0b4ed0234ba699a05f7478d7b0f2f0b38ea)
+FetchContent_MakeAvailable(elio)
 
 FetchContent_Declare(nlohmann_json
     URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)

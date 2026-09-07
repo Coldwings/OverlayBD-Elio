@@ -20,7 +20,7 @@ DART P2P acceleration, and per-device process isolation.
 ## Build
 
 ```bash
-git clone --recursive <repo-url>   # third_party/elio is a submodule
+git clone <repo-url>
 cmake -S . -B build && cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
