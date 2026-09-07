@@ -1,0 +1,57 @@
+// DART proxy integration. See dart.hpp.
+#include "source/dart.hpp"
+
+#include <elio/net/resolve.hpp>
+#include <elio/net/tcp.hpp>
+
+namespace obd::source {
+
+std::optional<DartProxyAddress> parse_dart_address(std::string_view address) {
+    // Strip an optional scheme; DART speaks plain HTTP regardless.
+    if (auto p = address.find("://"); p != std::string_view::npos) {
+        address.remove_prefix(p + 3);
+    }
+    DartProxyAddress out;
+    const auto slash = address.find('/');
+    const std::string_view authority =
+        slash == std::string_view::npos ? address : address.substr(0, slash);
+    out.prefix =
+        slash == std::string_view::npos
+            ? std::string("/dart")
+            : std::string(address.substr(slash));
+
+    const auto colon = authority.rfind(':');
+    if (colon == std::string_view::npos) return std::nullopt;
+    out.host = std::string(authority.substr(0, colon));
+    if (out.host.empty()) return std::nullopt;
+    const std::string port_str(authority.substr(colon + 1));
+    try {
+        const unsigned long p = std::stoul(port_str);
+        if (p == 0 || p > 65535) return std::nullopt;
+        out.port = static_cast<uint16_t>(p);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    out.base = "http://" + out.host + ":" + std::to_string(out.port) +
+               out.prefix;
+    return out;
+}
+
+std::string dart_prefixed_url(const DartProxyAddress& address,
+                              const std::string& actual_url) {
+    return address.base + "/" + actual_url;
+}
+
+elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address) {
+    try {
+        auto addrs = co_await elio::net::resolve_all(address.host,
+                                                     address.port);
+        if (addrs.empty()) co_return false;
+        auto stream = co_await elio::net::tcp_connect(addrs.front());
+        co_return stream.has_value();
+    } catch (const std::exception&) {
+        co_return false;
+    }
+}
+
+}  // namespace obd::source

@@ -1,0 +1,25 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Editor / tooling
+.vscode/
+.idea/
+.cache/
+*.swp
+
+# Test / coverage artifacts
+Testing/
+*.gcda
+*.gcno
+
+# Local runtime state (never commit)
+/run/
+*.pid
+*.sock
