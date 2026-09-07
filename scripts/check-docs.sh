@@ -80,7 +80,7 @@ status 1 "docs index <-> file sync" $fb $ab
 fb=$fail; ab=$advisory
 areas='common|format|source|image|ublk|supervisor|cli|integration'
 test_names_file=$(mktemp)
-grep -rhoE 'TEST_CASE\("[^"]+"' tests/ 2>/dev/null | sed 's/^TEST_CASE("//' | sort -u > "$test_names_file"
+grep -rhoE 'TEST_CASE\("[^"]+"' tests/ 2>/dev/null | sed 's/^TEST_CASE("//; s/"$//' | sort -u > "$test_names_file"
 cited_file=$(mktemp)
 grep -rhoE '`[^`]+`' docs/*.md docs/adr/*.md AGENTS.md README.md CONTRIBUTING.md 2>/dev/null \
   | sed 's/^`//; s/`$//' \
@@ -246,6 +246,7 @@ status 5 "ADR integrity" $fb $ab
 fb=$fail; ab=$advisory
 if command -v python3 >/dev/null 2>&1; then
   find . -name '*.md' -not -path './third_party/*' -not -path './build/*' -print0 \
+  | sed -z 's|^\./||' \
   | xargs -0 python3 scripts/_canonical_check.py 2>/dev/null > /tmp/checkdocs_canon.$$
   while IFS= read -r line; do
     case "$line" in
