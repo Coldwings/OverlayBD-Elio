@@ -113,10 +113,13 @@ ImageConfig ImageConfig::from_json_text(const std::string& text,
     }
     if (const auto it = j.find("upper"); it != j.end() && it->is_object() &&
         !it->empty()) {
-        // ADR-0007: read-only-first scope; writable uppers are rejected.
-        throw error(EINVAL,
-                    "image config has a non-empty 'upper': writable layers "
-                    "are out of scope (ADR-0007)");
+        // ADR-0008: a writable upper engages the writable device mode.
+        cfg.upper.dir = it->value("dir", "");
+        cfg.upper.type = it->value("type", "lsmt");
+        if (cfg.upper.type != "lsmt" && cfg.upper.type != "sparse") {
+            throw error(EINVAL, "unknown upper.type '" + cfg.upper.type +
+                                    "' (want lsmt|sparse, ADR-0008)");
+        }
     }
     cfg.result_file = j.value("resultFile", "");
     if (const auto it = j.find("download"); it != j.end()) {

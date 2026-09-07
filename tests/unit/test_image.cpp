@@ -57,16 +57,26 @@ TEST_CASE("image: per-image download overrides merge over global defaults",
     REQUIRE(image::ImageConfig::digest_sha256_hex("sha512:abc").empty());
 }
 
-TEST_CASE("image: non-empty upper is rejected (read-only scope)", "[image]") {
+TEST_CASE("image: upper config parses; unknown type rejected", "[image]") {
+    // ADR-0008: a non-empty upper engages the writable mode.
     const std::string text = R"({
         "repoBlobUrl": "x",
         "lowers": [{"digest": "sha256:a", "size": 1}],
-        "upper": {"dir": "/upper", "index": "/upper.idx"}
+        "upper": {"dir": "/upper"}
     })";
-    REQUIRE_THROWS(image::ImageConfig::from_json_text(text, {}));
-    // Empty/absent upper is fine.
+    const auto cfg = image::ImageConfig::from_json_text(text, {});
+    REQUIRE(cfg.writable());
+    REQUIRE(cfg.upper.dir == "/upper");
+    REQUIRE(cfg.upper.type == "lsmt");  // default
+    // Empty/absent upper stays read-only.
     const std::string ok = R"({"repoBlobUrl":"x","lowers":[]})";
-    REQUIRE_NOTHROW(image::ImageConfig::from_json_text(ok, {}));
+    REQUIRE(!image::ImageConfig::from_json_text(ok, {}).writable());
+    // Unknown upper types are rejected.
+    const std::string bad = R"({
+        "repoBlobUrl": "x", "lowers": [],
+        "upper": {"dir": "/u", "type": "turboci"}
+    })";
+    REQUIRE_THROWS(image::ImageConfig::from_json_text(bad, {}));
 }
 
 TEST_CASE("image: assembly from local layer files reads merged content",

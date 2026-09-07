@@ -3,6 +3,9 @@
 
 #include "common/errors.hpp"
 #include "format/lsmt.hpp"
+#include "format/lsmt_rw.hpp"
+#include "format/merged_writable.hpp"
+#include "format/sparse_rw.hpp"
 #include "format/zfile.hpp"
 #include "source/chunk_cache.hpp"
 #include "source/dart.hpp"
@@ -14,6 +17,9 @@
 #include <elio/log/macros.hpp>
 
 #include <sys/stat.h>
+
+#include <algorithm>
+#include <filesystem>
 
 namespace obd::image {
 
@@ -124,13 +130,42 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     }
 
     const size_t n = layers.size();
-    auto merged = co_await format::MergedLsmt::open(std::move(layers));
+    if (!cfg.writable()) {
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        OpenedImage out;
+        out.virtual_size = merged->size();
+        out.layer_count = n;
+        out.root = std::move(merged);
+        ELIO_LOG_INFO("image assembled: {} layers, virtual size {} bytes", n,
+                      out.virtual_size);
+        co_return out;
+    }
+
+    // Writable upper (ADR-0008): the device view is the lowers merged with
+    // a writable top layer sized to cover the whole image.
+    uint64_t vsize = 0;
+    for (const auto& l : layers) vsize = std::max(vsize, l->virtual_size());
+    std::filesystem::create_directories(cfg.upper.dir);
+    std::unique_ptr<format::WritableLayer> top;
+    std::string upper_path;
+    if (cfg.upper.type == "sparse") {
+        upper_path = cfg.upper.dir + "/overlaybd.sparse";
+        top = co_await format::SparseRwLayer::open(upper_path, vsize);
+    } else {
+        upper_path = cfg.upper.dir + "/overlaybd.rw";
+        top = co_await format::LsmtRwLayer::create(upper_path, vsize);
+    }
+    auto merged = co_await format::MergedWritable::open(std::move(layers),
+                                                        std::move(top));
     OpenedImage out;
     out.virtual_size = merged->size();
-    out.layer_count = n;
+    out.layer_count = n + 1;
+    out.writable = true;
+    out.upper_path = upper_path;
     out.root = std::move(merged);
-    ELIO_LOG_INFO("image assembled: {} layers, virtual size {} bytes", n,
-                  out.virtual_size);
+    ELIO_LOG_INFO("image assembled writable: {} lowers + {} upper, virtual "
+                  "size {} bytes",
+                  n, cfg.upper.type, out.virtual_size);
     co_return out;
 }
 

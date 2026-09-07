@@ -17,6 +17,9 @@
 //   → LsmtLayer
 //
 // All layers are finally merged by MergedLsmt (topmost = last lower).
+// With a non-empty `upper` (ADR-0008) the root instead becomes a
+// MergedWritable whose topmost layer is the writable upper — reads fall
+// through to the lowers, writes land in the upper.
 #pragma once
 
 #include "image/config.hpp"
@@ -31,9 +34,11 @@
 namespace obd::image {
 
 struct OpenedImage {
-    source::BlobSourcePtr root;  // MergedLsmt: the block-device backing
+    source::BlobSourcePtr root;  // MergedLsmt or MergedWritable
     uint64_t virtual_size = 0;
     size_t layer_count = 0;
+    bool writable = false;       // root is a WritableBlobSource (ADR-0008)
+    std::string upper_path;      // the writable layer file, when writable
 };
 
 /// Assembles the merged read-only view for an image. Throws obd::error /

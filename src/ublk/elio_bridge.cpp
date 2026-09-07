@@ -34,13 +34,34 @@ elio::coro::task<void> handle_io(Queue* q, source::BlobSource* src,
         }
         break;
     }
-    case UBLK_IO_OP_FLUSH:
-        result = 0;
+    case UBLK_IO_OP_FLUSH: {
+        auto* w = dynamic_cast<source::WritableBlobSource*>(src);
+        if (w) {
+            result = co_await w->flush();
+        } else {
+            result = 0;  // read-only device: nothing to flush
+        }
         break;
-    case UBLK_IO_OP_WRITE:
+    }
+    case UBLK_IO_OP_WRITE: {
+        // Writable images (ADR-0008) dispatch through WritableBlobSource;
+        // read-only images reject with -EROFS.
+        auto* w = dynamic_cast<source::WritableBlobSource*>(src);
+        if (!w) {
+            result = -EROFS;
+            break;
+        }
+        const void* buf = q->io_buf(req.tag);
+        const uint32_t len = req.byte_len();
+        const ssize_t r = co_await w->pwrite(buf, len, req.byte_offset());
+        result = r < 0 ? static_cast<int32_t>(r)
+                       : static_cast<int32_t>(len);
+        break;
+    }
     case UBLK_IO_OP_WRITE_SAME:
     case UBLK_IO_OP_WRITE_ZEROES:
-        result = -EROFS;
+        // Not advertised (max_sectors/basic attrs); reject defensively.
+        result = -EOPNOTSUPP;
         break;
     default:
         result = -EOPNOTSUPP;

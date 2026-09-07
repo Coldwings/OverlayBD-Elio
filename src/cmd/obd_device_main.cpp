@@ -67,6 +67,7 @@ elio::coro::task<int> device_main(Args args) {
 
         obd::ublk::DeviceParams params;
         params.dev_sectors = opened.virtual_size / 512;
+        params.read_only = !opened.writable;  // ADR-0008
         if (args.dev_id >= 0) {
             params.dev_id = static_cast<uint32_t>(args.dev_id);
         }

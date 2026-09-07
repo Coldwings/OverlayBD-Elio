@@ -11,6 +11,7 @@ add_executable(obd_unit_tests
     unit/test_source.cpp
     unit/test_registry.cpp
     unit/test_image.cpp
+    unit/test_writable.cpp
     unit/test_supervisor.cpp)
 target_include_directories(obd_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)

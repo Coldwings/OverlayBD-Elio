@@ -43,4 +43,20 @@ public:
 
 using BlobSourcePtr = std::unique_ptr<BlobSource>;
 
+/// Writable block source (ADR-0008): the device root of an image with a
+/// writable upper layer. Reads follow the BlobSource contract; writes are
+/// sector-aligned like reads and follow the same return convention.
+/// The ublk bridge dispatches WRITE/FLUSH through this interface and
+/// answers -EROFS when the root does not implement it.
+class WritableBlobSource : public BlobSource {
+public:
+    /// Writes count bytes at offset (both 512B multiples).
+    /// Returns count, or a negative -errno.
+    virtual elio::coro::task<ssize_t> pwrite(const void* buf, size_t count,
+                                             uint64_t offset) = 0;
+
+    /// Durability point (ublk FLUSH). Returns 0 or a negative -errno.
+    virtual elio::coro::task<int> flush() = 0;
+};
+
 }  // namespace obd::source

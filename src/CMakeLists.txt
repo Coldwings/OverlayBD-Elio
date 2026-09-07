@@ -11,6 +11,9 @@ add_library(obd_core STATIC
     format/lsmt_format.cpp
     format/lsmt.cpp
     format/writer.cpp
+    format/sparse_rw.cpp
+    format/lsmt_rw.cpp
+    format/merged_writable.cpp
     source/local_file.cpp
     source/tar_offset.cpp
     source/credentials.cpp
