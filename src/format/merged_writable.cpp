@@ -122,6 +122,16 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
     co_return r;
 }
 
+elio::coro::task<int> MergedWritable::discard(uint64_t offset,
+                                              uint64_t len) {
+    if ((offset % kSector) != 0 || (len % kSector) != 0) co_return -EINVAL;
+    if (offset + len > vsize_) co_return -EINVAL;
+    const int r = co_await top_->discard(offset, len);
+    if (r != 0) co_return r;
+    rebuild_index();
+    co_return 0;
+}
+
 elio::coro::task<int> MergedWritable::flush() {
     co_return co_await top_->flush();
 }

@@ -256,6 +256,147 @@ TEST_CASE("format: merged writable falls through and copy-on-writes",
                         lower_raw.size()) == 0);
 }
 
+TEST_CASE("format: lsmt rw discard masks coverage with zeroed segments",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto a = sectors_pattern(0, 16, 1100);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(a.size()));
+        int dr = co_await layer->discard(4 * 512, 8 * 512);  // [4,12)
+        REQUIRE(dr == 0);
+        // Index: data [0,4) | zeroed [4,12) | data [12,16).
+        REQUIRE(layer->segments().size() == 3);
+        REQUIRE(layer->segments()[1].zeroed);
+        REQUIRE(layer->segments()[1].offset == 4);
+        REQUIRE(layer->segments()[1].length == 8);
+        std::vector<uint8_t> buf(512 * 16);
+        r = co_await layer->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), a.data(), 4 * 512) == 0);
+        for (size_t i = 4 * 512; i < 12 * 512; ++i) REQUIRE(buf[i] == 0);
+        REQUIRE(std::memcmp(buf.data() + 12 * 512, a.data() + 12 * 512,
+                            4 * 512) == 0);
+        // Alignment and range rules match pwrite.
+        dr = co_await layer->discard(3, 100);
+        REQUIRE(dr == -EINVAL);
+
+        // Seal: zeroed segments survive into a valid standard LSMT file.
+        int src = co_await layer->seal("discard-test");
+        REQUIRE(src == 0);
+        auto ro = co_await source::LocalFileSource::open(path);
+        source::BlobSourcePtr base = std::move(ro);
+        auto ro_layer = co_await format::LsmtLayer::open(std::move(base));
+        REQUIRE(ro_layer->segments().size() == 3);
+        REQUIRE(ro_layer->segments()[1].zeroed);
+        // Live data is only 8 sectors; the sealed file must load and the
+        // discarded range reads as zeroes through the read-only path.
+        std::vector<uint8_t> buf2(512 * 16);
+        std::vector<bytes::segment_mapping> idx = ro_layer->segments();
+        source::BlobSource& ds = ro_layer->data_source();
+        for (const auto& seg : idx) {
+            if (seg.zeroed) continue;
+            r = co_await ds.pread(buf2.data() + seg.offset * 512,
+                                  seg.length * 512, seg.moffset * 512);
+            REQUIRE(r == static_cast<ssize_t>(seg.length * 512));
+        }
+        REQUIRE(std::memcmp(buf2.data(), a.data(), 4 * 512) == 0);
+        REQUIRE(std::memcmp(buf2.data() + 12 * 512, a.data() + 12 * 512,
+                            4 * 512) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse layer discard punches holes and recovers",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const auto a = sectors_pattern(8, 8, 1200);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer =
+                co_await format::SparseRwLayer::open(path, 512 * 64);
+            ssize_t r =
+                co_await layer->pwrite(a.data(), a.size(), 8 * 512);
+            REQUIRE(r == static_cast<ssize_t>(a.size()));
+            int dr = co_await layer->discard(10 * 512, 4 * 512);
+            REQUIRE(dr == 0);
+            REQUIRE(layer->segments().size() == 2);
+            REQUIRE(layer->segments()[0].offset == 8);
+            REQUIRE(layer->segments()[0].length == 2);
+            REQUIRE(layer->segments()[1].offset == 14);
+            REQUIRE(layer->segments()[1].length == 2);
+            std::vector<uint8_t> buf(512 * 8);
+            r = co_await layer->pread(buf.data(), buf.size(), 8 * 512);
+            REQUIRE(r == static_cast<ssize_t>(buf.size()));
+            REQUIRE(std::memcmp(buf.data(), a.data(), 2 * 512) == 0);
+            for (size_t i = 2 * 512; i < 6 * 512; ++i) REQUIRE(buf[i] == 0);
+            REQUIRE(std::memcmp(buf.data() + 6 * 512, a.data() + 6 * 512,
+                                2 * 512) == 0);
+            int frc = co_await layer->flush();
+            REQUIRE(frc == 0);
+        }
+        // Reopen: fiemap recovery is filesystem-block granular (a
+        // sub-block punch zeroes but cannot deallocate), so the recovered
+        // index may be fatter than the in-memory one — but reads must be
+        // identical: data at [8,10) and [14,16), zeroes in between.
+        {
+            auto layer =
+                co_await format::SparseRwLayer::open(path, 512 * 64);
+            std::vector<uint8_t> buf(512 * 8);
+            ssize_t r =
+                co_await layer->pread(buf.data(), buf.size(), 8 * 512);
+            REQUIRE(r == static_cast<ssize_t>(buf.size()));
+            REQUIRE(std::memcmp(buf.data(), a.data(), 2 * 512) == 0);
+            for (size_t i = 2 * 512; i < 6 * 512; ++i) REQUIRE(buf[i] == 0);
+            REQUIRE(std::memcmp(buf.data() + 6 * 512, a.data() + 6 * 512,
+                                2 * 512) == 0);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged writable discard masks the lower layer",
+          "[format]") {
+    TempDir dir;
+    const auto lower_raw = test::pattern_bytes(512 * 32, 71);
+    std::string lower_lsmt;
+    make_lsmt_lower(dir.str(), "lower", lower_raw, &lower_lsmt);
+    const std::string upper = dir / "upper.rw";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        {
+            auto s = co_await source::LocalFileSource::open(lower_lsmt);
+            source::BlobSourcePtr b = std::move(s);
+            layers.push_back(
+                co_await format::LsmtLayer::open(std::move(b)));
+        }
+        auto top = co_await format::LsmtRwLayer::create(upper, 512 * 32);
+        auto merged = co_await format::MergedWritable::open(
+            std::move(layers), std::move(top));
+        // Discard a range the upper never wrote: reads must return zeroes,
+        // NOT the lower's data (ADR-0009).
+        int dr = co_await merged->discard(8 * 512, 8 * 512);
+        REQUIRE(dr == 0);
+        std::vector<uint8_t> buf(512 * 32);
+        ssize_t r = co_await merged->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        for (size_t i = 8 * 512; i < 16 * 512; ++i) REQUIRE(buf[i] == 0);
+        REQUIRE(std::memcmp(buf.data(), lower_raw.data(), 8 * 512) == 0);
+        REQUIRE(std::memcmp(buf.data() + 16 * 512,
+                            lower_raw.data() + 16 * 512, 16 * 512) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("image: writable upper assembles and serves writes", "[image]") {
     TempDir dir;
     const auto lower_raw = test::pattern_bytes(512 * 32, 61);

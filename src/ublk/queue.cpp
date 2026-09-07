@@ -191,6 +191,7 @@ void Queue::dispatch_cqe(const io_uring_cqe* cqe) {
     IoRequest req;
     req.tag = tag;
     req.op = ublksrv_get_op(&iod);
+    req.flags = ublksrv_get_flags(&iod);
     req.start_sector = iod.start_sector;
     req.nr_sectors = iod.nr_sectors;
     {

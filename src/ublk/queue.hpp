@@ -31,6 +31,7 @@ namespace obd::ublk {
 struct IoRequest {
     uint16_t tag = 0;
     uint8_t op = 0;           // UBLK_IO_OP_*
+    uint32_t flags = 0;       // ublksrv_get_flags() (UBLK_IO_F_*)
     uint64_t start_sector = 0;
     uint32_t nr_sectors = 0;
 

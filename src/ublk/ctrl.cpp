@@ -77,7 +77,7 @@ uint32_t Ctrl::add_dev(const DeviceParams& p) {
 void Ctrl::set_params(uint32_t dev_id, const DeviceParams& p) {
     ublk_params params {};
     params.len = sizeof(params);
-    params.types = UBLK_PARAM_TYPE_BASIC | UBLK_PARAM_TYPE_DISCARD;
+    params.types = UBLK_PARAM_TYPE_BASIC;
     params.basic.attrs = UBLK_ATTR_VOLATILE_CACHE;
     if (p.read_only) params.basic.attrs |= UBLK_ATTR_READ_ONLY;
     params.basic.logical_bs_shift = p.logical_bs_shift;
@@ -86,7 +86,17 @@ void Ctrl::set_params(uint32_t dev_id, const DeviceParams& p) {
     params.basic.io_min_shift = p.logical_bs_shift;
     params.basic.max_sectors = p.max_sectors;
     params.basic.dev_sectors = p.dev_sectors;
-    // discard: not supported by a read-only view (all limits stay 0).
+    if (!p.read_only) {
+        // ADR-0009: discard/write-zeroes are served by the writable upper.
+        // Sector granularity matches the layer contract (512B).
+        params.types |= UBLK_PARAM_TYPE_DISCARD;
+        params.discard.discard_alignment = 512;
+        params.discard.discard_granularity = 512;
+        params.discard.max_discard_sectors = p.max_sectors;
+        params.discard.max_write_zeroes_sectors = p.max_sectors;
+        params.discard.max_discard_segments = 1;
+    }
+    // read-only: discard limits stay 0, so the kernel never issues them.
     ctrl_cmd(UBLK_U_CMD_SET_PARAMS, dev_id, static_cast<uint16_t>(-1),
              &params, sizeof(params), 0, "SET_PARAMS");
 }

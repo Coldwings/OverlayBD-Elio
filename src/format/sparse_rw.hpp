@@ -1,7 +1,10 @@
 // Sparse writable layer: a sparse file whose written extents form the
 // layer's segment index with identity mapping (moffset == offset).
 // Extents are rebuilt from the kernel fiemap (SEEK_DATA/SEEK_HOLE) when an
-// existing file is opened, so reopening preserves coverage.
+// existing file is opened, so reopening preserves coverage. Note: fiemap
+// is filesystem-block granular — a sub-block punch-hole zeroes but cannot
+// deallocate, so a recovered index may be fatter than the pre-reopen one;
+// reads are unaffected (punched blocks read back as zeroes).
 #pragma once
 
 #include "format/writable.hpp"
@@ -23,6 +26,7 @@ public:
     elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                     uint64_t offset) override;
     elio::coro::task<int> flush() override;
+    elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
 
     uint64_t virtual_size() const override { return vsize_; }
     const std::vector<bytes::segment_mapping>& segments() const override {

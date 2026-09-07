@@ -33,6 +33,7 @@ public:
     elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                     uint64_t offset) override;
     elio::coro::task<int> flush() override;
+    elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
 
     uint64_t virtual_size() const override { return vsize_; }
     const std::vector<bytes::segment_mapping>& segments() const override {

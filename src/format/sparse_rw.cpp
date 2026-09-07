@@ -173,6 +173,46 @@ elio::coro::task<ssize_t> SparseRwLayer::pread(void* buf, size_t count,
     co_return static_cast<ssize_t>(done);
 }
 
+elio::coro::task<int> SparseRwLayer::discard(uint64_t offset, uint64_t len) {
+    if (offset % kSector != 0 || len % kSector != 0 || len == 0) {
+        co_return -EINVAL;
+    }
+    if (offset + len > vsize_) co_return -EINVAL;
+    // Real deallocation: the blocks return to the filesystem and the range
+    // reads back as zeroes. Metadata-only syscall (same duration class as
+    // the fdatasync in flush()).
+    if (::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                    static_cast<off_t>(offset),
+                    static_cast<off_t>(len)) != 0) {
+        co_return -errno;
+    }
+    // Drop coverage of [lo,hi) from the extent index (split/trim).
+    const uint64_t lo = offset / kSector;
+    const uint64_t hi = lo + len / kSector;
+    std::vector<bytes::segment_mapping> next;
+    next.reserve(segments_.size());
+    for (const auto& s : segments_) {
+        if (s.end() <= lo || s.offset >= hi) {
+            next.push_back(s);
+            continue;
+        }
+        if (s.offset < lo) {
+            auto head = s;
+            head.length = static_cast<uint32_t>(lo - s.offset);
+            next.push_back(head);
+        }
+        if (s.end() > hi) {
+            auto tail = s;
+            tail.offset = hi;
+            tail.moffset += hi - s.offset;
+            tail.length = static_cast<uint32_t>(s.end() - hi);
+            next.push_back(tail);
+        }
+    }
+    segments_.swap(next);
+    co_return 0;
+}
+
 elio::coro::task<int> SparseRwLayer::flush() {
     if (::fdatasync(fd_) != 0) co_return -errno;
     co_return 0;

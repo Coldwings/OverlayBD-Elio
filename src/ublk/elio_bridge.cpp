@@ -58,9 +58,38 @@ elio::coro::task<void> handle_io(Queue* q, source::BlobSource* src,
                        : static_cast<int32_t>(len);
         break;
     }
+    case UBLK_IO_OP_DISCARD: {
+        // ADR-0009: writable images deallocate/mask; read-only reject.
+        auto* w = dynamic_cast<source::WritableBlobSource*>(src);
+        if (!w) {
+            result = -EROFS;
+            break;
+        }
+        result = co_await w->discard(req.byte_offset(), req.byte_len());
+        break;
+    }
+    case UBLK_IO_OP_WRITE_ZEROES: {
+        auto* w = dynamic_cast<source::WritableBlobSource*>(src);
+        if (!w) {
+            result = -EROFS;
+            break;
+        }
+        if (req.flags & UBLK_IO_F_NOUNMAP) {
+            // NOUNMAP: zero the data without deallocating — a real write
+            // of zeroes through the writable layer.
+            const uint32_t len = req.byte_len();
+            void* buf = q->io_buf(req.tag);
+            std::memset(buf, 0, len);
+            const ssize_t r =
+                co_await w->pwrite(buf, len, req.byte_offset());
+            result = r < 0 ? static_cast<int32_t>(r) : 0;
+        } else {
+            result = co_await w->discard(req.byte_offset(), req.byte_len());
+        }
+        break;
+    }
     case UBLK_IO_OP_WRITE_SAME:
-    case UBLK_IO_OP_WRITE_ZEROES:
-        // Not advertised (max_sectors/basic attrs); reject defensively.
+        // Not advertised (basic attrs); reject defensively.
         result = -EOPNOTSUPP;
         break;
     default:

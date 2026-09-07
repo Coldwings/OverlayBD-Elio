@@ -57,6 +57,13 @@ public:
 
     /// Durability point (ublk FLUSH). Returns 0 or a negative -errno.
     virtual elio::coro::task<int> flush() = 0;
+
+    /// Discards [offset, offset+len) (both 512B multiples): subsequent
+    /// reads of the range return zeroes (ADR-0009). The range masks lower
+    /// layers — discard does NOT fall through. Returns 0 or a negative
+    /// -errno.
+    virtual elio::coro::task<int> discard(uint64_t offset,
+                                          uint64_t len) = 0;
 };
 
 }  // namespace obd::source

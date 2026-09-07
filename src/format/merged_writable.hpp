@@ -28,6 +28,7 @@ public:
     elio::coro::task<ssize_t> pwrite(const void* buf, size_t count,
                                      uint64_t offset) override;
     elio::coro::task<int> flush() override;
+    elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
 
     uint64_t size() const noexcept override { return vsize_; }
     std::string_view label() const noexcept override { return label_; }

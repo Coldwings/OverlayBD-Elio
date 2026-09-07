@@ -300,6 +300,58 @@ elio::coro::task<ssize_t> LsmtRwLayer::pread(void* buf, size_t count,
     co_return static_cast<ssize_t>(done);
 }
 
+elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
+    if (sealed_) co_return -EROFS;
+    if (offset % kSector != 0 || len % kSector != 0 || len == 0) {
+        co_return -EINVAL;
+    }
+    if (offset + len > vsize_) co_return -EINVAL;
+    const uint64_t lo = offset / kSector;
+    const uint64_t hi = lo + len / kSector;
+
+    // Same split/trim as pwrite, but the covering segments are zeroed:
+    // no data is written; superseded data blocks become garbage that
+    // seal() drops (ADR-0009).
+    std::vector<bytes::segment_mapping> next;
+    next.reserve(segments_.size() + 1);
+    for (const auto& s : segments_) {
+        if (s.end() <= lo || s.offset >= hi) {
+            next.push_back(s);
+            continue;
+        }
+        if (s.offset < lo) {
+            auto head = s;
+            head.length = static_cast<uint32_t>(lo - s.offset);
+            next.push_back(head);
+        }
+        if (s.end() > hi) {
+            auto tail = s;
+            tail.offset = hi;
+            tail.moffset += hi - s.offset;
+            tail.length = static_cast<uint32_t>(s.end() - hi);
+            next.push_back(tail);
+        }
+    }
+    segments_.swap(next);
+    // Insert zeroed segments (capped at the 14-bit length field). moffset
+    // is never read for zeroed segments but must stay inside the data
+    // region for LsmtLayer validation after seal — kHeaderSectors always
+    // qualifies.
+    uint64_t cur = lo;
+    while (cur < hi) {
+        const uint64_t n = std::min(hi - cur, kMaxSegLen);
+        bytes::segment_mapping m;
+        m.offset = cur;
+        m.length = static_cast<uint32_t>(n);
+        m.moffset = kHeaderSectors;
+        m.zeroed = true;
+        m.tag = 0;
+        insert_sorted(segments_, m);
+        cur += n;
+    }
+    co_return 0;
+}
+
 elio::coro::task<int> LsmtRwLayer::flush() {
     if (::fdatasync(fd_) != 0) co_return -errno;
     co_return 0;
@@ -321,7 +373,10 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     std::vector<uint8_t> copy_buf(1 << 20);
     for (const auto& s : segments_) {
         bytes::segment_mapping m = s;
-        m.moffset = s.zeroed ? 0 : out_sector;
+        // Zeroed segments carry no data, but their moffset must stay inside
+        // the data region for the reader's validation; the current packing
+        // position always qualifies (ADR-0009).
+        m.moffset = out_sector;
         if (!s.zeroed) {
             uint64_t remaining = s.length * kSector;
             uint64_t from = s.moffset * kSector;

@@ -37,6 +37,12 @@ public:
     /// Durability point (ublk FLUSH).
     virtual elio::coro::task<int> flush() = 0;
 
+    /// Discards [offset, offset+len) (both 512B multiples): the range
+    /// reads back as zeroes from this layer onwards (ADR-0009). Returns 0
+    /// or a negative -errno.
+    virtual elio::coro::task<int> discard(uint64_t offset,
+                                          uint64_t len) = 0;
+
     virtual uint64_t virtual_size() const = 0;
 
     /// Current segment index: sorted, disjoint, 512B sector units, tag 0.
