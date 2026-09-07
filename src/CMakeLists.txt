@@ -20,7 +20,10 @@ add_library(obd_core STATIC
     source/downloader.cpp
     source/switch_source.cpp
     image/config.cpp
-    image/image_file.cpp)
+    image/image_file.cpp
+    supervisor/protocol.cpp
+    supervisor/child.cpp
+    supervisor/daemon.cpp)
 
 target_include_directories(obd_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR})
@@ -51,6 +54,7 @@ if(OBD_ENABLE_UBLK)
         ublk/device.cpp
         ublk/elio_bridge.cpp)
     target_include_directories(obd_ublk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(obd_ublk PUBLIC OBD_HAVE_UBLK=1)
     target_link_libraries(obd_ublk PUBLIC obd_core liburing::liburing)
 endif()
 

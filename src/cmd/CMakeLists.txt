@@ -1,0 +1,10 @@
+add_executable(obd-supervisor obd_supervisor_main.cpp)
+target_link_libraries(obd-supervisor PRIVATE obd_core)
+
+if(OBD_ENABLE_UBLK)
+    add_executable(obd-device obd_device_main.cpp)
+    target_link_libraries(obd-device PRIVATE obd_core obd_ublk)
+    install(TARGETS obd-supervisor obd-device RUNTIME DESTINATION bin)
+else()
+    install(TARGETS obd-supervisor RUNTIME DESTINATION bin)
+endif()
