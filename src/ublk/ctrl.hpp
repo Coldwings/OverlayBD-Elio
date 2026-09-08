@@ -1,7 +1,8 @@
 // ublk control plane: /dev/ublk-control commands driving the device
 // lifecycle ADD_DEV → SET_PARAMS → (queues start fetching) → START_DEV
-// → … → STOP_DEV → DEL_DEV. Synchronous cold path, never on a coroutine
-// hot path.
+// → … → STOP_DEV → DEL_DEV. Blocking cold path: coroutine callers must
+// offload via elio::spawn_blocking (kernel commands may sleep on our
+// own data plane, e.g. the START_DEV partition scan).
 //
 // NOTE: ublk-control has never had an unlocked_ioctl handler — control
 // commands are IORING_OP_URING_CMD on the control fd, with SQE128

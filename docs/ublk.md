@@ -182,7 +182,13 @@ and remembers the added device for best-effort cleanup. Non-copyable.
 - `static std::string cdev_path(uint32_t)` → `/dev/ublkc<N>`;
   `static std::string bdev_path(uint32_t)` → `/dev/ublkb<N>`.
 
-All `Ctrl` commands are **synchronous cold-path** calls — never invoke them on
+All `Ctrl` commands are blocking cold-path calls. Coroutine callers
+(`Device::create` / `Device::attach`) run them through
+`elio::spawn_blocking`: kernel control commands may sleep on our own
+data plane — START_DEV's `add_disk` partition scan issues device reads
+serviced by the bridges, and END_USER_RECOVERY waits for reissued IO.
+A synchronous control call on a scheduler worker deadlocks it (the
+worker stalls, the bridge coroutine never runs). Never invoke them on
 a coroutine hot path.
 
 ### `src/ublk/queue.hpp` — `obd::ublk::IoRequest`, `obd::ublk::Queue`

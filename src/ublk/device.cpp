@@ -6,6 +6,7 @@
 
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
 
 #include <cerrno>
@@ -24,8 +25,16 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
 
     try {
         dev->ctrl_ = std::make_unique<Ctrl>();
-        dev->dev_id_ = dev->ctrl_->add_dev(params);
-        dev->ctrl_->set_params(dev->dev_id_, params);
+        // Kernel control calls run off-scheduler (spawn_blocking): they
+        // may block in the kernel — START_DEV's add_disk partition scan
+        // issues reads serviced by OUR bridges, so a synchronous control
+        // call on a worker deadlocks the data plane (worker stalls, the
+        // bridge coroutine never runs). See ublk.md control plane.
+        dev->dev_id_ = co_await elio::spawn_blocking([&]() -> uint32_t {
+            const uint32_t id = dev->ctrl_->add_dev(params);
+            dev->ctrl_->set_params(id, params);
+            return id;
+        });
 
         for (uint16_t q = 0; q < params.nr_queues; ++q) {
             auto queue = std::make_unique<Queue>(dev->dev_id_, q,
@@ -64,7 +73,8 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
         bool started = false;
         for (int attempt = 0; attempt < 100 && !started; ++attempt) {
             try {
-                dev->ctrl_->start_dev(dev->dev_id_);
+                co_await elio::spawn_blocking(
+                    [&] { dev->ctrl_->start_dev(dev->dev_id_); });
                 started = true;
             } catch (const std::system_error& e) {
                 if (e.code().value() != EBUSY) throw;
@@ -106,7 +116,8 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         dev->ctrl_ = std::make_unique<Ctrl>();
         // Announce the replacement server BEFORE parking FETCH commands:
         // the device sits in QUIESCED while there is no server.
-        dev->ctrl_->start_user_recovery(dev_id);
+        co_await elio::spawn_blocking(
+            [&] { dev->ctrl_->start_user_recovery(dev_id); });
 
         for (uint16_t q = 0; q < params.nr_queues; ++q) {
             auto queue = std::make_unique<Queue>(dev_id, q,
@@ -137,7 +148,8 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         bool recovered = false;
         for (int attempt = 0; attempt < 100 && !recovered; ++attempt) {
             try {
-                dev->ctrl_->end_user_recovery(dev_id);
+                co_await elio::spawn_blocking(
+                    [&] { dev->ctrl_->end_user_recovery(dev_id); });
                 recovered = true;
             } catch (const std::system_error& e) {
                 if (e.code().value() != EBUSY) throw;
