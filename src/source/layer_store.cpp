@@ -181,10 +181,14 @@ elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
 
     const uint64_t resumed = ls->find_valid_pair();
     if (resumed == 0) {
-        const int rc = ls->create_fresh_pair();
+        FreshPair p;
+        const int rc = ls->create_fresh_pair(p);
         if (rc != 0) {
             throw_errno(rc, "cannot create staging pair in " + ls->dir_);
         }
+        ls->nonce_ = p.nonce;
+        ls->staging_fd_.store(p.staging_fd, std::memory_order_release);
+        ls->sidecar_fd_ = p.sidecar_fd;
         ELIO_LOG_INFO("layer store {}: fresh staging pair (nonce {})",
                       ls->dir_, hex_nonce(ls->nonce_));
     } else {
@@ -212,9 +216,10 @@ LayerStore::~LayerStore() {
     }
     if (sidecar_fd_ >= 0) ::close(sidecar_fd_);
     for (const int fd : retired_fds_) elio::io::close_fd_for_destructor(fd);
-    if (staging_fd_ >= 0) elio::io::close_fd_for_destructor(staging_fd_);
+    const int sfd = staging_fd_.load(std::memory_order_relaxed);
+    if (sfd >= 0) elio::io::close_fd_for_destructor(sfd);
     const int cfd = commit_fd_.load(std::memory_order_acquire);
-    if (cfd >= 0 && cfd != staging_fd_) {
+    if (cfd >= 0 && cfd != sfd) {
         elio::io::close_fd_for_destructor(cfd);
     }
 }
@@ -229,7 +234,7 @@ void LayerStore::set_test_write_hook(
 // Setup / recovery (cold paths)
 // ---------------------------------------------------------------------------
 
-int LayerStore::create_fresh_pair() {
+int LayerStore::create_fresh_pair(FreshPair& out) {
     std::random_device rd;
     for (int attempt = 0; attempt < 8; ++attempt) {
         const uint64_t nonce =
@@ -281,9 +286,9 @@ int LayerStore::create_fresh_pair() {
             ::unlink(bp.c_str());
             return rc;
         }
-        nonce_ = nonce;
-        staging_fd_ = fd;
-        sidecar_fd_ = bfd;
+        out.nonce = nonce;
+        out.staging_fd = fd;
+        out.sidecar_fd = bfd;
         return 0;
     }
     return EEXIST;  // repeated nonce collisions
@@ -390,7 +395,7 @@ bool LayerStore::try_load_pair(uint64_t nonce, const std::string& staging,
     }
     present_.store(present, std::memory_order_relaxed);
     nonce_ = nonce;
-    staging_fd_ = sfd;
+    staging_fd_.store(sfd, std::memory_order_release);
     sidecar_fd_ = bfd;
     return true;
 }
@@ -522,8 +527,9 @@ elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
                     tmp.resize(elen);
                     dst = tmp.data();
                 }
-                const ssize_t r =
-                    co_await read_fd_loop(staging_fd_, dst, elen, ebase);
+                const ssize_t r = co_await read_fd_loop(
+                    staging_fd_.load(std::memory_order_acquire), dst, elen,
+                    ebase);
                 if (r < 0) {
                     co_return done > 0 ? static_cast<ssize_t>(done) : r;
                 }
@@ -640,7 +646,8 @@ void LayerStore::process_job(
         }
     }
     // Consistency rule (ADR-0011): the record lands only after the data.
-    int rc = pwrite_all(staging_fd_, job.data->data(), job.data->size(),
+    int rc = pwrite_all(staging_fd_.load(std::memory_order_relaxed),
+                        job.data->data(), job.data->size(),
                         job.extent_id * cfg_.extent_size);
     if (rc == 0) {
         uint8_t rec[8];
@@ -701,8 +708,8 @@ void LayerStore::complete_layer() {
                 const size_t chunk = static_cast<size_t>(
                     std::min<uint64_t>(buf.size(), size_ - off));
                 const ssize_t r =
-                    ::pread(staging_fd_, buf.data(), chunk,
-                            static_cast<off_t>(off));
+                    ::pread(staging_fd_.load(std::memory_order_relaxed),
+                            buf.data(), chunk, static_cast<off_t>(off));
                 if (r <= 0) {
                     verified = false;
                     break;
@@ -738,7 +745,8 @@ void LayerStore::complete_layer() {
         }
         // The staging fd becomes the commit fd: same inode after the
         // rename, so reads in flight on it stay valid.
-        commit_fd_.store(staging_fd_, std::memory_order_release);
+        commit_fd_.store(staging_fd_.load(std::memory_order_relaxed),
+                         std::memory_order_release);
         state_.store(static_cast<int>(State::Complete),
                      std::memory_order_release);
         ELIO_LOG_INFO("layer store {} complete: {} ({} extents)", dir_,
@@ -756,23 +764,40 @@ void LayerStore::complete_layer() {
 }
 
 void LayerStore::restart_fresh() {
-    // Retire (don't close) the old staging fd: reader coroutines may still
-    // have io_uring reads in flight on it. Closed in the destructor.
-    retired_fds_.push_back(staging_fd_);
-    staging_fd_ = -1;
-    if (sidecar_fd_ >= 0) {
-        ::close(sidecar_fd_);
-        sidecar_fd_ = -1;
-    }
-    ::unlink(staging_path().c_str());
-    ::unlink(sidecar_path().c_str());
+    // Ordering contract: demote everything FIRST. Readers either see a
+    // cleared record (treated as a miss, re-fetched remotely — any write
+    // they enqueue lands in the new pair, because process_job resolves the
+    // fds after the publish below) or the old fd with a stale record (old
+    // bytes, CRC-verified). Only then build and publish the replacement
+    // pair, so a watcher that observes the new pair's files already sees
+    // cleared records.
     for (auto& rec : records_) rec.store(0, std::memory_order_relaxed);
     present_.store(0, std::memory_order_relaxed);
-    const int rc = create_fresh_pair();
+    const std::string old_staging = staging_path();
+    const std::string old_sidecar = sidecar_path();
+    // Build the replacement pair into locals: readers keep using the old
+    // staging fd (retired but still open, data intact) until the new one is
+    // published, so there is never an instant where readers observe
+    // staging_fd_ == -1.
+    FreshPair p;
+    const int rc = create_fresh_pair(p);
     if (rc != 0) {
         enter_bypass(rc, "fresh staging pair creation failed");
         return;
     }
+    // Publish: exchange the fd, retire (don't close) the old one — reader
+    // coroutines may still have io_uring reads in flight on it; closed in
+    // the destructor.
+    const int old_fd =
+        staging_fd_.exchange(p.staging_fd, std::memory_order_acq_rel);
+    retired_fds_.push_back(old_fd);
+    if (sidecar_fd_ >= 0) {
+        ::close(sidecar_fd_);
+    }
+    sidecar_fd_ = p.sidecar_fd;
+    nonce_ = p.nonce;
+    ::unlink(old_staging.c_str());
+    ::unlink(old_sidecar.c_str());
     ELIO_LOG_INFO("layer store {}: restarting fresh (nonce {})", dir_,
                   hex_nonce(nonce_));
 }

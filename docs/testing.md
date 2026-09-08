@@ -187,9 +187,13 @@ Every test, grouped by area, with the property it guards.
 - `source: layer store drops writes when the queue is full` — the bounded
   write-behind queue drops (never back-pressures) under a stalled writer;
   drops are counted and reads stay correct.
-- `source: layer store enters bypass on write failure` — `ENOSPC` from the
-  writer thread flips the store to `Bypass`; reads continue remotely and
-  `populate` no-ops.
+- `source: layer store enters bypass on write failure` — `ENOSPC` and
+  `EIO` from the writer thread both flip the store to `Bypass`; reads
+  continue remotely, `populate` no-ops, and no further extent is persisted
+  even after the injected failure stops.
+- `source: layer store stays filling after a non-fatal write error` — a
+  non-ENOSPC/EIO write failure drops only that entry: the store stays
+  `Filling`, other extents persist, and the failed extent re-fetches.
 - `source: layer store completes to overlaybd.commit and reopens read-only` —
   a fully-filled layer is sha256-verified, atomically renamed to
   `overlaybd.commit`, and a reopen binds it with zero remote reads.
@@ -205,6 +209,17 @@ Every test, grouped by area, with the property it guards.
 - `source: layer store handles a tail extent at eof` — the short tail
   extent of a non-extent-aligned blob reads, persists, and CRC-verifies
   over its actual length.
+- `source: layer store completes a fully-filled pair on reopen` — a
+  staging pair whose records are all present (death between the last
+  record write and the rename) is sha256-verified and renamed to
+  `overlaybd.commit` immediately at reopen.
+- `source: layer store accepts digest forms and rejects malformed` — the
+  `sha256:` prefix and uppercase hex are accepted (normalized before
+  comparison); malformed digests fail `open` with `EINVAL`.
+- `source: layer store completes without verification when digest is empty` —
+  an empty expected digest zero-fills the sidecar header (resume still
+  matches) and completes to `overlaybd.commit` without sha256
+  verification.
 
 ### image
 

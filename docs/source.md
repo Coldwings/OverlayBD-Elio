@@ -815,7 +815,9 @@ Callers may rely on:
   destroyed with reads in flight (the destructor orders the fd close against
   the io_uring backend). A `Downloader` must outlive its coroutine — keep
   the owning `SwitchSource` (or an explicit `shared_ptr<Downloader>`) alive
-  until `kDone`/`kFailed`.
+  until `kDone`/`kFailed`. A `LayerStore` must not be destroyed while
+  `pread`/`populate` coroutines are in flight on it (a suspended fetch or
+  joiner touches members on resume).
 - **Writable sources** — `WritableBlobSource::pwrite`/`flush` are called only
   from the ublk data plane on the image root, after the bridge has confirmed
   the root implements the interface; writers and readers may race on
@@ -913,8 +915,12 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   writes drop (`dropped_writes`), reads stay correct, and the queued
   entries persist once the writer resumes.
 - `source: layer store enters bypass on write failure` — an injected
-  `ENOSPC` moves the store to `Bypass`: reads keep working remotely and
-  `populate` is a no-op.
+  `ENOSPC` or `EIO` moves the store to `Bypass`: reads keep working
+  remotely, `populate` is a no-op, and nothing further persists even after
+  the injected failure stops.
+- `source: layer store stays filling after a non-fatal write error` — an
+  injected non-ENOSPC/EIO failure drops only that entry: the store stays
+  `Filling`, other extents persist, the failed extent re-fetches.
 - `source: layer store completes to overlaybd.commit and reopens read-only` —
   filling every extent sha256-verifies and renames the staging file to
   `overlaybd.commit` (sidecar gone, state `Complete`); a reopen binds the
@@ -931,6 +937,16 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: layer store handles a tail extent at eof` — a blob whose size is
   not a multiple of the extent size reads, persists, and CRC-verifies its
   short tail extent correctly (EOF clamping included).
+- `source: layer store completes a fully-filled pair on reopen` — a pair
+  left fully filled by a dead previous run (records written, rename never
+  happened) is verified and renamed to `overlaybd.commit` immediately at
+  reopen.
+- `source: layer store accepts digest forms and rejects malformed` — the
+  `sha256:` prefix and uppercase hex are accepted (normalized before
+  comparison); malformed digests fail `open` with `EINVAL`.
+- `source: layer store completes without verification when digest is empty` —
+  an empty expected digest zero-fills the sidecar header (resume still
+  matches) and completes to `overlaybd.commit` without verification.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → ChunkCache → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same wiring image

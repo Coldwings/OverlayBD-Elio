@@ -10,6 +10,8 @@
 // Catch2's REQUIRE decomposition macro is not a single evaluation.
 #include "source/layer_store.hpp"
 
+#include "common/bytes.hpp"
+#include "common/errors.hpp"
 #include "common/sha256.hpp"
 
 #include "../support.hpp"
@@ -21,6 +23,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include <atomic>
 #include <chrono>
@@ -81,6 +84,22 @@ std::vector<uint8_t> slice(const std::vector<uint8_t>& v, size_t off,
                            size_t len) {
     return {v.begin() + static_cast<ptrdiff_t>(off),
             v.begin() + static_cast<ptrdiff_t>(off + len)};
+}
+
+/// Writes one 8-byte sidecar record {crc32, flags} for `extent_id`
+/// (plain test-thread IO; the on-disk layout documented in layer_store.hpp).
+void write_sidecar_record(const std::string& sidecar_path, uint64_t extent_id,
+                          uint32_t crc, uint32_t flags) {
+    std::vector<uint8_t> rec(8);
+    bytes::store_u32_le(rec.data(), crc);
+    bytes::store_u32_le(rec.data() + 4, flags);
+    overwrite_file(sidecar_path, 80 + extent_id * 8, rec);
+}
+
+uint32_t crc32_of(const std::vector<uint8_t>& v) {
+    return static_cast<uint32_t>(::crc32(
+        0L, reinterpret_cast<const Bytef*>(v.data()),
+        static_cast<uInt>(v.size())));
 }
 
 /// A source whose reads block until `gate` is set, delegating to a
@@ -340,11 +359,16 @@ TEST_CASE("source: layer store enters bypass on write failure", "[source]") {
     auto blob = test::pattern_bytes(2 * kExtent, 11);
     const std::string digest = digest_of(blob);
 
+    int injected = 0;
+    SECTION("enospc") { injected = ENOSPC; }
+    SECTION("eio") { injected = EIO; }
+
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto* vec = new VectorSource(blob);
         auto store = co_await source::LayerStore::open(
             source::BlobSourcePtr(vec), dir.str(), digest);
-        store->set_test_write_hook([](uint64_t) -> int { return ENOSPC; });
+        store->set_test_write_hook(
+            [&injected](uint64_t) -> int { return injected; });
 
         std::vector<uint8_t> buf(kExtent);
         const ssize_t r0 = co_await store->pread(buf.data(), buf.size(), 0);
@@ -353,7 +377,10 @@ TEST_CASE("source: layer store enters bypass on write failure", "[source]") {
             return store->state() == source::LayerStore::State::Bypass;
         });
         REQUIRE(bypassed);
-        // Reads keep working remotely.
+        // The writer must not persist anything after bypass, even if the
+        // "disk" recovers (hook cleared): reads keep working remotely and
+        // nothing is enqueued.
+        store->set_test_write_hook([](uint64_t) -> int { return 0; });
         const ssize_t r =
             co_await store->pread(buf.data(), buf.size(), kExtent);
         REQUIRE(r == static_cast<ssize_t>(kExtent));
@@ -362,7 +389,48 @@ TEST_CASE("source: layer store enters bypass on write failure", "[source]") {
         // populate is a no-op in bypass.
         const ssize_t p = co_await store->populate(0, kExtent);
         REQUIRE(p == 0);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        REQUIRE(store->state() == source::LayerStore::State::Bypass);
         REQUIRE(store->extents_present() == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store stays filling after a non-fatal write error",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(2 * kExtent, 17);
+    const std::string digest = digest_of(blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest);
+        // Extent 0 writes always fail with a non-ENOSPC/EIO errno: the
+        // entry is dropped with a warning but the store keeps filling.
+        store->set_test_write_hook(
+            [](uint64_t eid) -> int { return eid == 0 ? EACCES : 0; });
+
+        std::vector<uint8_t> buf(kExtent);
+        const ssize_t r0 = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r0 == static_cast<ssize_t>(kExtent));
+        const ssize_t r1 =
+            co_await store->pread(buf.data(), buf.size(), kExtent);
+        REQUIRE(r1 == static_cast<ssize_t>(kExtent));
+        // Extent 1 persists; extent 0's entry is dropped; state stays.
+        const bool warm = co_await poll_until(
+            [&] { return store->extents_present() == 1; });
+        REQUIRE(warm);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(20));
+        REQUIRE(store->state() == source::LayerStore::State::Filling);
+        REQUIRE(store->extents_present() == 1);
+        // Extent 0 is still a hole: reading it re-fetches remotely.
+        const ssize_t r2 = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r2 == static_cast<ssize_t>(kExtent));
+        REQUIRE(buf == slice(blob, 0, kExtent));
+        REQUIRE(vec->reads() == 3);
+        REQUIRE(store->state() == source::LayerStore::State::Filling);
         co_return 0;
     });
     REQUIRE(rc == 0);
@@ -601,6 +669,170 @@ TEST_CASE("source: layer store handles a tail extent at eof", "[source]") {
         REQUIRE(r == 1500);
         REQUIRE(buf == slice(blob, 2 * kExtent - 500, 1500));
         REQUIRE(vec->reads() == 1);  // only the cold middle extent fetched
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store completes a fully-filled pair on reopen",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(2 * kExtent, 18);
+    const std::string digest = digest_of(blob);
+
+    // Phase 1: persist only extent 0, simulating a run that dies after the
+    // last extent's data+record but before the completion rename.
+    int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest);
+        const ssize_t p = co_await store->populate(0, kExtent);
+        REQUIRE(p == 0);
+        const bool warm = co_await poll_until(
+            [&] { return store->extents_present() == 1; });
+        REQUIRE(warm);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // Test-thread: persist the last extent (data + sidecar record) exactly
+    // as the writer thread would have — no rename afterwards.
+    const auto stagings = names_with_prefix(dir.str(), ".download.");
+    const auto sidecars = names_with_prefix(dir.str(), ".bitmap.");
+    REQUIRE(stagings.size() == 1);
+    REQUIRE(sidecars.size() == 1);
+    const auto tail = slice(blob, kExtent, kExtent);
+    overwrite_file(stagings.front(), kExtent, tail);
+    write_sidecar_record(sidecars.front(), 1, crc32_of(tail), 1);
+
+    // Reopen: every record is present, so the store completes immediately
+    // (verify + rename) without any further reads.
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest);
+        REQUIRE(store->extents_present() == 2);
+        const bool done = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        std::vector<uint8_t> buf(blob.size());
+        const ssize_t r = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(blob.size()));
+        REQUIRE(buf == blob);
+        REQUIRE(vec->reads() == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(std::filesystem::exists(dir.str() + "/overlaybd.commit"));
+    REQUIRE(names_with_prefix(dir.str(), ".download.").empty());
+    REQUIRE(names_with_prefix(dir.str(), ".bitmap.").empty());
+}
+
+TEST_CASE("source: layer store accepts digest forms and rejects malformed",
+          "[source]") {
+    auto blob = test::pattern_bytes(2 * kExtent, 19);
+    const std::string digest = digest_of(blob);
+
+    // The "sha256:" prefix form of the image config is accepted.
+    test::TempDir dir1;
+    int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir1.str(), "sha256:" + digest);
+        const ssize_t p = co_await store->populate(0, blob.size());
+        REQUIRE(p == 0);
+        const bool done = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // Uppercase hex is accepted (normalized before comparison).
+    test::TempDir dir2;
+    std::string upper = digest;
+    for (auto& c : upper) c = static_cast<char>(::toupper(c));
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir2.str(), upper);
+        const ssize_t p = co_await store->populate(0, blob.size());
+        REQUIRE(p == 0);
+        const bool done = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // Malformed digests fail open with EINVAL.
+    for (const std::string bad : {std::string("not-a-digest"),
+                                  std::string("sha256:abcd")}) {
+        test::TempDir dir3;
+        rc = test::run_coro([&]() -> elio::coro::task<int> {
+            try {
+                auto store = co_await source::LayerStore::open(
+                    std::make_unique<VectorSource>(blob), dir3.str(), bad);
+                co_return 0;
+            } catch (const error& e) {
+                co_return e.errno_value();
+            }
+        });
+        REQUIRE(rc == EINVAL);
+    }
+}
+
+TEST_CASE("source: layer store completes without verification when digest is empty",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(2 * kExtent, 20);
+
+    // Phase 1: warm extent 0 and destroy — the zero-filled digest in the
+    // sidecar header must match on resume.
+    int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), "");
+        const ssize_t p = co_await store->populate(0, kExtent);
+        REQUIRE(p == 0);
+        const bool warm = co_await poll_until(
+            [&] { return store->extents_present() == 1; });
+        REQUIRE(warm);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // Phase 2: resume, fill the rest, complete without verification.
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), "");
+        REQUIRE(store->extents_present() == 1);  // resumed
+        const ssize_t p = co_await store->populate(0, blob.size());
+        REQUIRE(p == 0);
+        const bool done = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(std::filesystem::exists(dir.str() + "/overlaybd.commit"));
+
+    // Reopen binds the commit; reads are local with zero remote reads.
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), "");
+        REQUIRE(store->state() == source::LayerStore::State::Complete);
+        std::vector<uint8_t> buf(1024);
+        const ssize_t r = co_await store->pread(buf.data(), buf.size(), 9);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == slice(blob, 9, buf.size()));
+        REQUIRE(vec->reads() == 0);
         co_return 0;
     });
     REQUIRE(rc == 0);

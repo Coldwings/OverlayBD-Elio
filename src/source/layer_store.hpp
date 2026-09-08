@@ -23,6 +23,11 @@
 //     sha256-verified against the image-config digest and atomically
 //     renamed to "<dir>/overlaybd.commit" (the same committed-layer
 //     contract the Downloader installs).
+//
+// Lifetime: a LayerStore must not be destroyed while pread/populate
+// coroutines are in flight on it — a suspended fetch or joiner touches
+// members on resume (unlike LocalFileSource, whose destructor orders the
+// fd close against the io_uring backend).
 #pragma once
 
 #include "source/blob_source.hpp"
@@ -137,7 +142,15 @@ private:
     };
 
     // Setup/recovery (cold paths, may throw obd::error).
-    int create_fresh_pair();   // 0 or errno; sets nonce_/paths/fds
+    // A newly created staging pair, built into locals first and published
+    // atomically by the caller, so readers never observe a -1 fd window
+    // (see restart_fresh).
+    struct FreshPair {
+        uint64_t nonce = 0;
+        int staging_fd = -1;
+        int sidecar_fd = -1;
+    };
+    int create_fresh_pair(FreshPair& out);  // 0 or errno; touches no members
     uint64_t find_valid_pair();  // nonce of a resumed pair, 0 = start fresh
     bool try_load_pair(uint64_t nonce, const std::string& staging,
                        const std::string& sidecar);
@@ -180,7 +193,11 @@ private:
     uint64_t extent_count_ = 0;
     uint64_t nonce_ = 0;
 
-    int staging_fd_ = -1;  // O_RDWR; promoted to the commit fd at completion
+    // O_RDWR; promoted to the commit fd at completion. Atomic: the writer
+    // thread exchanges it on a fresh restart while reader coroutines load
+    // it — readers always observe a valid fd (the retired-but-open old one
+    // or the new sparse file), never -1.
+    std::atomic<int> staging_fd_{-1};
     int sidecar_fd_ = -1;  // writer thread only
     std::atomic<int> commit_fd_{-1};  // valid once state == Complete
     std::vector<int> retired_fds_;    // superseded staging fds (writer only)
