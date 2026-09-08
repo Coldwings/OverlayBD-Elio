@@ -175,6 +175,36 @@ Every test, grouped by area, with the property it guards.
 - `source: DART prefix passthrough preserves the embedded URL` — the
   full upstream URL survives verbatim inside the DART path, including
   query and encoding edge cases.
+- `source: layer store cold read persists and reopen serves locally` —
+  remote-fetched extents persist to the staging pair and are served
+  locally (zero remote reads) after a destroy + reopen (ADR-0011).
+- `source: layer store detects corrupted staging via crc and refetches` —
+  on-disk staging corruption is caught by the per-extent CRC32, demoted,
+  re-fetched correctly, and counted.
+- `source: layer store deletes stale sidecar and restarts fresh` — wrong
+  nonce names and bad sidecar magic both invalidate the pair: stale files
+  are deleted and the layer restarts with a fresh nonce.
+- `source: layer store drops writes when the queue is full` — the bounded
+  write-behind queue drops (never back-pressures) under a stalled writer;
+  drops are counted and reads stay correct.
+- `source: layer store enters bypass on write failure` — `ENOSPC` from the
+  writer thread flips the store to `Bypass`; reads continue remotely and
+  `populate` no-ops.
+- `source: layer store completes to overlaybd.commit and reopens read-only` —
+  a fully-filled layer is sha256-verified, atomically renamed to
+  `overlaybd.commit`, and a reopen binds it with zero remote reads.
+- `source: layer store restarts on sha mismatch within try count` —
+  completion verification failure discards the pair and restarts fresh,
+  bounded by `try_count`, then degrades to remote-serving `Bypass`.
+- `source: layer store populate warms extents without serving data` —
+  `populate` delivers no data, persists the warmed extents, and they
+  survive a reopen.
+- `source: layer store coalesces concurrent fetches of one extent` — N
+  concurrent preads of a missing extent join one in-flight remote fetch
+  (exactly 1 fetch, N-1 joins).
+- `source: layer store handles a tail extent at eof` — the short tail
+  extent of a non-extent-aligned blob reads, persists, and CRC-verifies
+  over its actual length.
 
 ### image
 

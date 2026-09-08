@@ -1,0 +1,780 @@
+// LayerStore. See layer_store.hpp.
+#include "source/layer_store.hpp"
+
+#include "common/bytes.hpp"
+#include "common/errors.hpp"
+#include "common/sha256.hpp"
+
+#include <elio/io/io_awaitables.hpp>
+#include <elio/log/macros.hpp>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <zlib.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <map>
+#include <random>
+
+namespace obd::source {
+
+namespace {
+
+constexpr char kSidecarMagic[8] = {'O', 'B', 'D', 'S', 'I', 'D', 'E', '1'};
+constexpr uint32_t kSidecarVersion = 1;
+constexpr size_t kHeaderSize = 80;  // fixed, little-endian field layout below
+
+// Blocking write loop — writer-thread / cold-path use only, never on an
+// Elio worker. Returns 0 or an errno.
+int pwrite_all(int fd, const void* buf, size_t count, uint64_t offset) {
+    const uint8_t* p = static_cast<const uint8_t*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const ssize_t w =
+            ::pwrite(fd, p + done, count - done,
+                     static_cast<off_t>(offset + done));
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return errno;
+        }
+        if (w == 0) return EIO;
+        done += static_cast<size_t>(w);
+    }
+    return 0;
+}
+
+// Cold-path read loop; returns bytes read (short at EOF) or -errno.
+ssize_t pread_upto(int fd, void* buf, size_t count, uint64_t offset) {
+    uint8_t* p = static_cast<uint8_t*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const ssize_t r =
+            ::pread(fd, p + done, count - done,
+                    static_cast<off_t>(offset + done));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        if (r == 0) break;
+        done += static_cast<size_t>(r);
+    }
+    return static_cast<ssize_t>(done);
+}
+
+uint32_t crc32_of(const void* buf, size_t len) {
+    return static_cast<uint32_t>(::crc32(
+        0L, reinterpret_cast<const Bytef*>(buf), static_cast<uInt>(len)));
+}
+
+int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Normalizes an image-config digest: strips an optional "sha256:" prefix,
+// lowercases, and validates 64 hex chars. Empty input stays empty (no
+// verification). Fills `raw` with the 32 digest bytes when non-empty.
+std::string normalize_digest(std::string hex,
+                             std::array<uint8_t, 32>& raw) {
+    constexpr std::string_view kPrefix = "sha256:";
+    if (hex.compare(0, kPrefix.size(), kPrefix) == 0) {
+        hex.erase(0, kPrefix.size());
+    }
+    if (hex.empty()) return {};
+    if (hex.size() != 64) {
+        throw error(EINVAL, "malformed sha256 digest: " + hex);
+    }
+    for (size_t i = 0; i < 32; ++i) {
+        const int hi = hex_digit(hex[2 * i]);
+        const int lo = hex_digit(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            throw error(EINVAL, "malformed sha256 digest: " + hex);
+        }
+        raw[i] = static_cast<uint8_t>((hi << 4) | lo);
+        hex[2 * i] = "0123456789abcdef"[hi];
+        hex[2 * i + 1] = "0123456789abcdef"[lo];
+    }
+    return hex;
+}
+
+// Parses "<prefix><16 lowercase/any hex chars>" into a nonce; 0 = no match.
+uint64_t parse_nonce_name(const std::string& name, std::string_view prefix) {
+    if (name.size() != prefix.size() + 16) return 0;
+    if (name.compare(0, prefix.size(), prefix) != 0) return 0;
+    uint64_t nonce = 0;
+    for (size_t i = prefix.size(); i < name.size(); ++i) {
+        const int d = hex_digit(name[i]);
+        if (d < 0) return 0;
+        nonce = (nonce << 4) | static_cast<uint64_t>(d);
+    }
+    return nonce == 0 ? 0 : nonce;  // 0 is the "no pair" sentinel
+}
+
+}  // namespace
+
+std::string LayerStore::hex_nonce(uint64_t nonce) {
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx",
+                  static_cast<unsigned long long>(nonce));
+    return buf;
+}
+
+elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
+    BlobSourcePtr remote, std::string dir, std::string expected_sha256_hex) {
+    co_return co_await open(std::move(remote), std::move(dir),
+                            std::move(expected_sha256_hex), Config{});
+}
+
+elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
+    BlobSourcePtr remote, std::string dir, std::string expected_sha256_hex,
+    Config cfg) {
+    if (!remote) throw error(EINVAL, "layer store with null remote");
+    if (cfg.extent_size == 0) {
+        throw error(EINVAL, "layer store with zero extent size");
+    }
+    if (cfg.queue_max_bytes < cfg.extent_size) {
+        throw error(EINVAL, "layer store queue smaller than one extent");
+    }
+    if (cfg.try_count == 0) {
+        throw error(EINVAL, "layer store with zero try count");
+    }
+    struct stat st {};
+    if (::stat(dir.c_str(), &st) != 0) {
+        throw_errno(errno, "layer store dir " + dir);
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        throw error(ENOTDIR, "layer store dir " + dir);
+    }
+    if (::access(dir.c_str(), W_OK | X_OK) != 0) {
+        throw_errno(errno, "layer store dir not writable " + dir);
+    }
+
+    auto ls = std::unique_ptr<LayerStore>(new LayerStore());
+    ls->cfg_ = cfg;
+    ls->dir_ = std::move(dir);
+    ls->size_ = remote->size();
+    ls->label_ = "layer-store(" + std::string(remote->label()) + ")";
+    ls->expected_hex_ =
+        normalize_digest(std::move(expected_sha256_hex), ls->expected_raw_);
+    ls->extent_count_ =
+        (ls->size_ + cfg.extent_size - 1) / cfg.extent_size;
+    ls->records_ = std::vector<std::atomic<uint64_t>>(ls->extent_count_);
+    ls->remote_ = std::move(remote);
+
+    // A committed layer from a previous run binds read-only; no staging.
+    const std::string commit = commit_path(ls->dir_);
+    if (::stat(commit.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+        const int fd = ::open(commit.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) throw_errno(errno, "cannot open " + commit);
+        ls->commit_fd_.store(fd, std::memory_order_release);
+        ls->state_.store(static_cast<int>(State::Complete),
+                         std::memory_order_release);
+        ELIO_LOG_INFO("layer store {}: bound to commit file", ls->dir_);
+        co_return ls;
+    }
+
+    const uint64_t resumed = ls->find_valid_pair();
+    if (resumed == 0) {
+        const int rc = ls->create_fresh_pair();
+        if (rc != 0) {
+            throw_errno(rc, "cannot create staging pair in " + ls->dir_);
+        }
+        ELIO_LOG_INFO("layer store {}: fresh staging pair (nonce {})",
+                      ls->dir_, hex_nonce(ls->nonce_));
+    } else {
+        ELIO_LOG_INFO("layer store {}: resuming nonce {} ({}/{} extents)",
+                      ls->dir_, hex_nonce(resumed),
+                      ls->present_.load(std::memory_order_relaxed),
+                      ls->extent_count_);
+        ls->kick_completion_check_ =
+            ls->extent_count_ > 0 &&
+            ls->present_.load(std::memory_order_relaxed) == ls->extent_count_;
+    }
+    LayerStore* self = ls.get();
+    ls->writer_ = std::thread([self] { self->writer_main(); });
+    co_return ls;
+}
+
+LayerStore::~LayerStore() {
+    if (writer_.joinable()) {
+        {
+            std::lock_guard lk(qmu_);
+            stopping_ = true;
+        }
+        qcv_.notify_all();
+        writer_.join();
+    }
+    if (sidecar_fd_ >= 0) ::close(sidecar_fd_);
+    for (const int fd : retired_fds_) elio::io::close_fd_for_destructor(fd);
+    if (staging_fd_ >= 0) elio::io::close_fd_for_destructor(staging_fd_);
+    const int cfd = commit_fd_.load(std::memory_order_acquire);
+    if (cfd >= 0 && cfd != staging_fd_) {
+        elio::io::close_fd_for_destructor(cfd);
+    }
+}
+
+void LayerStore::set_test_write_hook(
+    std::function<int(uint64_t extent_id)> hook) {
+    std::lock_guard lk(qmu_);
+    write_hook_ = std::move(hook);
+}
+
+// ---------------------------------------------------------------------------
+// Setup / recovery (cold paths)
+// ---------------------------------------------------------------------------
+
+int LayerStore::create_fresh_pair() {
+    std::random_device rd;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const uint64_t nonce =
+            (static_cast<uint64_t>(rd()) << 32) | rd();
+        if (nonce == 0) continue;
+        const std::string sp = dir_ + "/.download." + hex_nonce(nonce);
+        const std::string bp = dir_ + "/.bitmap." + hex_nonce(nonce);
+        const int fd =
+            ::open(sp.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            if (errno == EEXIST) continue;
+            return errno;
+        }
+        if (::ftruncate(fd, static_cast<off_t>(size_)) != 0) {
+            const int e = errno;
+            ::close(fd);
+            ::unlink(sp.c_str());
+            return e;
+        }
+        const int bfd =
+            ::open(bp.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (bfd < 0) {
+            const int e = errno;
+            ::close(fd);
+            ::unlink(sp.c_str());
+            if (e == EEXIST) continue;
+            return e;
+        }
+        uint8_t hdr[kHeaderSize] = {};
+        std::memcpy(hdr, kSidecarMagic, sizeof kSidecarMagic);
+        bytes::store_u32_le(hdr + 8, kSidecarVersion);
+        bytes::store_u32_le(hdr + 12, cfg_.extent_size);
+        bytes::store_u64_le(hdr + 16, size_);
+        bytes::store_u64_le(hdr + 24, extent_count_);
+        std::memcpy(hdr + 32, expected_raw_.data(), expected_raw_.size());
+        bytes::store_u64_le(hdr + 64, nonce);
+        bytes::store_u32_le(hdr + 72, crc32_of(hdr, 72));
+        // [76,80) reserved, zero
+        int rc = pwrite_all(bfd, hdr, sizeof hdr, 0);
+        if (rc == 0 &&
+            ::ftruncate(bfd, static_cast<off_t>(kHeaderSize +
+                                                extent_count_ * 8)) != 0) {
+            rc = errno;
+        }
+        if (rc != 0) {
+            ::close(bfd);
+            ::close(fd);
+            ::unlink(sp.c_str());
+            ::unlink(bp.c_str());
+            return rc;
+        }
+        nonce_ = nonce;
+        staging_fd_ = fd;
+        sidecar_fd_ = bfd;
+        return 0;
+    }
+    return EEXIST;  // repeated nonce collisions
+}
+
+uint64_t LayerStore::find_valid_pair() {
+    std::map<uint64_t, std::string> stagings;
+    std::map<uint64_t, std::string> sidecars;
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(dir_, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (const uint64_t n = parse_nonce_name(name, ".download.")) {
+            stagings.emplace(n, entry.path().string());
+        } else if (const uint64_t n = parse_nonce_name(name, ".bitmap.")) {
+            sidecars.emplace(n, entry.path().string());
+        }
+    }
+    std::vector<std::string> stale;
+    for (const auto& [n, p] : stagings) {
+        if (!sidecars.count(n)) stale.push_back(p);
+    }
+    for (const auto& [n, p] : sidecars) {
+        if (!stagings.count(n)) stale.push_back(p);
+    }
+    uint64_t found = 0;
+    for (const auto& [n, p] : stagings) {
+        const auto it = sidecars.find(n);
+        if (it == sidecars.end()) continue;
+        if (found == 0 && try_load_pair(n, p, it->second)) {
+            found = n;
+        } else {
+            stale.push_back(p);
+            stale.push_back(it->second);
+        }
+    }
+    for (const std::string& p : stale) {
+        ELIO_LOG_WARNING("layer store {}: deleting stale staging file {}",
+                         dir_, p);
+        ::unlink(p.c_str());
+    }
+    return found;
+}
+
+bool LayerStore::try_load_pair(uint64_t nonce, const std::string& staging,
+                               const std::string& sidecar) {
+    const int bfd = ::open(sidecar.c_str(), O_RDWR | O_CLOEXEC);
+    if (bfd < 0) return false;
+    uint8_t hdr[kHeaderSize];
+    bool ok = pread_upto(bfd, hdr, sizeof hdr, 0) ==
+              static_cast<ssize_t>(sizeof hdr);
+    if (ok) {
+        ok = std::memcmp(hdr, kSidecarMagic, sizeof kSidecarMagic) == 0 &&
+             bytes::load_u32_le(hdr + 8) == kSidecarVersion &&
+             bytes::load_u32_le(hdr + 12) == cfg_.extent_size &&
+             bytes::load_u64_le(hdr + 16) == size_ &&
+             bytes::load_u64_le(hdr + 24) == extent_count_ &&
+             std::memcmp(hdr + 32, expected_raw_.data(),
+                         expected_raw_.size()) == 0 &&
+             bytes::load_u64_le(hdr + 64) == nonce &&
+             bytes::load_u32_le(hdr + 72) == crc32_of(hdr, 72);
+    }
+    int sfd = -1;
+    if (ok) {
+        sfd = ::open(staging.c_str(), O_RDWR | O_CLOEXEC);
+        if (sfd < 0) ok = false;
+    }
+    if (ok) {
+        struct stat st {};
+        if (::fstat(sfd, &st) != 0 || !S_ISREG(st.st_mode) ||
+            static_cast<uint64_t>(st.st_size) != size_) {
+            ok = false;
+        }
+    }
+    uint64_t present = 0;
+    std::vector<uint64_t> recs;
+    if (ok) {
+        recs.resize(extent_count_);
+        std::vector<uint8_t> raw(extent_count_ * 8);
+        // A short read is fine: records never written read back as zeros.
+        const ssize_t got =
+            pread_upto(bfd, raw.data(), raw.size(), kHeaderSize);
+        if (got < 0) {
+            ok = false;
+        } else {
+            std::memset(raw.data() + got, 0, raw.size() - got);
+            for (uint64_t i = 0; i < extent_count_; ++i) {
+                const uint32_t crc = bytes::load_u32_le(raw.data() + i * 8);
+                const uint32_t flags =
+                    bytes::load_u32_le(raw.data() + i * 8 + 4);
+                recs[i] = (static_cast<uint64_t>(crc) << 32) |
+                          (flags & kFlagPresent);
+                if (flags & kFlagPresent) ++present;
+            }
+        }
+    }
+    if (!ok) {
+        if (sfd >= 0) ::close(sfd);
+        ::close(bfd);
+        return false;
+    }
+    for (uint64_t i = 0; i < extent_count_; ++i) {
+        records_[i].store(recs[i], std::memory_order_relaxed);
+    }
+    present_.store(present, std::memory_order_relaxed);
+    nonce_ = nonce;
+    staging_fd_ = sfd;
+    sidecar_fd_ = bfd;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Hot paths (coroutines; -errno results; never throw)
+// ---------------------------------------------------------------------------
+
+elio::coro::task<ssize_t> LayerStore::read_fd_loop(int fd, void* buf,
+                                                   size_t count,
+                                                   uint64_t offset) {
+    uint8_t* p = static_cast<uint8_t*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const auto r = co_await elio::io::async_read(
+            fd, p + done, count - done,
+            static_cast<int64_t>(offset + done));
+        if (r.result < 0) {
+            co_return done > 0 ? static_cast<ssize_t>(done) : r.result;
+        }
+        if (r.result == 0) break;  // EOF (file shrank underneath us)
+        done += static_cast<size_t>(r.result);
+    }
+    co_return static_cast<ssize_t>(done);
+}
+
+elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
+    uint64_t extent_id) {
+    std::shared_ptr<InFlight> f;
+    bool starter = false;
+    co_await inflight_mu_.lock();
+    auto it = inflight_.find(extent_id);
+    if (it != inflight_.end()) {
+        f = it->second;
+    } else {
+        f = std::make_shared<InFlight>();
+        inflight_.emplace(extent_id, f);
+        starter = true;
+    }
+    inflight_mu_.unlock();
+
+    if (!starter) {
+        coalesced_joins_.fetch_add(1, std::memory_order_relaxed);
+        co_await f->done.wait();
+        co_return FetchResult{f->data, f->error};
+    }
+
+    const uint64_t ebase = extent_id * cfg_.extent_size;
+    const size_t elen = static_cast<size_t>(
+        std::min<uint64_t>(cfg_.extent_size, size_ - ebase));
+    auto buf = std::make_shared<std::vector<uint8_t>>(elen);
+    remote_fetches_.fetch_add(1, std::memory_order_relaxed);
+    const ssize_t r = co_await remote_->pread(buf->data(), elen, ebase);
+    if (r < 0) {
+        f->error = static_cast<int>(-r);
+    } else if (static_cast<size_t>(r) != elen) {
+        f->error = EIO;  // short fill from the remote (see ChunkCache)
+    } else {
+        f->data = std::move(buf);
+    }
+    co_await inflight_mu_.lock();
+    inflight_.erase(extent_id);
+    inflight_mu_.unlock();
+    // Joiners hold their own shared_ptr<InFlight>, so the event stays alive
+    // until every waiter has been scheduled away from it.
+    f->done.set();
+    co_return FetchResult{f->data, f->error};
+}
+
+void LayerStore::enqueue_write(
+    uint64_t extent_id, std::shared_ptr<const std::vector<uint8_t>> data) {
+    const uint32_t crc = crc32_of(data->data(), data->size());
+    std::lock_guard lk(qmu_);
+    if (stopping_ || state() != State::Filling) return;
+    if (queued_bytes_ + data->size() > cfg_.queue_max_bytes) {
+        dropped_writes_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    queued_bytes_ += data->size();
+    queue_.push_back(WriteJob{extent_id, std::move(data), crc, false});
+    qcv_.notify_one();
+}
+
+void LayerStore::enqueue_clear(uint64_t extent_id) {
+    std::lock_guard lk(qmu_);
+    if (stopping_ || state() != State::Filling) return;
+    // Bookkeeping, not payload: never dropped for queue fullness.
+    queue_.push_back(WriteJob{extent_id, nullptr, 0, true});
+    qcv_.notify_one();
+}
+
+elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
+                                            uint64_t offset) {
+    if (offset >= size_) co_return 0;
+    if (count > size_ - offset) {
+        count = static_cast<size_t>(size_ - offset);
+    }
+    if (count == 0) co_return 0;
+
+    if (state() == State::Complete) {
+        co_return co_await read_fd_loop(
+            commit_fd_.load(std::memory_order_acquire), buf, count, offset);
+    }
+
+    const uint64_t es = cfg_.extent_size;
+    uint8_t* out = static_cast<uint8_t*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const uint64_t pos = offset + done;
+        const uint64_t eid = pos / es;
+        const uint64_t ebase = eid * es;
+        const uint64_t eend = std::min(ebase + es, size_);
+        const size_t within = static_cast<size_t>(pos - ebase);
+        const size_t need =
+            static_cast<size_t>(std::min(eend, offset + count) - pos);
+        const size_t elen = static_cast<size_t>(eend - ebase);
+
+        bool served = false;
+        if (state() == State::Filling) {
+            const uint64_t rec =
+                records_[eid].load(std::memory_order_acquire);
+            if (rec & kFlagPresent) {
+                const uint32_t expected_crc = static_cast<uint32_t>(rec >> 32);
+                // Fast path: a request covering the whole extent CRCs the
+                // caller's buffer directly, avoiding a copy and an alloc.
+                std::vector<uint8_t> tmp;
+                void* dst = out + done;
+                if (within != 0 || need != elen) {
+                    tmp.resize(elen);
+                    dst = tmp.data();
+                }
+                const ssize_t r =
+                    co_await read_fd_loop(staging_fd_, dst, elen, ebase);
+                if (r < 0) {
+                    co_return done > 0 ? static_cast<ssize_t>(done) : r;
+                }
+                if (static_cast<size_t>(r) == elen &&
+                    crc32_of(dst, elen) == expected_crc) {
+                    if (dst != out + done) {
+                        std::memcpy(out + done,
+                                    static_cast<const uint8_t*>(dst) + within,
+                                    need);
+                    }
+                    served = true;
+                } else {
+                    // Corrupt or torn extent: demote to a hole and re-fetch.
+                    crc_failures_.fetch_add(1, std::memory_order_relaxed);
+                    const uint64_t old = records_[eid].exchange(
+                        0, std::memory_order_acq_rel);
+                    if (old & kFlagPresent) {
+                        present_.fetch_sub(1, std::memory_order_relaxed);
+                    }
+                    enqueue_clear(eid);
+                }
+            }
+        }
+        if (!served) {
+            const FetchResult fr = co_await join_or_fetch(eid);
+            if (fr.error != 0) {
+                co_return done > 0 ? static_cast<ssize_t>(done)
+                                   : -fr.error;
+            }
+            std::memcpy(out + done, fr.data->data() + within, need);
+            if (state() == State::Filling &&
+                !(records_[eid].load(std::memory_order_acquire) &
+                  kFlagPresent)) {
+                enqueue_write(eid, fr.data);
+            }
+        }
+        done += need;
+    }
+    co_return static_cast<ssize_t>(done);
+}
+
+elio::coro::task<ssize_t> LayerStore::populate(uint64_t offset, size_t len) {
+    if (state() != State::Filling) co_return 0;
+    if (offset >= size_) co_return 0;
+    const uint64_t end =
+        offset + std::min<uint64_t>(len, size_ - offset);
+    const uint64_t es = cfg_.extent_size;
+    for (uint64_t eid = offset / es; eid * es < end; ++eid) {
+        if (records_[eid].load(std::memory_order_acquire) & kFlagPresent) {
+            continue;
+        }
+        const FetchResult fr = co_await join_or_fetch(eid);
+        if (fr.error != 0) co_return -fr.error;
+        if (state() == State::Filling &&
+            !(records_[eid].load(std::memory_order_acquire) &
+              kFlagPresent)) {
+            enqueue_write(eid, fr.data);
+        }
+    }
+    co_return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Write-behind writer thread (blocking disk work lives here, never on an
+// Elio worker — same precedent as the ublk queue threads)
+// ---------------------------------------------------------------------------
+
+void LayerStore::writer_main() {
+    if (kick_completion_check_) {
+        // A previous run filled every extent but died before the rename.
+        kick_completion_check_ = false;
+        complete_layer();
+    }
+    std::unique_lock lk(qmu_);
+    for (;;) {
+        qcv_.wait(lk, [&] { return stopping_ || !queue_.empty(); });
+        if (stopping_) {
+            // Bounded best-effort drain by dropping: pending writes are
+            // only cache; teardown must never hang.
+            queue_.clear();
+            queued_bytes_ = 0;
+            return;
+        }
+        WriteJob job = std::move(queue_.front());
+        queue_.pop_front();
+        if (job.data) queued_bytes_ -= job.data->size();
+        std::function<int(uint64_t)> hook = write_hook_;
+        lk.unlock();
+        process_job(job, hook);
+        lk.lock();
+    }
+}
+
+void LayerStore::process_job(
+    const WriteJob& job, const std::function<int(uint64_t)>& hook) {
+    if (state() != State::Filling) return;  // bypass/complete: drop
+    if (job.clear) {
+        // Best-effort demote of a CRC-failed extent.
+        uint8_t rec[8] = {};
+        (void)pwrite_all(sidecar_fd_, rec, sizeof rec,
+                         kHeaderSize + job.extent_id * 8);
+        const uint64_t old = records_[job.extent_id].exchange(
+            0, std::memory_order_acq_rel);
+        if (old & kFlagPresent) {
+            present_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (hook) {
+        const int injected = hook(job.extent_id);
+        if (injected != 0) {
+            on_write_error(injected);
+            return;
+        }
+    }
+    // Consistency rule (ADR-0011): the record lands only after the data.
+    int rc = pwrite_all(staging_fd_, job.data->data(), job.data->size(),
+                        job.extent_id * cfg_.extent_size);
+    if (rc == 0) {
+        uint8_t rec[8];
+        bytes::store_u32_le(rec, job.crc);
+        bytes::store_u32_le(rec + 4, static_cast<uint32_t>(kFlagPresent));
+        rc = pwrite_all(sidecar_fd_, rec, sizeof rec,
+                        kHeaderSize + job.extent_id * 8);
+    }
+    if (rc != 0) {
+        on_write_error(rc);
+        return;
+    }
+    const uint64_t packed =
+        (static_cast<uint64_t>(job.crc) << 32) | kFlagPresent;
+    const uint64_t old =
+        records_[job.extent_id].exchange(packed, std::memory_order_acq_rel);
+    if (!(old & kFlagPresent)) {
+        const uint64_t p =
+            present_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (p == extent_count_) complete_layer();
+    }
+}
+
+void LayerStore::on_write_error(int err) {
+    if (err == ENOSPC || err == EIO) {
+        enter_bypass(err, "write failed");
+    } else {
+        ELIO_LOG_WARNING("layer store {}: entry dropped after write "
+                         "failure: {}",
+                         dir_, strerror(err));
+    }
+}
+
+void LayerStore::enter_bypass(int err, const char* what) {
+    int expected = static_cast<int>(State::Filling);
+    if (state_.compare_exchange_strong(expected,
+                                       static_cast<int>(State::Bypass),
+                                       std::memory_order_acq_rel)) {
+        // Logged once: only the first transition wins the CAS.
+        ELIO_LOG_ERROR("layer store {} entering bypass ({}: {}); reads "
+                       "continue remotely",
+                       dir_, what,
+                       err != 0 ? strerror(err) : "attempts exhausted");
+    }
+}
+
+void LayerStore::complete_layer() {
+    // Runs on the writer thread — the mandated blocking context for the
+    // whole-file read-back and sha256.
+    ++attempts_;
+    bool verified = true;
+    if (!expected_hex_.empty()) {
+        try {
+            common::Sha256 hash;
+            std::vector<uint8_t> buf(1 << 20);
+            uint64_t off = 0;
+            while (off < size_) {
+                const size_t chunk = static_cast<size_t>(
+                    std::min<uint64_t>(buf.size(), size_ - off));
+                const ssize_t r =
+                    ::pread(staging_fd_, buf.data(), chunk,
+                            static_cast<off_t>(off));
+                if (r <= 0) {
+                    verified = false;
+                    break;
+                }
+                hash.update(buf.data(), static_cast<size_t>(r));
+                off += static_cast<uint64_t>(r);
+            }
+            if (verified && hash.final_hex() != expected_hex_) {
+                verified = false;
+            }
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR("layer store {}: sha256 unavailable: {}",
+                           dir_, e.what());
+            enter_bypass(0, "verification unavailable");
+            return;
+        }
+    } else {
+        ELIO_LOG_WARNING("layer store {}: no sha256 digest; completing "
+                         "without verification",
+                         dir_);
+    }
+
+    if (verified) {
+        if (::rename(staging_path().c_str(), commit_path(dir_).c_str()) !=
+            0) {
+            enter_bypass(errno, "commit rename failed");
+            return;
+        }
+        ::unlink(sidecar_path().c_str());
+        if (sidecar_fd_ >= 0) {
+            ::close(sidecar_fd_);
+            sidecar_fd_ = -1;
+        }
+        // The staging fd becomes the commit fd: same inode after the
+        // rename, so reads in flight on it stay valid.
+        commit_fd_.store(staging_fd_, std::memory_order_release);
+        state_.store(static_cast<int>(State::Complete),
+                     std::memory_order_release);
+        ELIO_LOG_INFO("layer store {} complete: {} ({} extents)", dir_,
+                      commit_path(dir_), extent_count_);
+        return;
+    }
+
+    ELIO_LOG_WARNING("layer store {}: sha256 mismatch (attempt {}/{})",
+                     dir_, attempts_, cfg_.try_count);
+    if (attempts_ >= cfg_.try_count) {
+        enter_bypass(0, "sha256 mismatch persists");
+        return;
+    }
+    restart_fresh();
+}
+
+void LayerStore::restart_fresh() {
+    // Retire (don't close) the old staging fd: reader coroutines may still
+    // have io_uring reads in flight on it. Closed in the destructor.
+    retired_fds_.push_back(staging_fd_);
+    staging_fd_ = -1;
+    if (sidecar_fd_ >= 0) {
+        ::close(sidecar_fd_);
+        sidecar_fd_ = -1;
+    }
+    ::unlink(staging_path().c_str());
+    ::unlink(sidecar_path().c_str());
+    for (auto& rec : records_) rec.store(0, std::memory_order_relaxed);
+    present_.store(0, std::memory_order_relaxed);
+    const int rc = create_fresh_pair();
+    if (rc != 0) {
+        enter_bypass(rc, "fresh staging pair creation failed");
+        return;
+    }
+    ELIO_LOG_INFO("layer store {}: restarting fresh (nonce {})", dir_,
+                  hex_nonce(nonce_));
+}
+
+}  // namespace obd::source

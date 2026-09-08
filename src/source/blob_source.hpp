@@ -33,6 +33,14 @@ public:
     virtual elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                             uint64_t offset) = 0;
 
+    /// Warms local persistence for [offset, offset+len) without delivering
+    /// data (ADR-0011). Default: no-op. Returns 0 or a negative -errno.
+    virtual elio::coro::task<ssize_t> populate(uint64_t offset, size_t len) {
+        (void)offset;
+        (void)len;
+        co_return 0;
+    }
+
     /// Total blob size in bytes. Constant for the source's lifetime.
     virtual uint64_t size() const noexcept = 0;
 

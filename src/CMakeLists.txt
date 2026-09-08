@@ -22,6 +22,7 @@ add_library(obd_core STATIC
     source/chunk_cache.cpp
     source/downloader.cpp
     source/switch_source.cpp
+    source/layer_store.cpp
     image/config.cpp
     image/image_file.cpp
     supervisor/protocol.cpp

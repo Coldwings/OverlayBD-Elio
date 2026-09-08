@@ -2,7 +2,8 @@
 
 Pluggable blob sources behind one async byte-source interface: local files,
 OCI registry HTTP range reads, a DART P2P proxy front-end, an in-memory chunk
-cache, a background downloader, and a remote→local switch source.
+cache, a background downloader, a remote→local switch source, and a
+sparse-file layer store.
 
 ## Overview
 
@@ -30,6 +31,11 @@ blob gets its own source stack, assembled bottom-up from these pieces:
 - **Downloader / SwitchSource** — an optional background full-blob download
   into the per-layer directory, with an atomic switch of the read path once
   the local copy is verified and installed.
+- **LayerStore** — sparse-file layer persistence with a sidecar extent map
+  and per-extent CRC32 (ADR-0011): every remote byte served is persisted
+  into a local staging file, so remote dependence shrinks monotonically and
+  survives restarts. A standalone component for now — not yet wired into
+  image assembly.
 - **CredentialStore** — registry credentials from the overlaybd-compatible
   credential file, with longest-prefix matching.
 - **base64** (`base64.hpp`) — a minimal RFC 4648 codec used for Basic-auth
@@ -50,6 +56,11 @@ Every source is a positional, immutable byte range:
   (TarOffsetSource) sound without invalidation logic.
 - **Positional reads** — `pread(buf, count, offset)` never carries a cursor;
   concurrent reads on one source are independent.
+- **Optional warming** — `populate(offset, len)` asks a source to make a
+  range local without delivering data (ADR-0011: prefetch and background
+  fill must not materialize buffers nobody consumes). The default
+  implementation is a no-op; only sources with local persistence
+  (LayerStore) override it.
 - **Sources compose by wrapping** — each decorator holds a
   `src/source/blob_source.hpp::BlobSourcePtr` to its inner source and
   translates offsets or adds behavior. The canonical read stack for a remote
@@ -150,6 +161,38 @@ into the per-layer directory while reads keep being served remotely
   control block — whole-file, not per-extent
   (`docs/design-assumptions.md` §S-4).
 
+### Sparse layer persistence (ADR-0011, part 1)
+
+`LayerStore` persists every remotely-served byte into a sparse local staging
+file, so a layer's dependence on the remote shrinks monotonically and
+survives restarts (the component lands standalone in this change; wiring it
+into image assembly in place of ChunkCache/SwitchSource is the ADR-0011
+follow-up):
+
+- one staging file `<dir>/.download.<nonce>` (sparse-truncated to the blob
+  size) plus one sidecar `<dir>/.bitmap.<nonce>`; the shared nonce in the
+  file names pairs them, so a stale sidecar can never attach to a fresh
+  staging file — unpaired or header-invalid files are deleted at open and
+  the layer starts fresh;
+- a uniform extent (64 KiB default) is the remote-fetch, persistence
+  accounting, and sidecar-record unit at once;
+- the sidecar is a fixed 80-byte header (magic `OBDSIDE1`, version, extent
+  size, blob size, extent count, layer sha256, pairing nonce, header CRC32)
+  followed by one 8-byte `{crc32, flags}` record per extent, each written
+  with a single atomic `pwrite` **after** its data write completed (a crash
+  may lose a bit whose data survived — safe — never the reverse);
+- reads of a "present" extent verify its CRC32 first; a mismatch demotes the
+  extent to a hole and re-fetches, making torn writes a deterministic cache
+  miss instead of silent corruption;
+- persistence is write-behind on a bounded, droppable queue drained by a
+  dedicated plain `std::thread` (readers are never back-pressured, and no
+  Elio worker ever runs a blocking syscall); `ENOSPC`/`EIO` moves the store
+  into a bypass state — writes stop, reads continue purely remote;
+- when every extent is present, the staging file is sha256-verified against
+  the image-config digest and atomically renamed to
+  `<dir>/overlaybd.commit` — the same committed-layer contract the
+  Downloader installs; a mismatch restarts fresh (bounded by `try_count`).
+
 ### Credentials
 
 The credential file follows overlaybd's `credentialConfig` mode=file shape —
@@ -172,6 +215,7 @@ public:
     virtual ~BlobSource() = default;
     virtual elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                             uint64_t offset) = 0;
+    virtual elio::coro::task<ssize_t> populate(uint64_t offset, size_t len);
     virtual uint64_t size() const noexcept = 0;
     virtual std::string_view label() const noexcept = 0;
 };
@@ -186,6 +230,10 @@ interface every layer of the read stack is built on.
   count (0 at/after EOF); on failure returns a negative `-errno`.
   Implementations loop internally over short backend reads, so callers never
   see a mid-blob short read. Must not throw.
+- `populate` — warms local persistence for `[offset, offset+len)` without
+  delivering data (ADR-0011). Returns 0 or a negative `-errno`; the default
+  implementation is a no-op (`co_return 0`), so existing sources remain
+  valid without implementing it.
 - `size` — total blob size in bytes; constant for the source's lifetime.
 - `label` — human-readable identity for logs (path, URL, digest); the
   returned view is stable for the source's lifetime (it points into the
@@ -595,6 +643,98 @@ whole-file switch per `docs/design-assumptions.md` §S-4).
   (reads keep working over the remote). Public only for the completion
   helper — not part of the module API.
 
+### `layer_store.hpp` — LayerStore
+
+```cpp
+class LayerStore final : public BlobSource {
+public:
+    struct Config {
+        uint32_t extent_size = 64 * 1024;
+        uint64_t queue_max_bytes = 4ULL * 1024 * 1024;
+        uint32_t try_count = 5;
+    };
+    enum class State : int { Filling = 0, Complete = 1, Bypass = 2 };
+    static elio::coro::task<std::unique_ptr<LayerStore>> open(
+        BlobSourcePtr remote, std::string dir, std::string expected_sha256_hex);
+    static elio::coro::task<std::unique_ptr<LayerStore>> open(
+        BlobSourcePtr remote, std::string dir, std::string expected_sha256_hex,
+        Config cfg);
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                    uint64_t offset) override;
+    elio::coro::task<ssize_t> populate(uint64_t offset, size_t len) override;
+    uint64_t size() const noexcept override;
+    std::string_view label() const noexcept override;
+    State state() const noexcept;
+    uint64_t extents_present() const noexcept;
+    uint64_t extents_total() const noexcept;
+    uint64_t dropped_writes() const noexcept;
+    uint64_t crc_failures() const noexcept;
+    uint64_t remote_fetches() const noexcept;
+    uint64_t coalesced_joins() const noexcept;
+    void set_test_write_hook(std::function<int(uint64_t)> hook);  // test-only
+};
+```
+
+`src/source/layer_store.hpp::LayerStore` — a `BlobSource` that persists
+remote bytes into a sparse local staging file with a sidecar extent map
+(ADR-0011; see Concepts §"Sparse layer persistence").
+
+- `src/source/layer_store.hpp::LayerStore::open` — takes ownership of
+  `remote` (the read path for missing extents) and opens or creates the
+  persistence state in `dir`. `expected_sha256_hex` is the hex digest from
+  the image config (an optional `sha256:` prefix is stripped; empty means no
+  completion verification, logged). If `<dir>/overlaybd.commit` exists, the
+  store binds to it read-only (state `Complete`, no staging, no writer
+  thread). Otherwise it scans `dir` for a `.download.X`/`.bitmap.X` pair
+  whose sidecar header (magic, version, extent size, blob size, extent
+  count, layer sha256, nonce, header CRC32) matches this layer; a valid
+  pair's records are loaded and filling resumes, anything unpaired or
+  invalid is deleted and the layer starts fresh with a new random nonce.
+  Throws `obd::error` on unrecoverable setup problems (null remote, bad
+  config, missing/unwritable `dir`, unloadable commit file, staging-pair
+  creation failure).
+- `pread` — splits the request into extents. In `Complete` state: plain
+  positional reads from the commit file. In `Filling` state, a present
+  extent is read locally and CRC32-verified (the tail extent over its actual
+  length); a mismatch clears the bit (memory and sidecar), counts
+  `crc_failures`, and re-fetches. A missing extent (or any extent in
+  `Bypass`) is fetched whole from the remote with in-flight coalescing —
+  concurrent readers of the same missing extent join one fetch
+  (`coalesced_joins`) — and the fetched bytes are enqueued for write-behind
+  (not in `Bypass`). Returns the clamped count, or a negative `-errno` /
+  `-EIO` on remote error/short fill (matching ChunkCache). Never throws.
+- `src/source/layer_store.hpp::LayerStore::populate` — warms every missing
+  extent in `[offset, offset+len)` through the same coalesced fetch and
+  write-behind path without delivering data; returns 0 or a negative
+  `-errno`. No-op (0) in `Complete` and `Bypass`.
+- Write-behind: fetched extents queue (bounded by `queue_max_bytes`) for a
+  dedicated writer thread that `pwrite`s data, then the 8-byte sidecar
+  record, then sets the in-memory bit. A full queue drops the entry and
+  counts `dropped_writes` (never back-pressures readers). `ENOSPC`/`EIO`
+  from any write enters `Bypass` (logged once): writes stop, reads continue
+  remotely. Teardown stops the thread with a bounded drain-by-drop — pending
+  writes are only cache, so teardown never hangs.
+- Completion: when the last missing extent lands, the writer thread re-reads
+  the staging file in bounded chunks, sha256-verifies it against
+  `expected_sha256_hex` (skipped with a log when empty), and on match
+  atomically renames it to `<dir>/overlaybd.commit` (state `Complete`;
+  subsequent reads use the commit file without CRC). On mismatch it deletes
+  the pair and restarts fresh with a new nonce, bounded by
+  `Config::try_count`; exhaustion leaves the store serving remotely in
+  `Bypass` (logged as an error).
+- Observability — `state()` (`src/source/layer_store.hpp::LayerStore::State`),
+  `extents_present()`/`extents_total()`, `dropped_writes()`,
+  `crc_failures()`, `remote_fetches()`, `coalesced_joins()` are relaxed
+  atomic snapshots, safe to poll from any thread.
+- `src/source/layer_store.hpp::LayerStore::set_test_write_hook` — test-only
+  hook invoked by the writer thread before persisting each entry; a non-zero
+  return is treated as a pwrite failure with that errno. Not part of the
+  module API.
+
+Complexity: `pread` costs one local read + CRC32 per present extent, one
+coalesced remote fetch per missing extent, plus one memcpy per extent; the
+sidecar costs 8 bytes per extent on disk and in memory.
+
 ### `base64.hpp` — base64_encode, base64_decode
 
 ```cpp
@@ -636,25 +776,36 @@ Callers may rely on:
   pointer load, so no read can observe a torn mix of the two.
 - **Download integrity** — `overlaybd.commit` only ever appears via an
   atomic `rename()` after a successful sha256 verification (when a digest is
-  configured); a `.download` staging file is never served to readers.
+  configured); a `.download` staging file is never served to readers. This
+  holds for both the Downloader and LayerStore (whose staging file is
+  per-extent CRC-verified before any byte of it is served).
+- **LayerStore crash rule** — a sidecar bit is set only after the extent's
+  data write completed, and every local read verifies the extent's CRC32:
+  a crash or torn write degrades to a re-fetch, never to bad data.
 - **Registry byte-exactness** — `RegistryClient::get_data` returns `count`
   or an error, never a short count; a server short body maps to `-EIO`.
 
 ## Concurrency & Call Permissions
 
 - **Scheduler context** — every `open`, `pread`, `pwrite`, `flush`,
-  `get_data`, `get_length`, `dart_proxy_reachable`, and the downloader
-  coroutine must run on a thread with a running Elio scheduler. `start()`
-  additionally requires it at call time (`elio::go`). `CredentialStore` and
-  the base64 helpers are synchronous and scheduler-free.
+  `populate`, `get_data`, `get_length`, `dart_proxy_reachable`, and the
+  downloader coroutine must run on a thread with a running Elio scheduler.
+  `start()` additionally requires it at call time (`elio::go`).
+  `CredentialStore` and the base64 helpers are synchronous and
+  scheduler-free. LayerStore's blocking disk writes (and its completion
+  read-back) run on its own dedicated plain `std::thread`, never on an Elio
+  worker — the same precedent as the ublk queue threads.
 - **Concurrent reads** — concurrent `pread`s on one source are safe for
   every type in this module. `LocalFileSource` and `RegistrySource` are
   stateless per read; `ChunkCache` serializes its index under an
   `elio::sync::mutex` and fills outside the lock; `SwitchSource` reads an
-  atomic pointer; `RegistryClient`'s caches are mutex-guarded.
+  atomic pointer; `RegistryClient`'s caches are mutex-guarded; `LayerStore`
+  shares its extent map with the writer thread through per-extent atomics
+  and coalesces concurrent fetches of one extent to a single remote read.
 - **Instance state** — mutable state per instance: `ChunkCache` (chunk map,
   LRU, counters), `RegistryClient` (token and URL-info caches), `Downloader`
-  (status atomics), `SwitchSource::Control` (the atomic local pointer). No
+  (status atomics), `SwitchSource::Control` (the atomic local pointer),
+  `LayerStore` (extent map, write-behind queue, state/counter atomics). No
   hidden global mutable state anywhere in the module.
 - **Buffer ownership** — `buf` arguments are borrowed for the duration of
   the `co_await`; sources never retain pointers into caller buffers. Cached
@@ -706,7 +857,8 @@ additive status/observability APIs.
 
 ## Testing
 
-Unit tests live in `tests/unit/test_source.cpp` and
+Unit tests live in `tests/unit/test_source.cpp`,
+`tests/unit/test_layer_store.cpp`, and
 `tests/unit/test_registry.cpp` (Catch2; the registry tests run against an
 in-process mock registry speaking the auth/redirect/DART contract), plus
 `common: base64 round-trips and decodes cred.json form` in
@@ -746,6 +898,39 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   `accelerate_base` set, the mock observes the request path
   `/dart/<full upstream URL>` with the double slashes of the embedded scheme
   intact, and the data still round-trips.
+- `source: layer store cold read persists and reopen serves locally` — a
+  cold read fetches from the remote and persists; after destroy + reopen
+  the warmed extents are served locally with zero remote reads.
+- `source: layer store detects corrupted staging via crc and refetches` —
+  a staging file corrupted on disk between runs fails the per-extent CRC32,
+  is demoted to a hole, re-fetched (correct data), and counted in
+  `crc_failures`.
+- `source: layer store deletes stale sidecar and restarts fresh` — a
+  sidecar renamed to a wrong nonce name, and one with clobbered magic, are
+  both deleted (with their staging files) and the layer restarts fresh.
+- `source: layer store drops writes when the queue is full` — a stalled
+  writer plus a one-extent queue bounds the write-behind queue: extra
+  writes drop (`dropped_writes`), reads stay correct, and the queued
+  entries persist once the writer resumes.
+- `source: layer store enters bypass on write failure` — an injected
+  `ENOSPC` moves the store to `Bypass`: reads keep working remotely and
+  `populate` is a no-op.
+- `source: layer store completes to overlaybd.commit and reopens read-only` —
+  filling every extent sha256-verifies and renames the staging file to
+  `overlaybd.commit` (sidecar gone, state `Complete`); a reopen binds the
+  commit with zero remote reads.
+- `source: layer store restarts on sha mismatch within try count` — a wrong
+  expected digest fails completion verification, restarts fresh with a new
+  nonce exactly `try_count` times, then stays remote-serving in `Bypass`.
+- `source: layer store populate warms extents without serving data` —
+  `populate` returns 0, delivers no data, and the warmed extents are local
+  after a reopen.
+- `source: layer store coalesces concurrent fetches of one extent` — N
+  concurrent preads of one missing extent cause exactly 1 remote fetch and
+  N-1 `coalesced_joins`.
+- `source: layer store handles a tail extent at eof` — a blob whose size is
+  not a multiple of the extent size reads, persists, and CRC-verifies its
+  short tail extent correctly (EOF clamping included).
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → ChunkCache → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same wiring image
@@ -772,6 +957,10 @@ directly.
 
 ## Limitations & TODO
 
+- **LayerStore is not yet wired into image assembly.** The component exists
+  with its own tests (ADR-0011 part 1), but image assembly still stacks
+  ChunkCache + Downloader/SwitchSource; swapping the stack is the ADR-0011
+  follow-up.
 - **Chunk cache is memory-only and per-device.** There is no shared on-disk
   cache for range reads (overlaybd's fiemap-tracked cache file); restart
   loses cached chunks. DART, when enabled, is the shared on-node cache.
