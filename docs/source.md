@@ -775,9 +775,11 @@ directly.
 - **Chunk cache is memory-only and per-device.** There is no shared on-disk
   cache for range reads (overlaybd's fiemap-tracked cache file); restart
   loses cached chunks. DART, when enabled, is the shared on-node cache.
+  (Proposed ADR-0011 replaces this with a sparse-file LayerStore.)
 - **Whole-file switch only.** `SwitchSource` does not migrate extents
   incrementally; reads stay remote until the entire blob is local and
-  verified (`docs/design-assumptions.md` §S-4).
+  verified (`docs/design-assumptions.md` §S-4). (Proposed ADR-0011 makes
+  locality gradual per extent.)
 - **Single-request size bound** — one registry Range read is bounded by
   `RegistryClientConfig::max_response_size` (64 MiB default); larger single
   requests must be split by the caller (the format readers already read in
@@ -786,7 +788,9 @@ directly.
   lifetimes are constants, not config; registries issuing shorter-lived
   tokens rely on the 401-drop-and-re-resolve path.
 - **No prefetch / trace replay** — overlaybd's prefetch and TurboOCI paths
-  are out of scope (ADR-0007).
+  are out of scope (ADR-0007). (Proposed ADR-0012 and ADR-0013 re-scope
+  prefetch: an admission funnel with scavenger-class warm-up, and
+  upstream-compatible trace record/replay.)
 - **credentialConfig mode=file only** — inline/secret credential modes are
   ignored (see `docs/image.md` / `docs/config.md`).
 - **Downloader has no cancellation** — a running download finishes or fails

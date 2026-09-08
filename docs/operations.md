@@ -161,6 +161,8 @@ correlate by device id and by the supervisor's spawn logs.
   the upstream LSMT trim semantics, intentional.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
   or mutate registry content (ADR-0007). Writable uppers are local-only.
+  (Proposed ADR-0014 adds an offline commit command, deterministic seal,
+  grow-only resize, and the external-CLI boundary for standalone use.)
 - **Credentials**: only `credentialConfig` `mode=file` is honored; other
   modes are ignored with a warning (see [config.md](./config.md)).
 - **One supervisor per node** is the expected topology; multiple
