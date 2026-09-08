@@ -62,11 +62,25 @@ jobs:
             liburing-dev zlib1g-dev libssl-dev linux-libc-dev \
             cmake ninja-build g++
 
-      - name: Load ublk driver
-        # GitHub-hosted runners are full VMs: modprobe works. devtmpfs
-        # creates /dev/ublk-control on load.
+      - name: Build and load ublk_drv
+        # Ubuntu kernels do not ship ublk_drv (CONFIG_BLK_DEV_UBLK=n in
+        # every noble package), so modprobe alone cannot work. Build the
+        # driver out-of-tree against the running kernel's headers from
+        # the matching mainline source, then insmod it. GitHub-hosted
+        # runners are full VMs: module loading works (no Secure Boot).
         run: |
-          sudo modprobe ublk_drv
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "linux-headers-$(uname -r)" build-essential libelf-dev dwarves
+          kbase="$(uname -r | cut -d. -f1-2)"
+          mkdir -p /tmp/ublk && cd /tmp/ublk
+          curl -fsSL \
+            "https://raw.githubusercontent.com/torvalds/linux/v${kbase}/drivers/block/ublk_drv.c" \
+            -o ublk_drv.c
+          echo 'obj-m += ublk_drv.o' > Makefile
+          make -C "/lib/modules/$(uname -r)/build" M=/tmp/ublk modules
+          sudo insmod /tmp/ublk/ublk_drv.ko
           ls -l /dev/ublk-control
 
       - name: Configure

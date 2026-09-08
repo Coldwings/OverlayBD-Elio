@@ -159,8 +159,16 @@ TEST_CASE("supervisor: crashed device child is recovered with bounded respawns",
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         check(recoveries == 2, "recoveries != 2");
-        // 1 original spawn + 2 recovery respawns.
-        check(count_lines(argv_log) == 3, "argv log line count != 3");
+        // 1 original spawn + 2 recovery respawns. The third child's argv
+        // line lags the recoveries counter (spawn is fork+exec+shell), so
+        // poll instead of checking once.
+        size_t lines = 0;
+        for (int i = 0; i < 250; ++i) {
+            lines = count_lines(argv_log);
+            if (lines >= 3) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        check(lines == 3, "argv log line count != 3");
 
         const auto del = rpc_json({{"cmd", "destroy"}, {"id", "d1"}});
         check(del.value("ok", false) == true, "destroy failed");
@@ -195,10 +203,10 @@ TEST_CASE("supervisor: crashed device child is recovered with bounded respawns",
         co_return 0;
     });
     client.join();
+    INFO(fail_msg);
     REQUIRE(rc == 0);
     REQUIRE(daemon_rc.load() >= 0);
     REQUIRE(failures.load() == 0);
-    INFO(fail_msg);
     REQUIRE(::sigprocmask(SIG_SETMASK, &prev, nullptr) == 0);
     ::unsetenv("OBD_FAKE_ARGV");
 }
