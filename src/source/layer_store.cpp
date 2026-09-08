@@ -7,6 +7,7 @@
 
 #include <elio/io/io_awaitables.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -144,17 +145,6 @@ elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
     if (cfg.try_count == 0) {
         throw error(EINVAL, "layer store with zero try count");
     }
-    struct stat st {};
-    if (::stat(dir.c_str(), &st) != 0) {
-        throw_errno(errno, "layer store dir " + dir);
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        throw error(ENOTDIR, "layer store dir " + dir);
-    }
-    if (::access(dir.c_str(), W_OK | X_OK) != 0) {
-        throw_errno(errno, "layer store dir not writable " + dir);
-    }
-
     auto ls = std::unique_ptr<LayerStore>(new LayerStore());
     ls->cfg_ = cfg;
     ls->dir_ = std::move(dir);
@@ -167,39 +157,54 @@ elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
     ls->records_ = std::vector<std::atomic<uint64_t>>(ls->extent_count_);
     ls->remote_ = std::move(remote);
 
-    // A committed layer from a previous run binds read-only; no staging.
-    const std::string commit = commit_path(ls->dir_);
-    if (::stat(commit.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
-        const int fd = ::open(commit.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd < 0) throw_errno(errno, "cannot open " + commit);
-        ls->commit_fd_.store(fd, std::memory_order_release);
-        ls->state_.store(static_cast<int>(State::Complete),
-                         std::memory_order_release);
-        ELIO_LOG_INFO("layer store {}: bound to commit file", ls->dir_);
-        co_return ls;
-    }
-
-    const uint64_t resumed = ls->find_valid_pair();
-    if (resumed == 0) {
-        FreshPair p;
-        const int rc = ls->create_fresh_pair(p);
-        if (rc != 0) {
-            throw_errno(rc, "cannot create staging pair in " + ls->dir_);
+    co_await elio::spawn_blocking([self = ls.get()] {
+        struct stat st {};
+        if (::stat(self->dir_.c_str(), &st) != 0) {
+            throw_errno(errno, "layer store dir " + self->dir_);
         }
-        ls->nonce_ = p.nonce;
-        ls->staging_fd_.store(p.staging_fd, std::memory_order_release);
-        ls->sidecar_fd_ = p.sidecar_fd;
-        ELIO_LOG_INFO("layer store {}: fresh staging pair (nonce {})",
-                      ls->dir_, hex_nonce(ls->nonce_));
-    } else {
-        ELIO_LOG_INFO("layer store {}: resuming nonce {} ({}/{} extents)",
-                      ls->dir_, hex_nonce(resumed),
-                      ls->present_.load(std::memory_order_relaxed),
-                      ls->extent_count_);
-        ls->kick_completion_check_ =
-            ls->extent_count_ > 0 &&
-            ls->present_.load(std::memory_order_relaxed) == ls->extent_count_;
-    }
+        if (!S_ISDIR(st.st_mode)) {
+            throw error(ENOTDIR, "layer store dir " + self->dir_);
+        }
+        if (::access(self->dir_.c_str(), W_OK | X_OK) != 0) {
+            throw_errno(errno, "layer store dir not writable " + self->dir_);
+        }
+
+        // A committed layer from a previous run binds read-only; no staging.
+        const std::string commit = LayerStore::commit_path(self->dir_);
+        if (::stat(commit.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            const int fd = ::open(commit.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) throw_errno(errno, "cannot open " + commit);
+            self->commit_fd_.store(fd, std::memory_order_release);
+            self->state_.store(static_cast<int>(State::Complete),
+                               std::memory_order_release);
+            ELIO_LOG_INFO("layer store {}: bound to commit file", self->dir_);
+            return;
+        }
+
+        const uint64_t resumed = self->find_valid_pair();
+        if (resumed == 0) {
+            LayerStore::FreshPair p;
+            const int rc = self->create_fresh_pair(p);
+            if (rc != 0) {
+                throw_errno(rc, "cannot create staging pair in " + self->dir_);
+            }
+            self->nonce_ = p.nonce;
+            self->staging_fd_.store(p.staging_fd, std::memory_order_release);
+            self->sidecar_fd_ = p.sidecar_fd;
+            ELIO_LOG_INFO("layer store {}: fresh staging pair (nonce {})",
+                          self->dir_, LayerStore::hex_nonce(self->nonce_));
+        } else {
+            ELIO_LOG_INFO("layer store {}: resuming nonce {} ({}/{} extents)",
+                          self->dir_, LayerStore::hex_nonce(resumed),
+                          self->present_.load(std::memory_order_relaxed),
+                          self->extent_count_);
+        }
+        self->kick_completion_check_ =
+            self->extent_count_ == 0 ||
+            self->present_.load(std::memory_order_relaxed) ==
+                self->extent_count_;
+    });
+    if (ls->state() == State::Complete) co_return ls;
     LayerStore* self = ls.get();
     ls->writer_ = std::thread([self] { self->writer_main(); });
     co_return ls;
@@ -629,8 +634,12 @@ void LayerStore::process_job(
     if (job.clear) {
         // Best-effort demote of a CRC-failed extent.
         uint8_t rec[8] = {};
-        (void)pwrite_all(sidecar_fd_, rec, sizeof rec,
-                         kHeaderSize + job.extent_id * 8);
+        const int rc = pwrite_all(sidecar_fd_, rec, sizeof rec,
+                                  kHeaderSize + job.extent_id * 8);
+        if (rc != 0) {
+            on_write_error(rc);
+            return;
+        }
         const uint64_t old = records_[job.extent_id].exchange(
             0, std::memory_order_acq_rel);
         if (old & kFlagPresent) {

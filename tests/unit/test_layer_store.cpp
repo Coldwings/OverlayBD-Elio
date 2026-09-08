@@ -837,3 +837,24 @@ TEST_CASE("source: layer store completes without verification when digest is emp
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("source: layer store completes an empty layer", "[source]") {
+    test::TempDir dir;
+    const std::vector<uint8_t> blob;
+    const std::string digest = digest_of(blob);
+
+    int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto store = co_await source::LayerStore::open(
+            std::make_unique<VectorSource>(blob), dir.str(), digest);
+        const bool done = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        REQUIRE(store->extents_total() == 0);
+        REQUIRE(store->extents_present() == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(std::filesystem::exists(dir.str() + "/overlaybd.commit"));
+    REQUIRE(std::filesystem::file_size(dir.str() + "/overlaybd.commit") == 0);
+}

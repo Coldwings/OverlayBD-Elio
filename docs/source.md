@@ -690,6 +690,10 @@ remote bytes into a sparse local staging file with a sidecar extent map
   count, layer sha256, nonce, header CRC32) matches this layer; a valid
   pair's records are loaded and filling resumes, anything unpaired or
   invalid is deleted and the layer starts fresh with a new random nonce.
+  Filesystem probing and staging-pair creation run through
+  `elio::spawn_blocking`, so setup disk I/O does not occupy an Elio worker.
+  A zero-length layer starts its writer in the completion check and is
+  committed immediately.
   Throws `obd::error` on unrecoverable setup problems (null remote, bad
   config, missing/unwritable `dir`, unloadable commit file, staging-pair
   creation failure).
@@ -947,6 +951,8 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: layer store completes without verification when digest is empty` —
   an empty expected digest zero-fills the sidecar header (resume still
   matches) and completes to `overlaybd.commit` without verification.
+- `source: layer store completes an empty layer` — a zero-length remote
+  creates an empty `overlaybd.commit` instead of remaining in `Filling`.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → ChunkCache → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same wiring image
