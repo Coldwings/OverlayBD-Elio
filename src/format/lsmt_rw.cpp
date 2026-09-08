@@ -2,6 +2,7 @@
 #include "format/lsmt_rw.hpp"
 
 #include "common/errors.hpp"
+#include "common/sha256.hpp"
 #include "format/writer.hpp"  // generate_uuid
 
 #include <elio/io/io_awaitables.hpp>
@@ -129,6 +130,18 @@ void insert_sorted(std::vector<bytes::segment_mapping>& v,
     }
 }
 
+/// ADR-0014 seal determinism: formats the first 32 hex chars of the
+/// content digest as a 36-char 8-4-4-4-12 uuid string. Pure function of
+/// the digest — no randomness, no clock.
+std::string uuid_from_content_digest(const std::string& digest_hex) {
+    std::string u = digest_hex.substr(0, 32);
+    u.insert(20, 1, '-');
+    u.insert(16, 1, '-');
+    u.insert(12, 1, '-');
+    u.insert(8, 1, '-');
+    return u;
+}
+
 }  // namespace
 
 elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
@@ -166,7 +179,7 @@ elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
 
 elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
                                               uint64_t offset) {
-    if (sealed_) co_return -EROFS;
+    if (sealed_ || checkpointed_) co_return -EROFS;
     if (offset % kSector != 0 || count % kSector != 0 || count == 0) {
         co_return -EINVAL;
     }
@@ -301,7 +314,7 @@ elio::coro::task<ssize_t> LsmtRwLayer::pread(void* buf, size_t count,
 }
 
 elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
-    if (sealed_) co_return -EROFS;
+    if (sealed_ || checkpointed_) co_return -EROFS;
     if (offset % kSector != 0 || len % kSector != 0 || len == 0) {
         co_return -EINVAL;
     }
@@ -357,6 +370,46 @@ elio::coro::task<int> LsmtRwLayer::flush() {
     co_return 0;
 }
 
+elio::coro::task<int> LsmtRwLayer::checkpoint() {
+    if (sealed_ || checkpointed_) co_return -EROFS;
+
+    // Appended at the data end: index (SegmentMapping array, padded to
+    // 4096B) | unsealed trailer (4096B). The trailer sits in the file's
+    // last 4096 bytes, which is how open_checkpointed locates it.
+    const uint64_t index_sector =
+        (data_end_sector_ + kHeaderSectors - 1) / kHeaderSectors *
+        kHeaderSectors;
+    const uint64_t index_offset = index_sector * kSector;  // bytes
+    const uint64_t index_size = segments_.size();
+    const size_t index_bytes =
+        segments_.size() * bytes::segment_mapping::kEncodedSize;
+    const size_t index_region = (index_bytes + 4095) / 4096 * 4096;
+
+    std::vector<uint8_t> idx(index_region, 0);
+    for (size_t i = 0; i < segments_.size(); ++i) {
+        bytes::store_segment_le(
+            idx.data() + i * bytes::segment_mapping::kEncodedSize,
+            segments_[i]);
+    }
+    int rc = co_await write_all(fd_, idx.data(), idx.size(), index_offset);
+    if (rc != 0) co_return rc;
+
+    uint8_t region[4096];
+    std::memset(region, 0, sizeof(region));
+    const auto trailer = make_ht(/*header=*/false, /*sealed=*/false,
+                                 index_offset, index_size, vsize_, uuid_,
+                                 "");
+    trailer.serialize(region);
+    rc = co_await write_all(fd_, region, sizeof(region),
+                            index_offset + index_region);
+    if (rc != 0) co_return rc;
+    if (::fdatasync(fd_) != 0) co_return -errno;
+    data_bytes_.store(index_offset + index_region + sizeof(region),
+                      std::memory_order_release);
+    checkpointed_ = true;
+    co_return 0;
+}
+
 elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     if (sealed_) co_return -EROFS;
 
@@ -371,6 +424,14 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     std::vector<bytes::segment_mapping> packed;
     uint64_t out_sector = kHeaderSectors;
     std::vector<uint8_t> copy_buf(1 << 20);
+    // ADR-0014 seal determinism: the sealed uuid is derived from the
+    // content digest sha256(vsize as LE u64 || packed data bytes in
+    // segment order || packed index entries as stored). user_tag is
+    // caller input and deliberately excluded from the digest.
+    common::Sha256 content_hash;
+    uint8_t vsize_le[8];
+    bytes::store_u64_le(vsize_le, vsize_);
+    content_hash.update(vsize_le, sizeof(vsize_le));
     for (const auto& s : segments_) {
         bytes::segment_mapping m = s;
         // Zeroed segments carry no data, but their moffset must stay inside
@@ -386,6 +447,7 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
                     std::min<uint64_t>(remaining, copy_buf.size()));
                 rc = co_await read_all(fd_, copy_buf.data(), n, from);
                 if (rc != 0) goto out;
+                content_hash.update(copy_buf.data(), n);
                 rc = co_await write_all(out_fd, copy_buf.data(), n, to);
                 if (rc != 0) goto out;
                 remaining -= n;
@@ -409,6 +471,18 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
         const size_t index_region = (index_bytes + 4095) / 4096 * 4096;
 
         uint8_t region[4096];
+
+        // Index entries.
+        std::vector<uint8_t> idx(index_region, 0);
+        for (size_t i = 0; i < packed.size(); ++i) {
+            bytes::store_segment_le(idx.data() + i * 16, packed[i]);
+        }
+        // With data and index fixed, the content digest — and therefore
+        // the sealed uuid — is determined (ADR-0014). Derive it before the
+        // header is written.
+        content_hash.update(idx.data(), index_bytes);
+        uuid_ = uuid_from_content_digest(content_hash.final_hex());
+
         std::memset(region, 0, sizeof(region));
         const auto header = make_ht(true, true, index_offset, index_size,
                                     vsize_, uuid_, user_tag);
@@ -416,11 +490,6 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
         rc = co_await write_all(out_fd, region, sizeof(region), 0);
         if (rc != 0) goto out;
 
-        // Index entries.
-        std::vector<uint8_t> idx(index_region, 0);
-        for (size_t i = 0; i < packed.size(); ++i) {
-            bytes::store_segment_le(idx.data() + i * 16, packed[i]);
-        }
         rc = co_await write_all(out_fd, idx.data(), idx.size(),
                                 index_offset);
         if (rc != 0) goto out;
@@ -457,6 +526,163 @@ out:
     ::close(out_fd);
     if (rc != 0) ::unlink(tmp.c_str());
     co_return rc;
+}
+
+elio::coro::task<std::unique_ptr<LsmtRwLayer>>
+LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
+    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        *error = -errno;
+        co_return nullptr;
+    }
+    auto fail = [&fd, error](int e) {
+        ::close(fd);
+        *error = e;
+    };
+
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        fail(-errno);
+        co_return nullptr;
+    }
+    if (st.st_size < static_cast<off_t>(2 * lsmt::kSpace)) {
+        fail(-EINVAL);
+        co_return nullptr;
+    }
+
+    // The checkpoint trailer is the file's last 4096 bytes.
+    const uint64_t trailer_offset =
+        static_cast<uint64_t>(st.st_size) - lsmt::kSpace;
+    uint8_t region[lsmt::kSpace];
+    int rc = co_await read_all(fd, region, sizeof(region), trailer_offset);
+    if (rc != 0) {
+        fail(rc);
+        co_return nullptr;
+    }
+    lsmt::HeaderTrailer tht;
+    try {
+        tht = lsmt::HeaderTrailer::parse(region);
+    } catch (const std::exception&) {
+        fail(-EINVAL);
+        co_return nullptr;
+    }
+    if (!tht.is_trailer() || !tht.is_data_file()) {
+        fail(-EINVAL);
+        co_return nullptr;
+    }
+    if (tht.is_sealed()) {
+        fail(-EALREADY);
+        co_return nullptr;
+    }
+    if (tht.virtual_size == 0 || tht.virtual_size % kSector != 0 ||
+        tht.index_size > lsmt::kMaxRoIndexSize) {
+        fail(-EINVAL);
+        co_return nullptr;
+    }
+    const uint64_t index_bytes =
+        tht.index_size * bytes::segment_mapping::kEncodedSize;
+    if (tht.index_offset < lsmt::kSpace ||
+        index_bytes > trailer_offset - tht.index_offset) {
+        fail(-EINVAL);
+        co_return nullptr;
+    }
+
+    // Load and validate the checkpointed index (LsmtLayer::open rules:
+    // drop invalid entries, clear tags, strict ordering, moffset range).
+    std::vector<uint8_t> raw(index_bytes);
+    if (index_bytes > 0) {
+        rc = co_await read_all(fd, raw.data(), index_bytes, tht.index_offset);
+        if (rc != 0) {
+            fail(rc);
+            co_return nullptr;
+        }
+    }
+    std::vector<bytes::segment_mapping> segments;
+    segments.reserve(tht.index_size);
+    for (uint64_t i = 0; i < tht.index_size; ++i) {
+        auto s = bytes::load_segment_le(
+            raw.data() + i * bytes::segment_mapping::kEncodedSize);
+        if (s.offset == bytes::segment_mapping::kInvalidOffset) continue;
+        s.tag = 0;
+        segments.push_back(s);
+    }
+    for (size_t i = 1; i < segments.size(); ++i) {
+        if (segments[i - 1].end() > segments[i].offset) {
+            fail(-EINVAL);
+            co_return nullptr;
+        }
+    }
+    const uint64_t moffset_end = tht.index_offset / kSector;
+    for (const auto& m : segments) {
+        const bool ok = m.zeroed
+                            ? (kHeaderSectors <= m.moffset &&
+                               m.moffset <= moffset_end)
+                            : (kHeaderSectors <= m.moffset &&
+                               m.moffset < moffset_end &&
+                               kHeaderSectors < m.mend() &&
+                               m.mend() <= moffset_end);
+        if (!ok) {
+            fail(-EINVAL);
+            co_return nullptr;
+        }
+    }
+
+    auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer());
+    layer->fd_ = fd;
+    layer->vsize_ = tht.virtual_size;
+    layer->data_end_sector_ = tht.index_offset / kSector;
+    layer->uuid_ = tht.uuid;
+    layer->path_ = path;
+    layer->checkpointed_ = true;  // terminal: no more pwrite/discard
+    layer->segments_ = std::move(segments);
+    layer->data_bytes_.store(static_cast<uint64_t>(st.st_size),
+                             std::memory_order_release);
+    layer->view_ = std::make_unique<LsmtRwLayer::View>(
+        fd, &layer->data_bytes_, "lsmt-rw:" + path);
+    co_return layer;
+}
+
+elio::coro::task<int> LsmtRwLayer::seal_file(const std::string& path,
+                                             const std::string& user_tag,
+                                             std::string* sha256_hex,
+                                             uint64_t* size) {
+    int err = 0;
+    auto layer = co_await open_checkpointed(path, &err);
+    if (!layer) co_return err;
+    const int rc = co_await layer->seal(user_tag);
+    if (rc != 0) co_return rc;
+    layer.reset();  // seal renamed over path; drop the stale inode's fd
+
+    // Digest and size of the sealed file: a second streaming pass over a
+    // fresh fd (seal is a cold control path; simplicity beats hashing
+    // during compaction).
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) co_return -errno;
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        const int e = -errno;
+        ::close(fd);
+        co_return e;
+    }
+    common::Sha256 hash;
+    std::vector<uint8_t> buf(1 << 20);
+    uint64_t off = 0;
+    const uint64_t total = static_cast<uint64_t>(st.st_size);
+    while (off < total) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(
+            static_cast<uint64_t>(buf.size()), total - off));
+        const int rrc = co_await read_all(fd, buf.data(), n, off);
+        if (rrc != 0) {
+            ::close(fd);
+            co_return rrc;
+        }
+        hash.update(buf.data(), n);
+        off += n;
+    }
+    ::close(fd);
+    if (sha256_hex) *sha256_hex = hash.final_hex();
+    if (size) *size = total;
+    co_return 0;
 }
 
 }  // namespace obd::format

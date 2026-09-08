@@ -27,6 +27,11 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
             error = cmd + " requires 'id'";
             return std::nullopt;
         }
+    } else if (cmd == "commit") {
+        if (!j.contains("id")) {
+            error = "commit requires 'id'";
+            return std::nullopt;
+        }
     } else if (cmd != "list" && cmd != "hello") {
         error = "unknown cmd '" + cmd + "'";
         return std::nullopt;
@@ -51,7 +56,9 @@ std::string reply_hello() {
     nlohmann::json fields;
     fields["protocol"] = kProtocolVersion;
     fields["version"] = kProjectVersion;
-    fields["features"] = nlohmann::json::array();  // extension point
+    // Capability gate (additive-only rule): "commit" = the ADR-0014
+    // offline commit command is served.
+    fields["features"] = nlohmann::json::array({"commit"});
     return reply_ok(fields);
 }
 

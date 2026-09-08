@@ -11,6 +11,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+#include <algorithm>
+#include <string>
+#include <vector>
+
 using namespace obd;
 
 TEST_CASE("supervisor: protocol commands parse and reject garbage",
@@ -126,6 +130,32 @@ TEST_CASE("supervisor: child spawn execs and reports through the channel",
     REQUIRE(child->status().state == "exited");
     REQUIRE(child->status().exit_code == 0);
     ::close(child->release_control_fd());
+}
+
+TEST_CASE("supervisor: commit command parses and validates its fields",
+          "[supervisor]") {
+    // ADR-0014 additive protocol: commit requires `id`; `user_tag` is
+    // optional; unknown fields are ignored.
+    std::string err;
+    auto j = supervisor::parse_command(R"({"cmd":"commit","id":"a"})", err);
+    REQUIRE(j.has_value());
+    REQUIRE((*j)["cmd"] == "commit");
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"commit","id":"a","user_tag":"v1","future":1})",
+                err)
+                .has_value());
+    REQUIRE(!supervisor::parse_command(R"({"cmd":"commit"})", err)
+                 .has_value());
+    REQUIRE(err.find("commit requires 'id'") != std::string::npos);
+
+    // The hello handshake advertises the capability gate for commit.
+    const auto hello = nlohmann::json::parse(supervisor::reply_hello());
+    REQUIRE(hello.value("ok", false) == true);
+    REQUIRE((hello.contains("features") && hello["features"].is_array()));
+    const auto features =
+        hello["features"].get<std::vector<std::string>>();
+    REQUIRE(std::find(features.begin(), features.end(), "commit") !=
+            features.end());
 }
 
 TEST_CASE("supervisor: bdev path parses to device id", "[supervisor]") {

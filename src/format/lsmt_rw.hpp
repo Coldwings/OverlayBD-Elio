@@ -5,9 +5,17 @@
 // compacts the file into a standard sealed LSMT RO file (garbage from
 // superseded in-place regions is dropped), readable by LsmtLayer.
 //
-// v0.2 limitation: the segment index is memory-only until seal(); an
-// unsealed RW file is NOT recoverable across process restarts (create()
-// truncates). Seal explicitly to persist.
+// v0.2 limitation: the segment index is memory-only until checkpoint() or
+// seal(); an unsealed RW file is NOT recoverable across process restarts
+// (create() truncates). checkpoint() (called by the device process on
+// graceful shutdown, ADR-0014) persists the index as an unsealed trailer so
+// seal_file() can seal the file offline, from another process, after the
+// device is gone.
+//
+// Seal determinism (ADR-0014): the sealed file's uuid is derived from the
+// content digest (sha256 of virtual_size || packed data || packed index,
+// formatted as a 8-4-4-4-12 uuid string), so identical upper content seals
+// to identical bytes; see docs/format.md.
 #pragma once
 
 #include "format/lsmt_format.hpp"
@@ -35,6 +43,14 @@ public:
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
 
+    /// Persists the in-memory segment index into the file as an unsealed
+    /// trailer (index region + trailer appended at the data end), so the
+    /// file can later be sealed offline by seal_file() (ADR-0014). Called
+    /// by the device process on graceful shutdown after IO has drained.
+    /// Terminal: pwrite/discard after a checkpoint return -EROFS. Returns 0
+    /// or a negative -errno; -EROFS when already sealed or checkpointed.
+    elio::coro::task<int> checkpoint() override;
+
     uint64_t virtual_size() const override { return vsize_; }
     const std::vector<bytes::segment_mapping>& segments() const override {
         return segments_;
@@ -47,10 +63,30 @@ public:
 
     /// Compacts and seals the file in place (atomic rename); afterwards it
     /// is a standard sealed LSMT RO file. Subsequent pwrite returns -EROFS.
+    /// The sealed uuid is content-derived (see the file header comment), so
+    /// identical content seals to identical bytes (ADR-0014).
     elio::coro::task<int> seal(const std::string& user_tag = "");
+
+    /// Offline seal (ADR-0014): opens a checkpointed unsealed RW file at
+    /// `path` (one written by checkpoint(), e.g. by a device process that
+    /// has since exited), seals it in place, and reports the sealed file's
+    /// sha256 hex digest and byte size. Returns 0 or a negative -errno:
+    /// -ENOENT when the file is missing, -EALREADY when it is already
+    /// sealed, -EINVAL when it is not a valid checkpointed LSMT-RW file
+    /// (e.g. the device crashed before checkpointing).
+    static elio::coro::task<int> seal_file(const std::string& path,
+                                           const std::string& user_tag,
+                                           std::string* sha256_hex,
+                                           uint64_t* size);
 
 private:
     LsmtRwLayer() = default;
+
+    /// Opens an existing checkpointed RW file (no truncation) with its
+    /// index loaded from the on-disk unsealed trailer. Returns a negative
+    /// -errno via `error` (-EINVAL/-EALREADY/-ENOENT/...) on failure.
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> open_checkpointed(
+        const std::string& path, int* error);
 
     int fd_ = -1;                   // RW fd (also used for data_source reads)
     class View;                     // fd-backed BlobSource with dynamic size
@@ -61,6 +97,7 @@ private:
     std::string uuid_;
     std::string path_;
     bool sealed_ = false;
+    bool checkpointed_ = false;  // terminal: no more pwrite/discard
     std::vector<bytes::segment_mapping> segments_;
 };
 

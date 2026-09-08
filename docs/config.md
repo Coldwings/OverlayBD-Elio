@@ -150,8 +150,10 @@ empty `dir` keeps the device read-only.
 | `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` (unsealed in-place-edit LSMT); `"sparse"` → `<dir>/overlaybd.sparse` (fiemap sparse file). **Any other value is rejected** with `EINVAL`. |
 
 Durability note: the `lsmt` upper keeps its segment index in memory
-until `seal()`; unsealed data is not crash-durable (see *Limitations &
-TODO* in `docs/architecture.md`).
+until `checkpoint()`/`seal()`; unsealed data is not crash-durable (see
+*Limitations & TODO* in `docs/architecture.md`). A graceful device
+shutdown writes the checkpoint that the offline `commit` seal consumes
+(ADR-0014); a `"sparse"` upper never seals.
 
 ### `download` (per-image overrides)
 

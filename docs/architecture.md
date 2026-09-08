@@ -325,4 +325,6 @@ contracts above:
 - **LSMT-RW durability:** an unsealed `overlaybd.rw` upper keeps its
   segment index in memory only; unsealed data is **not crash-durable**
   and the file is not recoverable across process restarts until
-  `seal()` compacts it into a standard sealed LSMT layer.
+  `seal()` compacts it into a standard sealed LSMT layer. A graceful
+  obd-device shutdown checkpoints the index into the file (ADR-0014),
+  which is what the supervisor's offline `commit` seal consumes.

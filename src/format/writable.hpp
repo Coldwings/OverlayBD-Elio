@@ -43,6 +43,13 @@ public:
     virtual elio::coro::task<int> discard(uint64_t offset,
                                           uint64_t len) = 0;
 
+    /// Persists whatever on-disk state an offline seal needs (ADR-0014),
+    /// without sealing. Called once by the device process on graceful
+    /// shutdown, after IO has drained; it is terminal — no pwrite/discard
+    /// may follow. Layers whose state is already durable (sparse) return 0
+    /// without doing work. Returns 0 or a negative -errno.
+    virtual elio::coro::task<int> checkpoint() = 0;
+
     virtual uint64_t virtual_size() const = 0;
 
     /// Current segment index: sorted, disjoint, 512B sector units, tag 0.

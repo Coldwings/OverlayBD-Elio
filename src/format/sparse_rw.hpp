@@ -27,6 +27,9 @@ public:
                                     uint64_t offset) override;
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
+    /// No-op: sparse extents are durable via the fiemap already (sparse
+    /// uppers never seal — ADR-0014 upstream parity).
+    elio::coro::task<int> checkpoint() override;
 
     uint64_t virtual_size() const override { return vsize_; }
     const std::vector<bytes::segment_mapping>& segments() const override {

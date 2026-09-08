@@ -462,6 +462,7 @@ public:
     virtual elio::coro::task<int> flush() = 0;
     virtual elio::coro::task<int> discard(uint64_t offset,
                                           uint64_t len) = 0;
+    virtual elio::coro::task<int> checkpoint() = 0;
     virtual uint64_t virtual_size() const = 0;
     virtual const std::vector<bytes::segment_mapping>& segments() const = 0;
     virtual source::BlobSource& data_source() = 0;
@@ -475,9 +476,12 @@ negative -errno. `pread` reads through this layer alone — holes read as
 zeroes and fall-through to lower layers is the merger's job. `flush` is the
 durability point (ublk FLUSH). `discard` (ADR-0009) masks a 512B-aligned
 range with zeroes — reads of the range return zeroes from this layer
-onwards and never fall through to lower layers. `segments()` is the current
-index: sorted, disjoint, 512B sector units, tag 0. `data_source()` is the
-file view segment data is read from.
+onwards and never fall through to lower layers. `checkpoint()` (ADR-0014)
+persists whatever on-disk state an offline seal needs, without sealing; it
+is called once by the device process on graceful shutdown after IO has
+drained and is terminal (no `pwrite`/`discard` may follow). `segments()` is
+the current index: sorted, disjoint, 512B sector units, tag 0.
+`data_source()` is the file view segment data is read from.
 
 ### `src/format/sparse_rw.hpp` — `SparseRwLayer`
 
@@ -522,6 +526,10 @@ public:
 
     bool sealed() const noexcept;
     elio::coro::task<int> seal(const std::string& user_tag = "");
+    static elio::coro::task<int> seal_file(const std::string& path,
+                                           const std::string& user_tag,
+                                           std::string* sha256_hex,
+                                           uint64_t* size);
 };
 ```
 
@@ -558,6 +566,13 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
 - `data_source()`: an fd-backed `BlobSource` view whose size **tracks
   appends** (an `std::atomic<uint64_t>` upper bound), unlike a
   `LocalFileSource` which pins `st_size` at open.
+- `checkpoint()` (ADR-0014): appends the in-memory segment index plus an
+  **unsealed trailer** at the data end (index region padded to 4096B,
+  trailer in the file's last 4096 bytes) and fdatasyncs. Called by
+  obd-device on graceful shutdown; it is terminal — `pwrite`/`discard`
+  afterwards return `-EROFS`, as does a second `checkpoint()`. This is the
+  only on-disk persistence of the RW index; a crash before it loses the
+  unsealed writes.
 - `seal(user_tag)`: compacts the file into a **standard sealed LSMT RO
   file**: live segments are copied out packed sequentially into
   `<path>.sealing` (garbage left behind by in-place edits and discards is
@@ -566,9 +581,19 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
   and an **atomic rename** over `path`. Afterwards `sealed()` is true and
   `pwrite` returns `-EROFS`. Returns 0 or a negative -errno; on failure the
   temp file is unlinked and the original file is untouched.
-- **v0.2 limitation**: the segment index is memory-only until `seal()`; an
-  unsealed RW file is **not recoverable across process restarts**
-  (`create()` truncates). Seal explicitly to persist.
+- `seal_file(path, user_tag, sha256_hex, size)` (ADR-0014 offline commit):
+  opens a **checkpointed** RW file without truncating (index loaded from
+  the on-disk unsealed trailer, validated with the `LsmtLayer::open`
+  rules), seals it in place, and reports the sealed file's sha256 hex
+  digest and byte size. Used by the supervisor's `commit` command after
+  the device process has exited. Error channels: `-ENOENT` (missing
+  file), `-EALREADY` (already sealed), `-EINVAL` (not a valid checkpointed
+  LSMT-RW file — e.g. the device crashed before checkpointing), other
+  -errno propagated.
+- **v0.2 limitation**: the segment index is memory-only until
+  `checkpoint()` or `seal()`; an unsealed RW file is **not recoverable
+  across process restarts** (`create()` truncates). Checkpoint on graceful
+  shutdown and seal (possibly offline, via `seal_file`) to persist.
 
 ### `src/format/merged_writable.hpp` — `MergedWritable`
 
@@ -766,6 +791,26 @@ features (not yet implemented).
 - **Seal atomicity.** `LsmtRwLayer::seal` publishes the compacted file via
   fsync + atomic rename; a failed seal leaves the original file untouched
   and unsealed.
+- **Seal determinism (ADR-0014, the governing — currently proposed —
+  decision for offline commit).** The sealed file is a **pure function of
+  the upper's content plus the caller-supplied `user_tag`**: identical
+  content and tag seal to identical bytes, no wall-clock, randomness, or
+  process-derived fields. Concretely, the sealed header/trailer `uuid` is
+  derived from the content digest, replacing the random create-time uuid:
+
+  ```
+  content_digest = sha256( virtual_size as LE u64
+                           || packed data bytes, in segment order
+                           || packed index entries as stored (16B LE each) )
+  uuid = content_digest hex chars [0,32) formatted 8-4-4-4-12 (36 chars)
+  ```
+
+  `user_tag` is caller input and deliberately excluded from the digest;
+  `parent_uuid` stays empty (an RW upper has no recorded parent).
+  Stacking is unaffected: neither this stack's merge path
+  (`src/format/lsmt.cpp`) nor upstream validates a child's `parent_uuid`
+  against the parent's `uuid` — the field is informational. Pinned by
+  `format: lsmt rw seal is deterministic for identical content`.
 - **Error channels.** Cold paths (`open`, `parse`, writers) throw
   `obd::format_error` / `obd::error`; hot paths (`pread`/`pwrite`/`flush`)
   return negative -errno and never throw (the `source::BlobSource`
@@ -814,8 +859,10 @@ features (not yet implemented).
   (fixture writers, `seal` output): they must keep loading in upstream
   readers.
 - **Breaking (T1):** the writable-layer on-disk artifacts — the unsealed
-  LSMT RW header, the sealed output of `LsmtRwLayer::seal`, and sparse-file
-  extent semantics relied upon at reopen.
+  LSMT RW header, the checkpoint trailer layout (`checkpoint()`'s index
+  region + unsealed trailer consumed by `seal_file`), the sealed output of
+  `LsmtRwLayer::seal` (including the content-derived uuid rule), and
+  sparse-file extent semantics relied upon at reopen.
 - **Contract changes need ADRs.** The writable-layer rules on this page
   (interface shape, in-place edit, seal compaction, copy-on-write) are the
   ADR-0008 contract; weakening or reversing them requires a superseding
@@ -878,6 +925,17 @@ writers and readers agree on the same bytes.
   padded index + trailer), post-seal `pwrite` returns `-EROFS`, and the
   sealed file loads through the read-only `LsmtLayer` path with the patched
   content. Guards compaction, atomic rename, and RO compatibility.
+- `format: lsmt rw seal is deterministic for identical content` — the
+  ADR-0014 seal determinism invariant: two uppers with identical write
+  sequences seal to byte-identical files (equal sha256), their sealed
+  uuids match, and a different write sequence yields a different digest.
+  Catches accidental time/random fields in the sealed output.
+- `format: lsmt rw checkpoint persists the index for offline seal` — the
+  ADR-0014 offline-commit machinery: `checkpoint()` persists the index
+  (writes afterwards get `-EROFS`), `seal_file()` seals the file from a
+  fresh open with digest/size reported, the sealed output loads as a valid
+  RO layer, and the error channels are precise (`-EALREADY` sealed,
+  `-ENOENT` missing, `-EINVAL` never checkpointed).
 - `format: merged writable falls through and copy-on-writes` — before any
   write the merged view is pure fall-through; after a patch write, reads see
   the patch while the lower blob is verified **byte-identical** afterwards.
@@ -920,10 +978,11 @@ writers and readers agree on the same bytes.
 - **ZFile index files** (bit1 clear) and the compressed-index flag (bit5)
   are not supported; LSMT `gc_layer` / `sparse_rw` / `info_valid` flags are
   parsed but not acted on, and `parent_uuid` chains are not validated.
-- **`LsmtRwLayer` v0.2:** the segment index is memory-only until `seal()`;
-  an unsealed RW file is not recoverable across restarts and `create()`
-  truncates any existing file. Durability of unsealed state (checkpointed
-  index) is future work.
+- **`LsmtRwLayer` v0.2:** the segment index is memory-only until
+  `checkpoint()` or `seal()`; an unsealed RW file is not recoverable as a
+  writable layer across restarts (`create()` truncates any existing file),
+  and a crash before the graceful-shutdown checkpoint loses the unsealed
+  writes. Full RW restart recovery is future work.
 - **`SparseRwLayer` extent granularity:** fiemap extent boundaries are
   rounded outward to whole sectors on recovery, so a filesystem that splits
   extents sub-sector could mark unwritten sectors covered (harmless: they

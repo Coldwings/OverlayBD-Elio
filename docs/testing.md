@@ -141,6 +141,15 @@ Every test, grouped by area, with the property it guards.
 - `format: lsmt rw seal compacts into a standard sealed layer` —
   `seal()` turns the unsealed RW file into a byte-standard sealed LSMT
   RO layer that the normal reader opens.
+- `format: lsmt rw seal is deterministic for identical content` —
+  identical upper content seals to byte-identical files with equal
+  content-derived uuids (ADR-0014 seal determinism); a different write
+  sequence yields a different digest.
+- `format: lsmt rw checkpoint persists the index for offline seal` —
+  `checkpoint()` persists the RW index as an unsealed trailer (terminal:
+  later writes get `-EROFS`), `seal_file()` seals it offline with
+  sha256/size reported, and missing/sealed/uncheckpointed files map to
+  `-ENOENT`/`-EALREADY`/`-EINVAL` (ADR-0014).
 - `format: merged writable falls through and copy-on-writes` —
   `MergedWritable` reads fall through the upper to sealed lowers, and
   writes shadow lowers copy-on-write without mutating them (ADR-0008).
@@ -323,6 +332,9 @@ Every test, grouped by area, with the property it guards.
 - `supervisor: recover spec adds the recover flag to child argv` — a
   recovery respawn passes `--recover` and `--dev-id` to obd-device
   (ADR-0010).
+- `supervisor: commit command parses and validates its fields` — `commit`
+  requires `id`, accepts an optional `user_tag`, ignores unknown fields,
+  and the `hello` features list advertises `commit` (ADR-0014, proposed).
 
 ### integration
 
@@ -361,6 +373,14 @@ Every test, grouped by area, with the property it guards.
   handshake shape end to end, an unknown cmd is answered with an error,
   and malformed JSON is answered with an error rather than dropped
   (ADR-0014, proposed). Runs without privileges.
+- `supervisor: commit stops the device and seals its upper offline` — a
+  real daemon with a fake obd-device: commit on unknown id, sparse upper,
+  and upper-less devices fails with precise errors; commit on a live
+  LSMT-upper device stops it (bounded reap) and seals its checkpointed
+  upper, replying `path`/`sha256`/`size`; a second commit fails with
+  "already sealed"; the sealed file re-opens as a valid LSMT RO layer
+  with the checkpointed content (ADR-0014, proposed). Runs without
+  privileges.
 - `integration: switch source swaps reads to the local copy` — after
   install, reads migrate from the remote source to the local file.
 - `integration: ublk device serves sector reads from a blob` — the

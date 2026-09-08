@@ -2,6 +2,8 @@
 #include "supervisor/daemon.hpp"
 
 #include "common/errors.hpp"
+#include "format/lsmt_rw.hpp"
+#include "image/config.hpp"
 #include "supervisor/child.hpp"
 #include "supervisor/protocol.hpp"
 
@@ -17,6 +19,7 @@
 
 #include <libgen.h>
 #include <cstdio>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -45,6 +48,27 @@ std::string default_device_bin() {
 bool file_exists(const std::string& path) {
     struct stat st {};
     return ::stat(path.c_str(), &st) == 0;
+}
+
+/// Reads a small control-plane text file through the async IO backend
+/// (image configs are a few KiB). Throws obd::error on failure.
+elio::coro::task<std::string> read_text_file(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) throw_errno(errno, "cannot open " + path);
+    std::string text;
+    char buf[8192];
+    for (;;) {
+        const auto r = co_await elio::io::async_read(fd, buf, sizeof(buf), -1);
+        if (r.result < 0) {
+            const int e = static_cast<int>(-r.result);
+            ::close(fd);
+            throw_errno(e, "cannot read " + path);
+        }
+        if (r.result == 0) break;
+        text.append(buf, static_cast<size_t>(r.result));
+    }
+    ::close(fd);
+    co_return text;
 }
 
 /// Buffered JSON-lines reader over a raw fd (Elio IO backend).
@@ -211,6 +235,7 @@ private:
             const std::string c = (*cmd)["cmd"].get<std::string>();
             if (c == "create") reply = co_await cmd_create(*cmd);
             else if (c == "destroy") reply = co_await cmd_destroy(*cmd);
+            else if (c == "commit") reply = co_await cmd_commit(*cmd);
             else if (c == "list") reply = co_await cmd_list();
             else if (c == "hello") reply = reply_hello();
             else reply = co_await cmd_status(*cmd);
@@ -423,6 +448,102 @@ private:
             mu_.unlock();
         }
         co_return reply_ok({{"id", id}});
+    }
+
+    /// ADR-0014 offline commit: stop the device (when live), then seal its
+    /// LSMT-RW upper in this process and reply with the sealed file's path,
+    /// sha256 and size. The supervisor re-derives the upper path from the
+    /// recorded image config — the device owns the files, but the config
+    /// schema (docs/config.md) fixes both location and kind, so no extra
+    /// protocol state is needed. Sparse uppers and upper-less devices are
+    /// clear errors (upstream #216 parity).
+    elio::coro::task<std::string> cmd_commit(const nlohmann::json& j) {
+        const std::string id = j["id"].get<std::string>();
+        const std::string user_tag = j.value("user_tag", "");
+        std::shared_ptr<DeviceEntry> entry;
+        {
+            co_await mu_.lock();
+            auto it = children_.find(id);
+            if (it != children_.end()) entry = it->second;
+            mu_.unlock();
+        }
+        if (!entry) co_return reply_error("no such device: " + id);
+
+        image::ImageConfig img;
+        try {
+            const std::string text =
+                co_await read_text_file(entry->spec.config_path);
+            img = image::ImageConfig::from_json_text(text,
+                                                     source::DownloadConfig{});
+        } catch (const std::exception& e) {
+            co_return reply_error("cannot read image config for " + id +
+                                  ": " + e.what());
+        }
+        if (!img.writable()) {
+            co_return reply_error("device has no writable upper: " + id);
+        }
+        if (img.upper.type != "lsmt") {
+            co_return reply_error("sparse uppers cannot be sealed: " + id);
+        }
+        const std::string upper = img.upper.dir + "/overlaybd.rw";
+
+        // Stopped-device contract (ADR-0014): commit stops a live device
+        // first (SIGTERM + bounded reap — the destroy mechanics without
+        // removing the entry) and only then seals; a device that will not
+        // stop is never sealed underneath. The graceful shutdown makes the
+        // device checkpoint its upper's index (obd-device), which the
+        // offline seal below requires.
+        entry->destroying = true;  // intentional: supervise_entry must not respawn
+        std::shared_ptr<Child> child = entry->child;
+        if (child->status().state != "exited") {
+            child->terminate();
+            auto done = co_await elio::with_timeout(
+                std::chrono::seconds(cfg_.stop_timeout_sec),
+                [&child](elio::coro::cancel_token tok)
+                    -> elio::coro::task<void> {
+                    co_await child->exit_event().wait(std::move(tok));
+                });
+            if (!done) {
+                child->kill();
+                auto gone = co_await elio::with_timeout(
+                    std::chrono::seconds(2),
+                    [&child](elio::coro::cancel_token tok)
+                        -> elio::coro::task<void> {
+                        co_await child->exit_event().wait(std::move(tok));
+                    });
+                if (!gone) {
+                    co_return reply_error(
+                        "device did not stop in time; upper not sealed: " +
+                        id);
+                }
+            }
+        }
+
+        std::string sha256;
+        uint64_t size = 0;
+        const int rc = co_await format::LsmtRwLayer::seal_file(
+            upper, user_tag, &sha256, &size);
+        if (rc == -ENOENT) {
+            co_return reply_error("upper file not found: " + upper);
+        }
+        if (rc == -EALREADY) {
+            co_return reply_error("upper already sealed: " + upper);
+        }
+        if (rc == -EINVAL) {
+            co_return reply_error("upper has no shutdown checkpoint (device "
+                                  "crashed or was killed before stopping): " +
+                                  upper);
+        }
+        if (rc != 0) {
+            co_return reply_error(std::string("seal failed for ") + upper +
+                                  ": " + std::strerror(-rc));
+        }
+        nlohmann::json fields;
+        fields["id"] = id;
+        fields["path"] = upper;
+        fields["sha256"] = sha256;
+        fields["size"] = size;
+        co_return reply_ok(fields);
     }
 
     elio::coro::task<std::string> cmd_list() {

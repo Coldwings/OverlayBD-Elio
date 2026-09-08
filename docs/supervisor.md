@@ -48,11 +48,12 @@ these are the real field names):
 {"cmd":"destroy","id":"<name>"}
 {"cmd":"status","id":"<name>"}
 {"cmd":"list"}
+{"cmd":"commit","id":"<name>","user_tag":"<optional string>"}
 ```
 
 Validation: the message must be a JSON object with a string `cmd`;
-`create` requires `id` and `config`; `destroy`/`status` require `id`;
-`hello` and `list` take no fields; anything else is "unknown cmd".
+`create` requires `id` and `config`; `destroy`/`status`/`commit` require
+`id`; `hello` and `list` take no fields; anything else is "unknown cmd".
 Malformed input is answered, not dropped.
 
 Replies (`reply_ok` / `reply_error`): success is `{"ok":true,...}` with
@@ -62,16 +63,19 @@ command (`src/supervisor/daemon.cpp`):
 
 - **hello**: `{"ok":true,"protocol":<int>,"version":"<project version>",
   "features":[...]}` — the handshake. `protocol` is the control-protocol
-  revision (`kProtocolVersion`, starts at 1); `version` is the project
-  version string wired from CMake (`kProjectVersion`); `features` is a
-  JSON array of strings, initially empty, reserved as the extension point
-  for optional capabilities.
+  revision (`kProtocolVersion`, currently 2; 1 = initial command set,
+  2 = added `commit`); `version` is the project version string wired from
+  CMake (`kProjectVersion`); `features` is a JSON array of strings — the
+  capability gate for optional commands, currently `["commit"]`.
 - **create**: `{"ok":true,"id","pid","device"}` — `device` is the child's
   reported `/dev/ublkb<N>`.
 - **destroy**: `{"ok":true,"id"}`.
 - **list**: `{"ok":true,"devices":[{"id","pid","state","device","error"}, ...]}`.
 - **status**: `{"ok":true,"id","pid","state","device","error","exit_code"}`
   (`exit_code` is -1 until the child is reaped).
+- **commit** (ADR-0014, proposed): `{"ok":true,"id","path","sha256","size"}`
+  — the sealed upper's file path, the hex sha256 of the sealed file, and
+  its byte size. See "Offline commit" below for the full contract.
 
 ### Additive-only evolution rule
 
@@ -89,6 +93,46 @@ ADR-0014, currently proposed). Concretely:
 
 This rule is what allows obdctl, obd-supervisor, and any external
 (non-C++) CLI to be upgraded independently.
+
+### Offline commit (ADR-0014, proposed)
+
+`commit` seals a device's writable LSMT-RW upper into a standard sealed
+LSMT layer **offline** — the device process is never alive while its upper
+is being sealed. Contract:
+
+- **Stopped-device contract.** If the device is live (any state other than
+  `exited`), commit stops it first: SIGTERM plus a bounded reap
+  (`stop_timeout_sec`, escalating to SIGKILL with a 2 s grace) — the
+  destroy-path mechanics *without* removing the entry from the registry,
+  so `status` keeps working afterwards. Only when the child is reaped does
+  sealing begin. A device that will not stop is answered with an error and
+  its upper is never touched. Rationale for stopping rather than refusing:
+  the protocol has no separate stop command, so a refuse-when-live
+  contract would make commit unreachable without a destroy (which drops
+  the entry); ADR-0014 explicitly allows "requires the device stopped (or
+  stops it)".
+- **How the supervisor finds the upper.** The device process owns the
+  upper's files; the supervisor re-derives the upper path and kind from
+  the recorded image config (`create`'s `config` path, re-read at commit
+  time): `upper.dir` + `upper.type` fix the file
+  (`<dir>/overlaybd.rw`, docs/config.md). No extra state is recorded at
+  create and the device-status protocol is unchanged.
+- **The shutdown checkpoint.** An unsealed LSMT-RW file's segment index is
+  memory-only (docs/format.md); a graceful obd-device shutdown therefore
+  **checkpoints** the index into the file (unsealed trailer) before
+  exiting, which is what the supervisor's offline seal consumes. A device
+  that crashed or was SIGKILLed has no checkpoint and its upper is lost —
+  commit then fails with a precise error.
+- **Sealing** runs in the supervisor process via
+  `src/format/lsmt_rw.hpp::LsmtRwLayer::seal_file` over the async IO
+  backend (no blocking work on the Elio workers). The sealed uuid is
+  content-derived — identical upper content seals to identical bytes
+  (docs/format.md, seal determinism invariant).
+- **Errors** (via the `{"ok":false,"error"}` envelope, precise reasons):
+  unknown id ("no such device"), a config without `upper` ("no writable
+  upper"), a sparse upper ("sparse uppers cannot be sealed" — upstream
+  parity, ADR-0014), a missing upper file, an already-sealed upper, a
+  missing shutdown checkpoint (device crashed), and stop-timeout.
 
 ### Channel 2: obd-device → supervisor (status channel, fd 3)
 
@@ -166,7 +210,7 @@ SIGKILLed+reaped by `~Child`.
 
 - `inline constexpr size_t kMaxMessageBytes = 64 * 1024` — maximum JSON-line
   length on both channels.
-- `inline constexpr int kProtocolVersion = 1` — control-protocol revision;
+- `inline constexpr int kProtocolVersion = 2` — control-protocol revision;
   increments only for additive batches (see the additive-only rule above).
 - `inline constexpr std::string_view kProjectVersion` — the project version
   string, wired from CMake `project(... VERSION ...)` via the
@@ -176,6 +220,8 @@ SIGKILLed+reaped by `~Child`.
   supervisor default), `device_bin` (`""` = supervisor default), `dev_id`
   (`-1` = auto). Descriptive mirror of the create command's fields.
 - `struct IdCommand` — `cmd`, `id`; shape of `destroy` / `status`.
+- `struct CommitCommand` — `id`, `user_tag` (optional); shape of `commit`
+  (ADR-0014).
 - `std::optional<nlohmann::json> parse_command(std::string_view line,
   std::string& error)` — parses and validates one command line; `nullopt`
   with a human-readable `error` on malformed JSON, missing/extra-invalid
@@ -187,8 +233,8 @@ SIGKILLed+reaped by `~Child`.
   `{"ok":false,"error":...}` plus newline.
 - `std::string reply_hello()` — the `hello` handshake reply via the
   `reply_ok` envelope: `protocol` (`kProtocolVersion`), `version`
-  (`kProjectVersion`), and `features` (an initially empty JSON array of
-  strings, the capability extension point).
+  (`kProjectVersion`), and `features` (a JSON array of capability strings,
+  currently `["commit"]`).
 - `struct DeviceStatus` — `state` (`starting` | `ready` | `failed` |
   `stopped`), `device` (`/dev/ublkb<N>` when ready), `error` (when failed).
 - `std::optional<DeviceStatus> parse_device_status(std::string_view)` —
@@ -245,8 +291,9 @@ SIGKILLed+reaped by `~Child`.
 Command handlers are internal to `src/supervisor/daemon.cpp` but define the
 observable semantics: `create` rejects empty ids, ids containing `/`,
 missing config files, missing device binaries, and duplicate ids;
-`destroy`/`status` reject unknown ids with `{"ok":false,"error":"no such
-device: <id>"}`.
+`destroy`/`status`/`commit` reject unknown ids with `{"ok":false,"error":"no such
+device: <id>"}`; `commit` additionally rejects upper-less and sparse-upper
+devices and stops a live device before sealing (see "Offline commit").
 
 ## Invariants & Guarantees
 
@@ -349,6 +396,18 @@ needing a real ublk device or root.
   binary does not exist and guards that the reaped `exit_code` is exactly
   127 and the status error contains "exec failed". This pins the exec-fail
   convention that operators and `cmd_create` rely on.
+- `supervisor: commit command parses and validates its fields` — pins the
+  additive `commit` grammar (requires `id`, optional `user_tag`, unknown
+  fields ignored) and that the `hello` handshake advertises the `commit`
+  feature gate (ADR-0014, proposed).
+- `supervisor: commit stops the device and seals its upper offline`
+  (integration, `tests/integration/test_commit.cpp`) — a real daemon with
+  a fake obd-device: commit on an unknown id / sparse upper / upper-less
+  device are precise errors; commit on a **live** LSMT-upper device stops
+  it (bounded reap) and seals its checkpointed upper, replying with
+  `path`/`sha256`/`size`; a second commit fails with "already sealed";
+  the sealed file re-opens as a valid LSMT RO layer with the
+  checkpointed content (ADR-0014, proposed). Runs without privileges.
 
 Run: `ctest --test-dir build --output-on-failure` (no privileges needed;
 the spawn tests create their fake binaries under a temporary directory).
