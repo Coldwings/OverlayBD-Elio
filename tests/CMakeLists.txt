@@ -8,6 +8,7 @@ include(Catch)
 add_executable(obd_unit_tests
     unit/test_common.cpp
     unit/test_format.cpp
+    unit/test_trace.cpp
     unit/test_source.cpp
     unit/test_registry.cpp
     unit/test_image.cpp

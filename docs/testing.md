@@ -150,6 +150,27 @@ Every test, grouped by area, with the property it guards.
 - `format: merged writable discard masks the lower layer` — discarding
   a range covered only by the lower reads back zeroes, not the lower's
   data (mask semantics, ADR-0009).
+- `format: trace crc32c golden vectors match the spec` — the trace blob's
+  raw-chaining CRC-32C matches the trace-format.md §4 golden vectors,
+  including the chaining property (ADR-0013, proposed).
+- `format: trace decodes the spec worked example byte-for-byte` — the
+  golden 72-byte blob from the trace-format.md §13 appendix decodes to
+  the documented header fields and records, and the conforming writer
+  reproduces it byte-for-byte.
+- `format: trace writer round-trips through the parser` — written records
+  parse back to an identical list; the empty trace is a valid blob.
+- `format: trace parser rejects corrupt headers and checksums` — the four
+  precise failure kinds (Truncated, BadMagic, BadSize, ChecksumMismatch)
+  fire per the trace-format.md §7 acceptance order.
+- `format: trace parser accepts and ignores a non-multiple tail` — a
+  non-multiple `data_size` tail is accepted, ignored, and unchecksummed
+  (trace-format.md §7 rule 4).
+- `format: trace parser exposes unknown op bytes to the caller` — no op
+  validation at parse time; nonzero padding is checksummed, not
+  interpreted (trace-format.md §7/§8).
+- `format: trace writer enforces the conforming-writer contract` — count 0
+  and > 1 MiB, op 'W', and negative offsets are rejected
+  (trace-format.md §10 rule 4).
 
 ### source
 

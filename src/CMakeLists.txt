@@ -10,6 +10,7 @@ add_library(obd_core STATIC
     format/zfile.cpp
     format/lsmt_format.cpp
     format/lsmt.cpp
+    format/trace.cpp
     format/writer.cpp
     format/sparse_rw.cpp
     format/lsmt_rw.cpp
