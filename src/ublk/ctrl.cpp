@@ -66,7 +66,13 @@ int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
     std::memcpy(sqe->cmd, &cmd, sizeof(cmd));
     sqe->user_data = 0;
 
-    if (io_uring_submit_and_wait(&ring_, 1) < 0) return -errno;
+    ELIO_LOG_INFO("ublk ctrl cmd {:#x} dev {} submitting", cmd_op, dev_id);
+    const int submitted = io_uring_submit_and_wait(&ring_, 1);
+    if (submitted < 0) {
+        ELIO_LOG_INFO("ublk ctrl cmd {:#x} dev {} submit failed {}", cmd_op,
+                      dev_id, submitted);
+        return -errno;
+    }
     io_uring_cqe* cqe = nullptr;
     int res = -EIO;
     if (io_uring_peek_cqe(&ring_, &cqe) == 0 && cqe != nullptr) {

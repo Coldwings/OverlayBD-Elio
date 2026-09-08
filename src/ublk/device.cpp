@@ -56,6 +56,8 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
         for (auto& queue : dev->queues_) {
             elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_);
         }
+        ELIO_LOG_INFO("ublk dev {}: bridges started, START_DEV poll",
+                      dev->dev_id_);
         // START_DEV: the driver answers EBUSY until every queue tag has a
         // parked FETCH; poll briefly. (co_await is not allowed inside a
         // catch block, hence the flag-based loop.)
