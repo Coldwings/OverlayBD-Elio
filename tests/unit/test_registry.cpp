@@ -13,6 +13,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <limits>
+#include <mutex>
 
 using namespace obd;
 namespace http = elio::http;
@@ -164,6 +166,22 @@ private:
             co_await elio::time::sleep_for(
                 std::chrono::milliseconds(token_delay_ms_.load()));
         }
+        if (token_endpoint_rejects_) {
+            // Models a token endpoint that is down / rejecting the Basic
+            // credentials: every exchange fails.
+            http::response resp(http::status::unauthorized);
+            resp.set_header("Content-Length", "0");
+            co_return resp;
+        }
+        {
+            std::lock_guard<std::mutex> g(body_mu_);
+            if (!token_body_override_.empty()) {
+                // Hostile-input tests: raw response body, verbatim.
+                co_return http::response(http::status::ok,
+                                         token_body_override_,
+                                         "application/json");
+            }
+        }
         std::string token = token_prefix_;
         if (serial_tokens_) token += "-" + std::to_string(serial);
         std::string body = "{\"token\":\"" + token + "\"";
@@ -188,6 +206,8 @@ private:
     std::vector<uint8_t> blob_;
     uint16_t port_;
     std::unique_ptr<http::server> server_;
+    std::mutex body_mu_;
+    std::string token_body_override_;  // under body_mu_
 public:
     std::string last_dart_path_;
     // Auth knobs; set before the traffic they should affect. Defaults
@@ -196,9 +216,16 @@ public:
     std::atomic<bool> serial_tokens_{false};   // issue "<prefix>-<n>"
     std::atomic<long> accept_serial_above_{-1};  // serial acceptance floor
     std::atomic<bool> reject_data_auth_{false};  // 401 non-probe auth'd GETs
+    std::atomic<bool> token_endpoint_rejects_{false};  // fail all exchanges
     std::atomic<int> expires_in_{-1};            // <0: omit the field
     std::atomic<int> token_delay_ms_{0};
     std::atomic<int> token_hits_{0};             // token endpoint exchanges
+
+    /// Makes /token return `body` verbatim (empty restores normal issue).
+    void set_token_body_override(std::string body) {
+        std::lock_guard<std::mutex> g(body_mu_);
+        token_body_override_ = std::move(body);
+    }
 };
 
 struct MockGuard {
@@ -455,7 +482,10 @@ TEST_CASE("source: registry re-auths after expires_in lifetime elapses",
         REQUIRE(mock.token_hits_.load() == 2);
 
         std::vector<uint8_t> buf(1024);
-        REQUIRE(co_await src_c->pread(buf.data(), buf.size(), 0) == 1024);
+        // NB: co_await inside REQUIRE gets evaluated multiple times by the
+        // Catch2 decomposition — always hoist side-effecting awaits out.
+        const ssize_t read_c = co_await src_c->pread(buf.data(), buf.size(), 0);
+        REQUIRE(read_c == 1024);
         REQUIRE(buf == std::vector<uint8_t>(blob.begin(),
                                             blob.begin() + 1024));
         REQUIRE(mock.token_hits_.load() == 2);
@@ -487,9 +517,119 @@ TEST_CASE("source: registry keeps the cached token within expires_in lifetime", 
         auto src_b = co_await source::RegistrySource::open(client,
                                                            base + "b");
         std::vector<uint8_t> buf(1024);
-        REQUIRE(co_await src_a->pread(buf.data(), buf.size(), 7) == 1024);
-        REQUIRE(co_await src_b->pread(buf.data(), buf.size(), 9) == 1024);
+        const ssize_t read_a = co_await src_a->pread(buf.data(), buf.size(), 7);
+        REQUIRE(read_a == 1024);
+        const ssize_t read_b = co_await src_b->pread(buf.data(), buf.size(), 9);
+        REQUIRE(read_b == 1024);
         REQUIRE(mock.token_hits_.load() == 1);
+        co_await wait_drained(mock);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry failed token refresh reaches all concurrent waiters", "[source]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto blob = test::pattern_bytes(128 * 1024, 29);
+        MockRegistry mock(blob, 19199);
+        mock.serial_tokens_ = true;
+        mock.expires_in_ = 0;      // every resolution needs a fresh exchange
+        mock.token_delay_ms_ = 30; // make the concurrent 401s overlap
+        elio::go([&mock]() -> elio::coro::task<void> {
+            co_await mock.run();
+        });
+        MockGuard guard{mock};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        auto client = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        const std::string url = "http://127.0.0.1:19199/v2/auth/x";
+        auto src = co_await source::RegistrySource::open(client, url);
+        REQUIRE(mock.token_hits_.load() == 1);
+
+        // The cached token is now stale server-side AND the token endpoint
+        // rejects every exchange: the coalesced refresh must fail for all
+        // waiters, with exactly one exchange attempted.
+        mock.accept_serial_above_ = 1;
+        mock.token_endpoint_rejects_ = true;
+
+        constexpr int kReaders = 8;
+        constexpr size_t kCount = 2048;
+        auto join = std::make_shared<JoinLatch>(kReaders);
+        std::vector<ssize_t> results(kReaders, 0);
+        std::vector<std::vector<uint8_t>> bufs(
+            kReaders, std::vector<uint8_t>(kCount));
+        for (int i = 0; i < kReaders; ++i) {
+            elio::go([&, i]() -> elio::coro::task<void> {
+                results[i] = co_await src->pread(bufs[i].data(), kCount,
+                                                 i * 4096);
+                if (join->pending.fetch_sub(1) == 1) join->done.set();
+                co_return;
+            });
+        }
+        co_await join->done.wait();
+
+        // Every waiter receives the leader's error — no hang, no success.
+        for (int i = 0; i < kReaders; ++i) {
+            REQUIRE(results[i] == -EPERM);
+        }
+        REQUIRE(mock.token_hits_.load() == 2);
+
+        // A failed flight must not poison the key: once the endpoint
+        // recovers, the next request starts a fresh flight and succeeds.
+        mock.token_endpoint_rejects_ = false;
+        std::vector<uint8_t> buf(2048);
+        const ssize_t r = co_await src->pread(buf.data(), buf.size(), 512);
+        REQUIRE(r == 2048);
+        REQUIRE(buf == std::vector<uint8_t>(blob.begin() + 512,
+                                            blob.begin() + 512 + 2048));
+        REQUIRE(mock.token_hits_.load() == 3);
+        co_await wait_drained(mock);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry survives hostile token endpoint fields", "[source]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto blob = test::pattern_bytes(64 * 1024, 30);
+        MockRegistry mock(blob, 19200);
+        elio::go([&mock]() -> elio::coro::task<void> {
+            co_await mock.run();
+        });
+        MockGuard guard{mock};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        auto client = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        const std::string base = "http://127.0.0.1:19200/v2/auth/";
+
+        // A float expires_in far outside int64 range (1e100): converting
+        // it would be undefined behavior; it must be ignored and the
+        // token cached with the fixed fallback lifetime instead.
+        mock.set_token_body_override(
+            R"({"token":"sekrit","expires_in":1e100})");
+        auto src_a = co_await source::RegistrySource::open(client,
+                                                           base + "a");
+        REQUIRE(mock.token_hits_.load() == 1);
+        auto src_b = co_await source::RegistrySource::open(client,
+                                                           base + "b");
+        std::vector<uint8_t> buf(1024);
+        const ssize_t read_b = co_await src_b->pread(buf.data(), buf.size(), 0);
+        REQUIRE(read_b == 1024);
+        REQUIRE(buf == std::vector<uint8_t>(blob.begin(),
+                                            blob.begin() + 1024));
+        REQUIRE(mock.token_hits_.load() == 1);
+
+        // A non-string token field maps to format_error → -EINVAL through
+        // the -errno discipline; it must never escape as a raw exception
+        // (single-flight would fan it out to every waiter).
+        mock.set_token_body_override(R"({"token":123})");
+        auto client2 = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        const int64_t bad = co_await client2->get_length(base + "c");
+        REQUIRE(bad == -EINVAL);
+        REQUIRE(mock.token_hits_.load() == 2);
         co_await wait_drained(mock);
         co_return 0;
     });
@@ -508,4 +648,13 @@ TEST_CASE("source: registry token cache lifetime derives from expires_in",
     // Absent or negative (garbage) values fall back to the fixed 30 s.
     REQUIRE(token_cache_lifetime(std::nullopt) == seconds(30));
     REQUIRE(token_cache_lifetime(-5) == seconds(30));
+    // Absurd declared lifetimes are capped at 7 days instead of pinning
+    // the token forever or overflowing the arithmetic.
+    constexpr auto kCap = milliseconds(7LL * 24 * 3600 * 800);
+    REQUIRE(token_cache_lifetime(int64_t{1} << 62) == kCap);
+    REQUIRE(token_cache_lifetime(std::numeric_limits<int64_t>::max()) ==
+            kCap);
+    REQUIRE(token_cache_lifetime(7LL * 24 * 3600) == kCap);
+    REQUIRE(token_cache_lifetime(7LL * 24 * 3600 + 1) == kCap);
+    REQUIRE(token_cache_lifetime(7LL * 24 * 3600 - 1) < kCap);
 }

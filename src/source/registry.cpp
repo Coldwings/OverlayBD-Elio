@@ -9,7 +9,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <optional>
 
 namespace obd::source {
@@ -22,10 +24,15 @@ std::chrono::steady_clock::duration token_cache_lifetime(
     if (!expires_in_seconds || *expires_in_seconds < 0) {
         return std::chrono::seconds(30);
     }
+    // Clamp absurd declared lifetimes: a hostile or buggy endpoint must
+    // neither pin a token in the cache forever nor overflow the multiply
+    // below (int64 seconds * 800).
+    constexpr int64_t kMaxExpiresInSeconds = 7 * 24 * 3600;  // 7 days
+    const int64_t clamped = std::min(*expires_in_seconds, kMaxExpiresInSeconds);
     // 80% of the declared lifetime: refresh proactively instead of riding
     // the token to its exact expiry. Computed in milliseconds so short
     // declared lifetimes (< 5 s) keep a usable margin.
-    return std::chrono::milliseconds(*expires_in_seconds * 800);
+    return std::chrono::milliseconds(clamped * 800);
 }
 
 }  // namespace detail
@@ -191,27 +198,41 @@ elio::coro::task<RegistryClient::TokenResponse> RegistryClient::fetch_token(
                         std::to_string(resp->status_code()) + "): " + realm);
     }
     nlohmann::json j;
+    std::string token;
     try {
         j = nlohmann::json::parse(resp->body());
+        // Field extraction lives inside the guard too: a non-string token
+        // field must map to format_error (obd::error → system_error), not
+        // escape as a raw nlohmann type_error on a hot path.
+        if (j.contains("token")) token = j.at("token").get<std::string>();
+        else if (j.contains("access_token"))
+            token = j.at("access_token").get<std::string>();
     } catch (const nlohmann::json::exception& e) {
         throw format_error("malformed token response: " +
                            std::string(e.what()));
     }
-    std::string token;
-    if (j.contains("token")) token = j["token"].get<std::string>();
-    else if (j.contains("access_token"))
-        token = j["access_token"].get<std::string>();
     if (token.empty()) {
         throw format_error("token response has no token field: " + realm);
     }
-    // OAuth2 expires_in (seconds); registries may send it as a number or a
-    // string. Anything unparsable degrades to the fixed fallback lifetime.
+    // OAuth2 expires_in (seconds); registries may send it as an integer or
+    // a string. Anything unparsable degrades to the fixed fallback
+    // lifetime. Floats are rejected outright: float→int64 conversion is
+    // undefined for out-of-range values (e.g. a hostile 1e100), and a
+    // fractional seconds field is not worth honoring.
     std::optional<int64_t> expires_in;
     if (j.contains("expires_in")) {
         try {
             const auto& v = j.at("expires_in");
-            if (v.is_number()) {
+            if (v.is_number_integer()) {
                 expires_in = v.get<int64_t>();
+            } else if (v.is_number_unsigned()) {
+                const uint64_t u = v.get<uint64_t>();
+                // Saturate instead of wrapping; the lifetime ceiling
+                // clamps it back down.
+                expires_in = u > static_cast<uint64_t>(
+                                 std::numeric_limits<int64_t>::max())
+                                 ? std::numeric_limits<int64_t>::max()
+                                 : static_cast<int64_t>(u);
             } else if (v.is_string()) {
                 expires_in = std::stoll(v.get<std::string>());
             }

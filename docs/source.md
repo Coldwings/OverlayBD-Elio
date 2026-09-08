@@ -344,7 +344,8 @@ anonymous pull.
   ignores Range and answers 200. Negative `-errno` on failure. Never throws.
 
 Internal behavior worth depending on (see Concepts): tokens cached for 80%
-of the OAuth2 `expires_in` lifetime (30 s fallback) keyed by
+of the OAuth2 `expires_in` lifetime (30 s fallback for absent/unparsable/
+negative values, capped at 7 days) keyed by
 `realm|service|scope`, with single-flight exchanges and a per-key generation
 counter (ADR-0015); per-URL resolution (final URL + auth header) cached
 300 s; 401/403 on a data request drops the cached URL info and re-resolves
@@ -973,6 +974,11 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   concurrent reads that all take a 401 on the server-side-expired token
   trigger exactly one coalesced token exchange (the mock counts token
   endpoint hits), and every read succeeds (ADR-0015).
+- `source: registry failed token refresh reaches all concurrent waiters` —
+  with the token endpoint rejecting every exchange, eight concurrent 401s
+  share one failed flight: all receive `-EPERM` (no hang, no wrong
+  success), and the first read after the endpoint recovers starts a fresh
+  flight and succeeds (ADR-0015).
 - `source: registry 401 retry budget is bounded when re-auth keeps failing` —
   a registry that rejects every fresh token on data GETs drives one token
   exchange per retry attempt (generation rule) and then `-EPERM`: bounded
@@ -983,9 +989,14 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: registry keeps the cached token within expires_in lifetime` —
   with `expires_in=100` (80 s cache lifetime) repeated resolutions and
   reads never hit the token endpoint again.
+- `source: registry survives hostile token endpoint fields` — a float
+  `expires_in` of `1e100` is ignored rather than converted (no UB), and a
+  non-string `token` field surfaces as `-EINVAL` through the `-errno`
+  discipline instead of an escaping exception (ADR-0015).
 - `source: registry token cache lifetime derives from expires_in` — the
   lifetime mapping itself: 80% of the declared value, 0 for
-  `expires_in=0`, and the 30 s fallback for absent/negative values.
+  `expires_in=0`, the 30 s fallback for absent/negative values, and the
+  7-day cap for absurd ones.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → ChunkCache → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same wiring image

@@ -42,7 +42,9 @@ namespace detail {
 /// Maps an OAuth2 `expires_in` value (seconds, std::nullopt when the field
 /// is absent or unparsable) to the token cache lifetime: 80% of the
 /// declared lifetime (proactive refresh margin), or the fixed 30 s
-/// fallback. A declared lifetime of 0 caches the token as already expired.
+/// fallback. A declared lifetime of 0 caches the token as already expired;
+/// absurd declared lifetimes are capped at 7 days so a hostile endpoint
+/// can neither pin a token forever nor overflow the arithmetic.
 std::chrono::steady_clock::duration token_cache_lifetime(
     std::optional<int64_t> expires_in_seconds);
 
@@ -60,7 +62,9 @@ struct RegistryClientConfig {
 
 /// Shared HTTP client + auth/redirect caches for one device process. All
 /// RegistrySources of an image share one instance (same layering as
-/// overlaybd's per-image registryfs).
+/// overlaybd's per-image registryfs). The client must outlive all in-flight
+/// coroutines using it — methods borrow `this` (same lifetime contract
+/// shape as the ublk bridge's documented source rule, docs/ublk.md).
 class RegistryClient {
 public:
     RegistryClient(CredentialStorePtr creds, RegistryClientConfig cfg);

@@ -248,6 +248,11 @@ Every test, grouped by area, with the property it guards.
   concurrent reads on a server-side-expired token trigger exactly one
   coalesced token exchange (mock counts token endpoint hits); all reads
   succeed (single-flight, ADR-0015).
+- `source: registry failed token refresh reaches all concurrent waiters` —
+  when the coalesced exchange itself fails, every waiter receives the
+  error (no hang, no wrong success) with exactly one exchange attempted,
+  and the next request after the endpoint recovers starts a fresh flight
+  (the key is not poisoned, ADR-0015).
 - `source: registry 401 retry budget is bounded when re-auth keeps failing` —
   when every fresh token is still rejected on data GETs, the request fails
   with `-EPERM` after its retry budget with one exchange per attempt —
@@ -258,9 +263,15 @@ Every test, grouped by area, with the property it guards.
 - `source: registry keeps the cached token within expires_in lifetime` —
   with `expires_in=100` no re-auth happens across repeated resolutions
   and reads far inside the 80 s cache lifetime.
+- `source: registry survives hostile token endpoint fields` — a float
+  `expires_in` far outside int64 range (`1e100`) is ignored rather than
+  converted (no UB), and a non-string `token` field maps to `-EINVAL`
+  through the `-errno` discipline instead of escaping as a raw exception
+  (ADR-0015).
 - `source: registry token cache lifetime derives from expires_in` — the
   pure mapping: 80% of the declared lifetime, 0 for `expires_in=0`, 30 s
-  fallback for absent/negative values (ADR-0015).
+  fallback for absent/negative values, and the 7-day cap for absurd ones
+  (2^62, int64 max, and around the ceiling) (ADR-0015).
 
 ### image
 

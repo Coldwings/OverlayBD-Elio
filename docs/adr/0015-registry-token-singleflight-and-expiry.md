@@ -39,8 +39,11 @@ opaque query parameters.
   time-valid. The per-request 401 retry budget is unchanged — single-flight
   changes *who* performs the exchange, not how many retries a request gets.
 - **`expires_in` honored at 80%.** The token cache lifetime is 80% of the
-  declared `expires_in` (proactive refresh margin), falling back to the
-  fixed 30 s when the field is absent or unparsable. The redirect/URL-info
+  declared `expires_in` (proactive refresh margin). The fixed 30 s fallback
+  covers absent, unparsable, and negative values; `expires_in=0` caches the
+  token as already expired; absurd declared lifetimes are capped at 7 days
+  so a hostile or buggy endpoint can neither pin a token in the cache
+  forever nor overflow the lifetime arithmetic. The redirect/URL-info
   cache keeps its fixed 300 s lifetime.
 
 ## Consequences
