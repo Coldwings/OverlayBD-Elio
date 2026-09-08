@@ -10,6 +10,8 @@
 #include <elio/time/timer.hpp>
 
 #include <cerrno>
+#include <chrono>
+#include <thread>
 
 namespace obd::ublk {
 
@@ -63,7 +65,9 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
         }
         // Bridge coroutines on the Elio scheduler, one per queue.
         for (auto& queue : dev->queues_) {
-            elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_);
+            dev->io_tasks_running_.fetch_add(1, std::memory_order_acq_rel);
+            elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_,
+                     &dev->io_tasks_running_);
         }
         ELIO_LOG_INFO("ublk dev {}: bridges started, START_DEV poll",
                       dev->dev_id_);
@@ -141,7 +145,9 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
             });
         }
         for (auto& queue : dev->queues_) {
-            elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_);
+            dev->io_tasks_running_.fetch_add(1, std::memory_order_acq_rel);
+            elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_,
+                     &dev->io_tasks_running_);
         }
         // END_USER_RECOVERY completes the handshake once every tag has a
         // parked FETCH (same EBUSY polling as START_DEV).
@@ -181,6 +187,19 @@ void Device::stop() noexcept {
     // queue threads exit — a parked detached bridge outlives stop()
     // and hangs scheduler teardown.
     for (auto& q : queues_) q->notify_elio();
+    // Wait for bridge/handler coroutines to drain: they dereference
+    // queues_ and src_, so ~Queue must not run while any is alive
+    // (observed as an intermittent SIGSEGV after a passed E2E read).
+    for (int i = 0; i < 5000 &&
+                    io_tasks_running_.load(std::memory_order_acquire) > 0;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (io_tasks_running_.load(std::memory_order_acquire) > 0) {
+        ELIO_LOG_ERROR("ublk dev {}: {} IO coroutines still running at stop",
+                       dev_id_,
+                       io_tasks_running_.load(std::memory_order_acquire));
+    }
     for (auto& t : threads_) {
         if (t.joinable()) t.join();
     }

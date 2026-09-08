@@ -15,7 +15,13 @@ namespace obd::ublk {
 namespace {
 
 elio::coro::task<void> handle_io(Queue* q, source::BlobSource* src,
-                                 IoRequest req) {
+                                 IoRequest req, std::atomic<int>* running) {
+    // Decrement on every exit path: Device::stop() waits for all
+    // coroutines touching `q` to finish before ~Queue.
+    struct Guard {
+        std::atomic<int>* r;
+        ~Guard() { r->fetch_sub(1, std::memory_order_acq_rel); }
+    } guard{running};
     int32_t result = 0;
     switch (req.op) {
     case UBLK_IO_OP_READ: {
@@ -102,7 +108,12 @@ elio::coro::task<void> handle_io(Queue* q, source::BlobSource* src,
 }  // namespace
 
 elio::coro::task<void> run_bridge(Queue* q, source::BlobSource* src,
-                                  std::atomic<bool>* stop) {
+                                  std::atomic<bool>* stop,
+                                  std::atomic<int>* running) {
+    struct Guard {
+        std::atomic<int>* r;
+        ~Guard() { r->fetch_sub(1, std::memory_order_acq_rel); }
+    } guard{running};
     const int efd = q->elio_efd();
     uint64_t cnt = 0;
     while (!stop->load(std::memory_order_relaxed)) {
@@ -119,7 +130,10 @@ elio::coro::task<void> run_bridge(Queue* q, source::BlobSource* src,
         while (q->try_pop_request(req)) {
             // Each tag gets its own coroutine; per-tag IO overlaps. The
             // completion ordering across tags is irrelevant to ublk.
-            elio::go(handle_io, q, src, req);
+            // The counter is incremented BEFORE the spawn so stop()
+            // never observes a zero while a coroutine is still queued.
+            running->fetch_add(1, std::memory_order_acq_rel);
+            elio::go(handle_io, q, src, req, running);
         }
     }
 }

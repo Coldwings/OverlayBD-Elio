@@ -99,7 +99,12 @@ jobs:
         run: |
           sudo -E ./build/tests/obd_integration_tests             "integration: ublk device serves sector reads from a blob" -s &
           TESTPID=$!
-          sleep 45
+          # Poll instead of a fixed sleep: fast when the test is fast,
+          # still dumps kernel stacks for every thread if it hangs.
+          for i in $(seq 1 45); do
+            kill -0 $TESTPID 2>/dev/null || break
+            sleep 1
+          done
           if kill -0 $TESTPID 2>/dev/null; then
             CHILD=$(pgrep -P $TESTPID | head -1)
             echo "=== test still running after 45s (sudo=$TESTPID child=$CHILD)"

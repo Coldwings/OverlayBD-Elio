@@ -67,6 +67,9 @@ private:
     bool started_ = false;
 
     std::atomic<bool> stop_{false};
+    // Coroutines that dereference queues_/src_ (bridges + per-IO
+    // handlers). stop() drains this before ~Queue may run.
+    std::atomic<int> io_tasks_running_{0};
     std::vector<std::unique_ptr<Queue>> queues_;
     std::vector<std::thread> threads_;
 };

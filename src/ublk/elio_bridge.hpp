@@ -24,7 +24,11 @@ namespace obd::ublk {
 /// Runs the bridge loop for `q` against block source `src` until `stop`
 /// becomes true (and the efd watch errors out on device teardown).
 /// Intended to be spawned with elio::go() from the device process.
+/// `running` counts every coroutine that dereferences `q` (the bridge
+/// itself plus each handle_io it spawns); Device::stop() waits for it
+/// to drain before queues are destroyed.
 elio::coro::task<void> run_bridge(Queue* q, source::BlobSource* src,
-                                  std::atomic<bool>* stop);
+                                  std::atomic<bool>* stop,
+                                  std::atomic<int>* running);
 
 }  // namespace obd::ublk
