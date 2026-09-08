@@ -210,10 +210,9 @@ void Queue::dispatch_cqe(const io_uring_cqe* cqe) {
     // A FETCH (or the fetch side of COMMIT_AND_FETCH) delivered a new IO:
     // the tag's ublksrv_io_desc is now valid in the shared command buffer.
     const ublksrv_io_desc& iod = cmd_buf_[tag];
-    // Temporary data-plane tracing (E2E bring-up; demote to DEBUG after).
-    ELIO_LOG_INFO("ublk queue {}: io tag {} op {} sectors {} off {}",
-                  q_id_, tag, iod.op_flags & 0xff, iod.nr_sectors,
-                  iod.start_sector);
+    ELIO_LOG_DEBUG("ublk queue {}: io tag {} op {} sectors {} off {}",
+                   q_id_, tag, iod.op_flags & 0xff, iod.nr_sectors,
+                   iod.start_sector);
     IoRequest req;
     req.tag = tag;
     req.op = ublksrv_get_op(&iod);
