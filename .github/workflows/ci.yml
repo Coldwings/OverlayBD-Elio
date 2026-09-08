@@ -1,9 +1,13 @@
 # CI for overlaybd-elio.
 #
-# Two jobs mirroring the local verify-trio (AGENTS.md):
+# Three jobs mirroring the local verify-trio (AGENTS.md):
 #   build-test      — configure, build, ctest. The ublk end-to-end tests
 #                     self-skip without privileges and a loaded ublk_drv;
 #                     that skip is by design, so no sudo anywhere here.
+#   build-test-ublk-privileged — loads ublk_drv (GitHub-hosted runners are
+#                     full VMs; module loading works) and runs ONLY the
+#                     [ublk]-tagged E2E tests under sudo. Everything else
+#                     is already covered unprivileged by build-test.
 #   docs governance — the documentation floor checks (scripts/check-docs.sh).
 # FetchContent (Elio, nlohmann/json, lz4, zstd, Catch2) needs network on
 # first configure, which GitHub-hosted runners provide.
@@ -44,6 +48,40 @@ jobs:
         # Privileged ublk E2E tests self-skip on unprivileged runners —
         # intentionally not run under sudo (AGENTS.md).
         run: ctest --test-dir build --output-on-failure
+
+  build-test-ublk-privileged:
+    name: build-test (ublk E2E, privileged)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            liburing-dev zlib1g-dev libssl-dev linux-libc-dev \
+            cmake ninja-build g++
+
+      - name: Load ublk driver
+        # GitHub-hosted runners are full VMs: modprobe works. devtmpfs
+        # creates /dev/ublk-control on load.
+        run: |
+          sudo modprobe ublk_drv
+          ls -l /dev/ublk-control
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DOBD_BUILD_TESTS=ON
+          -DOBD_ENABLE_UBLK=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run privileged ublk E2E only
+        # Only the [ublk]-tagged E2E needs the kernel facility; the
+        # unprivileged suite runs in the build-test job.
+        run: sudo -E ./build/tests/obd_integration_tests "[ublk]"
 
   docs-governance:
     name: docs governance

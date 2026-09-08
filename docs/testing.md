@@ -78,14 +78,20 @@ filters directly:
 ./build/tests/obd_integration_tests             # e2e suite
 ```
 
-**Privileged ublk E2E.** `integration: ublk device serves sector reads from a blob`
-needs `/dev/ublk-control` and root (or `CAP_SYS_ADMIN` in a suitable
-user namespace) with `ublk_drv` loaded. It **self-skips** via Catch2
+**Privileged ublk E2E.** The tests tagged `[ublk]` (currently
+`integration: ublk device serves sector reads from a blob`,
+`integration: ublk writable device serves writes and discard`,
+`integration: ublk device survives server death via USER_RECOVERY`)
+need `/dev/ublk-control` and root (or `CAP_SYS_ADMIN` in a suitable
+user namespace) with `ublk_drv` loaded. They **self-skip** via Catch2
 `SKIP()` when the kernel facility is absent, and
 `obd_integration_tests` is registered with `SKIP_RETURN_CODE 4` so an
 all-skipped run is not a failure. **Never make the default test run
 depend on privileged kernel state** — new privileged tests must
-self-skip the same way.
+self-skip the same way. The privileged CI job
+(`build-test-ublk-privileged` in `.github/workflows/ci.yml`) loads
+`ublk_drv` and runs exactly these:
+`sudo -E ./build/tests/obd_integration_tests "[ublk]"`.
 
 ## Test inventory
 
@@ -241,3 +247,13 @@ Every test, grouped by area, with the property it guards.
   privileged E2E: a real ublk device backed by an in-memory blob
   returns correct sectors through `/dev/ublkb<N>` (self-skips without
   `/dev/ublk-control`).
+- `integration: ublk writable device serves writes and discard` — a
+  writable device (in-memory writable root) answers block-device
+  writes, and a `BLKDISCARD` ioctl reaches `discard()` with
+  mask-with-zeroes read-back (ADR-0009; self-skips without ublk).
+- `integration: ublk device survives server death via USER_RECOVERY` —
+  a forked server is SIGKILLed; the block device survives QUIESCED and
+  a replacement server completes the real
+  START/END_USER_RECOVERY handshake and keeps serving reads
+  (ADR-0010; self-skips without ublk or on kernels without the
+  feature).
