@@ -21,7 +21,16 @@ struct DeviceParams {
     uint8_t physical_bs_shift = 12;  // 4K
     uint32_t max_sectors = 256;    // 128 KiB per request
     bool read_only = true;
+    /// ADR-0010: create the device with UBLK_F_USER_RECOVERY{,_REISSUE} so
+    /// a crashed server process can be replaced without failing the block
+    /// device. Default on; ADD_DEV falls back to no-recovery (with a
+    /// warning) when the kernel rejects the flags.
+    bool enable_recovery = true;
 };
+
+/// Feature flags for ADD_DEV given the params (pure helper, unit-tested
+/// without a kernel).
+uint64_t dev_info_flags(const DeviceParams& p);
 
 /// One instance per device process; owns the /dev/ublk-control fd and
 /// remembers the added device for best-effort cleanup on destruction.
@@ -42,6 +51,16 @@ public:
     /// START_DEV with this process as the ublk server. Throws obd::error
     /// (EBUSY until every queue has parked its FETCH commands).
     void start_dev(uint32_t dev_id);
+
+    /// ADR-0010 recovery handshake for a replacement server process:
+    /// START_USER_RECOVERY announces the new server, END_USER_RECOVERY
+    /// returns the device to live once every queue re-parked its FETCH
+    /// commands (EBUSY until then). Throw obd::error.
+    void start_user_recovery(uint32_t dev_id);
+    void end_user_recovery(uint32_t dev_id);
+
+    /// Remembers an existing (recovered) device for ~Ctrl cleanup.
+    void adopt_dev(uint32_t dev_id) noexcept { added_dev_ = static_cast<int>(dev_id); }
 
     void stop_dev(uint32_t dev_id) noexcept;
     void del_dev(uint32_t dev_id) noexcept;

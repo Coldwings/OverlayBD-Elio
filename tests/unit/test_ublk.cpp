@@ -1,5 +1,6 @@
 // Unit tests: ublk module — ABI geometry helpers (kernel-dependent E2E
 // lives in tests/integration and self-skips without /dev/ublk-control).
+#include "ublk/ctrl.hpp"
 #include "ublk/queue.hpp"
 #include "ublk/uapi_compat.hpp"
 
@@ -25,4 +26,17 @@ TEST_CASE("ublk: IoRequest byte math is sector based", "[ublk]") {
     req.nr_sectors = 8;
     REQUIRE(req.byte_offset() == 51200);
     REQUIRE(req.byte_len() == 4096);
+}
+
+TEST_CASE("ublk: recovery feature flags follow device params", "[ublk]") {
+    using obd::ublk::DeviceParams;
+    DeviceParams p;
+    p.enable_recovery = true;
+    const uint64_t f = obd::ublk::dev_info_flags(p);
+    REQUIRE((f & UBLK_F_USER_RECOVERY) != 0);
+    REQUIRE((f & UBLK_F_USER_RECOVERY_REISSUE) != 0);
+    p.enable_recovery = false;
+    const uint64_t f2 = obd::ublk::dev_info_flags(p);
+    REQUIRE((f2 & UBLK_F_USER_RECOVERY) == 0);
+    REQUIRE((f2 & UBLK_F_USER_RECOVERY_REISSUE) == 0);
 }

@@ -3,6 +3,8 @@
 
 #include "common/errors.hpp"
 
+#include <elio/log/macros.hpp>
+
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -49,6 +51,14 @@ void Ctrl::ctrl_cmd(uint32_t cmd_op, uint32_t dev_id, uint16_t queue_id,
     }
 }
 
+uint64_t dev_info_flags(const DeviceParams& p) {
+    uint64_t flags = UBLK_F_URING_CMD_COMP_IN_TASK;
+    if (p.enable_recovery) {
+        flags |= UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE;
+    }
+    return flags;
+}
+
 uint32_t Ctrl::add_dev(const DeviceParams& p) {
     ublksrv_ctrl_dev_info info {};
     info.nr_hw_queues = p.nr_queues;
@@ -60,15 +70,28 @@ uint32_t Ctrl::add_dev(const DeviceParams& p) {
     info.dev_id = p.dev_id == UINT32_MAX ? static_cast<uint32_t>(-1)
                                          : p.dev_id;
     info.ublksrv_pid = static_cast<int32_t>(::getpid());
-    info.flags = UBLK_F_URING_CMD_COMP_IN_TASK;
+    info.flags = dev_info_flags(p);
 
     ublksrv_ctrl_cmd cmd {};
-    cmd.dev_id = info.dev_id;
     cmd.queue_id = static_cast<uint16_t>(-1);
     cmd.len = sizeof(info);
     cmd.addr = reinterpret_cast<uint64_t>(&info);
-    if (::ioctl(fd_, UBLK_U_CMD_ADD_DEV, &cmd) < 0) {
-        throw_errno(errno, "ublk ctrl: ADD_DEV failed");
+    for (;;) {
+        cmd.dev_id = info.dev_id;
+        if (::ioctl(fd_, UBLK_U_CMD_ADD_DEV, &cmd) == 0) break;
+        const int e = errno;
+        if (e == EINVAL && p.enable_recovery &&
+            (info.flags & UBLK_F_USER_RECOVERY) != 0) {
+            // Older kernel without USER_RECOVERY: degrade to a
+            // non-recoverable device rather than failing creation.
+            ELIO_LOG_WARNING(
+                "ublk ADD_DEV rejected USER_RECOVERY flags; creating "
+                "device without crash recovery");
+            info.flags &= ~(UBLK_F_USER_RECOVERY |
+                            UBLK_F_USER_RECOVERY_REISSUE);
+            continue;
+        }
+        throw_errno(e, "ublk ctrl: ADD_DEV failed");
     }
     added_dev_ = static_cast<int>(info.dev_id);
     return info.dev_id;
@@ -104,6 +127,18 @@ void Ctrl::set_params(uint32_t dev_id, const DeviceParams& p) {
 void Ctrl::start_dev(uint32_t dev_id) {
     ctrl_cmd(UBLK_U_CMD_START_DEV, dev_id, static_cast<uint16_t>(-1),
              nullptr, 0, static_cast<uint64_t>(::getpid()), "START_DEV");
+}
+
+void Ctrl::start_user_recovery(uint32_t dev_id) {
+    ctrl_cmd(UBLK_U_CMD_START_USER_RECOVERY, dev_id,
+             static_cast<uint16_t>(-1), nullptr, 0, 0,
+             "START_USER_RECOVERY");
+}
+
+void Ctrl::end_user_recovery(uint32_t dev_id) {
+    ctrl_cmd(UBLK_U_CMD_END_USER_RECOVERY, dev_id,
+             static_cast<uint16_t>(-1), nullptr, 0, 0,
+             "END_USER_RECOVERY");
 }
 
 void Ctrl::stop_dev(uint32_t dev_id) noexcept {

@@ -34,6 +34,11 @@ struct GlobalConfig {
     /// logConfig.logLevel: 0=debug, 1=info, 2=warn, 3=error.
     int log_level = 1;
 
+    /// ublkConfig.enableRecovery (ADR-0010): create devices with
+    /// UBLK_F_USER_RECOVERY so a crashed device process can be replaced
+    /// without failing the block device. Default on.
+    bool ublk_recovery = true;
+
     /// Parses overlaybd.json. Throws obd::error on IO failure,
     /// obd::format_error on malformed JSON.
     static GlobalConfig from_file(const std::string& path);

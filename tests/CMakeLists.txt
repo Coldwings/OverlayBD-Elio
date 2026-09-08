@@ -23,7 +23,8 @@ if(OBD_ENABLE_UBLK)
 endif()
 
 add_executable(obd_integration_tests
-    integration/test_integration.cpp)
+    integration/test_integration.cpp
+    integration/test_recovery.cpp)
 target_include_directories(obd_integration_tests
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_integration_tests

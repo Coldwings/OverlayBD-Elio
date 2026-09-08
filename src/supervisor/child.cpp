@@ -31,6 +31,7 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
         std::string ctl_fd;
         std::string devid_flag = "--dev-id";
         std::string dev_id;
+        std::string recover_flag = "--recover";
         std::vector<char*> argv;
     } a;
     a.bin = spec.device_bin;
@@ -52,6 +53,9 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
     if (!a.dev_id.empty()) {
         a.argv.push_back(a.devid_flag.data());
         a.argv.push_back(a.dev_id.data());
+    }
+    if (spec.recover) {
+        a.argv.push_back(a.recover_flag.data());
     }
     a.argv.push_back(nullptr);
 

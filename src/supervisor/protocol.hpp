@@ -60,4 +60,8 @@ std::optional<DeviceStatus> parse_device_status(std::string_view line);
 /// Builds a status line (obd-device side).
 std::string make_device_status(const DeviceStatus& st);
 
+/// Parses the device id out of a bdev path ("/dev/ublkb7" -> 7);
+/// returns -1 when the path is not a ublk bdev path.
+int dev_id_from_bdev_path(const std::string& path);
+
 }  // namespace obd::supervisor

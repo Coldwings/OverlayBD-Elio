@@ -26,7 +26,7 @@ namespace {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --config PATH [--global PATH] [--control-fd N] "
-                 "[--dev-id N]\n",
+                 "[--dev-id N] [--recover]\n",
                  argv0);
 }
 
@@ -35,6 +35,7 @@ struct Args {
     std::string global;
     int control_fd = -1;
     int dev_id = -1;
+    bool recover = false;  // ADR-0010: attach to an existing device
 };
 
 void report(const Args& args, const obd::supervisor::DeviceStatus& st) {
@@ -68,11 +69,25 @@ elio::coro::task<int> device_main(Args args) {
         obd::ublk::DeviceParams params;
         params.dev_sectors = opened.virtual_size / 512;
         params.read_only = !opened.writable;  // ADR-0008
+        params.enable_recovery = global.ublk_recovery;  // ADR-0010
         if (args.dev_id >= 0) {
             params.dev_id = static_cast<uint32_t>(args.dev_id);
         }
-        auto dev = co_await obd::ublk::Device::create(params,
-                                                      std::move(opened.root));
+        std::unique_ptr<obd::ublk::Device> dev;
+        if (args.recover) {
+            // ADR-0010: replace a crashed server for an existing device.
+            if (args.dev_id < 0) {
+                report(args, DeviceStatus{"failed", "",
+                                          "--recover requires --dev-id"});
+                co_return 1;
+            }
+            dev = co_await obd::ublk::Device::attach(
+                static_cast<uint32_t>(args.dev_id), params,
+                std::move(opened.root));
+        } else {
+            dev = co_await obd::ublk::Device::create(params,
+                                                     std::move(opened.root));
+        }
         report(args, DeviceStatus{"ready", dev->bdev_path(), ""});
 
         // Serve until SIGTERM/SIGINT.
@@ -119,6 +134,7 @@ int main(int argc, char** argv) {
         else if (a == "--control-fd")
             args.control_fd = std::stoi(next("--control-fd"));
         else if (a == "--dev-id") args.dev_id = std::stoi(next("--dev-id"));
+        else if (a == "--recover") args.recover = true;
         else if (a == "--help" || a == "-h") {
             usage(argv[0]);
             return 0;

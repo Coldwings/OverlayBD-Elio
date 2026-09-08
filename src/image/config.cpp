@@ -73,6 +73,9 @@ GlobalConfig GlobalConfig::from_json_text(const std::string& text) {
     if (const auto it = j.find("download"); it != j.end()) {
         apply_download_json(*it, cfg.download);
     }
+    if (const auto it = j.find("ublkConfig"); it != j.end() && it->is_object()) {
+        cfg.ublk_recovery = it->value("enableRecovery", true);
+    }
     if (const auto it = j.find("logConfig"); it != j.end() && it->is_object()) {
         cfg.log_level = it->value("logLevel", 1);
     }

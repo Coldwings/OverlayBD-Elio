@@ -24,6 +24,9 @@ struct ChildSpec {
     std::string config_path;  // per-image config.json
     std::string global_path;  // overlaybd.json (may be empty = device default)
     int dev_id_request = -1;
+    /// ADR-0010: spawn in recovery mode (obd-device --recover): attach to
+    /// the existing dev_id device instead of creating a new one.
+    bool recover = false;
 };
 
 class Child {

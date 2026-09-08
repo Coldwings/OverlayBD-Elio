@@ -75,6 +75,66 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
     co_return dev;
 }
 
+elio::coro::task<std::unique_ptr<Device>> Device::attach(
+    uint32_t dev_id, const DeviceParams& params,
+    source::BlobSourcePtr src) {
+    if (!src) throw error(EINVAL, "ublk recovery with null block source");
+    auto dev = std::unique_ptr<Device>(new Device());
+    dev->params_ = params;
+    dev->src_ = std::move(src);
+    dev->dev_id_ = dev_id;
+
+    try {
+        dev->ctrl_ = std::make_unique<Ctrl>();
+        // Announce the replacement server BEFORE parking FETCH commands:
+        // the device sits in QUIESCED while there is no server.
+        dev->ctrl_->start_user_recovery(dev_id);
+
+        for (uint16_t q = 0; q < params.nr_queues; ++q) {
+            auto queue = std::make_unique<Queue>(dev_id, q,
+                                                 params.queue_depth,
+                                                 params.max_io_buf_bytes);
+            queue->open();
+            dev->queues_.push_back(std::move(queue));
+        }
+        for (auto& queue : dev->queues_) {
+            Queue* q = queue.get();
+            dev->threads_.emplace_back([q, &stop = dev->stop_] {
+                q->run(stop);
+            });
+        }
+        for (auto& queue : dev->queues_) {
+            elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_);
+        }
+        // END_USER_RECOVERY completes the handshake once every tag has a
+        // parked FETCH (same EBUSY polling as START_DEV).
+        bool recovered = false;
+        for (int attempt = 0; attempt < 100 && !recovered; ++attempt) {
+            try {
+                dev->ctrl_->end_user_recovery(dev_id);
+                recovered = true;
+            } catch (const std::system_error& e) {
+                if (e.code().value() != EBUSY) throw;
+            }
+            if (!recovered) {
+                co_await elio::time::sleep_for(
+                    std::chrono::milliseconds(50));
+            }
+        }
+        if (!recovered) {
+            throw error(EBUSY, "ublk END_USER_RECOVERY not ready after 5s");
+        }
+        dev->ctrl_->adopt_dev(dev_id);
+        dev->started_ = true;
+        ELIO_LOG_INFO("ublk device {} recovered ({})", dev_id,
+                      dev->bdev_path());
+    } catch (...) {
+        dev->stop();
+        throw;
+    }
+    co_return dev;
+}
+
 void Device::stop() noexcept {
     stop_.store(true, std::memory_order_relaxed);
     for (auto& q : queues_) q->wakeup();

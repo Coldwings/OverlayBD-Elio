@@ -90,6 +90,56 @@ TEST_CASE("supervisor: child spawn execs and reports through the channel",
     ::close(child->release_control_fd());
 }
 
+TEST_CASE("supervisor: bdev path parses to device id", "[supervisor]") {
+    REQUIRE(supervisor::dev_id_from_bdev_path("/dev/ublkb7") == 7);
+    REQUIRE(supervisor::dev_id_from_bdev_path("/dev/ublkb0") == 0);
+    REQUIRE(supervisor::dev_id_from_bdev_path("/dev/ublkb123") == 123);
+    REQUIRE(supervisor::dev_id_from_bdev_path("/dev/ublkc7") == -1);
+    REQUIRE(supervisor::dev_id_from_bdev_path("/dev/ublkb") == -1);
+    REQUIRE(supervisor::dev_id_from_bdev_path("/dev/ublkb7x") == -1);
+    REQUIRE(supervisor::dev_id_from_bdev_path("") == -1);
+}
+
+TEST_CASE("supervisor: recover spec adds the recover flag to child argv",
+          "[supervisor]") {
+    // ADR-0010: a recovery respawn must pass --recover (and the dev id) to
+    // obd-device. The fake device logs its argv for inspection.
+    test::TempDir dir;
+    const std::string log = dir / "argv.log";
+    const std::string script = dir / "fake-device.sh";
+    {
+        const std::string content =
+            "#!/bin/sh\necho \"$@\" > \"" + log + "\"\nexit 0\n";
+        test::write_file(script,
+                         std::vector<uint8_t>(content.begin(), content.end()));
+        ::chmod(script.c_str(), 0755);
+    }
+    supervisor::ChildSpec spec;
+    spec.id = "fake-recover";
+    spec.device_bin = script;
+    spec.config_path = "/c.json";
+    spec.dev_id_request = 7;
+    spec.recover = true;
+    auto child = supervisor::Child::spawn(spec);
+    REQUIRE(child->pid() > 0);
+    int wstatus = 0;
+    REQUIRE(::waitpid(child->pid(), &wstatus, 0) == child->pid());
+    child->note_reaped(wstatus);
+    ::close(child->release_control_fd());
+
+    struct stat st {};
+    REQUIRE(::stat(log.c_str(), &st) == 0);
+    std::string argv(static_cast<size_t>(st.st_size), '\0');
+    const int fd = ::open(log.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    REQUIRE(::read(fd, argv.data(), argv.size()) ==
+            static_cast<ssize_t>(argv.size()));
+    ::close(fd);
+    REQUIRE(argv.find("--recover") != std::string::npos);
+    REQUIRE(argv.find("--dev-id 7") != std::string::npos);
+    REQUIRE(argv.find("--config /c.json") != std::string::npos);
+}
+
 TEST_CASE("supervisor: exec failure surfaces as exit 127", "[supervisor]") {
     supervisor::ChildSpec spec;
     spec.id = "missing";

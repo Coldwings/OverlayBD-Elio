@@ -33,6 +33,16 @@ public:
     static elio::coro::task<std::unique_ptr<Device>> create(
         const DeviceParams& params, source::BlobSourcePtr src);
 
+    /// ADR-0010: attaches to an EXISTING device created with
+    /// UBLK_F_USER_RECOVERY after the previous server process died.
+    /// Sequence: START_USER_RECOVERY → open queues → queue threads re-park
+    /// FETCH for every tag → END_USER_RECOVERY (retrying EBUSY). The
+    /// params' queue geometry must match the original device's. Must be
+    /// awaited on the Elio scheduler. Throws obd::error on failure.
+    static elio::coro::task<std::unique_ptr<Device>> attach(
+        uint32_t dev_id, const DeviceParams& params,
+        source::BlobSourcePtr src);
+
     ~Device();
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;

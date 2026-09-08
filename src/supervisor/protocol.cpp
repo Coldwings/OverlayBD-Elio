@@ -72,4 +72,17 @@ std::string make_device_status(const DeviceStatus& st) {
     return j.dump() + "\n";
 }
 
+int dev_id_from_bdev_path(const std::string& path) {
+    const std::string prefix = "/dev/ublkb";
+    if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0) {
+        return -1;
+    }
+    int id = 0;
+    for (size_t i = prefix.size(); i < path.size(); ++i) {
+        if (path[i] < '0' || path[i] > '9') return -1;
+        id = id * 10 + (path[i] - '0');
+    }
+    return id;
+}
+
 }  // namespace obd::supervisor
