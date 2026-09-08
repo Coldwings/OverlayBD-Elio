@@ -3,11 +3,21 @@
 //
 // Two channels, both JSON-lines (one message per line, UTF-8, <= 64KiB):
 //
-//   obdctl ──UDS──▶ supervisor:    {"cmd":"create"|"destroy"|"list"|"status", ...}
+//   obdctl ──UDS──▶ supervisor:    {"cmd":"hello"|"create"|"destroy"|"list"|"status", ...}
 //   supervisor ──▶ obdctl:         {"ok":true,...} | {"ok":false,"error":"..."}
 //
 //   obd-device ──socketpair──▶ supervisor: {"state":"starting"|"ready"|"failed"|"stopped", ...}
 //   supervisor ──▶ obd-device:     signals only (SIGTERM = shutdown)
+//
+// Additive-only evolution rule (current law; governing decision ADR-0014,
+// currently proposed):
+//   - New commands and new reply fields may be added; existing field names
+//     and meanings never change.
+//   - Servers ignore unknown request fields; clients must ignore unknown
+//     reply fields.
+//   - kProtocolVersion increments only for additive batches and, together
+//     with the `features` list from the `hello` reply, is the client's
+//     capability gate.
 #pragma once
 
 #include <nlohmann/json.hpp>
@@ -15,11 +25,25 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace obd::supervisor {
 
 /// Maximum JSON-line length on both channels.
 inline constexpr size_t kMaxMessageBytes = 64 * 1024;
+
+/// Control-protocol revision. Starts at 1 and increments only for additive
+/// batches (see the additive-only rule above); clients gate on it together
+/// with the `features` list from the `hello` reply.
+inline constexpr int kProtocolVersion = 1;
+
+/// Project version string, wired from CMake `project(... VERSION ...)` so
+/// it cannot drift; "dev" is the fallback for non-CMake builds.
+#ifdef OBD_VERSION_STRING
+inline constexpr std::string_view kProjectVersion = OBD_VERSION_STRING;
+#else
+inline constexpr std::string_view kProjectVersion = "dev";
+#endif
 
 // --- obdctl → supervisor commands ------------------------------------------
 
@@ -45,6 +69,10 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
 
 std::string reply_ok(const nlohmann::json& fields = nlohmann::json::object());
 std::string reply_error(const std::string& error);
+
+/// The `hello` handshake reply: protocol revision, project version, and
+/// the (initially empty) feature list, via the reply_ok envelope.
+std::string reply_hello();
 
 // --- obd-device → supervisor status ----------------------------------------
 

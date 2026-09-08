@@ -20,11 +20,12 @@ constexpr const char* kDefaultSocket = "/run/overlaybd-elio/supervisor.sock";
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage:\n"
+                 "  %s [--socket PATH] hello\n"
                  "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N]\n"
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n",
-                 argv0, argv0, argv0, argv0);
+                 argv0, argv0, argv0, argv0, argv0);
 }
 
 bool send_all(int fd, const std::string& data) {
@@ -80,7 +81,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         req["id"] = argv[i++];
-    } else if (cmd == "list") {
+    } else if (cmd == "list" || cmd == "hello") {
         // no fields
     } else {
         usage(argv[0]);

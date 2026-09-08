@@ -27,7 +27,7 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
             error = cmd + " requires 'id'";
             return std::nullopt;
         }
-    } else if (cmd != "list") {
+    } else if (cmd != "list" && cmd != "hello") {
         error = "unknown cmd '" + cmd + "'";
         return std::nullopt;
     }
@@ -45,6 +45,14 @@ std::string reply_error(const std::string& error) {
     j["ok"] = false;
     j["error"] = error;
     return j.dump() + "\n";
+}
+
+std::string reply_hello() {
+    nlohmann::json fields;
+    fields["protocol"] = kProtocolVersion;
+    fields["version"] = kProjectVersion;
+    fields["features"] = nlohmann::json::array();  // extension point
+    return reply_ok(fields);
 }
 
 std::optional<DeviceStatus> parse_device_status(std::string_view line) {

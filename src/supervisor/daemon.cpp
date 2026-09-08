@@ -212,6 +212,7 @@ private:
             if (c == "create") reply = co_await cmd_create(*cmd);
             else if (c == "destroy") reply = co_await cmd_destroy(*cmd);
             else if (c == "list") reply = co_await cmd_list();
+            else if (c == "hello") reply = reply_hello();
             else reply = co_await cmd_status(*cmd);
         }
         co_await stream.write(reply);

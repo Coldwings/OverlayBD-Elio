@@ -209,6 +209,11 @@ Every test, grouped by area, with the property it guards.
 - `supervisor: protocol commands parse and reject garbage` — the
   control-protocol parser accepts the four commands and rejects
   malformed JSON, missing fields, and unknown commands.
+- `supervisor: hello handshake replies with protocol version and features` —
+  the `hello` reply carries an integer `protocol` ≥ 1, a non-empty
+  `version` string, and a `features` array; `hello` requires no fields and
+  ignores extras; unknown cmds and malformed JSON stay answered errors
+  (ADR-0014, proposed).
 - `supervisor: child spawn execs and reports through the channel` — a
   spawned child's fd-3 status lines reach the parent and drive the
   ready event.
@@ -241,6 +246,11 @@ Every test, grouped by area, with the property it guards.
   a real daemon with a fake obd-device: crash → respawn with
   `--recover`, bounded at `max_recovery_attempts`, `recoveries` reported
   in status, destroy still works (ADR-0010). Runs without privileges.
+- `supervisor: daemon answers hello and never drops bad input` — a real
+  daemon over its control socket: `hello` returns the documented
+  handshake shape end to end, an unknown cmd is answered with an error,
+  and malformed JSON is answered with an error rather than dropped
+  (ADR-0014, proposed). Runs without privileges.
 - `integration: switch source swaps reads to the local copy` — after
   install, reads migrate from the remote source to the local file.
 - `integration: ublk device serves sector reads from a blob` — the

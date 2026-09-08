@@ -17,8 +17,8 @@ The module has three parts:
 - **Child lifecycle** (`src/supervisor/child.hpp`) — spawn
   (socketpair + fork + execve), signal, reap, and publish per-child status.
 - **Daemon** (`src/supervisor/daemon.hpp`) — the accept loop, the children
-  registry, the SIGCHLD reaper, and the create/destroy/list/status command
-  handlers with bounded ready/exit waits.
+  registry, the SIGCHLD reaper, and the hello/create/destroy/list/status
+  command handlers with bounded ready/exit waits.
 
 Both protocols are **wire contracts between independently upgradeable
 binaries**: changes require an ADR (T1, per AGENTS.md).
@@ -38,6 +38,8 @@ Requests (validated by `parse_command` in src/supervisor/protocol.cpp —
 these are the real field names):
 
 ```json
+{"cmd":"hello"}
+
 {"cmd":"create","id":"<name>","config":"<config.json path>",
  "global":"<overlaybd.json path, optional>",
  "device_bin":"<obd-device path, optional>",
@@ -50,19 +52,43 @@ these are the real field names):
 
 Validation: the message must be a JSON object with a string `cmd`;
 `create` requires `id` and `config`; `destroy`/`status` require `id`;
-anything else is "unknown cmd". Malformed input is answered, not dropped.
+`hello` and `list` take no fields; anything else is "unknown cmd".
+Malformed input is answered, not dropped.
 
 Replies (`reply_ok` / `reply_error`): success is `{"ok":true,...}` with
 command-specific fields merged in; failure is
 `{"ok":false,"error":"<human-readable reason>"}`. The success shapes by
 command (`src/supervisor/daemon.cpp`):
 
+- **hello**: `{"ok":true,"protocol":<int>,"version":"<project version>",
+  "features":[...]}` — the handshake. `protocol` is the control-protocol
+  revision (`kProtocolVersion`, starts at 1); `version` is the project
+  version string wired from CMake (`kProjectVersion`); `features` is a
+  JSON array of strings, initially empty, reserved as the extension point
+  for optional capabilities.
 - **create**: `{"ok":true,"id","pid","device"}` — `device` is the child's
   reported `/dev/ublkb<N>`.
 - **destroy**: `{"ok":true,"id"}`.
 - **list**: `{"ok":true,"devices":[{"id","pid","state","device","error"}, ...]}`.
 - **status**: `{"ok":true,"id","pid","state","device","error","exit_code"}`
   (`exit_code` is -1 until the child is reaped).
+
+### Additive-only evolution rule
+
+The control protocol evolves **additively only** (governing decision:
+ADR-0014, currently proposed). Concretely:
+
+- New commands and new reply fields **may be added**; existing field names
+  and meanings **never change**.
+- Servers **ignore unknown request fields**; clients **must ignore unknown
+  reply fields**.
+- `protocol` increments only for additive batches and, together with the
+  `features` list from the `hello` reply, is the client's capability gate:
+  a client that needs a capability checks `protocol`/`features` once at
+  handshake time instead of discovering breakage at runtime.
+
+This rule is what allows obdctl, obd-supervisor, and any external
+(non-C++) CLI to be upgraded independently.
 
 ### Channel 2: obd-device → supervisor (status channel, fd 3)
 
@@ -140,6 +166,12 @@ SIGKILLed+reaped by `~Child`.
 
 - `inline constexpr size_t kMaxMessageBytes = 64 * 1024` — maximum JSON-line
   length on both channels.
+- `inline constexpr int kProtocolVersion = 1` — control-protocol revision;
+  increments only for additive batches (see the additive-only rule above).
+- `inline constexpr std::string_view kProjectVersion` — the project version
+  string, wired from CMake `project(... VERSION ...)` via the
+  `OBD_VERSION_STRING` compile definition so it cannot drift; `"dev"` is
+  the fallback for non-CMake builds.
 - `struct CreateCommand` — `id`, `config` (required), `global` (`""` =
   supervisor default), `device_bin` (`""` = supervisor default), `dev_id`
   (`-1` = auto). Descriptive mirror of the create command's fields.
@@ -153,6 +185,10 @@ SIGKILLed+reaped by `~Child`.
   with a trailing newline.
 - `std::string reply_error(const std::string& error)` —
   `{"ok":false,"error":...}` plus newline.
+- `std::string reply_hello()` — the `hello` handshake reply via the
+  `reply_ok` envelope: `protocol` (`kProtocolVersion`), `version`
+  (`kProjectVersion`), and `features` (an initially empty JSON array of
+  strings, the capability extension point).
 - `struct DeviceStatus` — `state` (`starting` | `ready` | `failed` |
   `stopped`), `device` (`/dev/ublkb<N>` when ready), `error` (when failed).
 - `std::optional<DeviceStatus> parse_device_status(std::string_view)` —
@@ -265,11 +301,13 @@ device: <id>"}`.
 
 - **Both wire protocols are T1 wire contracts** (AGENTS.md): the control
   channel's command/reply shapes (`cmd`, `id`, `config`, `global`,
-  `device_bin`, `dev_id`; `ok`/`error` envelope; per-command success
+  `device_bin`, `dev_id`; `ok`/`error` envelope; the `hello` handshake
+  fields `protocol`/`version`/`features`; per-command success
   fields) and the status channel's shapes (`state` plus optional `device`/
   `error`; the state vocabulary `starting`/`ready`/`failed`/`stopped`) may
-  only change with an ADR. obdctl, obd-supervisor, and obd-device may be
-  upgraded independently.
+  only change with an ADR — and then only **additively** (see the
+  additive-only evolution rule above; ADR-0014, proposed). obdctl,
+  obd-supervisor, and obd-device may be upgraded independently.
 - **The fd-3 + argv contract** between supervisor and obd-device
   (`--control-fd 3`, `--config`, optional `--global`, optional `--dev-id`,
   CLOEXEC-cleared fd 3) is part of the same wire contract.
@@ -296,6 +334,11 @@ needing a real ublk device or root.
   parses; `{}` is rejected; and `make_device_status` → `parse_device_status`
   round-trips a `failed` status with its `error` field. This pins the exact
   wire shapes documented above.
+- `supervisor: hello handshake replies with protocol version and features` —
+  pins the documented `hello` reply shape (`ok`, integer `protocol` ≥ 1,
+  non-empty string `version`, array `features`), that `hello` parses with
+  no required fields and ignores extras, and that unknown cmds and
+  malformed JSON are still rejected with an answerable reason.
 - `supervisor: child spawn execs and reports through the channel` — spawns
   a fake `obd-device` (a `/bin/sh` script that echoes a `ready` JSON line
   to **fd 3**) and guards: the child is exec'd, the parent receives the

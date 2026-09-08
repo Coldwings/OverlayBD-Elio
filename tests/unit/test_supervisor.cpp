@@ -44,6 +44,44 @@ TEST_CASE("supervisor: protocol commands parse and reject garbage",
     REQUIRE(rt->error == "boom");
 }
 
+TEST_CASE("supervisor: hello handshake replies with protocol version and features",
+          "[supervisor]") {
+    std::string err;
+    // hello needs no other fields; extra fields are ignored (additive-only
+    // rule: servers ignore unknown request fields).
+    REQUIRE(supervisor::parse_command(R"({"cmd":"hello"})", err).has_value());
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"hello","future_field":42})", err)
+                .has_value());
+
+    // contains() before operator[]: a broken implementation must fail the
+    // test cleanly, not hit UB on a missing key.
+    const auto reply =
+        nlohmann::json::parse(supervisor::reply_hello());
+    REQUIRE(reply.value("ok", false) == true);
+    REQUIRE(reply.contains("protocol"));
+    REQUIRE(reply["protocol"].is_number_integer());
+    REQUIRE(reply["protocol"].get<int>() >= 1);
+    REQUIRE(reply["protocol"].get<int>() ==
+            supervisor::kProtocolVersion);
+    REQUIRE(reply.contains("version"));
+    REQUIRE(reply["version"].is_string());
+    REQUIRE(!reply["version"].get<std::string>().empty());
+    REQUIRE(reply.contains("features"));
+    REQUIRE(reply["features"].is_array());
+
+    // Bad input is still answered, never dropped: unknown cmd and malformed
+    // JSON are rejected with a reason the daemon can reply with.
+    REQUIRE(!supervisor::parse_command(R"({"cmd":"bogus"})", err).has_value());
+    REQUIRE(err.find("unknown cmd") != std::string::npos);
+    REQUIRE(!supervisor::parse_command("not json", err).has_value());
+    REQUIRE(err.find("malformed JSON") != std::string::npos);
+    const auto err_reply = nlohmann::json::parse(supervisor::reply_error(err));
+    REQUIRE(err_reply.value("ok", true) == false);
+    REQUIRE(err_reply.contains("error"));
+    REQUIRE(err_reply["error"].is_string());
+}
+
 TEST_CASE("supervisor: child spawn execs and reports through the channel",
           "[supervisor]") {
     // Fake obd-device: /bin/sh -c that writes a ready line to fd 3.
