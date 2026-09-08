@@ -136,3 +136,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0012](./0012-read-admission-funnel.md) | Admit all remote reads through one priority funnel with scavenger-class prefetch | proposed |
 | [0013](./0013-trace-prefetch.md) | Record and replay prefetch traces in upstream-compatible format without a photon dependency | proposed |
 | [0014](./0014-offline-commit-and-cli-boundary.md) | Commit offline with deterministic seal, grow-only resize, and an external CLI boundary | proposed |
+| [0015](./0015-registry-token-singleflight-and-expiry.md) | Single-flight registry token re-auth with expires_in-honoring cache lifetimes | proposed |

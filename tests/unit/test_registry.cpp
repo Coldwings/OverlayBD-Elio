@@ -7,9 +7,12 @@
 
 #include <elio/http/http_server.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <atomic>
 
 using namespace obd;
 namespace http = elio::http;
@@ -21,7 +24,8 @@ namespace {
 /// A mock OCI registry speaking the subset our client needs:
 ///   /v2/blobs/<x>     — plain Range-capable blob
 ///   /v2/auth/<x>      — 401 + Bearer challenge, then token-gated
-///   /token            — issues {"token":"sekrit"} for Basic u:p
+///   /token            — issues {"token":...} for Basic u:p; counts hits,
+///                       optional expires_in, per-exchange serial tokens
 ///   /v2/redir/<x>     — 302 to /cdn/blob (anonymous)
 ///   /cdn/blob         — Range-capable, no auth
 ///   /dart/<upstream>  — DART-style prefix passthrough echo endpoint
@@ -96,7 +100,34 @@ private:
         const std::string path(ctx.req().path());
         if (path.starts_with("/v2/auth/")) {
             const std::string_view auth = ctx.req().header("Authorization");
-            if (auth != "Bearer sekrit") {
+            bool accepted = false;
+            if (auth.starts_with("Bearer ")) {
+                const std::string_view presented = auth.substr(7);
+                if (serial_tokens_) {
+                    // "<prefix>-<serial>"; accept only serials above the
+                    // configured watermark (models server-side expiry of
+                    // the older, already-issued tokens).
+                    const std::string pfx = token_prefix_ + "-";
+                    if (presented.starts_with(pfx)) {
+                        try {
+                            const long serial = std::stol(std::string(
+                                presented.substr(pfx.size())));
+                            accepted =
+                                serial > accept_serial_above_.load();
+                        } catch (const std::exception&) {
+                        }
+                    }
+                } else {
+                    accepted = presented == token_prefix_;
+                }
+                if (accepted && reject_data_auth_ &&
+                    ctx.req().header("Range") != "bytes=0-0") {
+                    // Models a registry that accepts the token on the
+                    // 0-0 probes but rejects it on real data GETs.
+                    accepted = false;
+                }
+            }
+            if (!accepted) {
                 http::response resp(http::status::unauthorized);
                 resp.set_header("Content-Length", "0");
                 resp.set_header(
@@ -126,9 +157,21 @@ private:
             resp.set_header("Content-Length", "0");
             co_return resp;
         }
-        co_return http::response(http::status::ok,
-                                 R"({"token":"sekrit"})",
-                                 "application/json");
+        const int serial = ++token_hits_;
+        if (token_delay_ms_ > 0) {
+            // Widen the race window so concurrent re-auths genuinely
+            // overlap (single-flight tests count this endpoint's hits).
+            co_await elio::time::sleep_for(
+                std::chrono::milliseconds(token_delay_ms_.load()));
+        }
+        std::string token = token_prefix_;
+        if (serial_tokens_) token += "-" + std::to_string(serial);
+        std::string body = "{\"token\":\"" + token + "\"";
+        if (expires_in_ >= 0) {
+            body += ",\"expires_in\":" + std::to_string(expires_in_.load());
+        }
+        body += "}";
+        co_return http::response(http::status::ok, body, "application/json");
     }
 
     elio::coro::task<http::response> cdn_handler(http::context& ctx) {
@@ -147,6 +190,15 @@ private:
     std::unique_ptr<http::server> server_;
 public:
     std::string last_dart_path_;
+    // Auth knobs; set before the traffic they should affect. Defaults
+    // reproduce the original static-token mock ("sekrit", no expires_in).
+    std::string token_prefix_ = "sekrit";
+    std::atomic<bool> serial_tokens_{false};   // issue "<prefix>-<n>"
+    std::atomic<long> accept_serial_above_{-1};  // serial acceptance floor
+    std::atomic<bool> reject_data_auth_{false};  // 401 non-probe auth'd GETs
+    std::atomic<int> expires_in_{-1};            // <0: omit the field
+    std::atomic<int> token_delay_ms_{0};
+    std::atomic<int> token_hits_{0};             // token endpoint exchanges
 };
 
 struct MockGuard {
@@ -159,6 +211,13 @@ elio::coro::task<void> wait_drained(MockRegistry& mock) {
         co_await elio::time::sleep_for(std::chrono::milliseconds(5));
     }
 }
+
+/// Countdown latch for joining N elio::go children from a coroutine.
+struct JoinLatch {
+    explicit JoinLatch(int n) : pending(n) {}
+    std::atomic<int> pending;
+    elio::sync::event done;
+};
 
 source::CredentialStorePtr test_creds() {
     auto store = std::make_shared<source::CredentialStore>();
@@ -275,4 +334,178 @@ TEST_CASE("source: DART prefix passthrough preserves the embedded URL",
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry concurrent 401s share one token refresh",
+          "[source]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto blob = test::pattern_bytes(256 * 1024, 25);
+        MockRegistry mock(blob, 19195);
+        mock.serial_tokens_ = true;
+        mock.expires_in_ = 100;      // refreshed tokens live 80 s: no re-auth
+        mock.token_delay_ms_ = 30;   // make the concurrent 401s overlap
+        elio::go([&mock]() -> elio::coro::task<void> {
+            co_await mock.run();
+        });
+        MockGuard guard{mock};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        auto client = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        const std::string url = "http://127.0.0.1:19195/v2/auth/x";
+        auto src = co_await source::RegistrySource::open(client, url);
+        REQUIRE(mock.token_hits_.load() == 1);
+
+        // Server-side expiry: the token cached at open (serial 1) is now
+        // rejected; every in-flight read takes a 401 and must re-auth.
+        mock.accept_serial_above_ = 1;
+
+        constexpr int kReaders = 8;
+        constexpr size_t kCount = 4096;
+        auto join = std::make_shared<JoinLatch>(kReaders);
+        std::vector<ssize_t> results(kReaders, -1);
+        std::vector<std::vector<uint8_t>> bufs(
+            kReaders, std::vector<uint8_t>(kCount));
+        for (int i = 0; i < kReaders; ++i) {
+            elio::go([&, i]() -> elio::coro::task<void> {
+                results[i] = co_await src->pread(bufs[i].data(), kCount,
+                                                 i * 8192);
+                if (join->pending.fetch_sub(1) == 1) join->done.set();
+                co_return;
+            });
+        }
+        co_await join->done.wait();
+
+        for (int i = 0; i < kReaders; ++i) {
+            REQUIRE(results[i] == static_cast<ssize_t>(kCount));
+            REQUIRE(bufs[i] ==
+                    std::vector<uint8_t>(blob.begin() + i * 8192,
+                                         blob.begin() + i * 8192 + kCount));
+        }
+        // One exchange at open plus exactly ONE coalesced refresh for all
+        // eight concurrent 401s (un-coalesced this would be 1 + 8).
+        REQUIRE(mock.token_hits_.load() == 2);
+        co_await wait_drained(mock);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry 401 retry budget is bounded when re-auth keeps failing", "[source]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto blob = test::pattern_bytes(64 * 1024, 26);
+        MockRegistry mock(blob, 19196);
+        // The mock accepts every fresh token on the 0-0 probes but rejects
+        // it on data GETs: re-auth never helps, so the request must fail
+        // within its retry budget instead of looping on token exchanges.
+        mock.reject_data_auth_ = true;
+        elio::go([&mock]() -> elio::coro::task<void> {
+            co_await mock.run();
+        });
+        MockGuard guard{mock};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        auto client = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        const std::string url = "http://127.0.0.1:19196/v2/auth/x";
+        auto src = co_await source::RegistrySource::open(client, url);
+        REQUIRE(mock.token_hits_.load() == 1);
+
+        std::vector<uint8_t> buf(4096);
+        const ssize_t r = co_await src->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == -EPERM);
+        // One exchange per data-request attempt (the generation rule
+        // forbids retrying with the just-rejected token), then -EPERM:
+        // bounded retries, no livelock.
+        REQUIRE(mock.token_hits_.load() == 3);
+        co_await wait_drained(mock);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry re-auths after expires_in lifetime elapses",
+          "[source]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto blob = test::pattern_bytes(64 * 1024, 27);
+        MockRegistry mock(blob, 19197);
+        mock.expires_in_ = 1;  // cache lifetime: 80% of 1 s = 800 ms
+        elio::go([&mock]() -> elio::coro::task<void> {
+            co_await mock.run();
+        });
+        MockGuard guard{mock};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        auto client = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        const std::string base = "http://127.0.0.1:19197/v2/auth/";
+        auto src_a = co_await source::RegistrySource::open(client,
+                                                           base + "a");
+        REQUIRE(mock.token_hits_.load() == 1);
+        // A new URL resolves against the same token key; within the 800 ms
+        // lifetime the cached token is reused.
+        auto src_b = co_await source::RegistrySource::open(client,
+                                                           base + "b");
+        REQUIRE(mock.token_hits_.load() == 1);
+
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1200));
+        // Past 800 ms the token is stale: the next resolution re-auths.
+        auto src_c = co_await source::RegistrySource::open(client,
+                                                           base + "c");
+        REQUIRE(mock.token_hits_.load() == 2);
+
+        std::vector<uint8_t> buf(1024);
+        REQUIRE(co_await src_c->pread(buf.data(), buf.size(), 0) == 1024);
+        REQUIRE(buf == std::vector<uint8_t>(blob.begin(),
+                                            blob.begin() + 1024));
+        REQUIRE(mock.token_hits_.load() == 2);
+        co_await wait_drained(mock);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry keeps the cached token within expires_in lifetime", "[source]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto blob = test::pattern_bytes(64 * 1024, 28);
+        MockRegistry mock(blob, 19198);
+        mock.expires_in_ = 100;  // cache lifetime: 80 s
+        elio::go([&mock]() -> elio::coro::task<void> {
+            co_await mock.run();
+        });
+        MockGuard guard{mock};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        auto client = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        const std::string base = "http://127.0.0.1:19198/v2/auth/";
+        auto src_a = co_await source::RegistrySource::open(client,
+                                                           base + "a");
+        co_await elio::time::sleep_for(std::chrono::milliseconds(300));
+        // Far inside the 80 s lifetime: further resolutions and reads
+        // never touch the token endpoint again.
+        auto src_b = co_await source::RegistrySource::open(client,
+                                                           base + "b");
+        std::vector<uint8_t> buf(1024);
+        REQUIRE(co_await src_a->pread(buf.data(), buf.size(), 7) == 1024);
+        REQUIRE(co_await src_b->pread(buf.data(), buf.size(), 9) == 1024);
+        REQUIRE(mock.token_hits_.load() == 1);
+        co_await wait_drained(mock);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry token cache lifetime derives from expires_in",
+          "[source]") {
+    using namespace std::chrono;
+    using source::detail::token_cache_lifetime;
+    // 80% of the declared lifetime (proactive refresh margin).
+    REQUIRE(token_cache_lifetime(100) == seconds(80));
+    REQUIRE(token_cache_lifetime(10) == seconds(8));
+    // An immediately-expiring token is cached as already expired.
+    REQUIRE(token_cache_lifetime(0) == seconds(0));
+    // Absent or negative (garbage) values fall back to the fixed 30 s.
+    REQUIRE(token_cache_lifetime(std::nullopt) == seconds(30));
+    REQUIRE(token_cache_lifetime(-5) == seconds(30));
 }

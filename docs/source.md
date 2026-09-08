@@ -95,7 +95,9 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
 - **Auth discovery** — an unauthenticated probe; on 401/403 the
   `WWW-Authenticate` Bearer challenge (`realm`, `service`, `scope`) is parsed
   and a token is fetched from the realm with Basic auth built from the
-  credential store. Tokens are cached for 30 s.
+  credential store. Token cache lifetime honors the OAuth2 `expires_in`
+  field at 80% of the declared lifetime, falling back to a fixed 30 s when
+  the field is absent or unparsable (ADR-0015).
 - **Self vs Redirect mode** — after auth succeeds, a second probe discovers
   whether the registry serves the blob itself (Self mode: the
   `Authorization` header rides on every data request) or redirects to a CDN
@@ -104,6 +106,12 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
 - **Retries** — data requests retry up to 3 times with a short backoff on
   transport failures, stale-token 401/403s (dropping the cached URL info and
   re-resolving), and 429s.
+- **Single-flight re-auth** — the 401-triggered token exchange is coalesced
+  per `realm|service|scope` key: the first requester performs the exchange
+  and concurrent 401s await the same flight. Each successful exchange bumps
+  a token generation; a request that took a 401 retries only with a strictly
+  newer generation, so a just-rejected token is never reused even while it
+  is still time-valid (ADR-0015). The per-request retry budget is unchanged.
 - **Status mapping** — 416 → `-ERANGE`, 429 → `-EBUSY`, 401/403 after retry
   → `-EPERM`, 404 → `-ENOENT`, everything else → `-EIO`.
 
@@ -335,13 +343,16 @@ anonymous pull.
   `Content-Range` total; falls back to the body length when the server
   ignores Range and answers 200. Negative `-errno` on failure. Never throws.
 
-Internal behavior worth depending on (see Concepts): tokens cached 30 s
-keyed by `realm|service|scope`; per-URL resolution (final URL + auth header)
-cached 300 s; 401/403 on a data request drops the cached URL info and
-re-resolves; a 206 whose `Content-Range` does not start at `offset`
-invalidates the cache and retries. Both caches are guarded by an
-`elio::sync::mutex`; network IO never happens under the lock except during
-the resolve probe sequence, which is naturally serialized per URL.
+Internal behavior worth depending on (see Concepts): tokens cached for 80%
+of the OAuth2 `expires_in` lifetime (30 s fallback) keyed by
+`realm|service|scope`, with single-flight exchanges and a per-key generation
+counter (ADR-0015); per-URL resolution (final URL + auth header) cached
+300 s; 401/403 on a data request drops the cached URL info and re-resolves
+with a strictly newer token generation; a 206 whose `Content-Range` does not
+start at `offset` invalidates the cache and retries. Both caches and the
+in-flight exchange map are guarded by an `elio::sync::mutex`; network IO
+never happens under the lock except during the resolve probe sequence,
+which is naturally serialized per URL.
 
 ```cpp
 class RegistrySource final : public BlobSource {
@@ -803,7 +814,9 @@ Callers may rely on:
   every type in this module. `LocalFileSource` and `RegistrySource` are
   stateless per read; `ChunkCache` serializes its index under an
   `elio::sync::mutex` and fills outside the lock; `SwitchSource` reads an
-  atomic pointer; `RegistryClient`'s caches are mutex-guarded; `LayerStore`
+  atomic pointer; `RegistryClient`'s caches are mutex-guarded and its token
+  exchanges are single-flight per key (concurrent re-auths share one
+  exchange, ADR-0015); `LayerStore`
   shares its extent map with the writer thread through per-extent atomics
   and coalesces concurrent fetches of one extent to a single remote read.
 - **Instance state** — mutable state per instance: `ChunkCache` (chunk map,
@@ -834,10 +847,13 @@ Breaking changes (require an ADR per the trigger list in
 `docs/adr/README.md`):
 
 - **The registry wire behavior** is an operator contract: GET-with-Range
-  only, the bearer-token flow, Self/Redirect redirect handling, token/URL
-  cache lifetimes, and the status→errno mapping mirror overlaybd
-  `registryfs_v2.cpp`. Registries and CDNs that work with overlaybd must
-  keep working here (`docs/design-assumptions.md` §S-3).
+  only, the bearer-token flow, Self/Redirect redirect handling, and the
+  status→errno mapping mirror overlaybd `registryfs_v2.cpp`. Cache policy
+  on top of that wire behavior is ours (ADR-0015): token lifetime is 80%
+  of the server's `expires_in` (30 s fallback) with single-flight,
+  generation-counted re-auth; the redirect/URL-info cache keeps its fixed
+  300 s. Registries and CDNs that work with overlaybd must keep working
+  here (`docs/design-assumptions.md` §S-3).
 - **The DART integration shape** (ADR-0005): DART stays an external process
   reached by prefix passthrough (`base + "/" + full upstream URL`, embedded
   scheme preserved); in-process P2P is rejected. Enabled-but-unreachable
@@ -953,6 +969,23 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   matches) and completes to `overlaybd.commit` without verification.
 - `source: layer store completes an empty layer` — a zero-length remote
   creates an empty `overlaybd.commit` instead of remaining in `Filling`.
+- `source: registry concurrent 401s share one token refresh` — eight
+  concurrent reads that all take a 401 on the server-side-expired token
+  trigger exactly one coalesced token exchange (the mock counts token
+  endpoint hits), and every read succeeds (ADR-0015).
+- `source: registry 401 retry budget is bounded when re-auth keeps failing` —
+  a registry that rejects every fresh token on data GETs drives one token
+  exchange per retry attempt (generation rule) and then `-EPERM`: bounded
+  retries, no livelock (ADR-0015).
+- `source: registry re-auths after expires_in lifetime elapses` — with
+  `expires_in=1` (800 ms cache lifetime) a resolution within the lifetime
+  reuses the token and a resolution after it performs a new exchange.
+- `source: registry keeps the cached token within expires_in lifetime` —
+  with `expires_in=100` (80 s cache lifetime) repeated resolutions and
+  reads never hit the token endpoint again.
+- `source: registry token cache lifetime derives from expires_in` — the
+  lifetime mapping itself: 80% of the declared value, 0 for
+  `expires_in=0`, and the 30 s fallback for absent/negative values.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → ChunkCache → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same wiring image
@@ -995,9 +1028,11 @@ directly.
   `RegistryClientConfig::max_response_size` (64 MiB default); larger single
   requests must be split by the caller (the format readers already read in
   bounded blocks).
-- **Fixed cache lifetimes** — token (30 s) and redirect/URL-info (300 s)
-  lifetimes are constants, not config; registries issuing shorter-lived
-  tokens rely on the 401-drop-and-re-resolve path.
+- **Redirect cache lifetime is fixed** — the redirect/URL-info cache
+  lifetime is a 300 s constant, not config (the token cache honors
+  `expires_in`, ADR-0015; redirect responses carry no comparable declared
+  lifetime). Registries issuing shorter-lived redirect targets rely on the
+  401-drop-and-re-resolve path.
 - **No prefetch / trace replay** — overlaybd's prefetch and TurboOCI paths
   are out of scope (ADR-0007). (Proposed ADR-0012 and ADR-0013 re-scope
   prefetch: an admission funnel with scavenger-class warm-up, and

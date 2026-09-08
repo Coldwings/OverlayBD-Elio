@@ -5,7 +5,11 @@
 //   * GET with Range only — never HEAD; blob size comes from a Range 0-0
 //     probe's Content-Range total.
 //   * 401/403 → parse WWW-Authenticate Bearer {realm,service,scope}, fetch
-//     a token with Basic auth from the credential store, cache tokens 30s.
+//     a token with Basic auth from the credential store. Token cache
+//     lifetime honors the OAuth2 expires_in field at 80% of the declared
+//     lifetime, falling back to a fixed 30s when the field is absent or
+//     unparsable (ADR-0015). Concurrent re-auths are single-flight: one
+//     coroutine performs the exchange, the rest await it.
 //   * 3xx redirects → cache the Location for 300s and GET it without auth
 //     (registryfs_v2.cpp Redirect mode); otherwise re-send with auth per
 //     request (Self mode).
@@ -22,14 +26,27 @@
 
 #include <elio/coro/task.hpp>
 #include <elio/http/http_client.hpp>
+#include <elio/sync/event.hpp>
 #include <elio/sync/mutex.hpp>
 
 #include <chrono>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace obd::source {
+
+namespace detail {
+
+/// Maps an OAuth2 `expires_in` value (seconds, std::nullopt when the field
+/// is absent or unparsable) to the token cache lifetime: 80% of the
+/// declared lifetime (proactive refresh margin), or the fixed 30 s
+/// fallback. A declared lifetime of 0 caches the token as already expired.
+std::chrono::steady_clock::duration token_cache_lifetime(
+    std::optional<int64_t> expires_in_seconds);
+
+}  // namespace detail
 
 struct RegistryClientConfig {
     std::string user_agent = "overlaybd-elio/0.1";
@@ -62,11 +79,24 @@ private:
     struct TokenEntry {
         std::string token;
         std::chrono::steady_clock::time_point expiry;
+        /// Bumped on every successful exchange; a 401'd request demands a
+        /// strictly newer generation before retrying (ADR-0015).
+        uint64_t generation = 0;
+    };
+    /// One in-flight token exchange. Concurrent re-auths for the same
+    /// realm|service|scope key await the same flight instead of each
+    /// running the exchange (single-flight, ADR-0015).
+    struct TokenFlight {
+        elio::sync::event done;
+        TokenEntry entry;             // valid when error is null
+        std::exception_ptr error;     // set when the exchange failed
     };
     struct UrlInfo {
         std::string final_url;     // original (self) or redirect Location
         std::string auth_header;   // empty for redirect mode
         std::chrono::steady_clock::time_point expiry;
+        /// Generation of the token auth_header was built from (0 = none).
+        uint64_t token_generation = 0;
     };
 
     /// GET with Range [first,last]; returns nullopt with errno set on
@@ -76,16 +106,37 @@ private:
         const std::string& auth_header);
 
     /// Resolves auth + redirect state for `url`, refreshing caches as
-    /// needed (registryfs_v2 get_scope_auth/get_actual_url). Throws
+    /// needed (registryfs_v2 get_scope_auth/get_actual_url). When
+    /// `min_token_generation` is non-zero (a previous attempt took a 401),
+    /// a cached token is only reused if its generation is at least that
+    /// value; otherwise a new exchange is performed/awaited. Throws
     /// obd::error on failure.
-    elio::coro::task<UrlInfo> resolve(const std::string& url);
+    elio::coro::task<UrlInfo> resolve(const std::string& url,
+                                      uint64_t min_token_generation = 0);
+
+    /// Returns a usable token for the cache key, performing or awaiting a
+    /// single-flight exchange when the cached entry is expired or older
+    /// than `min_generation`. Throws obd::error on exchange failure.
+    elio::coro::task<TokenEntry> get_token(const std::string& key,
+                                           const std::string& realm,
+                                           const std::string& service,
+                                           const std::string& scope,
+                                           const std::string& url_for_creds,
+                                           uint64_t min_generation);
+
+    /// Raw token endpoint response: the bearer token plus the cache
+    /// lifetime derived from expires_in (see detail::token_cache_lifetime).
+    struct TokenResponse {
+        std::string token;
+        std::chrono::steady_clock::duration lifetime;
+    };
 
     /// Fetches a Bearer token for the challenge realm/service/scope with
     /// Basic auth from the credential store. Throws obd::error on failure.
-    elio::coro::task<std::string> fetch_token(const std::string& realm,
-                                              const std::string& service,
-                                              const std::string& scope,
-                                              const std::string& url_for_creds);
+    elio::coro::task<TokenResponse> fetch_token(const std::string& realm,
+                                                const std::string& service,
+                                                const std::string& scope,
+                                                const std::string& url_for_creds);
 
     CredentialStorePtr creds_;
     RegistryClientConfig cfg_;
@@ -93,6 +144,8 @@ private:
     elio::sync::mutex mu_;
     std::map<std::string, TokenEntry> tokens_;    // key: realm|service|scope
     std::map<std::string, UrlInfo> url_infos_;    // key: original url
+    // In-flight token exchanges, same key as tokens_.
+    std::map<std::string, std::shared_ptr<TokenFlight>> flights_;
 };
 
 using RegistryClientPtr = std::shared_ptr<RegistryClient>;

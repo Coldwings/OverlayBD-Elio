@@ -14,6 +14,22 @@
 
 namespace obd::source {
 
+namespace detail {
+
+std::chrono::steady_clock::duration token_cache_lifetime(
+    std::optional<int64_t> expires_in_seconds) {
+    // Absent/unparsable/negative → the pre-ADR-0015 fixed lifetime.
+    if (!expires_in_seconds || *expires_in_seconds < 0) {
+        return std::chrono::seconds(30);
+    }
+    // 80% of the declared lifetime: refresh proactively instead of riding
+    // the token to its exact expiry. Computed in milliseconds so short
+    // declared lifetimes (< 5 s) keep a usable margin.
+    return std::chrono::milliseconds(*expires_in_seconds * 800);
+}
+
+}  // namespace detail
+
 namespace {
 
 /// Parses "Bearer realm=\"...\",service=\"...\",scope=\"...\"" or "Basic
@@ -145,7 +161,7 @@ RegistryClient::request_range(const std::string& url, uint64_t first,
     co_return co_await http_.send(req, *parsed);
 }
 
-elio::coro::task<std::string> RegistryClient::fetch_token(
+elio::coro::task<RegistryClient::TokenResponse> RegistryClient::fetch_token(
     const std::string& realm, const std::string& service,
     const std::string& scope, const std::string& url_for_creds) {
     std::string token_url = realm;
@@ -188,16 +204,110 @@ elio::coro::task<std::string> RegistryClient::fetch_token(
     if (token.empty()) {
         throw format_error("token response has no token field: " + realm);
     }
-    co_return token;
+    // OAuth2 expires_in (seconds); registries may send it as a number or a
+    // string. Anything unparsable degrades to the fixed fallback lifetime.
+    std::optional<int64_t> expires_in;
+    if (j.contains("expires_in")) {
+        try {
+            const auto& v = j.at("expires_in");
+            if (v.is_number()) {
+                expires_in = v.get<int64_t>();
+            } else if (v.is_string()) {
+                expires_in = std::stoll(v.get<std::string>());
+            }
+        } catch (const std::exception&) {
+            expires_in.reset();
+        }
+    }
+    co_return TokenResponse{std::move(token),
+                            detail::token_cache_lifetime(expires_in)};
+}
+
+elio::coro::task<RegistryClient::TokenEntry> RegistryClient::get_token(
+    const std::string& key, const std::string& realm,
+    const std::string& service, const std::string& scope,
+    const std::string& url_for_creds, uint64_t min_generation) {
+    for (;;) {
+        std::shared_ptr<TokenFlight> flight;
+        bool leader = false;
+        {
+            co_await mu_.lock();
+            auto it = tokens_.find(key);
+            if (it != tokens_.end() &&
+                it->second.expiry > std::chrono::steady_clock::now() &&
+                it->second.generation >= min_generation) {
+                TokenEntry hit = it->second;
+                mu_.unlock();
+                co_return hit;
+            }
+            auto fit = flights_.find(key);
+            if (fit != flights_.end()) {
+                flight = fit->second;  // await the in-flight exchange
+            } else {
+                flight = std::make_shared<TokenFlight>();
+                flights_[key] = flight;
+                leader = true;
+            }
+            mu_.unlock();
+        }
+
+        if (!leader) {
+            co_await flight->done.wait();
+            if (flight->error) std::rethrow_exception(flight->error);
+            // Retry with the refreshed token only if the generation
+            // advanced past what this caller already saw fail (a refresh
+            // that produced an already-expired token still counts: it is
+            // the newest generation). Otherwise perform/await a new one.
+            if (flight->entry.generation >= min_generation) {
+                co_return flight->entry;
+            }
+            continue;
+        }
+
+        // Leader: run the exchange outside the lock, publish under it.
+        // (The catch only captures: await is not permitted in handlers.)
+        TokenResponse resp;
+        std::exception_ptr exchange_error;
+        try {
+            resp = co_await fetch_token(realm, service, scope,
+                                        url_for_creds);
+        } catch (...) {
+            exchange_error = std::current_exception();
+        }
+        if (exchange_error) {
+            flight->error = exchange_error;
+            co_await mu_.lock();
+            flights_.erase(key);
+            mu_.unlock();
+            flight->done.set();
+            std::rethrow_exception(exchange_error);
+        }
+        TokenEntry entry;
+        entry.token = std::move(resp.token);
+        entry.expiry = std::chrono::steady_clock::now() + resp.lifetime;
+        co_await mu_.lock();
+        uint64_t prev = 0;
+        if (auto it = tokens_.find(key); it != tokens_.end()) {
+            prev = it->second.generation;
+        }
+        entry.generation = prev + 1;
+        tokens_[key] = entry;
+        flight->entry = entry;
+        flights_.erase(key);
+        mu_.unlock();
+        flight->done.set();
+        co_return entry;
+    }
 }
 
 elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
-    const std::string& url) {
+    const std::string& url, uint64_t min_token_generation) {
     {
         co_await mu_.lock();
         auto it = url_infos_.find(url);
         const bool hit = it != url_infos_.end() &&
-                         it->second.expiry > std::chrono::steady_clock::now();
+                         it->second.expiry > std::chrono::steady_clock::now() &&
+                         it->second.token_generation >= min_token_generation;
         UrlInfo cached;
         if (hit) cached = it->second;
         mu_.unlock();
@@ -235,30 +345,16 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
                                    std::string(challenge_hdr));
         }
         std::string auth;
+        uint64_t token_generation = 0;
         if (challenge->bearer) {
             const std::string key = challenge->realm + "|" +
                                     challenge->service + "|" +
                                     challenge->scope;
-            std::string token;
-            {
-                co_await mu_.lock();
-                auto it = tokens_.find(key);
-                const bool hit =
-                    it != tokens_.end() &&
-                    it->second.expiry > std::chrono::steady_clock::now();
-                if (hit) token = it->second.token;
-                mu_.unlock();
-            }
-            if (token.empty()) {
-                token = co_await fetch_token(challenge->realm,
-                                             challenge->service,
-                                             challenge->scope, url);
-                co_await mu_.lock();
-                tokens_[key] = {token, std::chrono::steady_clock::now() +
-                                           std::chrono::seconds(30)};
-                mu_.unlock();
-            }
-            auth = "Bearer " + token;
+            const TokenEntry entry = co_await get_token(
+                key, challenge->realm, challenge->service, challenge->scope,
+                url, min_token_generation);
+            auth = "Bearer " + entry.token;
+            token_generation = entry.generation;
         } else {
             // Basic auth: credentials from the store for the blob URL.
             if (creds_) {
@@ -292,8 +388,13 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
                         "registry probe with auth rejected (HTTP " +
                             std::to_string(status2) + "): " + url);
         }
+        // The redirect/URL-info responses (3xx Location, probe 200/206)
+        // carry no server-declared expiry in the registryfs v2 contract —
+        // CDN signed-URL lifetimes live inside opaque query parameters —
+        // so the fixed 300 s cache lifetime stays (ADR-0015).
         info.expiry = std::chrono::steady_clock::now() +
                       std::chrono::seconds(300);
+        info.token_generation = token_generation;
     } else {
         throw_errno(status_to_errno(status),
                     "registry probe rejected (HTTP " + std::to_string(status) +
@@ -309,10 +410,13 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
 elio::coro::task<ssize_t> RegistryClient::get_data(const std::string& url,
                                                    void* buf, uint64_t offset,
                                                    size_t count) {
+    // Generation the retried request must beat: set after a 401 so the
+    // re-resolve cannot reuse the exact token that was just rejected.
+    uint64_t min_token_generation = 0;
     for (int attempt = 0; attempt < 3; ++attempt) {
         UrlInfo info;
         try {
-            info = co_await resolve(url);
+            info = co_await resolve(url, min_token_generation);
         } catch (const std::system_error& e) {
             co_return -e.code().value();
         }
@@ -359,11 +463,17 @@ elio::coro::task<ssize_t> RegistryClient::get_data(const std::string& url,
             continue;
         }
         if (status == 401 || status == 403) {
-            // Stale redirect/token: drop cached info and re-resolve.
+            // Stale redirect/token: drop cached info and re-resolve. When
+            // the request carried a bearer token, demand a strictly newer
+            // token generation on the retry — the exchange itself is
+            // single-flight, so concurrent 401s share one refresh.
             co_await mu_.lock();
             url_infos_.erase(url);
             mu_.unlock();
             if (attempt == 2) co_return -EPERM;
+            if (!info.auth_header.empty()) {
+                min_token_generation = info.token_generation + 1;
+            }
             co_await elio::time::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
