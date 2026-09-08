@@ -277,7 +277,10 @@ to end:
      "yes"` (`label.AccelerationLayer`);
    - annotations `containerd.io/snapshot/overlaybd/blob-digest` and
      `.../blob-size` (the tar blob's own digest/size), and
-     `.../blob-fs-type` when known.
+     `.../blob-fs-type` when known;
+   - annotation `containerd.io/snapshot/overlaybd/version`
+     (`label.OverlayBDVersion`), set unconditionally by the convertor and
+     ignored by the backstore's trace handling.
    The new manifest appends this layer as the last entry
    (`createImageWithAccelLayer` in `record_trace.go`).
    (`record_trace.go` also defines an unused constant
