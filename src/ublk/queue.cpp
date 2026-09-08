@@ -88,13 +88,20 @@ void Queue::open() {
         throw_errno(errno, "cannot create ublk bridge eventfds");
     }
 
-    // UBLK_F_URING_CMD_COMP_IN_TASK (set in dev_info_flags) makes the
-    // driver complete uring-cmds as task_work of the issuing task. That
-    // REQUIRES IORING_SETUP_DEFER_TASKRUN (task_work runs inside
-    // io_uring_enter, which is exactly where this queue thread waits)
-    // and IORING_SETUP_SINGLE_ISSUER (only this thread submits), the
-    // same pairing libublksrv uses; without it FETCH completions are
-    // never reaped and block-device I/O hangs forever.
+}
+
+void Queue::init_ring() {
+    // Must run on the queue thread (the first statement of run()):
+    // IORING_SETUP_SINGLE_ISSUER binds the creating task as the only
+    // allowed submitter, and IORING_SETUP_DEFER_TASKRUN runs completion
+    // task_work of the waiting task. Creating the ring on the creator
+    // thread makes every queue-thread io_uring_enter fail with EEXIST.
+    //
+    // The flag pairing is required by UBLK_F_URING_CMD_COMP_IN_TASK
+    // (dev_info_flags): the driver completes uring-cmds as task_work of
+    // the issuing task; without DEFER_TASKRUN the completions are never
+    // reaped and block-device I/O hangs forever. Same pairing as
+    // libublksrv.
     io_uring_params ring_params {};
     ring_params.flags = IORING_SETUP_SINGLE_ISSUER |
                         IORING_SETUP_DEFER_TASKRUN;
@@ -211,6 +218,7 @@ void Queue::dispatch_cqe(const io_uring_cqe* cqe) {
 }
 
 void Queue::run(std::atomic<bool>& stop) {
+    init_ring();  // throws; the device.cpp thread lambda catches
     // Park the initial FETCH for every tag: the driver refuses START_DEV
     // (EBUSY) until all queue tags are waiting for work.
     for (uint16_t tag = 0; tag < depth_; ++tag) {

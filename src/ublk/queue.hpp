@@ -47,8 +47,9 @@ public:
     Queue(const Queue&) = delete;
     Queue& operator=(const Queue&) = delete;
 
-    /// Opens the queue char device, mmaps the command buffer, initializes
-    /// the ring and buffers. Throws obd::error on failure.
+    /// Opens the queue char device, mmaps the command buffer and
+    /// allocates the buffers. Throws obd::error on failure. The ring is
+    /// NOT created here: see run().
     void open();
 
     uint16_t q_id() const noexcept { return q_id_; }
@@ -81,10 +82,20 @@ public:
     /// Interrupts the run() wait (e.g. after setting stop).
     void wakeup() noexcept;
 
+    /// Marks the queue failed from outside the queue thread (e.g. an
+    /// exception escaping run()).
+    void fail(int err) noexcept {
+        failure_.store(err);
+        failed_.store(true);
+    }
     bool failed() const noexcept { return failed_.load(); }
     int failure() const noexcept { return failure_.load(); }
 
 private:
+    /// Creates the queue io_uring. Must be called on the queue thread
+    /// (SINGLE_ISSUER binds the creator; DEFER_TASKRUN binds the
+    /// waiter). Throws obd::error on failure.
+    void init_ring();
     void prep_io_cmd(uint32_t cmd_op, uint16_t tag, int32_t result);
     void arm_done_poll();
     void drain_done();

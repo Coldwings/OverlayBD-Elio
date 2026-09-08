@@ -39,7 +39,15 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
         for (auto& queue : dev->queues_) {
             Queue* q = queue.get();
             dev->threads_.emplace_back([q, &stop = dev->stop_] {
-                q->run(stop);
+                try {
+                    q->run(stop);
+                } catch (const std::exception& e) {
+                    // Never let a queue-thread exception terminate the
+                    // process; surface it as a queue failure instead.
+                    ELIO_LOG_ERROR("ublk queue {} thread died: {}",
+                                   q->q_id(), e.what());
+                    q->fail(EIO);
+                }
             });
         }
         // Bridge coroutines on the Elio scheduler, one per queue.
@@ -58,6 +66,12 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
                 if (e.code().value() != EBUSY) throw;
             }
             if (!started) {
+                for (const auto& q : dev->queues_) {
+                    if (q->failed()) {
+                        throw_errno(q->failure() ? q->failure() : EIO,
+                                    "ublk queue failed before START_DEV");
+                    }
+                }
                 co_await elio::time::sleep_for(
                     std::chrono::milliseconds(50));
             }
@@ -100,7 +114,15 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         for (auto& queue : dev->queues_) {
             Queue* q = queue.get();
             dev->threads_.emplace_back([q, &stop = dev->stop_] {
-                q->run(stop);
+                try {
+                    q->run(stop);
+                } catch (const std::exception& e) {
+                    // Never let a queue-thread exception terminate the
+                    // process; surface it as a queue failure instead.
+                    ELIO_LOG_ERROR("ublk queue {} thread died: {}",
+                                   q->q_id(), e.what());
+                    q->fail(EIO);
+                }
             });
         }
         for (auto& queue : dev->queues_) {
