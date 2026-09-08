@@ -28,6 +28,11 @@ images built by upstream `overlaybd-*` tools load identically here:
   produce upstream-readable sealed ZFile and LSMT files; used by
   `obd-mkimage` and the test fixtures. The data plane never writes through
   these.
+- **Trace codec** (`trace.hpp`) — the upstream OverlayBD prefetch trace
+  blob (ADR-0013, proposed): an in-memory parser and conforming writer for
+  the raw-struct wire format specified in
+  [trace-format.md](./trace-format.md). The codec exists and is tested;
+  record/replay against live devices is **not wired yet**.
 
 Everything async in this module is an `elio::coro::task` running on the Elio
 scheduler over the `source::BlobSource` abstraction; the writers are plain
@@ -118,6 +123,17 @@ implementations exist: a sparse file with identity mapping
 (`SparseRwLayer`), and an unsealed single-file LSMT with in-place edit
 (`LsmtRwLayer`), which `seal()` compacts into a standard sealed LSMT RO
 file.
+
+### Trace blob (ADR-0013, proposed)
+
+The prefetch trace blob is a 24-byte header (magic, `data_size`,
+CRC-32C checksum) followed by fixed 24-byte records, an LP64
+little-endian raw struct image with padding bytes included in the
+checksum. The byte-level authority is
+[trace-format.md](./trace-format.md); the codec in `trace.hpp` implements
+its parser acceptance rules (§7) and conforming-writer contract (§10)
+with no third-party dependencies, reusing the in-repo raw-chaining
+CRC-32C (`src/common/crc32c.hpp`).
 
 ## Public API
 
@@ -664,6 +680,68 @@ on `EINTR`, throw on error). Produced files are byte-compatible with
 upstream overlaybd readers. Used by `obd-mkimage` and the test fixtures;
 the data plane never writes.
 
+### `src/format/trace.hpp` — `namespace obd::format::trace`
+
+Dependency-free codec for the upstream prefetch trace blob (ADR-0013,
+proposed; wire authority: [trace-format.md](./trace-format.md)). Pure
+in-memory: no IO, no coroutines. Expected failure modes (corrupt input,
+contract-violating appends) are reported by result value, never by
+exception; the only exceptional way out is allocation failure
+(`bad_alloc` → terminate), matching the codebase's hot-path stance.
+
+Constants: `src/format/trace.hpp::kMagic` (0xC2EF1820), `kHeaderSize` /
+`kRecordSize` (both 24), `kMaxRecordCount` (1048576 — the 1 MiB
+replay-buffer cap, trace-format.md §8/§10).
+
+`src/format/trace.hpp::TraceRecord`
+
+```cpp
+struct TraceRecord {
+    char op;               // 'R' (READ) or 'W' (WRITE); any byte parses
+    uint32_t layer_index;  // 0-based index into the image's lower list
+    uint64_t count;        // read length in bytes
+    int64_t offset;        // byte offset within the layer blob file
+};
+```
+
+`src/format/trace.hpp::parse`
+
+```cpp
+ParseResult parse(std::span<const uint8_t> blob);
+```
+
+Validates per the parser acceptance rules (trace-format.md §7) in check
+order and returns either the decoded records or a `TraceParseError`
+carrying a precise `TraceError` kind (`Truncated`, `BadMagic`, `BadSize`,
+`ChecksumMismatch`) plus a message. `ParseResult` is a hand-rolled
+std::expected-shaped result (the toolchain floor, GCC 12, predates
+`<expected>`). Any failure rejects the whole blob. Record fields are not
+validated: unknown `op` bytes and nonzero padding reach the caller
+verbatim (§7/§8).
+
+`src/format/trace.hpp::TraceWriter`
+
+```cpp
+class TraceWriter {
+public:
+    TraceWriter();                        // header with checksum = 0
+    bool append(const TraceRecord& rec) noexcept;
+    size_t record_count() const noexcept;
+    uint32_t checksum() const noexcept;   // running raw-chaining CRC-32C
+    std::span<const uint8_t> finalize() noexcept;
+};
+```
+
+Implements the conforming-writer contract (trace-format.md §10): zero
+padding bytes, raw-chaining CRC-32C over the records as written, header
+present from construction with checksum 0 and rewritten in place by
+`finalize()` (mirroring upstream's `PrefetcherImpl::dump`). `append`
+enforces §10 rule 4 — `op == 'R'`, `1 <= count <= kMaxRecordCount`,
+`offset >= 0` — and returns false (record rejected, blob unchanged) on a
+violation. The `finalize()` span borrows the writer; a memory buffer is
+the whole deliverable here, file writing lands with the record/replay
+features (not yet implemented).
+
 ## Invariants & Guarantees
 
 - **Byte-exact wire compatibility.** Header/trailer layouts, magics, flag
@@ -749,7 +827,8 @@ the data plane never writes.
 
 ## Testing
 
-Unit tests live in `tests/unit/test_format.cpp` and
+Unit tests live in `tests/unit/test_format.cpp`,
+`tests/unit/test_trace.cpp`, and
 `tests/unit/test_writable.cpp` (binary `obd_unit_tests`, Catch2 tag
 `[format]`). Run with `ctest --test-dir build --output-on-failure` or
 `./build/tests/obd_unit_tests "[format]"`.
@@ -803,6 +882,30 @@ writers and readers agree on the same bytes.
   write the merged view is pure fall-through; after a patch write, reads see
   the patch while the lower blob is verified **byte-identical** afterwards.
   Guards copy-on-write and index rebuild.
+- `format: trace crc32c golden vectors match the spec` — pins the
+  raw-chaining CRC-32C against the trace-format.md §4 vectors (empty →
+  0x00000000, one record → 0xBA691A13, two chained records → 0xD29283DD),
+  including the chaining property and the writer's incremental CRC. Golden
+  values come from the specification, never from the writer under test.
+- `format: trace decodes the spec worked example byte-for-byte` — parses
+  the golden 72-byte blob from the trace-format.md §13 appendix (header
+  fields at their documented offsets, both records, checksum position) and
+  requires the conforming writer to reproduce it byte-for-byte.
+- `format: trace writer round-trips through the parser` — 64 records
+  written, parsed back to an identical list; the empty trace (header only)
+  is a valid 24-byte blob with zero records (§8).
+- `format: trace parser rejects corrupt headers and checksums` — the four
+  precise failure kinds: truncated header, bad magic, exact-size mismatch
+  (both truncated and padded blobs), checksum mismatch (§7).
+- `format: trace parser accepts and ignores a non-multiple tail` — a
+  `data_size = 25` blob decodes its one full record and ignores the
+  unchecksummed trailing byte (§7 rule 4, §12.2).
+- `format: trace parser exposes unknown op bytes to the caller` — 'W' and
+  arbitrary op bytes parse fine; nonzero padding is checksummed but not
+  interpreted (§7, §8).
+- `format: trace writer enforces the conforming-writer contract` — count 0
+  and > 1 MiB, op 'W', and negative offsets are rejected; boundary values
+  pass; rejected appends leave the blob unchanged (§10 rule 4).
 - Cross-module: `image: writable upper assembles and serves writes` covers
   assembly of a `MergedWritable` device root from a config (see
   `docs/image.md`).
@@ -827,6 +930,9 @@ writers and readers agree on the same bytes.
   read back as the on-disk zeros).
 - **Merged index rebuild is O(index) per write.** `MergedWritable` rebuilds
   after every `pwrite`; write-heavy workloads should batch writes.
+- **Trace record/replay is not wired.** The trace codec (`trace.hpp`) is
+  implemented and tested, but no device path records or replays traces yet,
+  and the blob is not packaged as an image layer (ADR-0013, proposed).
 - **Writers are single-shot fixtures.** `write_lsmt_single_layer` covers the
   whole input contiguously (no sparse/zero segments); general-purpose image
   authoring belongs to upstream tools.
