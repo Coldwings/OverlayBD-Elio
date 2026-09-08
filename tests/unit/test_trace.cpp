@@ -72,6 +72,21 @@ TEST_CASE("format: trace crc32c golden vectors match the spec", "[format]") {
     REQUIRE(crc32::crc32c_extend(stream.data(), stream.size(), 0) ==
             0xD29283DDu);
 
+    // The software table-driven reference (crc32c_sw) must hit the same §4
+    // vectors and agree with the dispatching crc32c_extend: on SSE4.2
+    // hosts the dispatch path uses hardware instructions, so without this
+    // the table path would never execute in tests.
+    REQUIRE(crc32::crc32c_sw(nullptr, 0, 0) == 0x00000000u);
+    REQUIRE(crc32::crc32c_sw(stream.data(), 24, 0) == 0xBA691A13u);
+    REQUIRE(crc32::crc32c_sw(stream.data(), stream.size(), 0) ==
+            0xD29283DDu);
+    // ... and on an unaligned buffer larger than one record.
+    std::vector<uint8_t> big;
+    for (uint32_t i = 0; i < 37; ++i)
+        put_record(big, 'R', i, 100 + i, static_cast<int64_t>(i) * 13);
+    REQUIRE(crc32::crc32c_sw(big.data() + 1, big.size() - 1, 0) ==
+            crc32::crc32c_extend(big.data() + 1, big.size() - 1, 0));
+
     // The writer's incremental CRC lands on the same value.
     format::trace::TraceWriter w;
     REQUIRE(w.append({'R', 1, 4096, 0}));
@@ -138,6 +153,43 @@ TEST_CASE("format: trace writer round-trips through the parser", "[format]") {
     REQUIRE(parsed.has_value());
     REQUIRE(*parsed == want);
 
+    // Offset decode width (§2.2): offset is a signed 64-bit field. A
+    // value >= 2^32 must not truncate through the u64/i64 decode...
+    format::trace::TraceWriter wide;
+    const int64_t wide_offset = (int64_t{1} << 40) + 4096;
+    REQUIRE(wide.append({'R', 3, 4096, wide_offset}));
+    auto wide_parsed = format::trace::parse(wide.finalize());
+    REQUIRE(wide_parsed.has_value());
+    REQUIRE((*wide_parsed)[0].offset == wide_offset);
+
+    // ...and a negative offset bit pattern decodes back to the same i64
+    // (the parser performs no offset validation, §7; the writer contract
+    // rejects negatives, so this blob is hand-built).
+    std::vector<uint8_t> neg_records;
+    put_record(neg_records, 'R', 0, 512, -1);
+    put_record(neg_records, 'R', 0, 512, INT64_MIN);
+    auto neg_parsed = format::trace::parse(make_blob(neg_records));
+    REQUIRE(neg_parsed.has_value());
+    REQUIRE(neg_parsed->size() == 2);
+    REQUIRE((*neg_parsed)[0].offset == -1);
+    REQUIRE((*neg_parsed)[1].offset == INT64_MIN);
+
+    // finalize() is idempotent, and appending after finalize() is
+    // allowed: the next finalize() re-patches the header.
+    format::trace::TraceWriter f;
+    REQUIRE(f.append({'R', 1, 4096, 0}));
+    const auto first = f.finalize();
+    const std::vector<uint8_t> first_copy(first.begin(), first.end());
+    const auto second = f.finalize();
+    REQUIRE(second.size() == first_copy.size());
+    REQUIRE(std::memcmp(second.data(), first_copy.data(),
+                        first_copy.size()) == 0);
+    REQUIRE(f.append({'R', 2, 8192, 4096}));
+    auto grown = format::trace::parse(f.finalize());
+    REQUIRE(grown.has_value());
+    REQUIRE(grown->size() == 2);
+    REQUIRE((*grown)[1] == format::trace::TraceRecord{'R', 2, 8192, 4096});
+
     // The empty trace is a valid 24-byte blob with zero records (§8).
     format::trace::TraceWriter empty;
     auto empty_parsed = format::trace::parse(empty.finalize());
@@ -190,6 +242,17 @@ TEST_CASE("format: trace parser rejects corrupt headers and checksums",
         auto r = format::trace::parse(bad);
         REQUIRE(!r.has_value());
         REQUIRE(r.error().kind == format::trace::TraceError::BadSize);
+    }
+
+    // Check-order pin (§7): magic (rule 2) is reported before size
+    // (rule 3) when both are wrong.
+    {
+        auto bad = good;
+        bad[0] ^= 0xFF;                          // bad magic ...
+        bad.push_back(0x00);                     // ... and bad size
+        auto r = format::trace::parse(bad);
+        REQUIRE(!r.has_value());
+        REQUIRE(r.error().kind == format::trace::TraceError::BadMagic);
     }
 
     // Checksum mismatch (§7 rule 5): flip one record byte; the header

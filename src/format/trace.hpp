@@ -69,20 +69,26 @@ public:
         : data_(std::move(records)) {}
     /*implicit*/ ParseResult(TraceParseError error) : data_(std::move(error)) {}
 
-    bool has_value() const noexcept {
+    [[nodiscard]] bool has_value() const noexcept {
         return std::holds_alternative<std::vector<TraceRecord>>(data_);
     }
-    explicit operator bool() const noexcept { return has_value(); }
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return has_value();
+    }
 
     /// Record list; only valid when has_value().
-    const std::vector<TraceRecord>& value() const {
+    [[nodiscard]] const std::vector<TraceRecord>& value() const {
         return std::get<std::vector<TraceRecord>>(data_);
     }
-    const std::vector<TraceRecord>& operator*() const { return value(); }
-    const std::vector<TraceRecord>* operator->() const { return &value(); }
+    [[nodiscard]] const std::vector<TraceRecord>& operator*() const {
+        return value();
+    }
+    [[nodiscard]] const std::vector<TraceRecord>* operator->() const {
+        return &value();
+    }
 
     /// Failure detail; only valid when !has_value().
-    const TraceParseError& error() const {
+    [[nodiscard]] const TraceParseError& error() const {
         return std::get<TraceParseError>(data_);
     }
 
@@ -99,7 +105,7 @@ private:
 /// the whole blob (deliberately stricter than upstream's partial-queue
 /// quirk, §8). Record fields are not validated; unknown `op` bytes are
 /// exposed to the caller verbatim.
-ParseResult parse(std::span<const uint8_t> blob);
+[[nodiscard]] ParseResult parse(std::span<const uint8_t> blob);
 
 /// Conforming-writer implementation (trace-format.md §10). Accumulates
 /// records into an in-memory blob laid out exactly as upstream's

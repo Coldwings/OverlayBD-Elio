@@ -684,7 +684,10 @@ the data plane never writes.
 
 Dependency-free codec for the upstream prefetch trace blob (ADR-0013,
 proposed; wire authority: [trace-format.md](./trace-format.md)). Pure
-in-memory: no IO, no coroutines, never throws.
+in-memory: no IO, no coroutines. Expected failure modes (corrupt input,
+contract-violating appends) are reported by result value, never by
+exception; the only exceptional way out is allocation failure
+(`bad_alloc` → terminate), matching the codebase's hot-path stance.
 
 Constants: `src/format/trace.hpp::kMagic` (0xC2EF1820), `kHeaderSize` /
 `kRecordSize` (both 24), `kMaxRecordCount` (1048576 — the 1 MiB
