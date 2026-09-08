@@ -101,12 +101,13 @@ jobs:
           TESTPID=$!
           sleep 45
           if kill -0 $TESTPID 2>/dev/null; then
-            echo "=== test still running after 45s; kernel stacks:"
-            for t in /proc/$TESTPID/task/*; do
-              echo "--- tid ${t##*/} ($(cat $t/comm))"
+            CHILD=$(pgrep -P $TESTPID | head -1)
+            echo "=== test still running after 45s (sudo=$TESTPID child=$CHILD)"
+            for t in /proc/$CHILD/task/*; do
+              echo "--- tid ${t##*/} ($(cat $t/comm)) wchan=$(cat $t/wchan)"
               sudo cat $t/stack 2>/dev/null || true
             done
-            sudo kill -9 $TESTPID
+            sudo kill -9 $CHILD $TESTPID
             exit 1
           fi
           wait $TESTPID
