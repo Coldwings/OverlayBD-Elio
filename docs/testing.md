@@ -35,7 +35,10 @@ The ublk tests (`tests/unit/test_ublk.cpp`,
 
 A **mock registry server with HTTP Range support** (`MockRegistry` in
 `tests/unit/test_registry.cpp`) serves plain and redirecting blob
-endpoints plus a bearer-token endpoint; the integration tests reuse the
+endpoints plus a bearer-token endpoint; the token endpoint counts
+exchanges and can issue `expires_in`, per-exchange serial tokens, and
+selective rejections, so single-flight and cache-lifetime behavior is
+observable. The integration tests reuse the
 same style of in-process server, so no test touches the network.
 
 ## Naming convention
@@ -241,6 +244,35 @@ Every test, grouped by area, with the property it guards.
   an empty expected digest zero-fills the sidecar header (resume still
   matches) and completes to `overlaybd.commit` without sha256
   verification.
+- `source: registry concurrent 401s share one token refresh` — N
+  concurrent reads on a server-side-expired token trigger exactly one
+  coalesced token exchange (mock counts token endpoint hits); all reads
+  succeed (single-flight, ADR-0015).
+- `source: registry failed token refresh reaches all concurrent waiters` —
+  when the coalesced exchange itself fails, every waiter receives the
+  error (no hang, no wrong success) with exactly one exchange attempted,
+  and the next request after the endpoint recovers starts a fresh flight
+  (the key is not poisoned, ADR-0015).
+- `source: registry 401 retry budget is bounded when re-auth keeps failing` —
+  when every fresh token is still rejected on data GETs, the request fails
+  with `-EPERM` after its retry budget with one exchange per attempt —
+  no livelock (ADR-0015).
+- `source: registry re-auths after expires_in lifetime elapses` — with
+  `expires_in=1` (800 ms cache lifetime) the token is reused inside the
+  lifetime and re-fetched after it.
+- `source: registry keeps the cached token within expires_in lifetime` —
+  with `expires_in=100` no re-auth happens across repeated resolutions
+  and reads far inside the 80 s cache lifetime.
+- `source: registry survives hostile token endpoint fields` — a float
+  `expires_in` far outside int64 range (`1e100`) is ignored rather than
+  converted (no UB), a non-string `token` field maps to `-EINVAL`
+  through the `-errno` discipline instead of escaping as a raw exception,
+  and a partially-numeric string `expires_in` (`"1junk"`) takes the
+  fallback while a fully-numeric string (`"1"`) is honored (ADR-0015).
+- `source: registry token cache lifetime derives from expires_in` — the
+  pure mapping: 80% of the declared lifetime, 0 for `expires_in=0`, 30 s
+  fallback for absent/negative values, and the 7-day cap for absurd ones
+  (2^62, int64 max, and around the ceiling) (ADR-0015).
 
 ### image
 
