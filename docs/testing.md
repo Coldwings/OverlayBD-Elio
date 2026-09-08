@@ -327,6 +327,9 @@ Every test, grouped by area, with the property it guards.
   replayed (ADR-0013).
 - `image: garbage trace layer never fails assembly` — a garbage trace
   blob still yields a working, byte-exact device (opportunistic replay).
+- `image: writable image with a trace layer assembles and replays` — a
+  writable (`upper`) image with `accelerationLayer` still sets the trace
+  layer aside, replays it, and serves copy-on-write reads/writes.
 
 ### ublk
 
@@ -391,6 +394,10 @@ Every test, grouped by area, with the property it guards.
   translation is pinned by attributing fetched extents only the replay can
   reach — and the device serves the data layer byte-exactly (ADR-0013,
   proposed).
+- `integration: trace replay warms the lower addressed by layer index` —
+  two remote dir-configured data layers: a `layer_index` 1 record warms
+  an otherwise-untouched extent of layer 1's blob only, pinning the
+  warm-target ordering end to end (ADR-0013).
 - `integration: layer store restart serves warmed extents without remote reads` —
   a partially-warmed staging pair is resumed by a second `open_image`:
   repeated reads are served locally and the mock registry's remote-read

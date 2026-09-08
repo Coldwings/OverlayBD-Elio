@@ -738,11 +738,18 @@ TEST_CASE("integration: trace layer replays warm-up through the layer store",
     // tar wrapper is invisible to it). With the 512B tar header the
     // records land on underlying extents 0, 1, 2:
     //   [0, 4096)       -> underlying [512, 4608)        extent 0
-    //   [65024, +4096)  -> underlying [65536, 69632)     extent 1
+    //   [65024, +512)   -> underlying [65536, 66048)     extent 1 ONLY
     //   [131072, +4096) -> underlying [131584, 135680)   extent 2
+    // The second record pins the tar-base translation against the key
+    // mutation: translated it touches ONLY extent 1 (fresh — assembly
+    // probes read the zfile header in extent 0 and the trailer/index in
+    // the last extents), while an untranslated populate would touch ONLY
+    // extent 0 (65024..65536), which probe traffic already covers. With
+    // the translation dropped, extent 1 is never served and the
+    // assertion below fails.
     format::trace::TraceWriter tw;
     REQUIRE(tw.append({'R', 0, 4096, 0}));
-    REQUIRE(tw.append({'R', 0, 4096, 65024}));
+    REQUIRE(tw.append({'R', 0, 512, 65024}));
     REQUIRE(tw.append({'R', 0, 4096, 131072}));
     const auto trace_span = tw.finalize();
     const auto trace_blob =
@@ -782,13 +789,15 @@ TEST_CASE("integration: trace layer replays warm-up through the layer store",
         REQUIRE(opened.trace.trace_present);
         REQUIRE(opened.trace.records_total == 3);
         REQUIRE(opened.trace.records_replayed == 3);
-        REQUIRE(opened.trace.bytes_warmed == 3 * 4096);
+        REQUIRE(opened.trace.bytes_warmed == 2 * 4096 + 512);
         // The acceleration layer blob itself was fetched (small, direct).
         REQUIRE(server.data_gets(accel_digest) >= 1);
         // Warm-up reached the data layer through LayerStore::populate with
         // the tar-base translation: extents 1 and 2 are fetched ONLY by
         // the replay (assembly probes touch the zfile header in extent 0
-        // and the trailer/index in the last extents).
+        // and the trailer/index in the last extents), and extent 1 in
+        // particular is reachable only WITH the +512 translation (see the
+        // record layout above).
         REQUIRE(server.served_extent(data_digest, 0));
         REQUIRE(server.served_extent(data_digest, 1));
         REQUIRE(server.served_extent(data_digest, 2));
@@ -798,6 +807,83 @@ TEST_CASE("integration: trace layer replays warm-up through the layer store",
         const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
         REQUIRE(r == static_cast<ssize_t>(raw.size()));
         REQUIRE(buf == raw);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: trace replay warms the lower addressed by layer index",
+          "[integration]") {
+    // Two remote dir-configured data layers: a layer_index off-by-one or
+    // a reversed warm_targets vector would warm the WRONG blob — pinned
+    // here by a record for layer 1 whose extent nothing else touches.
+    TempDir dir;
+    // Large enough that extent 1 is a MIDDLE extent (assembly probes
+    // touch extent 0 and the last extents only).
+    const auto raw0 = test::pattern_bytes(512 * 384, 73);
+    const auto raw1 = test::pattern_bytes(512 * 384, 79);
+    const auto blob0 = make_zfile_blob(dir, raw0);
+    const auto blob1 = make_zfile_blob(dir, raw1);
+    REQUIRE(blob0.size() > 2 * 64 * 1024);
+    REQUIRE(blob1.size() > 2 * 64 * 1024);
+    // Plain (non-tar) blobs: record offsets map 1:1 to extent space.
+    format::trace::TraceWriter tw;
+    REQUIRE(tw.append({'R', 1, 4096, 65536}));  // layer 1, extent 1
+    REQUIRE(tw.append({'R', 0, 4096, 0}));      // layer 0, extent 0
+    const auto trace_span = tw.finalize();
+    const auto trace_blob =
+        tar_wrap({trace_span.begin(), trace_span.end()});
+
+    const std::string digest0 = "sha256:" + sha256_hex_of(blob0);
+    const std::string digest1 = "sha256:" + sha256_hex_of(blob1);
+    const std::string accel_digest = "sha256:" + sha256_hex_of(trace_blob);
+    const std::string layer_dir0 = dir / "layer0";
+    const std::string layer_dir1 = dir / "layer1";
+    std::filesystem::create_directories(layer_dir0);
+    std::filesystem::create_directories(layer_dir1);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server(
+            {{digest0, blob0}, {digest1, blob1}, {accel_digest, trace_blob}},
+            19202);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        nlohmann::json cfgj;
+        cfgj["repoBlobUrl"] = server.repo_base();
+        cfgj["accelerationLayer"] = true;
+        cfgj["lowers"] = nlohmann::json::array(
+            {nlohmann::json{{"digest", digest0},
+                            {"size", blob0.size()},
+                            {"dir", layer_dir0}},
+             nlohmann::json{{"digest", digest1},
+                            {"size", blob1.size()},
+                            {"dir", layer_dir1}},
+             nlohmann::json{{"digest", accel_digest},
+                            {"size", trace_blob.size()}}});
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        const image::GlobalConfig global;
+        auto opened = co_await image::open_image(cfg, global);
+
+        REQUIRE(opened.layer_count == 2);
+        REQUIRE(opened.trace.trace_present);
+        REQUIRE(opened.trace.records_replayed == 2);
+        // layer_index 1 must warm ONLY layer 1's blob: extent 1 is
+        // unreachable by assembly probes (header in extent 0, trailer and
+        // index in the last extents), so it is served exactly when the
+        // right lower is populated — and must NOT appear on layer 0.
+        REQUIRE(server.served_extent(digest1, 1));
+        REQUIRE(!server.served_extent(digest0, 1));
+
+        // The merged view is the two data layers: the top one wins.
+        REQUIRE(opened.virtual_size == raw1.size());
+        std::vector<uint8_t> buf(raw1.size());
+        const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw1.size()));
+        REQUIRE(buf == raw1);
         co_return 0;
     });
     REQUIRE(rc == 0);

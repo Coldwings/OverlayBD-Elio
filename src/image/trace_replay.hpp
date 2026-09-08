@@ -6,9 +6,10 @@
 // stored-blob-level source of the corresponding lower (the
 // TarOffsetSource view — the same byte space upstream's PrefetchFile
 // wraps, i.e. the layer blob file below decompression), executed in
-// recorded order and sequentially awaited (the admission funnel that
-// would deprioritize this traffic is B-phase, not merged yet — replay
-// calls populate directly).
+// recorded order. Until the admission funnel lands (B1), replay is
+// awaited INLINE during device bring-up, bounded by the wall-time
+// budget below; the funnel will then detach it into scavenger-class
+// warm-up.
 //
 // Replay is OPPORTUNISTIC: a missing, malformed, or stale trace and any
 // individual populate failure are logged and skipped — never a device

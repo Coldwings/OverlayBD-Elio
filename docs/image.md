@@ -112,9 +112,10 @@ and is logged and ignored.
 `populate(offset, count)` on the corresponding data lower's
 **stored-blob-level** source (the `TarOffsetSource` view — the same byte
 space upstream's `PrefetchFile` wraps, below decompression), executed in
-recorded order and sequentially awaited. The admission funnel that would
-deprioritize this traffic is B-phase work (not merged); replay calls
-`populate` directly. Skip rules follow upstream replay parity
+recorded order. **Until the admission funnel lands (B1), replay is
+awaited inline during device bring-up**, bounded by the 30 s wall-time
+budget below; the funnel will then detach it into scavenger-class
+warm-up (Fill-class by design). Skip rules follow upstream replay parity
 (trace-format.md §5/§8): non-READ ops, unknown layer indexes, zero
 counts, counts above the 1 MiB conforming-writer cap, and negative
 offsets are silently skipped. Replay is **opportunistic**: a missing,
@@ -543,6 +544,9 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   size, byte-exact content) and the trace fully replayed.
 - `image: garbage trace layer never fails assembly` — a garbage trace
   blob still yields a working device (opportunistic replay).
+- `image: writable image with a trace layer assembles and replays` — a
+  writable (`upper`) image with `accelerationLayer` still sets the trace
+  layer aside, replays it, and serves copy-on-write reads/writes.
 - `integration: trace layer replays warm-up through the layer store` —
   end to end against the multi-blob mock: a tar-wrapped trace layer is
   recognized, set aside, and its records warm the data layer through
@@ -550,6 +554,10 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   translation is pinned by attributing fetched extents on the mock (an
   extent only the replay can reach), and the device serves the data
   layer byte-exactly (ADR-0013 acceptance).
+- `integration: trace replay warms the lower addressed by layer index` —
+  two remote dir-configured data layers: a `layer_index` 1 record warms
+  an otherwise-untouched extent of layer 1's blob only, pinning the
+  warm-target ordering end to end.
 
 Fixture data is generated in-test (`obd-mkimage`-equivalent writers from
 `src/format`, deterministic patterned bytes); the mock registry serves a

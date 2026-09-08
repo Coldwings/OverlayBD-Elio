@@ -322,3 +322,57 @@ TEST_CASE("image: garbage trace layer never fails assembly", "[image]") {
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("image: writable image with a trace layer assembles and replays",
+          "[image]") {
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 32, 51);
+    const std::string l1 = dir / "layer.lsmt";
+    {
+        const std::string r1 = test::write_file(dir / "w.img", raw);
+        const int fd = ::open(r1.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        format::write_lsmt_single_layer(fd, raw.size(), l1, {});
+        ::close(fd);
+    }
+    const std::string accel_dir = dir / "accel";
+    REQUIRE(std::filesystem::create_directories(accel_dir));
+    test::write_file(accel_dir + "/trace",
+                     writer_blob({{'R', 0, 4096, 0}}));
+
+    nlohmann::json cfgj;
+    cfgj["repoBlobUrl"] = "";
+    cfgj["accelerationLayer"] = true;
+    cfgj["lowers"] = nlohmann::json::array(
+        {nlohmann::json{{"digest", "sha256:b"}, {"file", l1}},
+         nlohmann::json{{"digest", "sha256:a"}, {"dir", accel_dir}}});
+    cfgj["upper"] = nlohmann::json{{"dir", std::string(dir / "upper")},
+                                   {"type", "lsmt"}};
+    const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+    REQUIRE(cfg.writable());
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const image::GlobalConfig global;
+        auto opened = co_await image::open_image(cfg, global);
+        // Writable assembly still sets the trace layer aside and replays.
+        REQUIRE(opened.writable);
+        REQUIRE(opened.layer_count == 2);  // 1 data lower + upper
+        REQUIRE(opened.virtual_size == raw.size());
+        REQUIRE(opened.trace.trace_present);
+        REQUIRE(opened.trace.records_replayed == 1);
+        // The writable root serves writes and reads through to the lower.
+        auto* root =
+            static_cast<source::WritableBlobSource*>(opened.root.get());
+        auto patch = test::pattern_bytes(512, 5);
+        ssize_t wr = co_await root->pwrite(patch.data(), patch.size(), 0);
+        REQUIRE(wr == static_cast<ssize_t>(patch.size()));
+        std::vector<uint8_t> buf(raw.size());
+        const ssize_t r = co_await root->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        REQUIRE(std::vector<uint8_t>(buf.begin(), buf.begin() + 512) == patch);
+        REQUIRE(std::vector<uint8_t>(buf.begin() + 512, buf.end()) ==
+                std::vector<uint8_t>(raw.begin() + 512, raw.end()));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
