@@ -31,12 +31,17 @@ plain `write()`, and the reader `read()`s them back into the same structs
 `PrefetcherImpl::reload`). Consequently the format is a **raw struct
 image** and inherits the host C++ ABI:
 
-- **Byte order: little-endian.** All upstream-supported builds are
-  x86-64 or AArch64 Linux; both are little-endian. The format has no
-  byte-order marker and no endianness conversion anywhere.
-- **Word size: LP64.** `size_t` and `off_t` are 8 bytes each on all
-  upstream targets (64-bit Linux, large-file offsets). There is no 32-bit
-  or big-endian encoding.
+- **Byte order: little-endian.** Upstream's supported build targets are
+  x86-64 and AArch64 Linux — the only architectures with code paths in
+  the checksum translation unit (`src/overlaybd/zfile/crc32/crc32c.cpp`,
+  `crc_init`) — and both are little-endian. The format has no byte-order
+  marker and no endianness conversion anywhere.
+- **Word size: LP64.** `size_t` and `off_t` are 8 bytes each on those
+  targets (64-bit Linux, large-file offsets). There is no 32-bit or
+  big-endian encoding. The LP64 little-endian layout is the **documented
+  scope of this specification**: it describes the format as produced on
+  upstream's supported builds; any other ABI would emit a different byte
+  image and would need its own verification.
 - **Alignment/padding: the platform ABI's natural struct layout**
   (verified empirically with GCC on x86-64: `sizeof` = 24 for both
   structs, offsets as tabulated below). Padding bytes are part of the
@@ -412,27 +417,42 @@ layer blobs". Nothing in the blob gates device bring-up.
 
 ## 10. Minimal writer checklist
 
-A produced blob is accepted by upstream's parser (and replays as
-intended) if and only if:
+Two contracts must not be conflated:
+
+**Parser acceptance** — what upstream's parser actually accepts. Per §7
+the *only* gates are: a readable 24-byte header, `magic` = 3270449184,
+exact file size (`24 + data_size`), and a matching checksum over the
+`floor(data_size / 24)` records. Upstream does **not** parse-reject
+oversized `count`s, out-of-range offsets, a non-multiple `data_size`
+tail, unknown `op` bytes, or nonzero padding (§8).
+
+**Conforming-writer contract** — what a writer (in particular the
+ADR-0013 codec) MUST produce for safe, deterministic interop with
+upstream replayers:
 
 1. Exactly 24-byte header, then exactly `24 × N` record bytes, nothing
-   else (total size `24 + data_size`).
+   else (total size `24 + data_size`); `data_size` = `24 × N` as u64
+   little-endian.
 2. `magic` = 3270449184 (`20 18 EF C2` little-endian).
-3. `data_size` = `24 × N` as u64 little-endian.
-4. `checksum` = CRC-32C raw-chaining (seed 0, no complements) over **all
+3. `checksum` = CRC-32C raw-chaining (seed 0, no complements) over **all
    record bytes as written, padding included**, u64/u32 fields
    little-endian.
-5. Each record: `op = 0x52` (`'R'`); `layer_index` within the target
-   image's lower count; `1 ≤ count ≤ 1048576` (split larger ranges);
-   `offset ≥ 0` and `offset + count` within the layer blob's size
-   (out-of-range records replay as logged failures, not errors).
-6. Emit zero padding bytes (upstream accepts any values, but zeros make
+4. Each record: `op = 0x52` (`'R'`); `layer_index` within the target
+   image's lower count; `1 ≤ count ≤ 1048576` (split larger ranges —
+   larger counts are parse-accepted but overflow the upstream replay
+   buffer, §8); `offset ≥ 0` and `offset + count` within the layer
+   blob's size (out-of-range records replay as logged failures, not
+   errors).
+5. Emit zero padding bytes (upstream accepts any values, but zeros make
    produced blobs deterministic and match optimized upstream builds).
-7. Image packaging, if the blob ships as a layer: single tar member
+6. Image packaging, if the blob ships as a layer: single tar member
    named `trace`; layer media type
    `application/vnd.oci.image.layer.v1.tar`; annotation
    `containerd.io/snapshot/overlaybd/acceleration-layer: "yes"`;
    uppermost layer in the manifest (§6).
+
+A blob satisfying the writer contract always satisfies parser
+acceptance; the converse is false.
 
 ## 11. Codec guidance (dependency-free C++17/20)
 
