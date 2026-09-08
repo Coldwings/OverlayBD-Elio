@@ -181,8 +181,12 @@ void Ctrl::start_user_recovery(uint32_t dev_id) {
 }
 
 void Ctrl::end_user_recovery(uint32_t dev_id) {
+    // The driver requires data[0] == ub->ublksrv_tgid, which is the
+    // tgid recorded when the new daemon opened /dev/ublkcN (i.e. our
+    // own pid); a zero data[0] is rejected with EINVAL.
     ctrl_cmd(UBLK_U_CMD_END_USER_RECOVERY, dev_id,
-             static_cast<uint16_t>(-1), nullptr, 0, 0,
+             static_cast<uint16_t>(-1), nullptr, 0,
+             static_cast<uint64_t>(getpid()),
              "END_USER_RECOVERY");
 }
 
