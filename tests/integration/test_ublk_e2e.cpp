@@ -158,12 +158,14 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
                 }) == 4096);
         REQUIRE(buf == std::vector<uint8_t>(4096, 0));
 
-        // Untouched data still reads correctly.
+        // Untouched prefix (before the discarded range) still reads
+        // correctly — note [1024, 5120) is now zeroed by the discard,
+        // so only [0, 1024) may be compared against the original.
         REQUIRE(co_await bdev_io([&] {
-                    return ::pread(fd, buf.data(), buf.size(), 0);
-                }) == 4096);
-        REQUIRE(buf == std::vector<uint8_t>(data.begin(),
-                                            data.begin() + 4096));
+                    return ::pread(fd, buf.data(), 1024, 0);
+                }) == 1024);
+        REQUIRE(std::vector<uint8_t>(buf.begin(), buf.begin() + 1024) ==
+                std::vector<uint8_t>(data.begin(), data.begin() + 1024));
         ::close(fd);
         dev->stop();
         dev.reset();
