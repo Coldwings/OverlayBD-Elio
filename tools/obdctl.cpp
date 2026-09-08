@@ -24,8 +24,9 @@ void usage(const char* argv0) {
                  "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N]\n"
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
-                 "  %s [--socket PATH] status <id>\n",
-                 argv0, argv0, argv0, argv0, argv0);
+                 "  %s [--socket PATH] status <id>\n"
+                 "  %s [--socket PATH] commit <id> [--tag TAG]\n",
+                 argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 bool send_all(int fd, const std::string& data) {
@@ -81,6 +82,20 @@ int main(int argc, char** argv) {
             return 2;
         }
         req["id"] = argv[i++];
+    } else if (cmd == "commit") {
+        if (i >= argc) {
+            usage(argv[0]);
+            return 2;
+        }
+        req["id"] = argv[i++];
+        while (i < argc) {
+            const std::string a = argv[i++];
+            if (a == "--tag" && i < argc) req["user_tag"] = argv[i++];
+            else {
+                usage(argv[0]);
+                return 2;
+            }
+        }
     } else if (cmd == "list" || cmd == "hello") {
         // no fields
     } else {

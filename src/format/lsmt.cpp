@@ -57,7 +57,12 @@ elio::coro::task<std::unique_ptr<LsmtLayer>> LsmtLayer::open(
     }
     const uint64_t index_bytes =
         tht.index_size * bytes::segment_mapping::kEncodedSize;
-    if (index_bytes > trailer_offset - tht.index_offset) {
+    // index_offset bounds BEFORE the subtraction: an out-of-range
+    // index_offset would underflow it (and with index_size == 0 silently
+    // load an empty index).
+    if (tht.index_offset < lsmt::kSpace ||
+        tht.index_offset > trailer_offset ||
+        index_bytes > trailer_offset - tht.index_offset) {
         throw format_error("lsmt: invalid index bytes or size");
     }
 

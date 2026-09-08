@@ -3,6 +3,7 @@
 // status as JSON-lines on the inherited control fd (protocol.hpp).
 #include "image/config.hpp"
 #include "image/image_file.hpp"
+#include "format/merged_writable.hpp"
 #include "supervisor/protocol.hpp"
 
 #if defined(OBD_HAVE_UBLK) && OBD_HAVE_UBLK
@@ -73,6 +74,15 @@ elio::coro::task<int> device_main(Args args) {
         if (args.dev_id >= 0) {
             params.dev_id = static_cast<uint32_t>(args.dev_id);
         }
+        // ADR-0014: keep a handle on the writable top so the graceful-
+        // shutdown path can checkpoint it (persist its index) after the
+        // queues drain, enabling the supervisor's offline commit.
+        obd::format::WritableLayer* writable_top = nullptr;
+        if (opened.writable) {
+            auto* mw = dynamic_cast<obd::format::MergedWritable*>(
+                opened.root.get());
+            if (mw != nullptr) writable_top = &mw->writable_top();
+        }
         std::unique_ptr<obd::ublk::Device> dev;
         if (args.recover) {
             // ADR-0010: replace a crashed server for an existing device.
@@ -102,6 +112,17 @@ elio::coro::task<int> device_main(Args args) {
         }
         ELIO_LOG_INFO("device {} shutting down", dev->bdev_path());
         dev->stop();
+        // ADR-0014: with the queues drained, persist the writable top's
+        // index so the supervisor can seal the upper offline (commit). A
+        // checkpoint failure is logged, not fatal: shutdown continues and
+        // a later commit will report the missing checkpoint.
+        if (writable_top != nullptr) {
+            const int crc = co_await writable_top->checkpoint();
+            if (crc != 0) {
+                ELIO_LOG_ERROR("writable upper checkpoint failed: {}",
+                               std::strerror(-crc));
+            }
+        }
         dev.reset();
         report(args, DeviceStatus{"stopped", "", ""});
         co_return 0;

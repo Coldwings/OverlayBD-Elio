@@ -3,7 +3,7 @@
 //
 // Two channels, both JSON-lines (one message per line, UTF-8, <= 64KiB):
 //
-//   obdctl ──UDS──▶ supervisor:    {"cmd":"hello"|"create"|"destroy"|"list"|"status", ...}
+//   obdctl ──UDS──▶ supervisor:    {"cmd":"hello"|"create"|"destroy"|"list"|"status"|"commit", ...}
 //   supervisor ──▶ obdctl:         {"ok":true,...} | {"ok":false,"error":"..."}
 //
 //   obd-device ──socketpair──▶ supervisor: {"state":"starting"|"ready"|"failed"|"stopped", ...}
@@ -35,7 +35,9 @@ inline constexpr size_t kMaxMessageBytes = 64 * 1024;
 /// Control-protocol revision. Starts at 1 and increments only for additive
 /// batches (see the additive-only rule above); clients gate on it together
 /// with the `features` list from the `hello` reply.
-inline constexpr int kProtocolVersion = 1;
+///   1 — hello/create/destroy/list/status.
+///   2 — adds commit (ADR-0014 offline seal; feature "commit").
+inline constexpr int kProtocolVersion = 2;
 
 /// Project version string, wired from CMake `project(... VERSION ...)` so
 /// it cannot drift; "dev" is the fallback for non-CMake builds.
@@ -58,6 +60,11 @@ struct CreateCommand {
 struct IdCommand {  // destroy / status
     std::string cmd;
     std::string id;
+};
+
+struct CommitCommand {  // commit (ADR-0014: offline seal of the upper)
+    std::string id;
+    std::string user_tag;  // optional; recorded in the sealed header
 };
 
 /// Parses one command line. Returns nullopt when the message is not a

@@ -1,6 +1,7 @@
 // Unit tests: writable layers (ADR-0008) — sparse and LSMT-RW
 // implementations, in-place edit semantics, seal compaction, and the
 // merged writable view.
+#include "common/sha256.hpp"
 #include "format/lsmt.hpp"
 #include "format/lsmt_rw.hpp"
 #include "format/merged_writable.hpp"
@@ -16,6 +17,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 using namespace obd;
 using obd::test::TempDir;
@@ -43,6 +45,34 @@ void make_lsmt_lower(const std::string& dir_path, const std::string& name,
     *out = dir_path + "/" + name + ".lsmt";
     format::write_lsmt_single_layer(fd, raw.size(), *out, {});
     ::close(fd);
+}
+
+/// Synchronous whole-file sha256 (test-side digest oracle for the
+/// determinism assertions).
+std::string file_sha256(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    common::Sha256 h;
+    std::vector<uint8_t> buf(1 << 16);
+    for (;;) {
+        const ssize_t r = ::read(fd, buf.data(), buf.size());
+        REQUIRE(r >= 0);
+        if (r == 0) break;
+        h.update(buf.data(), static_cast<size_t>(r));
+    }
+    ::close(fd);
+    return h.final_hex();
+}
+
+/// The uuid recorded in a sealed LSMT file's header.
+std::string sealed_header_uuid(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    uint8_t region[4096];
+    REQUIRE(::read(fd, region, sizeof(region)) ==
+            static_cast<ssize_t>(sizeof(region)));
+    ::close(fd);
+    return format::lsmt::HeaderTrailer::parse(region).uuid;
 }
 
 }  // namespace
@@ -199,6 +229,316 @@ TEST_CASE("format: lsmt rw seal compacts into a standard sealed layer",
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: lsmt rw seal is deterministic for identical content",
+          "[format]") {
+    // ADR-0014 seal determinism: identical upper content must seal to
+    // identical bytes (the sealed uuid is content-derived, no clock or
+    // randomness). Also catches accidental time/random header fields.
+    TempDir dir;
+    const std::string p1 = dir / "u1.rw";
+    const std::string p2 = dir / "u2.rw";
+    const std::string p3 = dir / "u3.rw";
+    const auto a = sectors_pattern(0, 16, 700);
+    const auto b = sectors_pattern(4, 4, 800);
+    const auto d = sectors_pattern(32, 8, 900);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        for (const std::string* p : {&p1, &p2}) {
+            auto layer = co_await format::LsmtRwLayer::create(*p, 512 * 64);
+            ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
+            REQUIRE(r > 0);
+            r = co_await layer->pwrite(b.data(), b.size(), 4 * 512);
+            REQUIRE(r > 0);
+            r = co_await layer->pwrite(d.data(), d.size(), 32 * 512);
+            REQUIRE(r > 0);
+            const int src = co_await layer->seal("det-seal");
+            REQUIRE(src == 0);
+        }
+        // A different write sequence (b missing) must yield a different
+        // digest — the determinism is over content, not constant output.
+        auto layer = co_await format::LsmtRwLayer::create(p3, 512 * 64);
+        ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
+        REQUIRE(r > 0);
+        r = co_await layer->pwrite(d.data(), d.size(), 32 * 512);
+        REQUIRE(r > 0);
+        const int src3 = co_await layer->seal("det-seal");
+        REQUIRE(src3 == 0);
+        // p4: same data writes as p1 plus a discard of an UNCOVERED range
+        // (inserts zeroed segments — a no-op for reads, but changes the
+        // packed index). A different digest pins that the packed index
+        // (not only the data) feeds the content digest.
+        const std::string p4 = dir / "u4.rw";
+        auto l4 = co_await format::LsmtRwLayer::create(p4, 512 * 64);
+        r = co_await l4->pwrite(a.data(), a.size(), 0);
+        REQUIRE(r > 0);
+        r = co_await l4->pwrite(b.data(), b.size(), 4 * 512);
+        REQUIRE(r > 0);
+        r = co_await l4->pwrite(d.data(), d.size(), 32 * 512);
+        REQUIRE(r > 0);
+        int drc = co_await l4->discard(48 * 512, 8 * 512);
+        REQUIRE(drc == 0);
+        const int src4 = co_await l4->seal("det-seal");
+        REQUIRE(src4 == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // Double-seal determinism: byte-identical sealed files.
+    REQUIRE(file_sha256(p1) == file_sha256(p2));
+    REQUIRE(file_sha256(p1) != file_sha256(p3));
+    // Same data, different packed index (zeroed segments): different
+    // digest — the index is hashed, not only the data.
+    REQUIRE(file_sha256(p1) != file_sha256(dir / "u4.rw"));
+    // The sealed uuid is content-derived: equal for equal content, and
+    // distinct from the random create-time uuid (36-char uuid shape).
+    const std::string u1 = sealed_header_uuid(p1);
+    REQUIRE(u1.size() == 36);
+    REQUIRE(u1 == sealed_header_uuid(p2));
+    REQUIRE(u1 != sealed_header_uuid(p3));
+}
+
+TEST_CASE("format: lsmt rw checkpoint persists the index for offline seal",
+          "[format]") {
+    // ADR-0014 offline commit: the device checkpoints its in-memory index
+    // on graceful shutdown; seal_file() then seals the upper from another
+    // process (here: a fresh open) without any device alive.
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto a = sectors_pattern(0, 16, 700);
+    const auto b = sectors_pattern(4, 4, 800);
+    const auto d = sectors_pattern(32, 8, 900);
+    std::string sha;
+    uint64_t size = 0;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer =
+                co_await format::LsmtRwLayer::create(path, 512 * 64);
+            ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
+            REQUIRE(r > 0);
+            r = co_await layer->pwrite(b.data(), b.size(), 4 * 512);
+            REQUIRE(r > 0);
+            r = co_await layer->pwrite(d.data(), d.size(), 32 * 512);
+            REQUIRE(r > 0);
+            int crc = co_await layer->checkpoint();
+            REQUIRE(crc == 0);
+            // Terminal: no writes after a checkpoint.
+            r = co_await layer->pwrite(a.data(), 512, 0);
+            REQUIRE(r == -EROFS);
+            crc = co_await layer->discard(0, 512);
+            REQUIRE(crc == -EROFS);
+        }  // destruction ~ the device process exiting after checkpoint
+
+        // Offline seal: a fresh open over the checkpointed file.
+        int src = co_await format::LsmtRwLayer::seal_file(path, "offline",
+                                                          &sha, &size);
+        REQUIRE(src == 0);
+        REQUIRE(sha.size() == 64);
+        REQUIRE(size == file_bytes(path));
+        REQUIRE(sha == file_sha256(path));
+
+        // The sealed output re-opens as a valid standard RO layer with
+        // the patched content (data region starts at sector 8).
+        auto ro = co_await source::LocalFileSource::open(path);
+        source::BlobSourcePtr base = std::move(ro);
+        auto ro_layer = co_await format::LsmtLayer::open(std::move(base));
+        REQUIRE(ro_layer->virtual_size() == 512 * 64);
+        REQUIRE(ro_layer->segments().size() == 2);
+        std::vector<uint8_t> buf(16 * 512);
+        ssize_t r = co_await ro_layer->data_source().pread(
+            buf.data(), buf.size(), 8 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), a.data(), 4 * 512) == 0);
+        REQUIRE(std::memcmp(buf.data() + 4 * 512, b.data(), 4 * 512) == 0);
+
+        // Precise error channels.
+        src = co_await format::LsmtRwLayer::seal_file(path, "", &sha, &size);
+        REQUIRE(src == -EALREADY);
+        src = co_await format::LsmtRwLayer::seal_file(dir / "nope.rw", "",
+                                                      &sha, &size);
+        REQUIRE(src == -ENOENT);
+        // A crashed device (no checkpoint) leaves an unsealable file.
+        const std::string raw = dir / "crashed.rw";
+        auto l2 = co_await format::LsmtRwLayer::create(raw, 512 * 64);
+        r = co_await l2->pwrite(a.data(), a.size(), 0);
+        REQUIRE(r > 0);
+        l2.reset();
+        src = co_await format::LsmtRwLayer::seal_file(raw, "", &sha, &size);
+        REQUIRE(src == -EINVAL);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // Tampered checkpoint: a checkpointed index entry whose moffset lies
+    // outside the data region must fail validation (-EINVAL), not seal.
+    const std::string tampered = dir / "tampered.rw";
+    int crc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(tampered,
+                                                          512 * 64);
+        ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
+        REQUIRE(r > 0);
+        crc = co_await layer->checkpoint();
+        REQUIRE(crc == 0);
+        co_return 0;
+    });
+    REQUIRE(crc == 0);
+    // Locate the checkpointed index from the trailer and overwrite the
+    // first entry with an out-of-range moffset.
+    {
+        struct stat st {};
+        REQUIRE(::stat(tampered.c_str(), &st) == 0);
+        const uint64_t trailer_off =
+            static_cast<uint64_t>(st.st_size) - format::lsmt::kSpace;
+        std::vector<uint8_t> region(format::lsmt::kSpace);
+        int fd = ::open(tampered.c_str(), O_RDWR);
+        REQUIRE(fd >= 0);
+        REQUIRE(::pread(fd, region.data(), region.size(),
+                        static_cast<off_t>(trailer_off)) ==
+                static_cast<ssize_t>(region.size()));
+        const auto tht = format::lsmt::HeaderTrailer::parse(region.data());
+        REQUIRE(tht.index_size >= 1);
+        bytes::segment_mapping bogus;
+        bogus.offset = 0;
+        bogus.length = 1;
+        bogus.moffset = 0xFFFFFFF;  // beyond index_offset / kSector
+        bogus.zeroed = 0;
+        uint8_t entry[bytes::segment_mapping::kEncodedSize];
+        bytes::store_segment_le(entry, bogus);
+        REQUIRE(::pwrite(fd, entry, sizeof(entry),
+                         static_cast<off_t>(tht.index_offset)) ==
+                static_cast<ssize_t>(sizeof(entry)));
+        ::close(fd);
+    }
+    crc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::string s;
+        uint64_t n = 0;
+        const int src = co_await format::LsmtRwLayer::seal_file(
+            tampered, "", &s, &n);
+        REQUIRE(src == -EINVAL);
+        co_return 0;
+    });
+    REQUIRE(crc == 0);
+}
+
+TEST_CASE("format: lsmt rw offline seal rejects a torn checkpoint trailer",
+          "[format]") {
+    // A trailer torn mid-write can parse as a VALID BUT EMPTY checkpoint
+    // (magic/flags/virtual_size written, uuid and index fields still
+    // zero). Without the header cross-check the offline seal would
+    // silently seal an empty layer; with it, uuid agreement between the
+    // header (offset 0) and the trailer is required → -EINVAL, and the
+    // file is left untouched (still unsealed, repair possible).
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto a = sectors_pattern(0, 16, 700);
+
+    int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
+        REQUIRE(r > 0);
+        int crc = co_await layer->checkpoint();
+        REQUIRE(crc == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // Simulate the tear: keep magic/size/flags/virtual_size, zero
+    // index_offset..(virtual_size) and everything from uuid on.
+    {
+        struct stat st {};
+        REQUIRE(::stat(path.c_str(), &st) == 0);
+        const uint64_t trailer_off =
+            static_cast<uint64_t>(st.st_size) - format::lsmt::kSpace;
+        std::vector<uint8_t> zeros(4096, 0);
+        int fd = ::open(path.c_str(), O_RDWR);
+        REQUIRE(fd >= 0);
+        // bytes [32,48): index_offset + index_size
+        REQUIRE(::pwrite(fd, zeros.data(), 16,
+                         static_cast<off_t>(trailer_off + 32)) == 16);
+        // bytes [56,4096): uuid, parent_uuid, version, user_tag, padding
+        REQUIRE(::pwrite(fd, zeros.data(), 4096 - 56,
+                         static_cast<off_t>(trailer_off + 56)) ==
+                4096 - 56);
+        ::close(fd);
+    }
+
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::string sha;
+        uint64_t size = 0;
+        const int src =
+            co_await format::LsmtRwLayer::seal_file(path, "", &sha, &size);
+        REQUIRE(src == -EINVAL);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // The file was NOT sealed: its header is still the unsealed RW one.
+    {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        std::vector<uint8_t> region(format::lsmt::kSpace);
+        REQUIRE(::pread(fd, region.data(), region.size(), 0) ==
+                static_cast<ssize_t>(region.size()));
+        ::close(fd);
+        const auto hht = format::lsmt::HeaderTrailer::parse(region.data());
+        REQUIRE(hht.is_header());
+        REQUIRE(!hht.is_sealed());
+    }
+
+    // Same malformed-checkpoint family, one field over: an index_offset
+    // beyond the trailer with index_size == 0 must NOT underflow the
+    // bounds check into sealing an empty layer. Here uuid and
+    // virtual_size are intact, so the header cross-check alone would
+    // pass — the index_offset bounds guard is what rejects it.
+    const std::string path2 = dir / "upper2.rw";
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path2, 512 * 64);
+        ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
+        REQUIRE(r > 0);
+        int crc = co_await layer->checkpoint();
+        REQUIRE(crc == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    {
+        struct stat st {};
+        REQUIRE(::stat(path2.c_str(), &st) == 0);
+        const uint64_t trailer_off =
+            static_cast<uint64_t>(st.st_size) - format::lsmt::kSpace;
+        int fd = ::open(path2.c_str(), O_RDWR);
+        REQUIRE(fd >= 0);
+        uint8_t le[8];
+        bytes::store_u64_le(le, static_cast<uint64_t>(st.st_size) +
+                                    format::lsmt::kSpace);  // beyond EOF
+        REQUIRE(::pwrite(fd, le, 8, static_cast<off_t>(trailer_off + 32)) ==
+                8);
+        bytes::store_u64_le(le, 0);  // index_size == 0
+        REQUIRE(::pwrite(fd, le, 8, static_cast<off_t>(trailer_off + 40)) ==
+                8);
+        ::close(fd);
+    }
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::string sha;
+        uint64_t size = 0;
+        const int src =
+            co_await format::LsmtRwLayer::seal_file(path2, "", &sha, &size);
+        REQUIRE(src == -EINVAL);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    {
+        int fd = ::open(path2.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        std::vector<uint8_t> region(format::lsmt::kSpace);
+        REQUIRE(::pread(fd, region.data(), region.size(), 0) ==
+                static_cast<ssize_t>(region.size()));
+        ::close(fd);
+        const auto hht = format::lsmt::HeaderTrailer::parse(region.data());
+        REQUIRE(hht.is_header());
+        REQUIRE(!hht.is_sealed());
+    }
 }
 
 TEST_CASE("format: merged writable falls through and copy-on-writes",

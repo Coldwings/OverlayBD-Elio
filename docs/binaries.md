@@ -77,6 +77,7 @@ obdctl [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N]
 obdctl [--socket PATH] destroy <id>
 obdctl [--socket PATH] list
 obdctl [--socket PATH] status <id>
+obdctl [--socket PATH] commit <id> [--tag TAG]
 ```
 
 `--socket` defaults to `/run/overlaybd-elio/supervisor.sock` and, when
@@ -95,6 +96,13 @@ present, must precede the command word. Commands:
   supervisor's stop timeout) and remove the device.
 - `list` — list known devices and their states.
 - `status <id>` — query one device.
+- `commit <id> [--tag TAG]` — offline commit (ADR-0014): stop
+  the device when live, then seal its LSMT-RW upper in place and reply
+  with the sealed file's `path`, hex `sha256`, and byte `size`. `--tag`
+  is recorded as the sealed layer's `user_tag`. Sparse and upper-less
+  devices are errors; the full contract is in
+  [supervisor.md](./supervisor.md) and the runbook in
+  [operations.md](./operations.md).
 
 The supervisor's JSON reply is pretty-printed to stdout.
 
@@ -158,7 +166,12 @@ running on arbitrary threads.
 
 - obd-device: after reporting `ready`, it waits on the signal fd; the first
   SIGTERM or SIGINT breaks the loop, stops and destroys the ublk device,
-  reports `stopped`, and returns exit code 0.
+  reports `stopped`, and returns exit code 0. When the image has a writable
+  upper, the shutdown **checkpoints** the upper's in-memory segment index
+  into its file after the queues drain (ADR-0014) — this is what the
+  supervisor's offline `commit` seal consumes; a checkpoint failure is
+  logged and shutdown continues (commit will then report the missing
+  checkpoint).
 - obd-supervisor: SIGTERM/SIGINT triggers a graceful shutdown — children
   are terminated first (SIGTERM with the stop-timeout grace, then SIGKILL)
   before the daemon exits.
@@ -203,6 +216,8 @@ guarantee. `destroy` sends SIGTERM and escalates to SIGKILL after
 - `supervisor: daemon answers hello and never drops bad input` — the
   `obdctl hello` path end to end: a real daemon answers the handshake with
   `protocol`/`version`/`features` and never drops malformed input.
+- `supervisor: commit stops the device and seals its upper offline` — the
+  `obdctl commit` path end to end against a real daemon (ADR-0014).
 - `supervisor: child spawn execs and reports through the channel` — guards
   the fork/exec path the supervisor uses to start obd-device and the
   JSON-lines status channel back.

@@ -218,4 +218,8 @@ elio::coro::task<int> SparseRwLayer::flush() {
     co_return 0;
 }
 
+elio::coro::task<int> SparseRwLayer::checkpoint() {
+    co_return 0;  // extents are durable via the fiemap already
+}
+
 }  // namespace obd::format

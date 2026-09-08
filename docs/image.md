@@ -446,9 +446,9 @@ single Range-capable blob. No external golden files.
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically** — the
   ADR-0008 mode persists writes in the upper file across reopen, but
-  committing/sealing an upper into a new lower is a manual, offline
-  operation; TurboOCI and registry write-back remain out of scope
-  (ADR-0007).
+  committing/sealing an upper into a new lower is an explicit, offline
+  operation (the supervisor's `commit` command, ADR-0014); TurboOCI and
+  registry write-back remain out of scope (ADR-0007).
 - **Sparse uppers depend on filesystem fiemap support** for extent recovery
   after reopen (see `docs/format.md`); exotic filesystems without
   `SEEK_HOLE`/fiemap semantics are unsupported for `upper.type = "sparse"`.

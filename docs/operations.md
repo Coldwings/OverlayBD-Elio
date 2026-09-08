@@ -123,13 +123,57 @@ A per-image config may add a writable upper:
   layer into a standard sealed LSMT that ordinary OverlayBD tooling can
   consume; before sealing, the file is an intermediate format that only
   this stack reopens. A device destroyed without sealing keeps its data for
-  reopen by this stack, but do not ship the file elsewhere.
+  reopen by this stack, but do not ship the file elsewhere. On a **graceful
+  shutdown** (SIGTERM, e.g. via `destroy` or `commit`) obd-device
+  checkpoints the upper's in-memory index into the file; that checkpoint is
+  what the offline `commit` seal consumes. A crashed or SIGKILLed device
+  leaves no checkpoint and its unsealed upper is unsealable.
 - `type: "sparse"` → a sparse file (`<dir>/overlaybd.sparse`); after an
   unclean shutdown the written extents are recovered via fiemap scanning.
+  Sparse uppers never seal (ADR-0014 upstream parity).
 
 With an upper present the device is created read-write; without one it is
 read-only and write attempts fail with `EROFS`. See ADR-0008 for the
 decision and its durability contract.
+
+## Committing a writable device (ADR-0014)
+
+`commit` seals a device's LSMT-RW upper offline into a standard sealed
+LSMT layer and reports its content digest:
+
+```bash
+obdctl commit myimg --tag "build-2026-09-08"
+# → {"ok":true,"id":"myimg","path":".../overlaybd.rw",
+#    "sha256":"<hex>","size":<bytes>}
+```
+
+Contract and runbook notes:
+
+- **The device is stopped, then sealed.** A live device is SIGTERMed and
+  reaped (bounded; SIGKILL on timeout) before any byte is sealed — there
+  is no live seal. The device entry remains afterwards (`obdctl status`
+  still works, state `exited`); `destroy` removes it as usual.
+- **Graceful shutdown is required.** The seal consumes the index
+  checkpoint obd-device writes on graceful shutdown. If the device crashed
+  or was SIGKILLed, commit fails with "no valid shutdown checkpoint" and the
+  unsealed upper's writes are lost (the ADR-0008 durability rule).
+- **Deterministic output.** The sealed file is a pure function of the
+  upper's content plus the `--tag` string: identical content and tag seal
+  to identical bytes, so the reply's `sha256` is suitable for
+  content-addressed layer reuse. See docs/format.md for the invariant.
+- **Sparse uppers never seal** (upstream parity): commit fails with
+  "sparse uppers cannot be sealed". Upper-less (read-only) devices fail
+  with "no writable upper".
+- A second commit of the same upper fails with "already sealed" — commit
+  seals in place (atomic rename over `overlaybd.rw`); copy the file
+  beforehand if you need the unsealed form. A commit issued while another
+  commit of the same device is still running fails with "commit already
+  in progress" — retry after it returns.
+- **The upper is the one recorded at create time.** Commit seals the
+  upper path/kind the supervisor recorded when the device was created;
+  editing the image config afterwards does not redirect it.
+- The sealed file is a standard LSMT layer: reference it as a `lowers[]`
+  entry (with its sha256 as the digest) in subsequent image configs.
 
 ## Logging
 
@@ -147,7 +191,9 @@ correlate by device id and by the supervisor's spawn logs.
 | `create` fails with "virtual size not sector aligned" | The merged image size is zero or not a multiple of 512 bytes; the image is malformed for block serving. |
 | No `/dev/ublkb<N>` after a successful `create` | `ublk_drv` not loaded or missing udev; check `/dev/ublk-control` and `lsmod`. |
 | Slow first reads, DART warnings in the log | DART proxy configured but unreachable. This is handled: the source logs a warning and falls back to direct registry reads (guarded by `integration: enabled-but-unreachable DART falls back to direct reads`). Fix the `p2pConfig` address or disable P2P. |
-| A device child crashed | Siblings and the supervisor are unaffected (ADR-0004), and the device itself survives: the supervisor respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection (`destroy` + `create`). Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008). |
+| A device child crashed | Siblings and the supervisor are unaffected (ADR-0004), and the device itself survives: the supervisor respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection (`destroy` + `create`). Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008), and commit of such an upper fails with "no valid shutdown checkpoint". |
+| `commit` fails with "no valid shutdown checkpoint" | The device crashed or was SIGKILLed instead of shutting down gracefully, so its LSMT-RW index never reached the disk. The unsealed upper is unsealable (ADR-0014); start over from the lowers. |
+| `commit` fails with "sparse uppers cannot be sealed" | Sparse uppers never seal (upstream parity, ADR-0014). Use `type: "lsmt"` uppers for content you intend to commit. |
 | `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard is supported only on writable devices (ADR-0009). |
 
 ## Known operational limitations
@@ -160,9 +206,9 @@ correlate by device id and by the supervisor's spawn logs.
   back as zeroes even if lower layers have data there (ADR-0009); this is
   the upstream LSMT trim semantics, intentional.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
-  or mutate registry content (ADR-0007). Writable uppers are local-only.
-  (Proposed ADR-0014 adds an offline commit command, deterministic seal,
-  grow-only resize, and the external-CLI boundary for standalone use.)
+  or mutate registry content (ADR-0007). Writable uppers are local-only;
+  `commit` (ADR-0014) seals an upper into a local layer file —
+  publishing it as an OCI artifact is the external CLI's job.
 - **Credentials**: only `credentialConfig` `mode=file` is honored; other
   modes are ignored with a warning (see [config.md](./config.md)).
 - **One supervisor per node** is the expected topology; multiple

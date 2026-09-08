@@ -1,6 +1,6 @@
 # ADR-0014: Commit offline with deterministic seal, grow-only resize, and an external CLI boundary
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-09-08
 - Supersedes: none
 - Binds: docs/supervisor.md, docs/operations.md, docs/binaries.md,

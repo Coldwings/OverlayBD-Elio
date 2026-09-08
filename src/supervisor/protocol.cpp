@@ -17,14 +17,45 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
         return std::nullopt;
     }
     const std::string cmd = j["cmd"].get<std::string>();
+    // Field types are validated here — not in the handlers — so a
+    // malformed field is answered with a clean protocol error instead of
+    // a json::type_error escaping the handler.
     if (cmd == "create") {
         if (!j.contains("id") || !j.contains("config")) {
             error = "create requires 'id' and 'config'";
             return std::nullopt;
         }
+        if (!j["id"].is_string() || !j["config"].is_string()) {
+            error = "create 'id' and 'config' must be strings";
+            return std::nullopt;
+        }
+        if ((j.contains("global") && !j["global"].is_string()) ||
+            (j.contains("device_bin") && !j["device_bin"].is_string()) ||
+            (j.contains("dev_id") && !j["dev_id"].is_number_integer())) {
+            error = "create 'global'/'device_bin' must be strings, "
+                    "'dev_id' an integer";
+            return std::nullopt;
+        }
     } else if (cmd == "destroy" || cmd == "status") {
         if (!j.contains("id")) {
             error = cmd + " requires 'id'";
+            return std::nullopt;
+        }
+        if (!j["id"].is_string()) {
+            error = cmd + " 'id' must be a string";
+            return std::nullopt;
+        }
+    } else if (cmd == "commit") {
+        if (!j.contains("id")) {
+            error = "commit requires 'id'";
+            return std::nullopt;
+        }
+        if (!j["id"].is_string()) {
+            error = "commit 'id' must be a string";
+            return std::nullopt;
+        }
+        if (j.contains("user_tag") && !j["user_tag"].is_string()) {
+            error = "commit 'user_tag' must be a string";
             return std::nullopt;
         }
     } else if (cmd != "list" && cmd != "hello") {
@@ -51,7 +82,9 @@ std::string reply_hello() {
     nlohmann::json fields;
     fields["protocol"] = kProtocolVersion;
     fields["version"] = kProjectVersion;
-    fields["features"] = nlohmann::json::array();  // extension point
+    // Capability gate (additive-only rule): "commit" = the ADR-0014
+    // offline commit command is served.
+    fields["features"] = nlohmann::json::array({"commit"});
     return reply_ok(fields);
 }
 
