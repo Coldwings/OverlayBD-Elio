@@ -96,9 +96,20 @@ jobs:
       # AND localize. Stage logs ([e2e-stage]) stream live in the log.
       - name: "E2E - block device reads"
         timeout-minutes: 5
-        run: >
-          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
-          "integration: ublk device serves sector reads from a blob" -s
+        run: |
+          sudo -E ./build/tests/obd_integration_tests             "integration: ublk device serves sector reads from a blob" -s &
+          TESTPID=$!
+          sleep 45
+          if kill -0 $TESTPID 2>/dev/null; then
+            echo "=== test still running after 45s; kernel stacks:"
+            for t in /proc/$TESTPID/task/*; do
+              echo "--- tid ${t##*/} ($(cat $t/comm))"
+              sudo cat $t/stack 2>/dev/null || true
+            done
+            sudo kill -9 $TESTPID
+            exit 1
+          fi
+          wait $TESTPID
 
       - name: "E2E - writes and discard"
         timeout-minutes: 5
