@@ -98,7 +98,9 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
         stage("reads: create");
         auto dev = co_await ublk::Device::create(params, std::move(src));
         stage("reads: created, open bdev");
-        const int fd = ::open(dev->bdev_path().c_str(), O_RDONLY);
+        const int fd = co_await bdev_io([&] {
+            return ::open(dev->bdev_path().c_str(), O_RDONLY);
+        });
         REQUIRE(fd >= 0);
         std::vector<uint8_t> buf(4096);
         stage("reads: pread");
@@ -132,14 +134,19 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
         auto dev = co_await ublk::Device::create(
             params, source::BlobSourcePtr(std::move(src)));
         stage("writes: created");
-        const int fd = ::open(dev->bdev_path().c_str(), O_RDWR);
+        const int fd = co_await bdev_io([&] {
+            return ::open(dev->bdev_path().c_str(), O_RDWR);
+        });
         REQUIRE(fd >= 0);
+        stage("writes: opened");
 
         // Write through the block device, read back through it.
         const auto patch = test::pattern_bytes(4096, 83);
+        stage("writes: pwrite");
         REQUIRE(co_await bdev_io([&] {
                     return ::pwrite(fd, patch.data(), patch.size(), 1024);
                 }) == 4096);
+        stage("writes: pwrite done");
         std::vector<uint8_t> buf(4096);
         REQUIRE(co_await bdev_io([&] {
                     return ::pread(fd, buf.data(), buf.size(), 1024);
@@ -148,6 +155,7 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
 
         // BLKDISCARD the range: the bridge maps it to root->discard, and
         // the range reads back as zeroes (ADR-0009).
+        stage("writes: blkdiscard");
         uint64_t range[2] = {1024, 4096};
         REQUIRE(co_await bdev_io([&] {
                     return ::ioctl(fd, BLKDISCARD, &range);
@@ -248,7 +256,9 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
         params.dev_sectors = data.size() / 512;
         auto dev = co_await ublk::Device::attach(
             static_cast<uint32_t>(dev_id), params, std::move(src));
-        const int fd2 = ::open(dev->bdev_path().c_str(), O_RDONLY);
+        const int fd2 = co_await bdev_io([&] {
+            return ::open(dev->bdev_path().c_str(), O_RDONLY);
+        });
         REQUIRE(fd2 >= 0);
         std::vector<uint8_t> buf2(4096);
         REQUIRE(co_await bdev_io([&] {
