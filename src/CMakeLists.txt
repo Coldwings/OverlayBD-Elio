@@ -31,6 +31,12 @@ add_library(obd_core STATIC
 target_include_directories(obd_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Project version for the supervisor `hello` handshake
+# (src/supervisor/protocol.hpp::kProjectVersion); PUBLIC so tools and tests
+# share the same string.
+target_compile_definitions(obd_core PUBLIC
+    OBD_VERSION_STRING="${PROJECT_VERSION}")
+
 target_link_libraries(obd_core PUBLIC
     elio_http
     nlohmann_json::nlohmann_json

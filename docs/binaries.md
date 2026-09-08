@@ -72,6 +72,7 @@ backend; the source does not compile otherwise).
 ### obdctl
 
 ```
+obdctl [--socket PATH] hello
 obdctl [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N]
 obdctl [--socket PATH] destroy <id>
 obdctl [--socket PATH] list
@@ -81,6 +82,10 @@ obdctl [--socket PATH] status <id>
 `--socket` defaults to `/run/overlaybd-elio/supervisor.sock` and, when
 present, must precede the command word. Commands:
 
+- `hello` — the protocol handshake: the reply carries the control-protocol
+  revision (`protocol`), the supervisor's version string (`version`), and
+  the capability list (`features`); see [supervisor.md](./supervisor.md)
+  for the additive-only evolution rule.
 - `create <id> <config.json>` — ask the supervisor to spawn an obd-device
   child serving that image config. Optional `--global PATH` overrides the
   supervisor's default global config for this device; optional `--dev-id N`
@@ -195,6 +200,9 @@ guarantee. `destroy` sends SIGTERM and escalates to SIGKILL after
   obdctl↔supervisor command grammar: valid `create`/`destroy`/`list`/
   `status` lines parse; malformed JSON, unknown commands and bad fields are
   rejected with an error.
+- `supervisor: daemon answers hello and never drops bad input` — the
+  `obdctl hello` path end to end: a real daemon answers the handshake with
+  `protocol`/`version`/`features` and never drops malformed input.
 - `supervisor: child spawn execs and reports through the channel` — guards
   the fork/exec path the supervisor uses to start obd-device and the
   JSON-lines status channel back.
