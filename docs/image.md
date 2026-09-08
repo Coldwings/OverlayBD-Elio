@@ -387,7 +387,8 @@ single Range-capable blob. No external golden files.
   `prefetch`, non-file `credentialConfig` modes, and `resultFile` handling
   are parsed-as-ignored / informational in v0.1 (see `docs/config.md` for
   the full compatibility matrix). A trace layer carried as the uppermost
-  layer is not yet recognized or replayed (proposed ADR-0013).
+  layer is not yet recognized or replayed (proposed ADR-0013; byte-exact
+  specification in [trace-format.md](./trace-format.md)).
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically** — the

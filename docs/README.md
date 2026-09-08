@@ -16,6 +16,7 @@ contract), testing status, and stability guarantees.
 | [architecture.md](./architecture.md) | system-wide — data flow, process model, thread model, module map | Living overview |
 | [common.md](./common.md) | `src/common` — errors, logging glue, digest, byte ranges | Implemented, tests passing |
 | [format.md](./format.md) | `src/format` — ZFile + LSMT readers, layer merge, fixture writers | Implemented, tests passing |
+| [trace-format.md](./trace-format.md) | upstream OverlayBD prefetch trace blob — byte-exact wire specification (ADR-0013 step 0) | Specification of upstream format; not implemented |
 | [source.md](./source.md) | `src/source` — blob sources: local, registry, switch/download, chunk cache, DART proxy | Implemented, tests passing |
 | [image.md](./image.md) | `src/image` — config.json parsing and image assembly (read-only or with a writable upper) | Implemented, tests passing |
 | [ublk.md](./ublk.md) | `src/ublk` — ublk control plane, per-queue data plane, Elio bridge | Implemented, tests passing |
@@ -76,7 +77,7 @@ module: Overview; Concepts; Public API; Invariants & Guarantees; Concurrency & C
 cmd: Overview; Usage; Behavior & guarantees; Testing; Limitations & TODO
 multi: Overview; per-module sections; Concurrency & Call Permissions; Stability Contract; Testing; Limitations & TODO
 policy: free-form policy document (no required sections)
-assignments: docs/architecture.md=multi; docs/binaries.md=cmd; docs/config.md=policy; docs/testing.md=policy; docs/operations.md=policy; docs/design-assumptions.md=policy
+assignments: docs/architecture.md=multi; docs/binaries.md=cmd; docs/config.md=policy; docs/testing.md=policy; docs/operations.md=policy; docs/design-assumptions.md=policy; docs/trace-format.md=policy
 heading-aliases: Concepts <=> Wire form; Concurrency & Call Permissions <=> Threading & Call Permissions; Stability Contract <=> Compatibility / Stability Contract
 -->
 
