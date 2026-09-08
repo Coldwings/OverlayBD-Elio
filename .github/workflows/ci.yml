@@ -92,12 +92,25 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
-      - name: Run privileged ublk E2E only
-        # Only the [ublk]-tagged E2E needs the kernel facility; the
-        # unprivileged suite runs in the build-test job. Bound the run:
-        # a wedged kernel handshake must fail fast, not hang the job.
-        timeout-minutes: 10
-        run: timeout -s KILL 300 sudo -E ./build/tests/obd_integration_tests "[ublk]" --durations yes
+      # One step per E2E test: a wedged kernel handshake must fail fast
+      # AND localize. Stage logs ([e2e-stage]) stream live in the log.
+      - name: E2E: block device reads
+        timeout-minutes: 5
+        run: >
+          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
+          "integration: ublk device serves sector reads from a blob" -s
+
+      - name: E2E: writes and discard
+        timeout-minutes: 5
+        run: >
+          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
+          "integration: ublk writable device serves writes and discard" -s
+
+      - name: E2E: USER_RECOVERY handshake
+        timeout-minutes: 5
+        run: >
+          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
+          "integration: ublk device survives server death via USER_RECOVERY" -s
 
   docs-governance:
     name: docs governance

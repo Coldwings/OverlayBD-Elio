@@ -91,20 +91,15 @@ void Queue::open() {
 }
 
 void Queue::init_ring() {
-    // Must run on the queue thread (the first statement of run()):
-    // IORING_SETUP_SINGLE_ISSUER binds the creating task as the only
-    // allowed submitter, and IORING_SETUP_DEFER_TASKRUN runs completion
-    // task_work of the waiting task. Creating the ring on the creator
-    // thread makes every queue-thread io_uring_enter fail with EEXIST.
-    //
-    // The flag pairing is required by UBLK_F_URING_CMD_COMP_IN_TASK
-    // (dev_info_flags): the driver completes uring-cmds as task_work of
-    // the issuing task; without DEFER_TASKRUN the completions are never
-    // reaped and block-device I/O hangs forever. Same pairing as
-    // libublksrv.
+    // Must run on the queue thread (the first statement of run()): with
+    // UBLK_F_URING_CMD_COMP_IN_TASK (dev_info_flags) the driver
+    // completes uring-cmds as task_work of the issuing task, and
+    // io_uring_enter only runs task_work of the calling task — ring
+    // creation on the wrong thread makes every queue-thread
+    // io_uring_enter fail (EEXIST with SINGLE_ISSUER) or never reap
+    // completions. Flags match libublksrv (COOP_TASKRUN).
     io_uring_params ring_params {};
-    ring_params.flags = IORING_SETUP_SINGLE_ISSUER |
-                        IORING_SETUP_DEFER_TASKRUN;
+    ring_params.flags = IORING_SETUP_COOP_TASKRUN;
     if (io_uring_queue_init_params(depth_ * 2, &ring_, &ring_params) < 0) {
         throw_errno(errno, "cannot create ublk queue io_uring");
     }

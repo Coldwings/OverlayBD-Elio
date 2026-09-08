@@ -22,6 +22,11 @@ using namespace obd;
 
 namespace {
 
+void stage(const char* msg) {
+    std::fprintf(stderr, "[e2e-stage] %s\n", msg);
+    std::fflush(stderr);
+}
+
 bool ublk_available() {
     return ::access("/dev/ublk-control", F_OK) == 0;
 }
@@ -81,11 +86,15 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
             std::make_unique<test::VectorSource>(data);
         ublk::DeviceParams params;
         params.dev_sectors = data.size() / 512;
+        stage("reads: create");
         auto dev = co_await ublk::Device::create(params, std::move(src));
+        stage("reads: created, open bdev");
         const int fd = ::open(dev->bdev_path().c_str(), O_RDONLY);
         REQUIRE(fd >= 0);
         std::vector<uint8_t> buf(4096);
+        stage("reads: pread");
         REQUIRE(::pread(fd, buf.data(), buf.size(), 1024) == 4096);
+        stage("reads: pread done");
         REQUIRE(buf == std::vector<uint8_t>(data.begin() + 1024,
                                             data.begin() + 1024 + 4096));
         ::close(fd);
@@ -108,8 +117,10 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
         ublk::DeviceParams params;
         params.dev_sectors = data.size() / 512;
         params.read_only = false;  // advertises discard (ADR-0009)
+        stage("writes: create");
         auto dev = co_await ublk::Device::create(
             params, source::BlobSourcePtr(std::move(src)));
+        stage("writes: created");
         const int fd = ::open(dev->bdev_path().c_str(), O_RDWR);
         REQUIRE(fd >= 0);
 
@@ -150,6 +161,7 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
     // ADR-0010). The block device must survive and keep serving reads.
     int pipefd[2];
     REQUIRE(::pipe(pipefd) == 0);
+    stage("recovery: fork");
     const pid_t child = ::fork();
     REQUIRE(child >= 0);
     if (child == 0) {
@@ -204,6 +216,7 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
     }
 
     // Attach a replacement server (this process) and keep reading.
+    stage("recovery: attach");
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto data = test::pattern_bytes(512 * 64, 84);
         source::BlobSourcePtr src =
