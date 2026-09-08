@@ -54,15 +54,20 @@ TEST_CASE("supervisor: hello handshake replies with protocol version and feature
                 R"({"cmd":"hello","future_field":42})", err)
                 .has_value());
 
+    // contains() before operator[]: a broken implementation must fail the
+    // test cleanly, not hit UB on a missing key.
     const auto reply =
         nlohmann::json::parse(supervisor::reply_hello());
     REQUIRE(reply.value("ok", false) == true);
+    REQUIRE(reply.contains("protocol"));
     REQUIRE(reply["protocol"].is_number_integer());
     REQUIRE(reply["protocol"].get<int>() >= 1);
     REQUIRE(reply["protocol"].get<int>() ==
             supervisor::kProtocolVersion);
+    REQUIRE(reply.contains("version"));
     REQUIRE(reply["version"].is_string());
     REQUIRE(!reply["version"].get<std::string>().empty());
+    REQUIRE(reply.contains("features"));
     REQUIRE(reply["features"].is_array());
 
     // Bad input is still answered, never dropped: unknown cmd and malformed
@@ -73,6 +78,7 @@ TEST_CASE("supervisor: hello handshake replies with protocol version and feature
     REQUIRE(err.find("malformed JSON") != std::string::npos);
     const auto err_reply = nlohmann::json::parse(supervisor::reply_error(err));
     REQUIRE(err_reply.value("ok", true) == false);
+    REQUIRE(err_reply.contains("error"));
     REQUIRE(err_reply["error"].is_string());
 }
 

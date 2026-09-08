@@ -65,6 +65,16 @@ std::string uds_rpc(const std::string& path, const std::string& line) {
     return reply;
 }
 
+/// Restores the previous signal mask on destruction, however the test
+/// exits — including a failed Catch2 assertion, which unwinds via
+/// exception. (A trailing sigprocmask restore would be skipped by an
+/// earlier failure and leave SIGTERM/SIGINT/SIGCHLD blocked for the rest
+/// of the test process.)
+struct SigMaskGuard {
+    sigset_t prev {};
+    ~SigMaskGuard() { ::sigprocmask(SIG_SETMASK, &prev, nullptr); }
+};
+
 }  // namespace
 
 TEST_CASE("supervisor: daemon answers hello and never drops bad input",
@@ -73,12 +83,14 @@ TEST_CASE("supervisor: daemon answers hello and never drops bad input",
     const std::string sock = dir / "supervisor.sock";
 
     // run_daemon requires signals blocked process-wide (signalfd model).
-    sigset_t block, prev;
+    // The guard restores the previous mask on every exit path.
+    sigset_t block;
     ::sigemptyset(&block);
     ::sigaddset(&block, SIGTERM);
     ::sigaddset(&block, SIGINT);
     ::sigaddset(&block, SIGCHLD);
-    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &prev) == 0);
+    SigMaskGuard mask_guard;
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &mask_guard.prev) == 0);
 
     // The synchronous RPC client runs on its own thread; the daemon and
     // the test driver share one Elio scheduler whose root coroutine stays
@@ -108,22 +120,27 @@ TEST_CASE("supervisor: daemon answers hello and never drops bad input",
 
         // The documented hello shape: protocol integer >= 1, non-empty
         // version string, features array; extra request fields ignored.
+        // contains() first: operator[] on a missing key is UB, and a
+        // broken implementation must fail the test, not crash it.
         const auto hello =
             rpc_json({{"cmd", "hello"}, {"future_field", 42}});
         check(hello.value("ok", false) == true, "hello not ok");
-        check(hello["protocol"].is_number_integer() &&
+        check(hello.contains("protocol") &&
+                  hello["protocol"].is_number_integer() &&
                   hello["protocol"].get<int>() >= 1,
               "hello protocol not an integer >= 1");
-        check(hello["version"].is_string() &&
+        check(hello.contains("version") && hello["version"].is_string() &&
                   !hello["version"].get<std::string>().empty(),
               "hello version not a non-empty string");
-        check(hello["features"].is_array(), "hello features not an array");
+        check(hello.contains("features") && hello["features"].is_array(),
+              "hello features not an array");
 
         // Unknown cmd is answered with an error, never dropped.
         const auto unknown = rpc_json({{"cmd", "bogus"}});
         check(unknown.value("ok", true) == false, "unknown cmd not an error");
-        check(unknown["error"].get<std::string>().find("unknown cmd") !=
-                  std::string::npos,
+        check(unknown.contains("error") &&
+                  unknown["error"].get<std::string>().find("unknown cmd") !=
+                      std::string::npos,
               "unknown cmd error text mismatch");
 
         // Malformed JSON is answered with an error too.
@@ -163,5 +180,4 @@ TEST_CASE("supervisor: daemon answers hello and never drops bad input",
     REQUIRE(rc == 0);
     REQUIRE(daemon_rc.load() >= 0);
     REQUIRE(failures.load() == 0);
-    REQUIRE(::sigprocmask(SIG_SETMASK, &prev, nullptr) == 0);
 }
