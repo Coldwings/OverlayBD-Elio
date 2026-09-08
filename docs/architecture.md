@@ -67,9 +67,11 @@ A read travels through four ownership boundaries:
    decompression), wrapped over a `TarOffsetSource` (ustar wrapper
    stripping), over the raw blob source — a `LocalFileSource` for
    already-local blobs, or a `RegistrySource` (HTTP range reads with
-   bearer auth), usually behind a `ChunkCache` and, when background
-   download is enabled, a `SwitchSource` that atomically swaps reads to
-   the downloaded local copy once it is verified and installed. When
+   bearer auth) behind a `LayerStore` (ADR-0011: sparse-file read-through
+   persistence per layer; extents already persisted are served locally,
+   and a completed layer is renamed to `overlaybd.commit` for the local
+   probe to bind on the next open) — or, for a layer without a configured
+   `dir`, behind the legacy in-memory `ChunkCache`. When
    DART is enabled and reachable, the registry client's requests go
    through the DART prefix proxy instead (ADR-0005). This assembly is
    built once at open time in `open_image` (see `src/image/image_file.cpp`).
@@ -178,9 +180,12 @@ to parsing semantics is breaking for image compatibility.
 
 Pluggable blob sources behind the single async `BlobSource` interface:
 `LocalFileSource`, `RegistrySource` (OCI registry HTTP range reads,
-bearer-token auth, redirect handling), `SwitchSource` plus `Downloader`
-(remote→local atomic switch with resume, throttle, and sha256
-verification), `ChunkCache` (in-memory read cache), `TarOffsetSource`
+bearer-token auth, redirect handling), `LayerStore` (sparse-file
+read-through layer persistence with sidecar bitmap and per-extent CRC —
+the remote-layer backing in image assembly, ADR-0011), `SwitchSource`
+plus `Downloader` and `ChunkCache` (the retired pre-ADR-0011 mechanism,
+kept as composable components until the part-3 follow-up),
+`TarOffsetSource`
 (ustar wrapper detection), the DART prefix proxy helpers (ADR-0005), and
 the `CredentialStore` (longest-prefix registry credential matching).
 `WritableBlobSource` extends the interface for writable device roots

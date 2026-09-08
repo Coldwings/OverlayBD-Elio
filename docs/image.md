@@ -61,9 +61,17 @@ For each lower, in order:
    `repoBlobUrl + "/" + digest`:
    `RegistrySource` (on the image-wide shared `RegistryClient`, with the
    DART accelerate prefix when `p2pConfig` is enabled **and** the proxy is
-   reachable) → `ChunkCache` on the read path → optionally a `SwitchSource`
-   with a background `Downloader` (a second, un-cached `RegistrySource`)
-   when `download.enable` is set.
+   reachable) → `LayerStore` (ADR-0011): one remote source per layer,
+   read through by the store, which persists every served extent into
+   `lower.dir` (created if missing) as a sparse staging file plus sidecar
+   bitmap, and renames it to `<dir>/overlaybd.commit` once the layer is
+   complete and sha256-verified. A remote layer with an **empty**
+   `lower.dir` cannot persist — it keeps the legacy in-memory
+   `ChunkCache` in front of the `RegistrySource` (with a warning;
+   restart-cold, retired with part 3). The `download` section is
+   still parsed (operator contract) but currently has no effect: locality
+   already grows read-through; background whole-blob fill returns as
+   LayerStore fill in the ADR-0011 follow-up (part 3).
 3. **TarOffsetSource** — auto-detects and removes the tar wrapper.
 4. **ZFile detection** — when `format::is_zfile()` recognizes the ZFile
    magic, the view becomes a `ZFileSource` (with caller-side digest
@@ -129,7 +137,8 @@ struct GlobalConfig {
 - `src/image/config.hpp::download` — the global download defaults
   (`enable`, `delay`, `delayExtra`, `maxMBps`, `tryCnt`, `blockSize` →
   `src/source/downloader.hpp::DownloadConfig`); per-image `download`
-  sections override these field by field.
+  sections override these field by field. Parsed for compatibility but
+  currently inert (ADR-0011 part 2 — see Limitations & TODO).
 - `src/image/config.hpp::log_level` — `logConfig.logLevel`:
   0=debug, 1=info (default), 2=warn, 3=error.
 - `from_file(path)` — reads and parses the file. Throws `obd::error` on IO
@@ -174,7 +183,10 @@ struct ImageConfig {
 is the OCI digest; `size` is the blob size as recorded by the snapshotter
 (informational — the authoritative size comes from the local file or the
 registry probe); `dir` is the per-layer directory used for the local probe
-and downloads; `file` names a local blob file (empty = the layer is remote).
+and the `LayerStore` persistence state (staging pair and
+`overlaybd.commit`; created if missing; empty disables persistence for a
+remote layer, which then keeps the legacy in-memory `ChunkCache`); `file`
+names a local blob file (empty = the layer is remote).
 
 `src/image/config.hpp::UpperConfig` — the writable upper (ADR-0008).
 `src/image/config.hpp::dir` holds the layer file; `src/image/config.hpp::type`
@@ -194,8 +206,8 @@ selects `overlaybd.rw` (`"lsmt"`, default) or `overlaybd.sparse`
   is populated only when the config carries a non-empty `upper` object;
   `writable()` is true iff `upper.dir` is non-empty.
 - `src/image/config.hpp::digest_sha256_hex` — the digest's hex payload with
-  the `"sha256:"` prefix stripped (the download integrity-check value);
-  returns empty for any other algorithm.
+  the `"sha256:"` prefix stripped (the `LayerStore` completion-verify
+  value); returns empty for any other algorithm.
 - `src/image/config.hpp::from_file` / `from_json_text` — parse the config.
   Throw `obd::error` on IO failure, `src/common/errors.hpp::format_error` on
   malformed JSON, and `obd::error(EINVAL)` on an unknown `upper.type`
@@ -257,11 +269,13 @@ Behavior, in order:
    `MergedWritable`, and returns with `writable = true`.
 
 Error behavior: **all-or-nothing** — any failure (config, credentials parse
-aside, network probe, corrupt layer, unsupported format) throws `obd::error`
-/ `src/common/errors.hpp::format_error`; a device that cannot assemble must
+aside, network probe, corrupt layer, unsupported format, an unwritable
+layer dir) throws `obd::error` /
+`src/common/errors.hpp::format_error`; a device that cannot assemble must
 not come up half-broken. `open_image` never returns a partially assembled
-image. When downloads are enabled it starts background coroutines (requires
-a running scheduler, per `Downloader::start`).
+image. It requires a running Elio scheduler (the DART probe, the registry
+size probes, and `LayerStore::open`'s blocking setup via
+`elio::spawn_blocking`).
 
 ## Invariants & Guarantees
 
@@ -274,6 +288,12 @@ a running scheduler, per `Downloader::start`).
   lowers stay byte-identical (guarded by tests, below).
 - **Local-first** — a layer with a usable local file (`lower.file` or a
   commit marker in `lower.dir`) never touches the network for that layer.
+- **Read-through persistence (ADR-0011)** — every byte a remote layer
+  serves is persisted into `lower.dir` by the `LayerStore`, so locality
+  grows monotonically and survives restarts; once complete and
+  sha256-verified, the staging file is renamed to
+  `<dir>/overlaybd.commit`, which the local probe binds directly on the
+  next open.
 - **DART is strictly optional** — enabling `p2pConfig` can never make an
   image that would otherwise open fail to open (ADR-0005).
 - **Fail-loud assembly** — `open_image` either returns a fully assembled
@@ -291,18 +311,24 @@ a running scheduler, per `Downloader::start`).
   members are data-only; parsing is synchronous, scheduler-free, and safe
   from any thread. No instance-level mutable state after parsing.
 - **`open_image` is a cold-path Elio coroutine** — call it once per device
-  during setup, on a thread with a running Elio scheduler (required when
-  downloads are enabled, and for the DART probe and registry size probes).
+  during setup, on a thread with a running Elio scheduler (required by
+  `LayerStore::open`, the DART probe, and the registry size probes).
   It is not re-entrant per config and not intended for the IO hot path.
 - **The returned root follows the `BlobSource` contract** — concurrent
   `pread`s are safe (see `docs/source.md`); `pwrite`/`flush` on a writable
   root are called only from the ublk data plane after checking
   `OpenedImage.writable`.
 - **Side effects** — `open_image` may: read the credential file, probe the
-  DART proxy, create `upper.dir` and the upper file (writable mode), create
-  `<dir>/.download` staging files and start background download coroutines
-  (download mode). The caller must keep the returned `OpenedImage` (and thus
-  the sources and downloader) alive for the device's lifetime.
+  DART proxy, create `upper.dir` and the upper file (writable mode), and —
+  for every remote lower with a non-empty `dir` — create the layer
+  directory if missing and open a `LayerStore` in it (staging pair
+  `<dir>/.download.<nonce>` + `<dir>/.bitmap.<nonce>`, a dedicated writer
+  `std::thread`, and an atomic rename to `<dir>/overlaybd.commit` on
+  completion). The caller must keep the returned `OpenedImage` (and thus
+  the sources and stores) alive for the device's lifetime, and must not
+  destroy it while reads are in flight: a `LayerStore` touches members on
+  resume of a suspended `pread`/`populate` (its lifetime contract, see
+  `docs/source.md`).
 - **No global state** — all per-image state (registry client, caches,
   downloaders) hangs off the returned `OpenedImage` ownership tree.
 
@@ -320,8 +346,10 @@ changes are T1):
   (`enable`/`address`, ADR-0005), `download` defaults, `logConfig.logLevel`.
 - **The local probe contract** — the probe order (`lower.file`, then
   `overlaybd.commit`, `.commit`, `overlaybd.sealed` in the layer directory)
-  is shared with the snapshotter's on-disk layout and with the downloader's
-  install path; changing it strands previously downloaded blobs.
+  is shared with the snapshotter's on-disk layout and with the install
+  path every persistence mechanism uses (the retired Downloader, and the
+  `LayerStore` whose completion rename lands exactly there); changing it
+  strands previously downloaded blobs.
 - **The remote addressing rule** — `repoBlobUrl + "/" + digest`.
 - **The writable mode (ADR-0008)** — the `upper` object shape, the
   `lsmt`/`sparse` type set, the upper file names (`overlaybd.rw`,
@@ -370,9 +398,23 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   `format: merged writable falls through and copy-on-writes` (see
   `docs/format.md`).
 - `integration: registry pipeline serves a zfile-compressed image` — a
-  remote image config (no local files) assembles through the mock registry
-  and serves the full image byte-exactly, with the expected layer count and
-  virtual size.
+  remote image config (no local files, no layer dir) assembles through the
+  mock registry and serves the full image byte-exactly, with the expected
+  layer count and virtual size; the missing `dir` exercises the no-dir
+  exception path (legacy in-memory `ChunkCache`).
+- `integration: image assembly serves remote reads through the layer store` —
+  a remote lower with a configured `dir` is served through the
+  `RegistrySource → LayerStore` chain byte-exactly, and the read-through
+  path leaves persistence state (a staging pair or `overlaybd.commit`) in
+  the layer dir (ADR-0011).
+- `integration: layer store restart serves warmed extents without remote reads` —
+  after a partially-warmed first open (a prefix read, staging pair drained
+  to disk), a second `open_image` serves the same reads entirely from the
+  resumed pair: the mock registry's remote-read counter does not move.
+- `integration: completed layer store commit binds read-only without remote reads` —
+  a single-extent layer driven to completion renames to
+  `overlaybd.commit`; a reopen binds the commit marker via the local probe
+  and serves byte-exact reads with zero remote data reads.
 - `integration: enabled-but-unreachable DART falls back to direct reads` —
   with `p2pConfig` enabled against a dead address, `open_image` still opens
   and serves the full image directly from the registry (ADR-0005).
@@ -383,6 +425,17 @@ single Range-capable blob. No external golden files.
 
 ## Limitations & TODO
 
+- **`download.enable` is parsed but currently inert** — the `download`
+  sections keep parsing (operator contract), but the SwitchSource/Downloader
+  background download was retired from assembly in ADR-0011 part 2:
+  locality already grows read-through via the `LayerStore`. Background
+  whole-blob fill returns in part 3 as LayerStore fill (see
+  `docs/config.md`).
+- **In-memory caching only on the no-dir exception path** — for
+  dir-configured remote layers the kernel page cache over the
+  `LayerStore` staging/commit file is the L1 (ADR-0011 rejected a
+  user-space LRU on top); a remote layer without `lower.dir` keeps the
+  legacy in-memory `ChunkCache` (restart-cold) until part 3.
 - **Honored config surface is a subset** — `cacheConfig`, `ioEngine`,
   `prefetch`, non-file `credentialConfig` modes, and `resultFile` handling
   are parsed-as-ignored / informational in v0.1 (see `docs/config.md` for

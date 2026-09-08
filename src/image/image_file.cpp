@@ -9,9 +9,9 @@
 #include "format/zfile.hpp"
 #include "source/chunk_cache.hpp"
 #include "source/dart.hpp"
+#include "source/layer_store.hpp"
 #include "source/local_file.hpp"
 #include "source/registry.hpp"
-#include "source/switch_source.hpp"
 #include "source/tar_offset.hpp"
 
 #include <elio/log/macros.hpp>
@@ -102,18 +102,26 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                         lower.digest);
             }
             const std::string url = cfg.repo_blob_url + "/" + lower.digest;
-            auto reg_read = co_await source::RegistrySource::open(client, url);
-            source::BlobSourcePtr read_path =
-                co_await source::ChunkCache::open(std::move(reg_read));
-            if (cfg.download.enable) {
-                auto reg_dl =
-                    co_await source::RegistrySource::open(client, url);
-                raw = co_await source::SwitchSource::open(
-                    std::move(read_path), std::move(reg_dl), lower.dir,
-                    ImageConfig::digest_sha256_hex(lower.digest),
-                    cfg.download);
+            auto reg = co_await source::RegistrySource::open(client, url);
+            if (lower.dir.empty()) {
+                // No persistence directory configured: a LayerStore needs
+                // a writable per-layer dir to stage into, so the layer
+                // keeps the legacy in-memory ChunkCache in front of the
+                // registry (restart-cold; retired with part 3).
+                ELIO_LOG_WARNING("layer {} has no dir; serving remotely "
+                                 "with in-memory caching only",
+                                 lower.digest);
+                raw = co_await source::ChunkCache::open(std::move(reg));
             } else {
-                raw = std::move(read_path);
+                // ADR-0011: one remote source per layer; the LayerStore
+                // reads through it and persists every served extent into
+                // the per-layer dir (staging pair, renamed to
+                // overlaybd.commit on completion).
+                std::error_code ec;
+                std::filesystem::create_directories(lower.dir, ec);
+                raw = co_await source::LayerStore::open(
+                    std::move(reg), lower.dir,
+                    ImageConfig::digest_sha256_hex(lower.digest));
             }
         }
 

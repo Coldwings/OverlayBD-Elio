@@ -1,6 +1,7 @@
 // LayerStore — sparse-file layer persistence with a sidecar extent map
-// (ADR-0011, part 1: the standalone component; image assembly wiring is a
-// follow-up).
+// (ADR-0011). Wired into image assembly as the read chain for
+// dir-configured remote layers; background fill (populate driven without
+// readers) is the remaining follow-up.
 //
 // Every remote byte a layer serves is persisted into a sparse local staging
 // file, so the layer's dependence on the remote source shrinks monotonically

@@ -9,8 +9,9 @@
 //   else remote chain:
 //     RegistrySource (shared RegistryClient; DART accelerate prefix when
 //     p2pConfig is enabled and reachable)
-//     → ChunkCache (read path)
-//     [→ SwitchSource with background Downloader when download.enable]
+//     → LayerStore (ADR-0011: read-through persistence into lower.dir,
+//       staging pair renamed to overlaybd.commit on completion; a lower
+//       without a dir keeps the legacy in-memory ChunkCache instead)
 //
 //   → TarOffsetSource (auto-detected tar wrapper)
 //   → ZFileSource when is_zfile(), else the raw view

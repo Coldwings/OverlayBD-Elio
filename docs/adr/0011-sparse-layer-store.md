@@ -1,6 +1,6 @@
 # ADR-0011: Unify layer persistence into a sparse-file LayerStore with sidecar bitmap and per-extent CRC
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-09-08
 - Supersedes: none
 - Binds: docs/design-assumptions.md, docs/source.md, docs/config.md,
