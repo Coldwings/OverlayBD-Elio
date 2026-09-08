@@ -103,6 +103,9 @@ elio::coro::task<void> handle_io(Queue* q, source::BlobSource* src,
         break;
     }
     q->push_completion(req.tag, result);
+    // Temporary data-plane tracing (E2E bring-up; demote after).
+    ELIO_LOG_INFO("ublk bridge: tag {} op {} -> {}", req.tag, req.op,
+                  result);
 }
 
 }  // namespace
