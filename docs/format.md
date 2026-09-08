@@ -444,6 +444,8 @@ public:
     virtual elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                             uint64_t offset) = 0;
     virtual elio::coro::task<int> flush() = 0;
+    virtual elio::coro::task<int> discard(uint64_t offset,
+                                          uint64_t len) = 0;
     virtual uint64_t virtual_size() const = 0;
     virtual const std::vector<bytes::segment_mapping>& segments() const = 0;
     virtual source::BlobSource& data_source() = 0;
@@ -455,9 +457,11 @@ stack. `pwrite`/`pread` offsets and counts must be 512-byte multiples (the
 same alignment contract as the read side); both return the byte count or a
 negative -errno. `pread` reads through this layer alone — holes read as
 zeroes and fall-through to lower layers is the merger's job. `flush` is the
-durability point (ublk FLUSH). `segments()` is the current index: sorted,
-disjoint, 512B sector units, tag 0. `data_source()` is the file view segment
-data is read from.
+durability point (ublk FLUSH). `discard` (ADR-0009) masks a 512B-aligned
+range with zeroes — reads of the range return zeroes from this layer
+onwards and never fall through to lower layers. `segments()` is the current
+index: sorted, disjoint, 512B sector units, tag 0. `data_source()` is the
+file view segment data is read from.
 
 ### `src/format/sparse_rw.hpp` — `SparseRwLayer`
 
@@ -522,12 +526,26 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
 - `pread`: sector-aligned; holes and zeroed segments read as zeroes; clamped
   at `virtual_size()`.
 - `flush()`: `fdatasync`; 0 or `-errno`.
+- `discard` (ADR-0009): a real
+  `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` plus a
+  split/trim of the extent index. Note the granularity caveat: fiemap is
+  filesystem-block granular, so a sub-block punch zeroes but cannot
+  deallocate — a reopened index may be fatter than the pre-restart one,
+  with identical reads (punched blocks read back as zeroes).
+- `discard` (ADR-0009): inserts **zeroed segments** covering the range
+  (split/trimming overlapped segments exactly like `pwrite`); no data is
+  written and superseded blocks become garbage that `seal()` drops. Zeroed
+  segments carry a valid in-data-region `moffset` (never read, but the
+  read-only loader validates the range), so a sealed file keeps them
+  intact. `-EINVAL` on unaligned/out-of-`vsize` ranges, `-EROFS` once
+  sealed.
 - `data_source()`: an fd-backed `BlobSource` view whose size **tracks
   appends** (an `std::atomic<uint64_t>` upper bound), unlike a
   `LocalFileSource` which pins `st_size` at open.
 - `seal(user_tag)`: compacts the file into a **standard sealed LSMT RO
   file**: live segments are copied out packed sequentially into
-  `<path>.sealing` (garbage left behind by in-place edits is dropped),
+  `<path>.sealing` (garbage left behind by in-place edits and discards is
+  dropped; zeroed segments consume no data space),
   followed by the padded index, a sealed header and trailer, `fdatasync`,
   and an **atomic rename** over `path`. Afterwards `sealed()` is true and
   `pwrite` returns `-EROFS`. Returns 0 or a negative -errno; on failure the
@@ -575,9 +593,12 @@ plus a writable top layer, as one block source.
   merged index (`rebuild_index()`). Write-heavy workloads should batch,
   since the rebuild is O(index size) per write.
 - `flush()` delegates to the top layer's `flush()`.
+- `discard()` (ADR-0009) delegates to the top layer and rebuilds the index;
+  the discarded range then reads as zeroes even when lower layers have data
+  there (mask semantics, matching upstream LSMT trim).
 - As a `source::WritableBlobSource`, this is the device root the ublk bridge
-  dispatches WRITE/FLUSH to; a read-only image root simply does not
-  implement the interface and writes get `-EROFS`.
+  dispatches WRITE/FLUSH/DISCARD/WRITE_ZEROES to; a read-only image root
+  simply does not implement the interface and writes/discards get `-EROFS`.
 
 ### `src/format/writer.hpp` — fixture writers (`namespace obd::format`)
 

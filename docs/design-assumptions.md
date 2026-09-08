@@ -51,7 +51,10 @@ half-broken: assembly failure fails the create request.
 Each block device is served by exactly one child process spawned by the
 supervisor (ADR-0004). Devices never share a process; a device crash
 cannot take down siblings. The supervisor owns lifecycle over the
-documented wire protocols and never serves device IO itself.
+documented wire protocols and never serves device IO itself. A crashed
+device process is replaced via ublk USER_RECOVERY with a bounded respawn
+(ADR-0010): the kernel keeps the device QUIESCED and reissues outstanding
+IO to the replacement, so a crash is a latency spike, not a mount failure.
 
 ## A7. Ring ownership and the bridge
 
@@ -68,6 +71,9 @@ sanctioned types exist: `sparse` (fiemap-recovered sparse file) and
 `lsmt` (in-place-edit LSMT-RW that seals into a standard LSMT lower).
 Writes are copy-on-write into the upper; unsealed LSMT-RW data is durable
 only at flush level and is not recoverable across restarts until sealed.
+Discard follows mask-with-zeroes semantics (ADR-0009): a discarded range
+reads back as zeroes and never falls through to the lowers — LSMT-RW
+records it as zeroed segments, sparse performs a real punch-hole.
 
 ## A9. DART is never on the required path
 

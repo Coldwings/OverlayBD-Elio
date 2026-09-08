@@ -54,7 +54,7 @@ Runs in the foreground until SIGTERM/SIGINT. Options (defaults from
 ### obd-device
 
 ```
-obd-device --config PATH [--global PATH] [--control-fd N] [--dev-id N]
+obd-device --config PATH [--global PATH] [--control-fd N] [--dev-id N] [--recover]
 ```
 
 | Option | Default | Meaning |
@@ -63,6 +63,7 @@ obd-device --config PATH [--global PATH] [--control-fd N] [--dev-id N]
 | `--global PATH` | empty = built-in defaults | Global `overlaybd.json`; when omitted, a default-constructed `GlobalConfig` is used. |
 | `--control-fd N` | `-1` (no reporting) | Inherited fd for JSON-lines lifecycle status reports (the socketpair end installed by the supervisor). |
 | `--dev-id N` | `-1` (auto-assign) | Requested ublk device id; the kernel picks a free id when negative. |
+| `--recover` | off | ADR-0010: attach to the existing `--dev-id` device via `START_USER_RECOVERY` instead of creating a new one (requires `--dev-id`). Used by the supervisor when respawning a crashed device. |
 | `--help`, `-h` | — | Print usage and exit 0. |
 
 Requires a build with `OBD_ENABLE_UBLK=ON` (the only supported block-device
@@ -222,10 +223,10 @@ ctest --test-dir build --output-on-failure
 
 ## Limitations & TODO
 
-- No supervisor auto-restart of crashed children: a dead device's state is
-  reported, reaping it is the operator's job (`destroy` + `create`).
-  Restart policy is deliberately deferred (see
-  [operations.md](./operations.md)).
+- Recovery respawns are bounded (`max_recovery_attempts`, default 3);
+  beyond the bound the device stays down and re-creating it is the
+  operator's job (`destroy` + `create`). See
+  [operations.md](./operations.md) and ADR-0010.
 - No combined `--opt=value` form and no short-option aliases (other than
   `-h`) on any binary.
 - obdctl is one-shot: one command per invocation, no interactive or batch

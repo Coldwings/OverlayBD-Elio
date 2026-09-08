@@ -112,6 +112,7 @@ docs/adr/         Architecture Decision Records
 
 Implemented and tested: read path (local + registry + download + cache +
 DART), ZFile/LSMT formats, multi-layer merge, writable uppers (sparse and
-in-place-edit LSMT-RW with seal), ublk data plane, supervisor process
-model. Deferred by design: TurboOCI, ublk USER_RECOVERY, prefetch,
-supervisor auto-restart of crashed children, discard/punch-hole.
+in-place-edit LSMT-RW with seal), discard/punch-hole with mask-with-zeroes
+semantics (ADR-0009), ublk data plane, supervisor process model with ublk
+USER_RECOVERY crash recovery (ADR-0010). Deferred by design: TurboOCI,
+prefetch.

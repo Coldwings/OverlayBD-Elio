@@ -105,14 +105,31 @@ device's op policy:
 | `READ` | `BlobSource::pread` into the tag's IO buffer; short reads at EOF are **zero-filled** so the device always answers the full request; success result = requested length. |
 | `WRITE` | If the root source is a `WritableBlobSource` (writable image, ADR-0008): `pwrite` from the tag's IO buffer; success result = requested length. Otherwise **-EROFS**. |
 | `FLUSH` | If writable root: `WritableBlobSource::flush()` (0 or -errno). Otherwise immediate **0** (read-only device, nothing to persist). |
-| `WRITE_SAME`, `WRITE_ZEROES` | **-EOPNOTSUPP** (never advertised via params; rejected defensively). |
-| discard / punch-hole | **-EOPNOTSUPP** — deferred to v0.2 (see Limitations). |
+| `DISCARD` | If writable root: `WritableBlobSource::discard()` with mask-with-zeroes semantics (ADR-0009); success result = 0. Otherwise **-EROFS**. |
+| `WRITE_ZEROES` | If writable root: `discard()` — or, with `UBLK_IO_F_NOUNMAP`, a real write of zeroes (no deallocation). Otherwise **-EROFS**. |
+| `WRITE_SAME` | **-EOPNOTSUPP** (never advertised via params; rejected defensively). |
 | anything else | **-EOPNOTSUPP**. |
 
-`SET_PARAMS` advertises BASIC + DISCARD parameter types with
-`UBLK_ATTR_VOLATILE_CACHE` (plus `UBLK_ATTR_READ_ONLY` when
-`DeviceParams::read_only`), `io_min` = logical block shift, `io_opt` =
-physical block shift; all discard limits stay 0 for a read-only view.
+`SET_PARAMS` advertises BASIC with `UBLK_ATTR_VOLATILE_CACHE` (plus
+`UBLK_ATTR_READ_ONLY` when `DeviceParams::read_only`), `io_min` = logical
+block shift, `io_opt` = physical block shift. For writable devices it adds
+the DISCARD parameter type with sector granularity (matching the layer
+contract) and `max_discard_sectors`/`max_write_zeroes_sectors` =
+`max_sectors`, one segment; for read-only devices all discard limits stay
+0 so the kernel never issues the commands (ADR-0009).
+
+### Crash recovery (ADR-0010)
+
+Devices are created with `UBLK_F_USER_RECOVERY |
+UBLK_F_USER_RECOVERY_REISSUE` when `DeviceParams::enable_recovery` (the
+default, driven by `ublkConfig.enableRecovery`): the kernel then keeps the
+device QUIESCED when its server process dies and reissues outstanding I/O
+to a replacement. `Ctrl::start_user_recovery` / `end_user_recovery` drive
+the handshake and `Device::attach` is the replacement-side path: open
+`/dev/ublkcN`, `START_USER_RECOVERY`, re-park FETCH for every tag on every
+queue, `END_USER_RECOVERY` (same EBUSY polling as `START_DEV`). `ADD_DEV`
+falls back to a non-recoverable device (with a warning) when the kernel
+rejects the flags with `EINVAL`.
 
 ## Public API
 
@@ -304,9 +321,10 @@ Three distinct execution contexts, with strict permissions:
   ADR-0006).
 - **Op dispatch semantics** are user-visible contract: READ zero-fill at
   EOF; WRITE → writable root `pwrite` else `-EROFS`; FLUSH → writable root
-  `flush` else `0`; WRITE_SAME / WRITE_ZEROES / discard / unknown →
-  `-EOPNOTSUPP`. Changing any of these (e.g. enabling discard) is breaking
-  for callers that depend on the errno surface.
+  `flush` else `0`; DISCARD → writable root `discard` else `-EROFS`;
+  WRITE_ZEROES → `discard`, or a real zero-write under `UBLK_IO_F_NOUNMAP`;
+  WRITE_SAME / unknown → `-EOPNOTSUPP` (ADR-0009). Changing any of these
+  is breaking for callers that depend on the errno surface.
 - **Bridge contract**: `Queue::push_completion` result convention
   (`>= 0` bytes, `< 0` `-errno`) and the eventfd handoff are internal but
   cross-module (source layer depends on the read/write semantics through
@@ -346,9 +364,10 @@ root or `CAP_SYS_ADMIN` plus a loaded `ublk_drv` to actually execute).
 
 ## Limitations & TODO
 
-- **Discard / punch-hole**: not implemented; `SET_PARAMS` advertises zeroed
-  discard limits and the bridge answers `-EOPNOTSUPP`. Planned for v0.2.
-- **WRITE_SAME / WRITE_ZEROES**: never advertised, defensively rejected.
+- **WRITE_SAME**: never advertised, defensively rejected.
+- **Recovery re-open data boundary**: `Device::attach` re-opens the image
+  from disk; an unsealed LSMT-RW upper loses its unsealed writes on
+  recovery while a sparse upper recovers via fiemap (ADR-0008, ADR-0010).
 - **Single device per `Ctrl` instance**: the class remembers one added
   device; multi-device processes would need one `Ctrl` each.
 - **START_DEV polling**: fixed 100 × 50 ms bound rather than an event-driven

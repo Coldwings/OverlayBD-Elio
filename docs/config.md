@@ -83,6 +83,12 @@ atomically renames to `<dir>/overlaybd.commit` on success.
 |---|---|---|---|
 | `logLevel` | int | `1` | 0 = debug, 1 = info, 2 = warn, 3 = error. |
 
+### `ublkConfig`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enableRecovery` | bool | `true` | ADR-0010: create devices with `UBLK_F_USER_RECOVERY` so a crashed device process can be replaced without failing the block device. Disable only for debugging; kernels without the feature fall back automatically. |
+
 ### Recognized but not honored
 
 `cacheConfig`, `ioEngine`, and `prefetch` are parsed-tolerated (ignored

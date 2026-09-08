@@ -135,6 +135,15 @@ Every test, grouped by area, with the property it guards.
 - `format: merged writable falls through and copy-on-writes` —
   `MergedWritable` reads fall through the upper to sealed lowers, and
   writes shadow lowers copy-on-write without mutating them (ADR-0008).
+- `format: lsmt rw discard masks coverage with zeroed segments` —
+  discard inserts zeroed segments that read back as zeroes and survive
+  `seal()` into a valid standard LSMT file (ADR-0009).
+- `format: sparse layer discard punches holes and recovers` — discard
+  is a real punch-hole; reads stay correct across a reopen even though
+  fiemap recovery is filesystem-block granular (ADR-0009).
+- `format: merged writable discard masks the lower layer` — discarding
+  a range covered only by the lower reads back zeroes, not the lower's
+  data (mask semantics, ADR-0009).
 
 ### source
 
@@ -185,6 +194,9 @@ Every test, grouped by area, with the property it guards.
   exactly (uapi compatibility).
 - `ublk: IoRequest byte math is sector based` — sector↔byte conversion
   in `IoRequest` is exact, including boundary sector counts.
+- `ublk: recovery feature flags follow device params` — `dev_info_flags`
+  adds `UBLK_F_USER_RECOVERY | _REISSUE` exactly when
+  `DeviceParams::enable_recovery` is set (ADR-0010).
 
 ### supervisor
 
@@ -196,6 +208,12 @@ Every test, grouped by area, with the property it guards.
   ready event.
 - `supervisor: exec failure surfaces as exit 127` — a missing device
   binary yields EOF on the status channel plus exit code 127.
+- `supervisor: bdev path parses to device id` —
+  `dev_id_from_bdev_path` extracts the id from `/dev/ublkbN` and
+  rejects non-bdev paths (ADR-0010).
+- `supervisor: recover spec adds the recover flag to child argv` — a
+  recovery respawn passes `--recover` and `--dev-id` to obd-device
+  (ADR-0010).
 
 ### integration
 
@@ -213,6 +231,10 @@ Every test, grouped by area, with the property it guards.
 - `integration: downloader writes, verifies and installs the blob` —
   the background downloader stages, sha256-verifies, and atomically
   installs `overlaybd.commit`.
+- `supervisor: crashed device child is recovered with bounded respawns` —
+  a real daemon with a fake obd-device: crash → respawn with
+  `--recover`, bounded at `max_recovery_attempts`, `recoveries` reported
+  in status, destroy still works (ADR-0010). Runs without privileges.
 - `integration: switch source swaps reads to the local copy` — after
   install, reads migrate from the remote source to the local file.
 - `integration: ublk device serves sector reads from a blob` — the

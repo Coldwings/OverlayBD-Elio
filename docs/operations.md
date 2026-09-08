@@ -147,16 +147,18 @@ correlate by device id and by the supervisor's spawn logs.
 | `create` fails with "virtual size not sector aligned" | The merged image size is zero or not a multiple of 512 bytes; the image is malformed for block serving. |
 | No `/dev/ublkb<N>` after a successful `create` | `ublk_drv` not loaded or missing udev; check `/dev/ublk-control` and `lsmod`. |
 | Slow first reads, DART warnings in the log | DART proxy configured but unreachable. This is handled: the source logs a warning and falls back to direct registry reads (guarded by `integration: enabled-but-unreachable DART falls back to direct reads`). Fix the `p2pConfig` address or disable P2P. |
-| A device child crashed | Siblings and the supervisor are unaffected (ADR-0004). The supervisor reports the device state; it does **not** restart the child (see limitations). `destroy` the stale entry and `create` it again. |
-| `discard`/`fstrim` fails with EOPNOTSUPP | By design — see limitations. |
+| A device child crashed | Siblings and the supervisor are unaffected (ADR-0004), and the device itself survives: the supervisor respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection (`destroy` + `create`). Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008). |
+| `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard is supported only on writable devices (ADR-0009). |
 
 ## Known operational limitations
 
-- **No supervisor auto-restart of crashed children.** A crashed device is
-  detected and reported, but re-creating it is an operator/orchestrator
-  decision. Automatic restart policy is deliberately deferred.
-- **No discard / punch-hole / write-zeroes.** These operations return
-  `EOPNOTSUPP`; on a read-only device (no upper), writes return `EROFS`.
+- **Recovery loses unsealed LSMT-RW writes.** Crash recovery re-opens the
+  image from disk; a sparse upper recovers via fiemap, an unsealed LSMT-RW
+  upper does not (ADR-0008, ADR-0010). Choose the sparse upper when write
+  durability across crashes matters.
+- **Discard masks, it does not punch through.** A discarded range reads
+  back as zeroes even if lower layers have data there (ADR-0009); this is
+  the upstream LSMT trim semantics, intentional.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
   or mutate registry content (ADR-0007). Writable uppers are local-only.
 - **Credentials**: only `credentialConfig` `mode=file` is honored; other

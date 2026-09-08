@@ -310,12 +310,35 @@ needing a real ublk device or root.
 Run: `ctest --test-dir build --output-on-failure` (no privileges needed;
 the spawn tests create their fake binaries under a temporary directory).
 
+### Crash recovery (ADR-0010)
+
+Each device is supervised for its whole lifetime by one coroutine
+(`supervise_entry`) that reads the child's status channel and, on an
+**unexpected** exit (not a requested `destroy`, not daemon shutdown),
+respawns the child with `--recover --dev-id N`: the ublk device was
+created with `UBLK_F_USER_RECOVERY` and survives serverless in the kernel,
+so the replacement *attaches* instead of re-creating. The dev id is parsed
+from the ready status's bdev path by the supervising coroutine itself, so
+an instant crash can never be observed before the id is recorded.
+Respawns are bounded by `DaemonConfig::max_recovery_attempts` (default 3);
+`list`/`status` report the `recoveries` count. Intentional destroys set a
+flag first and never respawn.
+
+### Daemon shutdown
+
+`run()` wakes and joins its detached tasks before returning: the accept
+loop (a dummy connection, because `close()` does not cancel an in-flight
+accept SQE) and the reaper (a synthetic SIGCHLD, because a parked signalfd
+wait has no cancel path). The reaper constructs its `signal_fd` itself and
+is pinned with `go_to(0)`: `signal_fd` caches the creating worker's
+`io_context`, and `sync::mutex` wakeups could otherwise migrate the
+coroutine to a worker where that context is invalid.
+
 ## Limitations & TODO
 
-- **No hot re-registration**: a crashed child stays in the registry as
-  `exited` until an explicit `destroy`; there is no automatic restart
-  policy. Restart-on-crash is a deliberate non-goal for v0.1 (fail loud,
-  let the operator decide).
+- **No recovery backoff**: respawn is immediate with a fixed bound
+  (ADR-0010); exponential backoff / flapping detection can be revisited if
+  operations show the need.
 - **No output capture**: child stdout/stderr are inherited, not piped
   through the supervisor; log aggregation is the operator's job.
 - **One command per connection**: clients needing many operations pay a
