@@ -258,6 +258,28 @@ TEST_CASE("supervisor: commit stops the device and seals its upper offline",
                           "no such device") != std::string::npos,
                   "unknown id error text mismatch");
 
+            // Malformed field types are clean protocol errors (answered
+            // over the socket), not a dropped connection; the daemon
+            // keeps serving afterwards.
+            const auto bad_id = rpc_json({{"cmd", "commit"}, {"id", 123}});
+            check(bad_id.value("ok", true) == false,
+                  "numeric commit id not an error");
+            check(bad_id.contains("error") &&
+                      bad_id["error"].get<std::string>().find(
+                          "must be a string") != std::string::npos,
+                  "numeric id error text mismatch");
+            const auto bad_tag = rpc_json({{"cmd", "commit"},
+                                           {"id", "ghost"},
+                                           {"user_tag", 42}});
+            check(bad_tag.value("ok", true) == false,
+                  "numeric user_tag not an error");
+            check(bad_tag.contains("error") &&
+                      bad_tag["error"].get<std::string>().find("user_tag") !=
+                          std::string::npos,
+                  "numeric user_tag error text mismatch");
+            check(rpc_json({{"cmd", "hello"}}).value("ok", false) == true,
+                  "daemon unusable after malformed commit commands");
+
             // Three devices: lsmt upper (committable), sparse upper (never
             // seals, upstream parity), no upper.
             check(rpc_json({{"cmd", "create"},

@@ -486,6 +486,59 @@ TEST_CASE("format: lsmt rw offline seal rejects a torn checkpoint trailer",
         REQUIRE(hht.is_header());
         REQUIRE(!hht.is_sealed());
     }
+
+    // Same malformed-checkpoint family, one field over: an index_offset
+    // beyond the trailer with index_size == 0 must NOT underflow the
+    // bounds check into sealing an empty layer. Here uuid and
+    // virtual_size are intact, so the header cross-check alone would
+    // pass — the index_offset bounds guard is what rejects it.
+    const std::string path2 = dir / "upper2.rw";
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path2, 512 * 64);
+        ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
+        REQUIRE(r > 0);
+        int crc = co_await layer->checkpoint();
+        REQUIRE(crc == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    {
+        struct stat st {};
+        REQUIRE(::stat(path2.c_str(), &st) == 0);
+        const uint64_t trailer_off =
+            static_cast<uint64_t>(st.st_size) - format::lsmt::kSpace;
+        int fd = ::open(path2.c_str(), O_RDWR);
+        REQUIRE(fd >= 0);
+        uint8_t le[8];
+        bytes::store_u64_le(le, static_cast<uint64_t>(st.st_size) +
+                                    format::lsmt::kSpace);  // beyond EOF
+        REQUIRE(::pwrite(fd, le, 8, static_cast<off_t>(trailer_off + 32)) ==
+                8);
+        bytes::store_u64_le(le, 0);  // index_size == 0
+        REQUIRE(::pwrite(fd, le, 8, static_cast<off_t>(trailer_off + 40)) ==
+                8);
+        ::close(fd);
+    }
+    rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::string sha;
+        uint64_t size = 0;
+        const int src =
+            co_await format::LsmtRwLayer::seal_file(path2, "", &sha, &size);
+        REQUIRE(src == -EINVAL);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    {
+        int fd = ::open(path2.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        std::vector<uint8_t> region(format::lsmt::kSpace);
+        REQUIRE(::pread(fd, region.data(), region.size(), 0) ==
+                static_cast<ssize_t>(region.size()));
+        ::close(fd);
+        const auto hht = format::lsmt::HeaderTrailer::parse(region.data());
+        REQUIRE(hht.is_header());
+        REQUIRE(!hht.is_sealed());
+    }
 }
 
 TEST_CASE("format: merged writable falls through and copy-on-writes",

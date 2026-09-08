@@ -52,9 +52,12 @@ these are the real field names):
 ```
 
 Validation: the message must be a JSON object with a string `cmd`;
-`create` requires `id` and `config`; `destroy`/`status`/`commit` require
-`id`; `hello` and `list` take no fields; anything else is "unknown cmd".
-Malformed input is answered, not dropped.
+`create` requires string `id` and `config`; `destroy`/`status`/`commit`
+require a string `id`; `commit`'s optional `user_tag` must be a string;
+`hello` and `list` take no fields; anything else is "unknown cmd". Field
+TYPES are validated at parse time: a wrong-typed field is answered with a
+clean protocol error, never an exception escaping the handler. Malformed
+input is answered, not dropped.
 
 Replies (`reply_ok` / `reply_error`): success is `{"ok":true,...}` with
 command-specific fields merged in; failure is

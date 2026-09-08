@@ -393,7 +393,10 @@ underlying data source (typically a `ZFileSource` view of the layer blob).
 1. header region: magic, `is_header`, `is_data_file`;
 2. trailer region: magic, `is_trailer`, `is_data_file`, `is_sealed` —
    trailer fields are authoritative;
-3. `index_size ≤ kMaxRoIndexSize` and the index region fits before the
+3. `index_size ≤ kMaxRoIndexSize`, `index_offset` lies inside
+   `[kSpace, trailer_offset]` (bounds checked BEFORE the subtraction —
+   an out-of-range `index_offset` must not underflow the fit check into
+   accepting an empty index), and the index region fits before the
    trailer;
 4. index entries with `offset == segment_mapping::kInvalidOffset` are
    dropped; tags are cleared;

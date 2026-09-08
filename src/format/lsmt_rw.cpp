@@ -609,7 +609,12 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
 
     const uint64_t index_bytes =
         tht.index_size * bytes::segment_mapping::kEncodedSize;
+    // Bounds: index_offset must lie inside [kSpace, trailer_offset] BEFORE
+    // any subtraction — with index_size == 0 an out-of-range index_offset
+    // would otherwise underflow the check below and seal an empty layer
+    // instead of rejecting the malformed checkpoint.
     if (tht.index_offset < lsmt::kSpace ||
+        tht.index_offset > trailer_offset ||
         index_bytes > trailer_offset - tht.index_offset) {
         fail(-EINVAL);
         co_return nullptr;

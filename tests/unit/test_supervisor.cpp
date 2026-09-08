@@ -148,6 +148,17 @@ TEST_CASE("supervisor: commit command parses and validates its fields",
                  .has_value());
     REQUIRE(err.find("commit requires 'id'") != std::string::npos);
 
+    // Malformed field TYPES are clean protocol errors at parse time —
+    // they must not reach the handler (which would throw a
+    // json::type_error out of get<std::string>()).
+    REQUIRE(!supervisor::parse_command(R"({"cmd":"commit","id":123})", err)
+                 .has_value());
+    REQUIRE(err.find("must be a string") != std::string::npos);
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"commit","id":"a","user_tag":42})", err)
+                 .has_value());
+    REQUIRE(err.find("user_tag") != std::string::npos);
+
     // The hello handshake advertises the capability gate for commit —
     // including the protocol version field itself (clients gate on both).
     const auto hello = nlohmann::json::parse(supervisor::reply_hello());

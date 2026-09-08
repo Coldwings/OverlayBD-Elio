@@ -158,7 +158,10 @@ Every test, grouped by area, with the property it guards.
   trailer torn mid-write (magic/flags/virtual_size present, uuid and
   index fields still zero) parses as a valid but empty checkpoint; the
   header/trailer uuid cross-check rejects it with `-EINVAL` and the file
-  is left unsealed (ADR-0014).
+  is left unsealed. Also: an out-of-range `index_offset` with
+  `index_size == 0` (uuid intact, cross-check would pass) is rejected by
+  the index bounds guard instead of underflowing into an empty seal
+  (ADR-0014).
 - `format: merged writable falls through and copy-on-writes` —
   `MergedWritable` reads fall through the upper to sealed lowers, and
   writes shadow lowers copy-on-write without mutating them (ADR-0008).
@@ -342,9 +345,10 @@ Every test, grouped by area, with the property it guards.
   recovery respawn passes `--recover` and `--dev-id` to obd-device
   (ADR-0010).
 - `supervisor: commit command parses and validates its fields` — `commit`
-  requires `id`, accepts an optional `user_tag`, ignores unknown fields,
-  and the `hello` reply pins the `protocol` field plus the `commit`
-  feature advertisement (ADR-0014).
+  requires a string `id`, accepts an optional string `user_tag` (wrong
+  field types are parse-time protocol errors, not handler exceptions),
+  ignores unknown fields, and the `hello` reply pins the `protocol` field
+  plus the `commit` feature advertisement (ADR-0014).
 
 ### integration
 
@@ -389,7 +393,9 @@ Every test, grouped by area, with the property it guards.
   its LSMT-RW upper only on SIGTERM — so a commit that sealed without
   stopping the device first could not succeed (stop-then-seal is pinned,
   not just narrated): commit on unknown id, sparse upper, and upper-less
-  devices fails with precise errors; editing the config file after create
+  devices fails with precise errors; malformed field types (non-string
+  `id`/`user_tag`) are answered as protocol errors and the daemon keeps
+  serving; editing the config file after create
   does not redirect commit (upper path provenance); commit on a live
   LSMT-upper device stops it (bounded reap) and seals its checkpointed
   upper, replying `path`/`sha256`/`size`; a second commit fails with

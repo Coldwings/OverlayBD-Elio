@@ -256,12 +256,20 @@ private:
             reply = reply_error(error);
         } else {
             const std::string c = (*cmd)["cmd"].get<std::string>();
-            if (c == "create") reply = co_await cmd_create(*cmd);
-            else if (c == "destroy") reply = co_await cmd_destroy(*cmd);
-            else if (c == "commit") reply = co_await cmd_commit(*cmd);
-            else if (c == "list") reply = co_await cmd_list();
-            else if (c == "hello") reply = reply_hello();
-            else reply = co_await cmd_status(*cmd);
+            // Exception boundary: the parser validates field types, but a
+            // handler must never kill the client coroutine without the
+            // promised clean error reply.
+            try {
+                if (c == "create") reply = co_await cmd_create(*cmd);
+                else if (c == "destroy") reply = co_await cmd_destroy(*cmd);
+                else if (c == "commit") reply = co_await cmd_commit(*cmd);
+                else if (c == "list") reply = co_await cmd_list();
+                else if (c == "hello") reply = reply_hello();
+                else reply = co_await cmd_status(*cmd);
+            } catch (const std::exception& e) {
+                reply = reply_error(std::string("internal error handling '") +
+                                    c + "': " + e.what());
+            }
         }
         co_await stream.write(reply);
         // One command per connection; the stream closes on destruction.
