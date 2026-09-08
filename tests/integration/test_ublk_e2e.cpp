@@ -6,6 +6,7 @@
 
 #include "../support.hpp"
 
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -21,6 +22,14 @@
 using namespace obd;
 
 namespace {
+
+/// Run a blocking bdev syscall off-scheduler: a synchronous read/write
+/// on a worker stalls it, and the ublk request it issues is serviced by
+/// bridge coroutines that may need that very worker (deadlock).
+template <typename F>
+auto bdev_io(F&& f) {
+    return elio::spawn_blocking(std::forward<F>(f));
+}
 
 void stage(const char* msg) {
     std::fprintf(stderr, "[e2e-stage] %s\n", msg);
@@ -93,7 +102,9 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
         REQUIRE(fd >= 0);
         std::vector<uint8_t> buf(4096);
         stage("reads: pread");
-        REQUIRE(::pread(fd, buf.data(), buf.size(), 1024) == 4096);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pread(fd, buf.data(), buf.size(), 1024);
+                }) == 4096);
         stage("reads: pread done");
         REQUIRE(buf == std::vector<uint8_t>(data.begin() + 1024,
                                             data.begin() + 1024 + 4096));
@@ -126,21 +137,31 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
 
         // Write through the block device, read back through it.
         const auto patch = test::pattern_bytes(4096, 83);
-        REQUIRE(::pwrite(fd, patch.data(), patch.size(), 1024) == 4096);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pwrite(fd, patch.data(), patch.size(), 1024);
+                }) == 4096);
         std::vector<uint8_t> buf(4096);
-        REQUIRE(::pread(fd, buf.data(), buf.size(), 1024) == 4096);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pread(fd, buf.data(), buf.size(), 1024);
+                }) == 4096);
         REQUIRE(buf == patch);
 
         // BLKDISCARD the range: the bridge maps it to root->discard, and
         // the range reads back as zeroes (ADR-0009).
         uint64_t range[2] = {1024, 4096};
-        REQUIRE(::ioctl(fd, BLKDISCARD, &range) == 0);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::ioctl(fd, BLKDISCARD, &range);
+                }) == 0);
         REQUIRE(raw->discards() >= 1);
-        REQUIRE(::pread(fd, buf.data(), buf.size(), 1024) == 4096);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pread(fd, buf.data(), buf.size(), 1024);
+                }) == 4096);
         REQUIRE(buf == std::vector<uint8_t>(4096, 0));
 
         // Untouched data still reads correctly.
-        REQUIRE(::pread(fd, buf.data(), buf.size(), 0) == 4096);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pread(fd, buf.data(), buf.size(), 0);
+                }) == 4096);
         REQUIRE(buf == std::vector<uint8_t>(data.begin(),
                                             data.begin() + 4096));
         ::close(fd);
@@ -228,7 +249,9 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
         const int fd2 = ::open(dev->bdev_path().c_str(), O_RDONLY);
         REQUIRE(fd2 >= 0);
         std::vector<uint8_t> buf2(4096);
-        REQUIRE(::pread(fd2, buf2.data(), buf2.size(), 2048) == 4096);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pread(fd2, buf2.data(), buf2.size(), 2048);
+                }) == 4096);
         REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
                                              expected.begin() + 2048 + 4096));
         ::close(fd2);
