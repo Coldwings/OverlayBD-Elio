@@ -94,8 +94,10 @@ jobs:
 
       - name: Run privileged ublk E2E only
         # Only the [ublk]-tagged E2E needs the kernel facility; the
-        # unprivileged suite runs in the build-test job.
-        run: sudo -E ./build/tests/obd_integration_tests "[ublk]"
+        # unprivileged suite runs in the build-test job. Bound the run:
+        # a wedged kernel handshake must fail fast, not hang the job.
+        timeout-minutes: 10
+        run: timeout -s KILL 300 sudo -E ./build/tests/obd_integration_tests "[ublk]" --durations yes
 
   docs-governance:
     name: docs governance

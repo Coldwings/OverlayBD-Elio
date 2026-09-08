@@ -88,7 +88,17 @@ void Queue::open() {
         throw_errno(errno, "cannot create ublk bridge eventfds");
     }
 
-    if (io_uring_queue_init(depth_ * 2, &ring_, 0) < 0) {
+    // UBLK_F_URING_CMD_COMP_IN_TASK (set in dev_info_flags) makes the
+    // driver complete uring-cmds as task_work of the issuing task. That
+    // REQUIRES IORING_SETUP_DEFER_TASKRUN (task_work runs inside
+    // io_uring_enter, which is exactly where this queue thread waits)
+    // and IORING_SETUP_SINGLE_ISSUER (only this thread submits), the
+    // same pairing libublksrv uses; without it FETCH completions are
+    // never reaped and block-device I/O hangs forever.
+    io_uring_params ring_params {};
+    ring_params.flags = IORING_SETUP_SINGLE_ISSUER |
+                        IORING_SETUP_DEFER_TASKRUN;
+    if (io_uring_queue_init_params(depth_ * 2, &ring_, &ring_params) < 0) {
         throw_errno(errno, "cannot create ublk queue io_uring");
     }
     ring_ok_ = true;
