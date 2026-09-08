@@ -82,6 +82,11 @@ public:
     /// Interrupts the run() wait (e.g. after setting stop).
     void wakeup() noexcept;
 
+    /// Pokes the bridge side (elio_efd_). Called by run() when new
+    /// requests arrive and by Device::stop() so parked bridge
+    /// coroutines can observe the stop flag.
+    void notify_elio() noexcept;
+
     /// Marks the queue failed from outside the queue thread (e.g. an
     /// exception escaping run()).
     void fail(int err) noexcept {
@@ -100,7 +105,6 @@ private:
     void arm_done_poll();
     void drain_done();
     void dispatch_cqe(const io_uring_cqe* cqe);
-    void notify_elio() noexcept;
 
     uint32_t dev_id_;
     uint16_t q_id_;
