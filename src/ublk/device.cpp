@@ -176,6 +176,11 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
 void Device::stop() noexcept {
     stop_.store(true, std::memory_order_relaxed);
     for (auto& q : queues_) q->wakeup();
+    // Also wake the bridge coroutines: each is parked in an eventfd
+    // async_read, and nothing will write that eventfd again once the
+    // queue threads exit — a parked detached bridge outlives stop()
+    // and hangs scheduler teardown.
+    for (auto& q : queues_) q->notify_elio();
     for (auto& t : threads_) {
         if (t.joinable()) t.join();
     }
