@@ -34,8 +34,8 @@ blob gets its own source stack, assembled bottom-up from these pieces:
 - **LayerStore** — sparse-file layer persistence with a sidecar extent map
   and per-extent CRC32 (ADR-0011): every remote byte served is persisted
   into a local staging file, so remote dependence shrinks monotonically and
-  survives restarts. A standalone component for now — not yet wired into
-  image assembly.
+  survives restarts. This is the component image assembly wires behind
+  `RegistrySource` for every remote layer with a per-layer directory.
 - **CredentialStore** — registry credentials from the overlaybd-compatible
   credential file, with longest-prefix matching.
 - **base64** (`base64.hpp`) — a minimal RFC 4648 codec used for Basic-auth
@@ -64,14 +64,16 @@ Every source is a positional, immutable byte range:
 - **Sources compose by wrapping** — each decorator holds a
   `src/source/blob_source.hpp::BlobSourcePtr` to its inner source and
   translates offsets or adds behavior. The canonical read stack for a remote
-  layer is:
+  layer (as wired by image assembly, ADR-0011) is:
 
   ```
-  RegistrySource → ChunkCache [→ SwitchSource] → TarOffsetSource
+  RegistrySource → LayerStore → TarOffsetSource
   ```
 
-  (The format module then wraps this with ZFile/LSMT readers; see
-  `docs/image.md` for the full per-lower chain.)
+  (A remote layer without a per-layer `dir` is the one exception: it keeps
+  the legacy `RegistrySource → ChunkCache` chain until part 3 — see
+  `docs/image.md`. The format module then wraps this with ZFile/LSMT
+  readers; see `docs/image.md` for the full per-lower chain.)
 
 ### Hot path vs cold path error reporting
 
@@ -145,8 +147,15 @@ wrapping source or hands the original source back unchanged.
 
 ### Background download and the remote→local switch
 
-When `download.enable` is set, a background `Downloader` pulls the whole blob
-into the per-layer directory while reads keep being served remotely
+**Retired from image assembly (ADR-0011 part 2).** Assembly no longer
+composes `Downloader`/`SwitchSource` — the `LayerStore` replaced them and
+the `ChunkCache` in the remote-layer chain. The components remain in the
+module (their tests compose them manually) until the ADR-0011 follow-up
+(part 3), which ports background fill into the LayerStore and decides
+their removal. The historical mechanism, kept for reference:
+
+When `download.enable` was set, a background `Downloader` pulled the whole
+blob into the per-layer directory while reads kept being served remotely
 (overlaybd's download contract):
 
 - staging file `<dir>/.download`, `ftruncate`'d sparse to the blob size;
@@ -161,13 +170,14 @@ into the per-layer directory while reads keep being served remotely
   control block — whole-file, not per-extent
   (`docs/design-assumptions.md` §S-4).
 
-### Sparse layer persistence (ADR-0011, part 1)
+### Sparse layer persistence (ADR-0011)
 
 `LayerStore` persists every remotely-served byte into a sparse local staging
 file, so a layer's dependence on the remote shrinks monotonically and
-survives restarts (the component lands standalone in this change; wiring it
-into image assembly in place of ChunkCache/SwitchSource is the ADR-0011
-follow-up):
+survives restarts. Image assembly wires it behind `RegistrySource` for
+every remote layer with a non-empty `dir` (part 1 landed the component;
+part 2 wired it in place of ChunkCache/SwitchSource; part 3 ports
+background fill into it):
 
 - one staging file `<dir>/.download.<nonce>` (sparse-truncated to the blob
   size) plus one sidecar `<dir>/.bitmap.<nonce>`; the shared nonce in the
@@ -432,7 +442,12 @@ fixed-size chunks in front of a slow source (registry or DART). It stands in
 for overlaybd's file-based cache: the per-device process model makes a
 private in-memory cache simpler and safer than shared on-disk cache files,
 and when DART is in the path DART itself provides the shared on-node disk
-cache (`docs/design-assumptions.md` §S-4).
+cache (`docs/design-assumptions.md` §S-4). Since ADR-0011 part 2, image
+assembly composes it **only on the no-dir exception path** (a remote layer
+without `lower.dir`, where no persistence is possible): dir-configured
+remote layers use the `LayerStore` instead, with the kernel page cache
+over the staging/commit file as the L1; the component remains until the
+part-3 follow-up decides its removal.
 
 - `open(inner, cfg)` — takes ownership of `inner`, which must report a
   stable size. Throws `obd::error(EINVAL)` on a null source or an invalid
@@ -567,7 +582,9 @@ public:
 ```
 
 `src/source/downloader.hpp::Downloader` — pulls one remote blob into the
-per-layer directory in the background.
+per-layer directory in the background. (Not wired by image assembly since
+ADR-0011 part 2; see Concepts §"Background download and the remote→local
+switch".)
 
 - The constructor takes ownership of `remote` (the raw, un-cached source —
   the download must not pollute the read-path chunk cache) and snapshots
@@ -619,7 +636,9 @@ public:
 
 `src/source/switch_source.hpp::SwitchSource` — the atomic remote→local
 switch of a blob's read path (overlaybd `SwitchFile`, simplified to a
-whole-file switch per `docs/design-assumptions.md` §S-4).
+whole-file switch per `docs/design-assumptions.md` §S-4). (Not wired by
+image assembly since ADR-0011 part 2; see Concepts §"Background download
+and the remote→local switch".)
 
 - `open(remote, raw_remote, dir, expected_sha256, dl_cfg)` — `remote` is the
   read path used until the switch (typically the chunk-cached
@@ -955,8 +974,9 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   creates an empty `overlaybd.commit` instead of remaining in `Filling`.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → ChunkCache → TarOffsetSource → ZFile → LSMT
-  merge reads the original content byte-exactly (the same wiring image
-  assembly performs automatically).
+  merge reads the original content byte-exactly (a component-composition
+  test; image assembly itself now wires RegistrySource → LayerStore,
+  ADR-0011).
 - `integration: cancelled connect probe does not break later io` — a DART
   probe against a dead port returns `false` quickly and subsequent registry
   IO on the same scheduler is unaffected (no leaked cancellation state).
@@ -972,6 +992,16 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   on the remote (`!switched()`), the switch flips after the download
   completes, and post-switch reads serve byte-exact content from the local
   copy.
+- `integration: image assembly serves remote reads through the layer store` —
+  image assembly wires `RegistrySource → LayerStore` for a remote lower
+  and serves reads byte-exactly while persisting read-through state into
+  the layer dir (ADR-0011 part 2).
+- `integration: layer store restart serves warmed extents without remote reads` —
+  a partially-warmed staging pair survives an assembly restart: the second
+  open serves the warmed reads locally (mock remote-read counter flat).
+- `integration: completed layer store commit binds read-only without remote reads` —
+  a store driven to completion installs `overlaybd.commit`, which the next
+  assembly binds locally with zero remote data reads.
 
 No golden external files: blob contents are deterministic patterned bytes
 generated in-test; the mock registry implements the RFC 7233 / OCI subset
@@ -979,18 +1009,22 @@ directly.
 
 ## Limitations & TODO
 
-- **LayerStore is not yet wired into image assembly.** The component exists
-  with its own tests (ADR-0011 part 1), but image assembly still stacks
-  ChunkCache + Downloader/SwitchSource; swapping the stack is the ADR-0011
-  follow-up.
-- **Chunk cache is memory-only and per-device.** There is no shared on-disk
-  cache for range reads (overlaybd's fiemap-tracked cache file); restart
-  loses cached chunks. DART, when enabled, is the shared on-node cache.
-  (Proposed ADR-0011 replaces this with a sparse-file LayerStore.)
-- **Whole-file switch only.** `SwitchSource` does not migrate extents
-  incrementally; reads stay remote until the entire blob is local and
-  verified (`docs/design-assumptions.md` §S-4). (Proposed ADR-0011 makes
-  locality gradual per extent.)
+- **No background fill yet (ADR-0011 part 3).** The `LayerStore` warms
+  read-through only: extents nobody reads stay remote until they are read.
+  Background whole-blob fill (the retired Downloader's role) returns in
+  the part-3 follow-up as LayerStore fill driven through `populate`.
+- **ChunkCache is memory-only and per-device.** It loses its content on
+  restart. Since ADR-0011 part 2, image assembly uses it only on the
+  no-dir exception path (a remote layer without `lower.dir`);
+  dir-configured layers are persisted by the sparse-file LayerStore, with
+  the kernel page cache as the L1. It remains as a composable component
+  until part 3 decides its removal. DART, when enabled, is the shared
+  on-node cache.
+- **Downloader/SwitchSource are unused by assembly.** The whole-file
+  switch never migrated extents incrementally
+  (`docs/design-assumptions.md` §S-4); ADR-0011 made locality gradual per
+  extent and retired the pair from image assembly in part 2. They remain
+  as composable components until part 3.
 - **Single-request size bound** — one registry Range read is bounded by
   `RegistryClientConfig::max_response_size` (64 MiB default); larger single
   requests must be split by the caller (the format readers already read in

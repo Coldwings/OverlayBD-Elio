@@ -1,6 +1,7 @@
 // Integration tests: the full read pipeline (registry mock -> chunk cache
-// -> tar adapter -> zfile -> lsmt merge), image assembly via open_image,
-// DART optional-accelerator fallback, background download and the
+// -> tar adapter -> zfile -> lsmt merge), image assembly via open_image
+// (remote layers served through the LayerStore, ADR-0011), DART
+// optional-accelerator fallback, background download and the
 // remote->local switch. No kernel dependencies (ublk E2E lives in
 // test_ublk_e2e.cpp and self-skips). See docs/testing.md.
 #include "common/sha256.hpp"
@@ -28,6 +29,11 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include <atomic>
+#include <filesystem>
+#include <mutex>
+#include <set>
+
 using namespace obd;
 using obd::test::TempDir;
 namespace http = elio::http;
@@ -50,6 +56,17 @@ public:
             elio::net::ipv4_address("127.0.0.1", port_)));
     }
     void stop() { server_->stop(); }
+    /// GETs serving more than the 1-byte size probe (Range bytes=0-0):
+    /// the observable "went to the remote" counter for cache assertions.
+    uint64_t data_gets() const {
+        return data_gets_.load(std::memory_order_relaxed);
+    }
+    /// Distinct 64 KiB extents (the LayerStore granularity) ever served —
+    /// each LayerStore remote fetch is exactly one extent.
+    size_t served_extent_count() const {
+        std::lock_guard lk(extents_mu_);
+        return served_extents_.size();
+    }
     std::string repo_base() const {
         return "http://127.0.0.1:" + std::to_string(port_) + "/v2";
     }
@@ -75,6 +92,11 @@ private:
             resp.set_header("Content-Length", "0");
             co_return resp;
         }
+        if (last > first) {  // more than the 1-byte size probe
+            data_gets_.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard lk(extents_mu_);
+            served_extents_.insert(first / (64 * 1024));
+        }
         http::response resp(
             partial ? http::status::partial_content : http::status::ok,
             std::string_view(
@@ -91,6 +113,9 @@ private:
     std::vector<uint8_t> blob_;
     uint16_t port_;
     std::unique_ptr<http::server> server_;
+    std::atomic<uint64_t> data_gets_{0};
+    mutable std::mutex extents_mu_;
+    std::set<uint64_t> served_extents_;
 };
 
 /// RAII stop: an exception mid-test must not leave the accept loop pending
@@ -143,6 +168,48 @@ nlohmann::json remote_image_config(const std::string& repo_base,
     cfgj["lowers"] = nlohmann::json::array({nlohmann::json{
         {"digest", "sha256:" + digest_hex}, {"size", size}}});
     return cfgj;
+}
+
+/// Same as remote_image_config plus the per-layer directory the LayerStore
+/// persists into.
+nlohmann::json remote_image_config_with_dir(const std::string& repo_base,
+                                            const std::string& digest_hex,
+                                            uint64_t size,
+                                            const std::string& layer_dir) {
+    nlohmann::json cfgj = remote_image_config(repo_base, digest_hex, size);
+    cfgj["lowers"][0]["dir"] = layer_dir;
+    return cfgj;
+}
+
+/// Present-extent count in the sidecar of the (single) LayerStore staging
+/// pair in `layer_dir`; -1 while no sidecar exists yet. The sidecar layout
+/// is documented in docs/source.md: an 80-byte header, then 8-byte
+/// {crc32, flags} records with the present bit in the flags byte.
+long sidecar_present_count(const std::string& layer_dir) {
+    for (const auto& entry :
+         std::filesystem::directory_iterator(layer_dir)) {
+        const std::string name = entry.path().filename().string();
+        if (!name.starts_with(".bitmap.")) continue;
+        const int fd = ::open(entry.path().c_str(), O_RDONLY);
+        if (fd < 0) return -1;
+        struct stat st {};
+        if (::fstat(fd, &st) != 0) {
+            ::close(fd);
+            return -1;
+        }
+        long present = 0;
+        uint8_t rec[8];
+        for (off_t off = 80; off + 8 <= st.st_size; off += 8) {
+            if (::pread(fd, rec, sizeof rec, off) !=
+                static_cast<ssize_t>(sizeof rec)) {
+                break;
+            }
+            if (rec[4] & 1) ++present;  // flags u32 LE, bit 0 = present
+        }
+        ::close(fd);
+        return present;
+    }
+    return -1;
 }
 
 }  // namespace
@@ -361,6 +428,185 @@ TEST_CASE("integration: switch source swaps reads to the local copy",
         REQUIRE(co_await sw->pread(buf2.data(), buf2.size(), 8192) == 4096);
         REQUIRE(buf2 == std::vector<uint8_t>(blob.begin() + 8192,
                                              blob.begin() + 8192 + 4096));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: image assembly serves remote reads through the layer store",
+          "[integration]") {
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 64, 57);
+    const auto blob = make_zfile_blob(dir, raw);
+    const std::string digest_hex = sha256_hex_of(blob);
+    // Deliberately NOT pre-created: assembly creates a missing layer dir.
+    const std::string layer_dir = dir / "layer_cold";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobServer server(blob, 19191);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        const auto cfgj = remote_image_config_with_dir(
+            server.repo_base(), digest_hex, blob.size(), layer_dir);
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        const image::GlobalConfig global;
+        auto opened = co_await image::open_image(cfg, global);
+        REQUIRE(opened.layer_count == 1);
+        REQUIRE(opened.virtual_size == raw.size());
+        std::vector<uint8_t> buf(raw.size());
+        const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        REQUIRE(buf == raw);
+        REQUIRE(server.data_gets() > 0);
+        // Read-through persistence: the layer dir holds a staging pair (or,
+        // for a fully fetched small blob, already the commit file).
+        bool persisted = false;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(layer_dir)) {
+            const std::string name = entry.path().filename().string();
+            if (name.starts_with(".download.") ||
+                name == "overlaybd.commit") {
+                persisted = true;
+            }
+        }
+        REQUIRE(persisted);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: layer store restart serves warmed extents without remote reads",
+          "[integration]") {
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 256, 63);
+    const auto blob = make_zfile_blob(dir, raw);
+    // Several 64 KiB extents, so a prefix read warms only part of the blob.
+    REQUIRE(blob.size() > 2 * 64 * 1024);
+    const std::string digest_hex = sha256_hex_of(blob);
+    const std::string layer_dir = dir / "layer_warm";
+    std::filesystem::create_directories(layer_dir);
+    constexpr size_t kPrefix = 8192;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobServer server(blob, 19192);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        const auto cfgj = remote_image_config_with_dir(
+            server.repo_base(), digest_hex, blob.size(), layer_dir);
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        const image::GlobalConfig global;
+
+        // Run 1 (cold): open and read only a prefix of the image, then wait
+        // until every remotely-served extent has been persisted — teardown
+        // drops queued writes, so the store must drain before it closes.
+        {
+            auto opened = co_await image::open_image(cfg, global);
+            std::vector<uint8_t> buf(kPrefix);
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(kPrefix));
+            REQUIRE(buf == std::vector<uint8_t>(raw.begin(),
+                                                raw.begin() + kPrefix));
+            const size_t served = server.served_extent_count();
+            bool drained = false;
+            for (int i = 0; i < 400 && !drained; ++i) {
+                drained = sidecar_present_count(layer_dir) ==
+                          static_cast<long>(served);
+                if (!drained) {
+                    co_await elio::time::sleep_for(
+                        std::chrono::milliseconds(25));
+                }
+            }
+            REQUIRE(drained);
+        }
+        // Genuinely partial: no completion, no commit file.
+        REQUIRE(server.served_extent_count() <
+                (blob.size() + 64 * 1024 - 1) / (64 * 1024));
+        REQUIRE(!std::filesystem::exists(layer_dir + "/overlaybd.commit"));
+        const uint64_t served_gets = server.data_gets();
+
+        // Run 2 (restart): the same reads come from the resumed staging
+        // pair — the mock observes no further remote data reads.
+        {
+            auto opened = co_await image::open_image(cfg, global);
+            REQUIRE(opened.virtual_size == raw.size());
+            std::vector<uint8_t> buf(kPrefix);
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(kPrefix));
+            REQUIRE(buf == std::vector<uint8_t>(raw.begin(),
+                                                raw.begin() + kPrefix));
+        }
+        REQUIRE(server.data_gets() == served_gets);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: completed layer store commit binds read-only without remote reads",
+          "[integration]") {
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 32, 67);
+    const auto blob = make_zfile_blob(dir, raw);
+    // One extent: a single remote fetch fills the whole store and drives
+    // it to the sha256-verified overlaybd.commit rename.
+    REQUIRE(blob.size() < 64 * 1024);
+    const std::string digest_hex = sha256_hex_of(blob);
+    const std::string layer_dir = dir / "layer_commit";
+    std::filesystem::create_directories(layer_dir);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobServer server(blob, 19193);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        const auto cfgj = remote_image_config_with_dir(
+            server.repo_base(), digest_hex, blob.size(), layer_dir);
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        const image::GlobalConfig global;
+
+        // Run 1: read the whole image; the store completes and renames its
+        // staging file to overlaybd.commit while it is still alive.
+        {
+            auto opened = co_await image::open_image(cfg, global);
+            std::vector<uint8_t> buf(raw.size());
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(raw.size()));
+            REQUIRE(buf == raw);
+            bool committed = false;
+            for (int i = 0; i < 400 && !committed; ++i) {
+                committed = std::filesystem::exists(layer_dir +
+                                                    "/overlaybd.commit");
+                if (!committed) {
+                    co_await elio::time::sleep_for(
+                        std::chrono::milliseconds(25));
+                }
+            }
+            REQUIRE(committed);
+        }
+        const uint64_t served_gets = server.data_gets();
+
+        // Run 2: the commit marker binds the layer locally (the local
+        // probe) — zero remote data reads, byte-exact content.
+        {
+            auto opened = co_await image::open_image(cfg, global);
+            REQUIRE(opened.virtual_size == raw.size());
+            std::vector<uint8_t> buf(raw.size());
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(raw.size()));
+            REQUIRE(buf == raw);
+        }
+        REQUIRE(server.data_gets() == served_gets);
         co_return 0;
     });
     REQUIRE(rc == 0);

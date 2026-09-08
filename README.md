@@ -40,10 +40,10 @@ of pulling and unpacking full image layers first.
                                       │
         MergedWritable (optional upper) / MergedLsmt
         ├─ LsmtLayer ◀─ ZFileSource? ◀─ TarOffsetSource?
-        │        ◀─ ChunkCache ◀─ SwitchSource? ◀─ RegistrySource
-        │                                             │ (or DART prefix)
-        ▼                                             ▼
-     local blobs                              OCI registry (HTTP range)
+        │        ◀─ LayerStore ◀─ RegistrySource
+        │                             │ (or DART prefix)
+        ▼                             ▼
+     local blobs              OCI registry (HTTP range)
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full data flow,

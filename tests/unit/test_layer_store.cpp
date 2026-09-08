@@ -1,4 +1,4 @@
-// Unit tests: LayerStore sparse-file persistence (ADR-0011, part 1).
+// Unit tests: LayerStore sparse-file persistence (ADR-0011).
 //
 // The fixtures are deterministic patterned bytes generated in-test; the
 // expected sha256 digests come from the project's OpenSSL-backed helper

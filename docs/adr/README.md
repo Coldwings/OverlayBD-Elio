@@ -132,7 +132,7 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0008](./0008-writable-upper-layers.md) | Writable upper layers: sparse file and in-place-edit LSMT-RW | accepted |
 | [0009](./0009-discard-punch-hole.md) | Discard/punch-hole with mask-with-zeroes semantics | accepted |
 | [0010](./0010-ublk-user-recovery.md) | ublk USER_RECOVERY crash recovery with bounded respawn | accepted |
-| [0011](./0011-sparse-layer-store.md) | Unify layer persistence into a sparse-file LayerStore with sidecar bitmap and per-extent CRC | proposed |
+| [0011](./0011-sparse-layer-store.md) | Unify layer persistence into a sparse-file LayerStore with sidecar bitmap and per-extent CRC | accepted |
 | [0012](./0012-read-admission-funnel.md) | Admit all remote reads through one priority funnel with scavenger-class prefetch | proposed |
 | [0013](./0013-trace-prefetch.md) | Record and replay prefetch traces in upstream-compatible format without a photon dependency | proposed |
 | [0014](./0014-offline-commit-and-cli-boundary.md) | Commit offline with deterministic seal, grow-only resize, and an external CLI boundary | proposed |

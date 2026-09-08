@@ -305,6 +305,18 @@ Every test, grouped by area, with the property it guards.
   to direct registry reads within the probe budget (ADR-0005).
 - `integration: registry pipeline serves a zfile-compressed image` —
   end-to-end correctness for a compressed image fetched over HTTP.
+- `integration: image assembly serves remote reads through the layer store` —
+  a remote lower with a configured `dir` assembles through
+  RegistrySource → LayerStore and reads back byte-exactly, leaving
+  read-through persistence state in the layer dir (ADR-0011).
+- `integration: layer store restart serves warmed extents without remote reads` —
+  a partially-warmed staging pair is resumed by a second `open_image`:
+  repeated reads are served locally and the mock registry's remote-read
+  counter does not increase.
+- `integration: completed layer store commit binds read-only without remote reads` —
+  a LayerStore driven to completion renames its staging file to
+  `overlaybd.commit`; a reopen binds it via the local probe and serves
+  byte-exact reads with zero remote data reads.
 - `integration: downloader writes, verifies and installs the blob` —
   the background downloader stages, sha256-verifies, and atomically
   installs `overlaybd.commit`.
