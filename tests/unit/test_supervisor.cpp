@@ -148,9 +148,12 @@ TEST_CASE("supervisor: commit command parses and validates its fields",
                  .has_value());
     REQUIRE(err.find("commit requires 'id'") != std::string::npos);
 
-    // The hello handshake advertises the capability gate for commit.
+    // The hello handshake advertises the capability gate for commit —
+    // including the protocol version field itself (clients gate on both).
     const auto hello = nlohmann::json::parse(supervisor::reply_hello());
     REQUIRE(hello.value("ok", false) == true);
+    REQUIRE(hello.contains("protocol"));
+    REQUIRE(hello["protocol"].get<int>() == supervisor::kProtocolVersion);
     REQUIRE((hello.contains("features") && hello["features"].is_array()));
     const auto features =
         hello["features"].get<std::vector<std::string>>();

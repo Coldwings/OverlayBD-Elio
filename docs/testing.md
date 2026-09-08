@@ -144,12 +144,21 @@ Every test, grouped by area, with the property it guards.
 - `format: lsmt rw seal is deterministic for identical content` —
   identical upper content seals to byte-identical files with equal
   content-derived uuids (ADR-0014 seal determinism); a different write
-  sequence yields a different digest.
+  sequence yields a different digest, as does identical data with a
+  different packed index (zeroed segments — pinning that the index, not
+  only the data, feeds the digest).
 - `format: lsmt rw checkpoint persists the index for offline seal` —
   `checkpoint()` persists the RW index as an unsealed trailer (terminal:
   later writes get `-EROFS`), `seal_file()` seals it offline with
-  sha256/size reported, and missing/sealed/uncheckpointed files map to
-  `-ENOENT`/`-EALREADY`/`-EINVAL` (ADR-0014).
+  sha256/size reported, missing/sealed/uncheckpointed files map to
+  `-ENOENT`/`-EALREADY`/`-EINVAL`, and a checkpointed index entry with an
+  out-of-range moffset is rejected (`-EINVAL`) rather than sealed
+  (ADR-0014).
+- `format: lsmt rw offline seal rejects a torn checkpoint trailer` — a
+  trailer torn mid-write (magic/flags/virtual_size present, uuid and
+  index fields still zero) parses as a valid but empty checkpoint; the
+  header/trailer uuid cross-check rejects it with `-EINVAL` and the file
+  is left unsealed (ADR-0014).
 - `format: merged writable falls through and copy-on-writes` —
   `MergedWritable` reads fall through the upper to sealed lowers, and
   writes shadow lowers copy-on-write without mutating them (ADR-0008).
@@ -320,7 +329,7 @@ Every test, grouped by area, with the property it guards.
   the `hello` reply carries an integer `protocol` ≥ 1, a non-empty
   `version` string, and a `features` array; `hello` requires no fields and
   ignores extras; unknown cmds and malformed JSON stay answered errors
-  (ADR-0014, proposed).
+  (ADR-0014).
 - `supervisor: child spawn execs and reports through the channel` — a
   spawned child's fd-3 status lines reach the parent and drive the
   ready event.
@@ -334,7 +343,8 @@ Every test, grouped by area, with the property it guards.
   (ADR-0010).
 - `supervisor: commit command parses and validates its fields` — `commit`
   requires `id`, accepts an optional `user_tag`, ignores unknown fields,
-  and the `hello` features list advertises `commit` (ADR-0014, proposed).
+  and the `hello` reply pins the `protocol` field plus the `commit`
+  feature advertisement (ADR-0014).
 
 ### integration
 
@@ -372,15 +382,24 @@ Every test, grouped by area, with the property it guards.
   daemon over its control socket: `hello` returns the documented
   handshake shape end to end, an unknown cmd is answered with an error,
   and malformed JSON is answered with an error rather than dropped
-  (ADR-0014, proposed). Runs without privileges.
+  (ADR-0014). Runs without privileges.
 - `supervisor: commit stops the device and seals its upper offline` — a
-  real daemon with a fake obd-device: commit on unknown id, sparse upper,
-  and upper-less devices fails with precise errors; commit on a live
+  real daemon with a signalfd-based fake obd-device
+  (`tests/fake_device_main.cpp`) that, like the real device, checkpoints
+  its LSMT-RW upper only on SIGTERM — so a commit that sealed without
+  stopping the device first could not succeed (stop-then-seal is pinned,
+  not just narrated): commit on unknown id, sparse upper, and upper-less
+  devices fails with precise errors; editing the config file after create
+  does not redirect commit (upper path provenance); commit on a live
   LSMT-upper device stops it (bounded reap) and seals its checkpointed
   upper, replying `path`/`sha256`/`size`; a second commit fails with
   "already sealed"; the sealed file re-opens as a valid LSMT RO layer
-  with the checkpointed content (ADR-0014, proposed). Runs without
-  privileges.
+  with the fake's payload (ADR-0014). Runs without privileges.
+- `supervisor: concurrent commits are serialized and reject the loser` —
+  two barrier-synchronized commits of the same device: exactly one
+  succeeds, the loser gets a precise error ("commit already in progress"
+  or "already sealed"), and the sealed file is intact (no interleaved
+  tmp-file writes) (ADR-0014). Runs without privileges.
 - `integration: switch source swaps reads to the local copy` — after
   install, reads migrate from the remote source to the local file.
 - `integration: ublk device serves sector reads from a blob` — the

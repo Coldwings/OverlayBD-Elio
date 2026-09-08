@@ -98,15 +98,38 @@ private:
     std::string buf_;
 };
 
+/// RAII unlock for elio::sync::mutex (unlock() is synchronous; only lock()
+/// is a co_await). Lets coroutine exit paths (co_return, exception unwind)
+/// release a held per-entry mutex without manual bookkeeping.
+struct SyncMutexGuard {
+    elio::sync::mutex& m;
+    ~SyncMutexGuard() { m.unlock(); }
+};
+
 class Daemon {
     /// Per-device bookkeeping (ADR-0010): the spec is the respawn
     /// template; dev_id is learned from the ready status's bdev path.
+    ///
+    /// ADR-0014 commit bookkeeping: `upper_path`/`upper_type` are recorded
+    /// from the image config at create time (provenance — later edits to
+    /// the config file must not redirect commit). `committing` (guarded by
+    /// `mu_`, like `destroying`) rejects concurrent commits. `op_mu`
+    /// serializes a commit's stop-and-seal (and destroy's stop) against a
+    /// recovery respawn in supervise_entry, so a seal never runs while a
+    /// recovery child is booting or alive. Lock order: `mu_` is never held
+    /// while acquiring `op_mu`; brief `mu_` sections inside `op_mu` are
+    /// fine (no one acquires `op_mu` while holding `mu_`).
     struct DeviceEntry {
         ChildSpec spec;
         std::shared_ptr<Child> child;
         int dev_id = -1;
         int recoveries = 0;   // completed respawns
         bool destroying = false;  // intentional teardown: never respawn
+        std::string upper_path;   // <upper.dir>/overlaybd.rw when lsmt
+        std::string upper_type;   // "" = no writable upper recorded
+        bool image_config_ok = false;  // config parsed at create time
+        bool committing = false;      // a commit is in flight
+        elio::sync::mutex op_mu;      // commit/destroy vs recovery respawn
     };
 
 public:
@@ -291,7 +314,13 @@ private:
                 }
                 ::close(fd);
             }
-            if (stopping_.load() || entry->destroying) co_return;
+            if (stopping_.load()) co_return;
+            {
+                co_await mu_.lock();
+                const bool destroy = entry->destroying;
+                mu_.unlock();
+                if (destroy) co_return;
+            }
             if (entry->dev_id < 0 ||
                 entry->recoveries >= cfg_.max_recovery_attempts) {
                 ELIO_LOG_ERROR(
@@ -302,25 +331,39 @@ private:
             }
             // Respawn in recovery mode: the kernel kept the ublk device
             // (created with UBLK_F_USER_RECOVERY), so the replacement
-            // attaches instead of creating.
-            ChildSpec spec = entry->spec;
-            spec.recover = true;
-            spec.dev_id_request = entry->dev_id;
-            std::shared_ptr<Child> next;
-            try {
-                next = std::shared_ptr<Child>(Child::spawn(spec).release());
-            } catch (const std::system_error& e) {
-                ELIO_LOG_ERROR("device {} recovery spawn failed: {}",
-                               entry->spec.id, e.what());
-                co_return;
+            // attaches instead of creating. op_mu serializes the respawn
+            // against a concurrent commit/destroy (ADR-0014): either the
+            // respawn completes first and the commit stops this child, or
+            // the commit holds op_mu and the re-check below aborts the
+            // respawn — a seal never runs while a recovery child is
+            // booting or alive.
+            co_await entry->op_mu.lock();
+            {
+                SyncMutexGuard op_guard{entry->op_mu};
+                co_await mu_.lock();
+                const bool destroy = entry->destroying;
+                mu_.unlock();
+                if (destroy) co_return;  // op_guard releases
+                ChildSpec spec = entry->spec;
+                spec.recover = true;
+                spec.dev_id_request = entry->dev_id;
+                std::shared_ptr<Child> next;
+                try {
+                    next = std::shared_ptr<Child>(
+                        Child::spawn(spec).release());
+                } catch (const std::system_error& e) {
+                    ELIO_LOG_ERROR("device {} recovery spawn failed: {}",
+                                   entry->spec.id, e.what());
+                    co_return;
+                }
+                entry->recoveries += 1;
+                ELIO_LOG_WARNING(
+                    "device {} recovering via ublk USER_RECOVERY "
+                    "(attempt {}, dev_id {})",
+                    entry->spec.id, entry->recoveries, entry->dev_id);
+                entry->child = next;
+                fd = next->release_control_fd();
             }
-            entry->recoveries += 1;
-            ELIO_LOG_WARNING(
-                "device {} recovering via ublk USER_RECOVERY "
-                "(attempt {}, dev_id {})",
-                entry->spec.id, entry->recoveries, entry->dev_id);
-            entry->child = next;
-            fd = next->release_control_fd();
         }
     }
 
@@ -371,6 +414,26 @@ private:
 
         auto entry = std::make_shared<DeviceEntry>();
         entry->spec = ChildSpec{id, bin, config, global, dev_id, false};
+        // ADR-0014: record the upper's path/kind for a later commit.
+        // Provenance is the config as of create time — a later edit of the
+        // config file must not redirect commit. A parse failure leaves the
+        // entry without upper info (commit then reports it); the child
+        // reports the config error itself.
+        try {
+            const std::string text = co_await read_text_file(config);
+            const image::ImageConfig img = image::ImageConfig::from_json_text(
+                text, source::DownloadConfig{});
+            entry->image_config_ok = true;
+            if (img.writable()) {
+                entry->upper_type = img.upper.type;
+                if (img.upper.type == "lsmt") {
+                    entry->upper_path = img.upper.dir + "/overlaybd.rw";
+                }
+            }
+        } catch (const std::exception& e) {
+            ELIO_LOG_WARNING("device {}: cannot pre-parse image config ({})",
+                             id, e.what());
+        }
         try {
             entry->child =
                 std::shared_ptr<Child>(Child::spawn(entry->spec).release());
@@ -419,28 +482,37 @@ private:
         {
             co_await mu_.lock();
             auto it = children_.find(id);
-            if (it != children_.end()) entry = it->second;
+            if (it != children_.end()) {
+                entry = it->second;
+                // Intentional: supervise_entry must not respawn. Written
+                // under mu_ — supervise_entry reads it under mu_ too.
+                entry->destroying = true;
+            }
             mu_.unlock();
         }
         if (!entry) co_return reply_error("no such device: " + id);
-        entry->destroying = true;  // intentional: supervise_entry must not respawn
-        std::shared_ptr<Child> child = entry->child;
 
-        child->terminate();
-        auto done = co_await elio::with_timeout(
-            std::chrono::seconds(cfg_.stop_timeout_sec),
-            [&child](elio::coro::cancel_token tok)
-                -> elio::coro::task<void> {
-                co_await child->exit_event().wait(std::move(tok));
-            });
-        if (!done) {
-            child->kill();
-            co_await elio::with_timeout(
-                std::chrono::seconds(2),
+        // op_mu serializes the stop against a recovery respawn in flight.
+        co_await entry->op_mu.lock();
+        {
+            SyncMutexGuard op_guard{entry->op_mu};
+            std::shared_ptr<Child> child = entry->child;
+            child->terminate();
+            auto done = co_await elio::with_timeout(
+                std::chrono::seconds(cfg_.stop_timeout_sec),
                 [&child](elio::coro::cancel_token tok)
                     -> elio::coro::task<void> {
                     co_await child->exit_event().wait(std::move(tok));
                 });
+            if (!done) {
+                child->kill();
+                co_await elio::with_timeout(
+                    std::chrono::seconds(2),
+                    [&child](elio::coro::cancel_token tok)
+                        -> elio::coro::task<void> {
+                        co_await child->exit_event().wait(std::move(tok));
+                    });
+            }
         }
         {
             co_await mu_.lock();
@@ -452,11 +524,12 @@ private:
 
     /// ADR-0014 offline commit: stop the device (when live), then seal its
     /// LSMT-RW upper in this process and reply with the sealed file's path,
-    /// sha256 and size. The supervisor re-derives the upper path from the
-    /// recorded image config — the device owns the files, but the config
-    /// schema (docs/config.md) fixes both location and kind, so no extra
-    /// protocol state is needed. Sparse uppers and upper-less devices are
-    /// clear errors (upstream #216 parity).
+    /// sha256 and size. The upper path/kind recorded at create time is the
+    /// provenance (docs/supervisor.md). Sparse uppers and upper-less
+    /// devices are clear errors (upstream #216 parity). Concurrent commits
+    /// of the same device are rejected (`committing`); the stop-and-seal
+    /// itself is serialized against recovery respawns by the entry's
+    /// op_mu, so a seal never runs while a device child is alive.
     elio::coro::task<std::string> cmd_commit(const nlohmann::json& j) {
         const std::string id = j["id"].get<std::string>();
         const std::string user_tag = j.value("user_tag", "");
@@ -464,38 +537,72 @@ private:
         {
             co_await mu_.lock();
             auto it = children_.find(id);
-            if (it != children_.end()) entry = it->second;
+            if (it != children_.end()) {
+                entry = it->second;
+                if (entry->committing) {
+                    mu_.unlock();
+                    co_return reply_error("commit already in progress: " +
+                                          id);
+                }
+                entry->committing = true;
+                // Intentional stop: supervise_entry must not respawn.
+                entry->destroying = true;
+            }
             mu_.unlock();
         }
         if (!entry) co_return reply_error("no such device: " + id);
 
-        image::ImageConfig img;
+        std::string reply;
         try {
-            const std::string text =
-                co_await read_text_file(entry->spec.config_path);
-            img = image::ImageConfig::from_json_text(text,
-                                                     source::DownloadConfig{});
+            reply = co_await commit_stop_and_seal(entry, id, user_tag);
         } catch (const std::exception& e) {
-            co_return reply_error("cannot read image config for " + id +
-                                  ": " + e.what());
+            reply = reply_error(std::string("commit failed for ") + id +
+                                ": " + e.what());
         }
-        if (!img.writable()) {
+        {
+            co_await mu_.lock();
+            entry->committing = false;
+            mu_.unlock();
+        }
+        co_return reply;
+    }
+
+    /// The commit critical section (see cmd_commit). Runs with the entry's
+    /// op_mu held across the stop and the seal.
+    elio::coro::task<std::string> commit_stop_and_seal(
+        const std::shared_ptr<DeviceEntry>& entry, const std::string& id,
+        const std::string& user_tag) {
+        if (!entry->image_config_ok) {
+            co_return reply_error(
+                "image config unreadable at create; upper unknown: " + id);
+        }
+        if (entry->upper_type.empty()) {
             co_return reply_error("device has no writable upper: " + id);
         }
-        if (img.upper.type != "lsmt") {
+        if (entry->upper_type != "lsmt") {
             co_return reply_error("sparse uppers cannot be sealed: " + id);
         }
-        const std::string upper = img.upper.dir + "/overlaybd.rw";
+        const std::string& upper = entry->upper_path;
+
+        co_await entry->op_mu.lock();
+        SyncMutexGuard op_guard{entry->op_mu};
 
         // Stopped-device contract (ADR-0014): commit stops a live device
         // first (SIGTERM + bounded reap — the destroy mechanics without
         // removing the entry) and only then seals; a device that will not
         // stop is never sealed underneath. The graceful shutdown makes the
         // device checkpoint its upper's index (obd-device), which the
-        // offline seal below requires.
-        entry->destroying = true;  // intentional: supervise_entry must not respawn
-        std::shared_ptr<Child> child = entry->child;
-        if (child->status().state != "exited") {
+        // offline seal below requires. The loop re-reads entry->child: a
+        // recovery respawn that completed just before op_mu was taken
+        // installed a fresh child, which is stopped here too; while op_mu
+        // is held no further respawn can install another.
+        for (int attempt = 0;; ++attempt) {
+            std::shared_ptr<Child> child = entry->child;
+            if (child->status().state == "exited") break;
+            if (attempt >= 3) {
+                co_return reply_error(
+                    "device keeps being replaced; upper not sealed: " + id);
+            }
             child->terminate();
             auto done = co_await elio::with_timeout(
                 std::chrono::seconds(cfg_.stop_timeout_sec),
@@ -530,9 +637,9 @@ private:
             co_return reply_error("upper already sealed: " + upper);
         }
         if (rc == -EINVAL) {
-            co_return reply_error("upper has no shutdown checkpoint (device "
-                                  "crashed or was killed before stopping): " +
-                                  upper);
+            co_return reply_error("upper has no valid shutdown checkpoint "
+                                  "(device crashed or was killed before "
+                                  "stopping): " + upper);
         }
         if (rc != 0) {
             co_return reply_error(std::string("seal failed for ") + upper +

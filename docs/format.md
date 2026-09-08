@@ -575,7 +575,8 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
   unsealed writes.
 - `seal(user_tag)`: compacts the file into a **standard sealed LSMT RO
   file**: live segments are copied out packed sequentially into
-  `<path>.sealing` (garbage left behind by in-place edits and discards is
+  `<path>.sealing.<pid>` (a per-process tmp name — two seals never
+  interleave writes; garbage left behind by in-place edits and discards is
   dropped; zeroed segments consume no data space),
   followed by the padded index, a sealed header and trailer, `fdatasync`,
   and an **atomic rename** over `path`. Afterwards `sealed()` is true and
@@ -584,8 +585,10 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
 - `seal_file(path, user_tag, sha256_hex, size)` (ADR-0014 offline commit):
   opens a **checkpointed** RW file without truncating (index loaded from
   the on-disk unsealed trailer, validated with the `LsmtLayer::open`
-  rules), seals it in place, and reports the sealed file's sha256 hex
-  digest and byte size. Used by the supervisor's `commit` command after
+  rules, and the trailer's uuid/virtual_size cross-checked against the
+  on-disk header at offset 0 — a trailer torn mid-write or forged cannot
+  seal an empty or wrong layer), seals it in place, and reports the
+  sealed file's sha256 hex digest and byte size. Used by the supervisor's `commit` command after
   the device process has exited. Error channels: `-ENOENT` (missing
   file), `-EALREADY` (already sealed), `-EINVAL` (not a valid checkpointed
   LSMT-RW file — e.g. the device crashed before checkpointing), other
@@ -791,8 +794,7 @@ features (not yet implemented).
 - **Seal atomicity.** `LsmtRwLayer::seal` publishes the compacted file via
   fsync + atomic rename; a failed seal leaves the original file untouched
   and unsealed.
-- **Seal determinism (ADR-0014, the governing — currently proposed —
-  decision for offline commit).** The sealed file is a **pure function of
+- **Seal determinism (ADR-0014).** The sealed file is a **pure function of
   the upper's content plus the caller-supplied `user_tag`**: identical
   content and tag seal to identical bytes, no wall-clock, randomness, or
   process-derived fields. Concretely, the sealed header/trailer `uuid` is

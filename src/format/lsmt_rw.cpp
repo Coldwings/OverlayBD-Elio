@@ -414,8 +414,11 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     if (sealed_) co_return -EROFS;
 
     // Compaction: live segments are copied out packed sequentially; the
-    // garbage left behind by in-place edits is dropped.
-    const std::string tmp = path_ + ".sealing";
+    // garbage left behind by in-place edits is dropped. The tmp name is
+    // per-process so two seals can never interleave writes into the same
+    // file (defense in depth; the supervisor additionally serializes
+    // commits per device).
+    const std::string tmp = path_ + ".sealing." + std::to_string(::getpid());
     const int out_fd =
         ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (out_fd < 0) co_return -errno;
@@ -579,6 +582,31 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
         fail(-EINVAL);
         co_return nullptr;
     }
+
+    // Cross-check the on-disk header (offset 0) against the trailer. A
+    // trailer torn mid-write can otherwise parse as a valid but EMPTY
+    // checkpoint — silently sealing an empty layer — and a trailer alone
+    // is forgeable by the block-device guest. The header is written at
+    // create() with a random uuid the guest never sees, so agreement of
+    // uuid and virtual_size authenticates the checkpoint.
+    rc = co_await read_all(fd, region, sizeof(region), 0);
+    if (rc != 0) {
+        fail(rc);
+        co_return nullptr;
+    }
+    lsmt::HeaderTrailer hht;
+    try {
+        hht = lsmt::HeaderTrailer::parse(region);
+    } catch (const std::exception&) {
+        fail(-EINVAL);
+        co_return nullptr;
+    }
+    if (!hht.is_header() || !hht.is_data_file() || hht.is_sealed() ||
+        hht.uuid != tht.uuid || hht.virtual_size != tht.virtual_size) {
+        fail(-EINVAL);
+        co_return nullptr;
+    }
+
     const uint64_t index_bytes =
         tht.index_size * bytes::segment_mapping::kEncodedSize;
     if (tht.index_offset < lsmt::kSpace ||

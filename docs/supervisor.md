@@ -73,14 +73,14 @@ command (`src/supervisor/daemon.cpp`):
 - **list**: `{"ok":true,"devices":[{"id","pid","state","device","error"}, ...]}`.
 - **status**: `{"ok":true,"id","pid","state","device","error","exit_code"}`
   (`exit_code` is -1 until the child is reaped).
-- **commit** (ADR-0014, proposed): `{"ok":true,"id","path","sha256","size"}`
+- **commit** (ADR-0014): `{"ok":true,"id","path","sha256","size"}`
   — the sealed upper's file path, the hex sha256 of the sealed file, and
   its byte size. See "Offline commit" below for the full contract.
 
 ### Additive-only evolution rule
 
 The control protocol evolves **additively only** (governing decision:
-ADR-0014, currently proposed). Concretely:
+ADR-0014). Concretely:
 
 - New commands and new reply fields **may be added**; existing field names
   and meanings **never change**.
@@ -94,7 +94,7 @@ ADR-0014, currently proposed). Concretely:
 This rule is what allows obdctl, obd-supervisor, and any external
 (non-C++) CLI to be upgraded independently.
 
-### Offline commit (ADR-0014, proposed)
+### Offline commit (ADR-0014)
 
 `commit` seals a device's writable LSMT-RW upper into a standard sealed
 LSMT layer **offline** — the device process is never alive while its upper
@@ -112,11 +112,12 @@ is being sealed. Contract:
   the entry); ADR-0014 explicitly allows "requires the device stopped (or
   stops it)".
 - **How the supervisor finds the upper.** The device process owns the
-  upper's files; the supervisor re-derives the upper path and kind from
-  the recorded image config (`create`'s `config` path, re-read at commit
-  time): `upper.dir` + `upper.type` fix the file
-  (`<dir>/overlaybd.rw`, docs/config.md). No extra state is recorded at
-  create and the device-status protocol is unchanged.
+  upper's files; the supervisor records the upper path and kind
+  (`<upper.dir>/overlaybd.rw`, docs/config.md) **from the image config at
+  create time** — provenance. A later edit of the config file does not
+  redirect commit; if the config could not be parsed at create, commit
+  reports "image config unreadable at create; upper unknown". The
+  device-status protocol is unchanged.
 - **The shutdown checkpoint.** An unsealed LSMT-RW file's segment index is
   memory-only (docs/format.md); a graceful obd-device shutdown therefore
   **checkpoints** the index into the file (unsealed trailer) before
@@ -128,11 +129,20 @@ is being sealed. Contract:
   backend (no blocking work on the Elio workers). The sealed uuid is
   content-derived — identical upper content seals to identical bytes
   (docs/format.md, seal determinism invariant).
+- **Concurrency.** One commit per device at a time: a second commit of
+  the same device while one is in flight is rejected ("commit already in
+  progress"). The stop-and-seal critical section is serialized against a
+  crash-recovery respawn (ADR-0010) by a per-entry mutex: either the
+  respawn completes first and commit stops the recovery child too, or the
+  respawn aborts on the `destroying` flag — a seal never runs while a
+  device child is booting or alive.
 - **Errors** (via the `{"ok":false,"error"}` envelope, precise reasons):
   unknown id ("no such device"), a config without `upper` ("no writable
   upper"), a sparse upper ("sparse uppers cannot be sealed" — upstream
-  parity, ADR-0014), a missing upper file, an already-sealed upper, a
-  missing shutdown checkpoint (device crashed), and stop-timeout.
+  parity, ADR-0014), a concurrent commit ("commit already in progress"),
+  a config unreadable at create time, a missing upper file, an
+  already-sealed upper, a missing or invalid shutdown checkpoint (device
+  crashed), and stop-timeout.
 
 ### Channel 2: obd-device → supervisor (status channel, fd 3)
 
@@ -353,7 +363,7 @@ devices and stops a live device before sealing (see "Offline commit").
   fields) and the status channel's shapes (`state` plus optional `device`/
   `error`; the state vocabulary `starting`/`ready`/`failed`/`stopped`) may
   only change with an ADR — and then only **additively** (see the
-  additive-only evolution rule above; ADR-0014, proposed). obdctl,
+  additive-only evolution rule above; ADR-0014). obdctl,
   obd-supervisor, and obd-device may be upgraded independently.
 - **The fd-3 + argv contract** between supervisor and obd-device
   (`--control-fd 3`, `--config`, optional `--global`, optional `--dev-id`,
@@ -399,7 +409,7 @@ needing a real ublk device or root.
 - `supervisor: commit command parses and validates its fields` — pins the
   additive `commit` grammar (requires `id`, optional `user_tag`, unknown
   fields ignored) and that the `hello` handshake advertises the `commit`
-  feature gate (ADR-0014, proposed).
+  feature gate (ADR-0014).
 - `supervisor: commit stops the device and seals its upper offline`
   (integration, `tests/integration/test_commit.cpp`) — a real daemon with
   a fake obd-device: commit on an unknown id / sparse upper / upper-less
@@ -407,7 +417,7 @@ needing a real ublk device or root.
   it (bounded reap) and seals its checkpointed upper, replying with
   `path`/`sha256`/`size`; a second commit fails with "already sealed";
   the sealed file re-opens as a valid LSMT RO layer with the
-  checkpointed content (ADR-0014, proposed). Runs without privileges.
+  checkpointed content (ADR-0014). Runs without privileges.
 
 Run: `ctest --test-dir build --output-on-failure` (no privileges needed;
 the spawn tests create their fake binaries under a temporary directory).
