@@ -8,8 +8,11 @@ the kernel **ublk** driver (the ADR-0003 decision: ublk, not tcmu). It has
 three layers:
 
 - **Control plane** (`src/ublk/ctrl.hpp`) — synchronous `/dev/ublk-control`
-  ioctls driving the device lifecycle: `ADD_DEV` → `SET_PARAMS` → (queues
+  commands driving the device lifecycle: `ADD_DEV` → `SET_PARAMS` → (queues
   park their FETCH commands) → `START_DEV` → … → `STOP_DEV` → `DEL_DEV`.
+  Control commands are `IORING_OP_URING_CMD` on the control fd (with
+  `IORING_SETUP_SQE128`, which the driver requires) — ublk-control has
+  never had an `unlocked_ioctl` handler; libublksrv works the same way.
 - **Per-queue data plane** (`src/ublk/queue.hpp`) — one `Queue` per hardware
   queue, each owning a raw liburing ring that speaks
   `UBLK_IO_FETCH_REQ` / `UBLK_IO_COMMIT_AND_FETCH_REQ` uring-cmds to
@@ -157,6 +160,7 @@ size / 512), `logical_bs_shift` (9 = 512 B), `physical_bs_shift` (12 = 4 K),
 `UBLK_ATTR_READ_ONLY`).
 
 `Ctrl` — one instance per device process; owns the `/dev/ublk-control` fd
+  and the SQE128 control ring
 and remembers the added device for best-effort cleanup. Non-copyable.
 
 - `Ctrl()` — opens `/dev/ublk-control` (`O_RDWR | O_CLOEXEC`); throws
@@ -174,11 +178,11 @@ and remembers the added device for best-effort cleanup. Non-copyable.
   the kernel answers `EBUSY` until every queue tag has a parked FETCH —
   callers poll (see `Device::create`).
 - `void stop_dev(uint32_t) noexcept`, `void del_dev(uint32_t) noexcept` —
-  best-effort teardown ioctls; errors are deliberately ignored.
+  best-effort teardown commands; errors are deliberately ignored.
 - `static std::string cdev_path(uint32_t)` → `/dev/ublkc<N>`;
   `static std::string bdev_path(uint32_t)` → `/dev/ublkb<N>`.
 
-All `Ctrl` ioctls are **synchronous cold-path** calls — never invoke them on
+All `Ctrl` commands are **synchronous cold-path** calls — never invoke them on
 a coroutine hot path.
 
 ### `src/ublk/queue.hpp` — `obd::ublk::IoRequest`, `obd::ublk::Queue`
@@ -290,7 +294,7 @@ Three distinct execution contexts, with strict permissions:
 
 | Context | Threads | May touch |
 |---|---|---|
-| Control path | caller of `Device::create` (an Elio coroutine) | `Ctrl` ioctls (blocking; cold path only) |
+| Control path | caller of `Device::create` (an Elio coroutine) | `Ctrl` control commands (blocking; cold path only) |
 | ublk queue threads | one `std::thread` per `Queue` | **exclusively** their ring, the read-only mmap window, `pending_` push, `done_` drain |
 | Elio scheduler threads | bridge + per-tag `handle_io` coroutines | `try_pop_request`, tag IO buffers, `BlobSource` stack, `push_completion` |
 

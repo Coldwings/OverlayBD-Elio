@@ -6,7 +6,6 @@
 #include <elio/log/macros.hpp>
 
 #include <fcntl.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -27,6 +26,17 @@ Ctrl::Ctrl() {
         throw_errno(errno, "cannot open /dev/ublk-control (is ublk_drv "
                            "loaded and accessible?)");
     }
+    io_uring_params params {};
+    // The driver requires SQE128 for control commands; CQE32 pairs with
+    // it in libublksrv, keep them together.
+    params.flags = IORING_SETUP_SQE128 | IORING_SETUP_CQE32;
+    const int ret = io_uring_queue_init_params(8, &ring_, &params);
+    if (ret < 0) {
+        const int e = -ret;
+        ::close(fd_);
+        fd_ = -1;
+        throw_errno(e, "cannot init ublk control io_uring");
+    }
 }
 
 Ctrl::~Ctrl() {
@@ -34,20 +44,45 @@ Ctrl::~Ctrl() {
         stop_dev(static_cast<uint32_t>(added_dev_));
         del_dev(static_cast<uint32_t>(added_dev_));
     }
+    io_uring_queue_exit(&ring_);
     if (fd_ >= 0) ::close(fd_);
 }
 
-void Ctrl::ctrl_cmd(uint32_t cmd_op, uint32_t dev_id, uint16_t queue_id,
-                    void* data, uint16_t len, uint64_t data0,
-                    const char* what) {
+int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
+                       uint16_t queue_id, void* data, uint16_t len,
+                       uint64_t data0) noexcept {
     ublksrv_ctrl_cmd cmd {};
     cmd.dev_id = dev_id;
     cmd.queue_id = queue_id;
     cmd.len = len;
     cmd.addr = reinterpret_cast<uint64_t>(data);
     cmd.data[0] = data0;
-    if (::ioctl(fd_, cmd_op, &cmd) < 0) {
-        throw_errno(errno, std::string("ublk ctrl: ") + what + " failed");
+
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (sqe == nullptr) return -EBUSY;
+    sqe->opcode = IORING_OP_URING_CMD;
+    sqe->fd = fd_;
+    sqe->cmd_op = cmd_op;
+    std::memcpy(sqe->cmd, &cmd, sizeof(cmd));
+    sqe->user_data = 0;
+
+    if (io_uring_submit_and_wait(&ring_, 1) < 0) return -errno;
+    io_uring_cqe* cqe = nullptr;
+    int res = -EIO;
+    if (io_uring_peek_cqe(&ring_, &cqe) == 0 && cqe != nullptr) {
+        res = cqe->res;
+        io_uring_cqe_seen(&ring_, cqe);
+    }
+    return res;
+}
+
+void Ctrl::ctrl_cmd(uint32_t cmd_op, uint32_t dev_id, uint16_t queue_id,
+                    void* data, uint16_t len, uint64_t data0,
+                    const char* what) {
+    const int res = ctrl_cmd_raw(cmd_op, dev_id, queue_id, data, len,
+                                 data0);
+    if (res < 0) {
+        throw_errno(-res, std::string("ublk ctrl: ") + what + " failed");
     }
 }
 
@@ -78,8 +113,11 @@ uint32_t Ctrl::add_dev(const DeviceParams& p) {
     cmd.addr = reinterpret_cast<uint64_t>(&info);
     for (;;) {
         cmd.dev_id = info.dev_id;
-        if (::ioctl(fd_, UBLK_U_CMD_ADD_DEV, &cmd) == 0) break;
-        const int e = errno;
+        const int res = ctrl_cmd_raw(UBLK_U_CMD_ADD_DEV, info.dev_id,
+                                     static_cast<uint16_t>(-1), &info,
+                                     sizeof(info), 0);
+        if (res == 0) break;
+        const int e = -res;
         if (e == EINVAL && p.enable_recovery &&
             (info.flags & UBLK_F_USER_RECOVERY) != 0) {
             // Older kernel without USER_RECOVERY: degrade to a
@@ -142,17 +180,13 @@ void Ctrl::end_user_recovery(uint32_t dev_id) {
 }
 
 void Ctrl::stop_dev(uint32_t dev_id) noexcept {
-    ublksrv_ctrl_cmd cmd {};
-    cmd.dev_id = dev_id;
-    cmd.queue_id = static_cast<uint16_t>(-1);
-    ::ioctl(fd_, UBLK_U_CMD_STOP_DEV, &cmd);
+    ctrl_cmd_raw(UBLK_U_CMD_STOP_DEV, dev_id, static_cast<uint16_t>(-1),
+                 nullptr, 0, 0);
 }
 
 void Ctrl::del_dev(uint32_t dev_id) noexcept {
-    ublksrv_ctrl_cmd cmd {};
-    cmd.dev_id = dev_id;
-    cmd.queue_id = static_cast<uint16_t>(-1);
-    ::ioctl(fd_, UBLK_U_CMD_DEL_DEV, &cmd);
+    ctrl_cmd_raw(UBLK_U_CMD_DEL_DEV, dev_id, static_cast<uint16_t>(-1),
+                 nullptr, 0, 0);
 }
 
 }  // namespace obd::ublk

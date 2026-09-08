@@ -1,10 +1,17 @@
-// ublk control plane: /dev/ublk-control ioctls driving the device lifecycle
-// ADD_DEV → SET_PARAMS → (queues start fetching) → START_DEV → … →
-// STOP_DEV → DEL_DEV. Synchronous cold path — plain ioctl()s, never on a
-// coroutine hot path.
+// ublk control plane: /dev/ublk-control commands driving the device
+// lifecycle ADD_DEV → SET_PARAMS → (queues start fetching) → START_DEV
+// → … → STOP_DEV → DEL_DEV. Synchronous cold path, never on a coroutine
+// hot path.
+//
+// NOTE: ublk-control has never had an unlocked_ioctl handler — control
+// commands are IORING_OP_URING_CMD on the control fd, with SQE128
+// (ublk_ctrl_uring_cmd rejects anything else). This is true since the
+// driver first merged (v6.0); libublksrv works the same way.
 #pragma once
 
 #include "ublk/uapi_compat.hpp"
+
+#include <liburing.h>
 
 #include <cstdint>
 #include <string>
@@ -69,11 +76,18 @@ public:
     static std::string bdev_path(uint32_t dev_id);  // /dev/ublkb<N>
 
 private:
+    /// Issues one control command; returns 0 or -errno.
+    int ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id, uint16_t queue_id,
+                     void* data, uint16_t len, uint64_t data0) noexcept;
     void ctrl_cmd(uint32_t cmd_op, uint32_t dev_id, uint16_t queue_id,
                   void* data, uint16_t len, uint64_t data0, const char* what);
 
     int fd_ = -1;
     int added_dev_ = -1;
+    // ublk-control has never had an unlocked_ioctl handler: control
+    // commands go through IORING_OP_URING_CMD, and the driver requires
+    // SQE128 (ublk_ctrl_uring_cmd checks IO_URING_F_SQE128).
+    io_uring ring_ {};
 };
 
 }  // namespace obd::ublk
