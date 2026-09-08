@@ -73,6 +73,7 @@ int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
         res = cqe->res;
         io_uring_cqe_seen(&ring_, cqe);
     }
+    ELIO_LOG_INFO("ublk ctrl cmd {:#x} dev {} -> {}", cmd_op, dev_id, res);
     return res;
 }
 

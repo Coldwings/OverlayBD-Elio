@@ -34,6 +34,8 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
             queue->open();
             dev->queues_.push_back(std::move(queue));
         }
+        ELIO_LOG_INFO("ublk dev {}: add_dev+set_params done, opening queues",
+                      dev->dev_id_);
         // Queue threads first: they park the per-tag FETCH commands the
         // driver requires before START_DEV.
         for (auto& queue : dev->queues_) {

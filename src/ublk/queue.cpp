@@ -220,7 +220,9 @@ void Queue::run(std::atomic<bool>& stop) {
         prep_io_cmd(UBLK_U_IO_FETCH_REQ, tag, 0);
     }
     arm_done_poll();
-    io_uring_submit(&ring_);
+    const int submitted = io_uring_submit(&ring_);
+    ELIO_LOG_INFO("ublk queue {}: parked FETCHes (submitted {})", q_id_,
+                  submitted);
 
     std::vector<io_uring_cqe*> cqes(depth_ * 2);
     while (!stop.load(std::memory_order_relaxed) &&
