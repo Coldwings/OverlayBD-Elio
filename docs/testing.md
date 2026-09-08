@@ -265,9 +265,10 @@ Every test, grouped by area, with the property it guards.
   and reads far inside the 80 s cache lifetime.
 - `source: registry survives hostile token endpoint fields` — a float
   `expires_in` far outside int64 range (`1e100`) is ignored rather than
-  converted (no UB), and a non-string `token` field maps to `-EINVAL`
-  through the `-errno` discipline instead of escaping as a raw exception
-  (ADR-0015).
+  converted (no UB), a non-string `token` field maps to `-EINVAL`
+  through the `-errno` discipline instead of escaping as a raw exception,
+  and a partially-numeric string `expires_in` (`"1junk"`) takes the
+  fallback while a fully-numeric string (`"1"`) is honored (ADR-0015).
 - `source: registry token cache lifetime derives from expires_in` — the
   pure mapping: 80% of the declared lifetime, 0 for `expires_in=0`, 30 s
   fallback for absent/negative values, and the 7-day cap for absurd ones

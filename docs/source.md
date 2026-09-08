@@ -990,9 +990,11 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   with `expires_in=100` (80 s cache lifetime) repeated resolutions and
   reads never hit the token endpoint again.
 - `source: registry survives hostile token endpoint fields` — a float
-  `expires_in` of `1e100` is ignored rather than converted (no UB), and a
+  `expires_in` of `1e100` is ignored rather than converted (no UB), a
   non-string `token` field surfaces as `-EINVAL` through the `-errno`
-  discipline instead of an escaping exception (ADR-0015).
+  discipline instead of an escaping exception, and string `expires_in`
+  values are strict (`"1junk"` takes the fallback, `"1"` is honored)
+  (ADR-0015).
 - `source: registry token cache lifetime derives from expires_in` — the
   lifetime mapping itself: 80% of the declared value, 0 for
   `expires_in=0`, the 30 s fallback for absent/negative values, and the

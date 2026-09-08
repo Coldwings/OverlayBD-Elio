@@ -630,6 +630,37 @@ TEST_CASE("source: registry survives hostile token endpoint fields", "[source]")
         const int64_t bad = co_await client2->get_length(base + "c");
         REQUIRE(bad == -EINVAL);
         REQUIRE(mock.token_hits_.load() == 2);
+
+        // A partially-numeric string expires_in must NOT earn the declared
+        // lifetime (std::stoll alone would parse the "1" prefix of
+        // "1junk"): it takes the 30 s fallback, so a resolution 1.2 s
+        // later still reuses the token — a bogus 80%-of-1-s lifetime
+        // would have expired after 800 ms.
+        mock.set_token_body_override(
+            R"({"token":"sekrit","expires_in":"1junk"})");
+        auto client3 = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        auto src_junk = co_await source::RegistrySource::open(client3,
+                                                              base + "d");
+        REQUIRE(mock.token_hits_.load() == 3);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1200));
+        auto src_junk2 = co_await source::RegistrySource::open(client3,
+                                                               base + "e");
+        REQUIRE(mock.token_hits_.load() == 3);
+
+        // A fully-numeric string expires_in IS honored ("1" → 800 ms):
+        // the same 1.2 s spacing forces a fresh exchange.
+        mock.set_token_body_override(
+            R"({"token":"sekrit","expires_in":"1"})");
+        auto client4 = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        auto src_str = co_await source::RegistrySource::open(client4,
+                                                             base + "f");
+        REQUIRE(mock.token_hits_.load() == 4);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1200));
+        auto src_str2 = co_await source::RegistrySource::open(client4,
+                                                              base + "g");
+        REQUIRE(mock.token_hits_.load() == 5);
         co_await wait_drained(mock);
         co_return 0;
     });

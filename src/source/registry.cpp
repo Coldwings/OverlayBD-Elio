@@ -234,7 +234,15 @@ elio::coro::task<RegistryClient::TokenResponse> RegistryClient::fetch_token(
                                  ? std::numeric_limits<int64_t>::max()
                                  : static_cast<int64_t>(u);
             } else if (v.is_string()) {
-                expires_in = std::stoll(v.get<std::string>());
+                // Strict: only a fully-integer string earns the declared
+                // lifetime; trailing garbage ("10junk" — stoll alone
+                // would silently parse the prefix) takes the fallback.
+                const std::string s = v.get<std::string>();
+                size_t pos = 0;
+                const long long parsed = std::stoll(s, &pos);
+                if (pos == s.size()) {
+                    expires_in = parsed;
+                }
             }
         } catch (const std::exception&) {
             expires_in.reset();
