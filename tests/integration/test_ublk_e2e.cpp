@@ -110,7 +110,9 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
         stage("reads: pread done");
         REQUIRE(buf == std::vector<uint8_t>(data.begin() + 1024,
                                             data.begin() + 1024 + 4096));
-        ::close(fd);
+        // close() also belongs off-scheduler: closing a dirty bdev fd
+        // issues writeback IO that our bridges must service.
+        co_await bdev_io([&] { return ::close(fd); });
         dev->stop();
         dev.reset();
         co_return 0;
@@ -174,7 +176,9 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
                 }) == 1024);
         REQUIRE(std::vector<uint8_t>(buf.begin(), buf.begin() + 1024) ==
                 std::vector<uint8_t>(data.begin(), data.begin() + 1024));
-        ::close(fd);
+        // close() flushes the dirty bdev page cache (writeback IO that
+        // our bridges must service) — keep it off the scheduler.
+        co_await bdev_io([&] { return ::close(fd); });
         dev->stop();
         dev.reset();
         co_return 0;
@@ -266,7 +270,7 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
                 }) == 4096);
         REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
                                              expected.begin() + 2048 + 4096));
-        ::close(fd2);
+        co_await bdev_io([&] { return ::close(fd2); });
         dev->stop();
         dev.reset();
         co_return 0;
