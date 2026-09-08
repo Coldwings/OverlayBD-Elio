@@ -94,19 +94,19 @@ jobs:
 
       # One step per E2E test: a wedged kernel handshake must fail fast
       # AND localize. Stage logs ([e2e-stage]) stream live in the log.
-      - name: E2E: block device reads
+      - name: "E2E - block device reads"
         timeout-minutes: 5
         run: >
           timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
           "integration: ublk device serves sector reads from a blob" -s
 
-      - name: E2E: writes and discard
+      - name: "E2E - writes and discard"
         timeout-minutes: 5
         run: >
           timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
           "integration: ublk writable device serves writes and discard" -s
 
-      - name: E2E: USER_RECOVERY handshake
+      - name: "E2E - USER_RECOVERY handshake"
         timeout-minutes: 5
         run: >
           timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
