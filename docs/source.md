@@ -251,7 +251,11 @@ interface every layer of the read stack is built on.
 - `populate` — warms local persistence for `[offset, offset+len)` without
   delivering data (ADR-0011). Returns 0 or a negative `-errno`; the default
   implementation is a no-op (`co_return 0`), so existing sources remain
-  valid without implementing it.
+  valid without implementing it. Implementations: `LayerStore::populate`
+  fetches and persists the covering extents; `TarOffsetSource::populate`
+  translates by the tar base offset and forwards. Consumer: trace replay
+  (ADR-0013, proposed; `src/image/trace_replay.hpp::replay_trace`) drives
+  it on the data lowers' stored-blob-level sources.
 - `size` — total blob size in bytes; constant for the source's lifetime.
 - `label` — human-readable identity for logs (path, URL, digest); the
   returned view is stable for the source's lifetime (it points into the
@@ -397,6 +401,7 @@ public:
     static elio::coro::task<BlobSourcePtr> open(BlobSourcePtr src);
     elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                     uint64_t offset) override;
+    elio::coro::task<ssize_t> populate(uint64_t offset, size_t len) override;
     uint64_t size() const noexcept override;
     std::string_view label() const noexcept override;
     uint64_t base_offset() const noexcept;
@@ -422,6 +427,11 @@ around an overlaybd layer blob.
 - `pread` — clamps to the detected payload size and forwards at
   `offset + base_offset`. A short inner read is propagated as-is (the inner
   source's contract makes that an EOF case).
+- `populate` — the same translation for warm-up: clamps to the payload
+  size and forwards `populate(offset + base_offset, len)` to the wrapped
+  source, so trace replay (ADR-0013) addressing the payload byte space
+  reaches the `LayerStore` below. When the blob is not tar-wrapped, `open`
+  returns the inner source itself and its own `populate` applies.
 - `base_offset()` — the detected payload offset (512 or 1536); diagnostics
   and tests.
 
@@ -1080,10 +1090,12 @@ directly.
   `expires_in`, ADR-0015; redirect responses carry no comparable declared
   lifetime). Registries issuing shorter-lived redirect targets rely on the
   401-drop-and-re-resolve path.
-- **No prefetch / trace replay** — overlaybd's prefetch and TurboOCI paths
-  are out of scope (ADR-0007). (Proposed ADR-0012 and ADR-0013 re-scope
-  prefetch: an admission funnel with scavenger-class warm-up, and
-  upstream-compatible trace record/replay.)
+- **Prefetch is trace-replay only** — overlaybd's dynamic prefetcher and
+  TurboOCI paths are out of scope (ADR-0007). The upstream-compatible
+  trace blob IS replayed through `populate` (ADR-0013, proposed — the
+  trace layer is recognized in image assembly; see `docs/image.md`);
+  trace recording, the dynamic file-list fallback, and the B-phase
+  admission funnel (ADR-0012) remain open.
 - **credentialConfig mode=file only** — inline/secret credential modes are
   ignored (see `docs/image.md` / `docs/config.md`).
 - **Downloader has no cancellation** — a running download finishes or fails

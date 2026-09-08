@@ -45,6 +45,68 @@ std::string probe_local_blob(const LowerConfig& lower) {
     return "";
 }
 
+/// Read cap for the trace blob itself: a conforming trace is small
+/// (24 + 24 × records; the replay record cap of 65536 needs ~1.5 MiB), so
+/// 64 MiB is generous while bounding a hostile layer's memory/IO cost.
+constexpr uint64_t kMaxTraceBlobBytes = uint64_t{64} << 20;
+
+/// Reads a whole (small) source into memory; empty vector on failure or
+/// when the source exceeds kMaxTraceBlobBytes (callers treat empty as
+/// "no usable trace").
+elio::coro::task<std::vector<uint8_t>> read_trace_blob(
+    source::BlobSource& src) {
+    if (src.size() > kMaxTraceBlobBytes) {
+        ELIO_LOG_WARNING("trace layer blob too large ({} bytes, cap {}); "
+                         "prefetch disabled",
+                         src.size(), kMaxTraceBlobBytes);
+        co_return std::vector<uint8_t>{};
+    }
+    std::vector<uint8_t> out(static_cast<size_t>(src.size()));
+    if (out.empty()) co_return out;
+    const ssize_t r = co_await src.pread(out.data(), out.size(), 0);
+    if (r < 0 || static_cast<uint64_t>(r) != src.size()) {
+        ELIO_LOG_WARNING("trace layer blob unreadable; prefetch disabled");
+        co_return std::vector<uint8_t>{};
+    }
+    co_return out;
+}
+
+/// Best-effort load of the acceleration layer's trace blob
+/// (trace-format.md §6): locally the extracted member `<dir>/trace` (the
+/// upstream lookup name) or an explicit `file`; remotely the layer blob
+/// through the tar wrapper (a plain RegistrySource — the blob is small
+/// and needs no LayerStore persistence). NEVER fails assembly: every
+/// error path logs and returns an empty vector.
+elio::coro::task<std::vector<uint8_t>> load_trace_blob(
+    const LowerConfig& accel, const ImageConfig& cfg,
+    const std::shared_ptr<source::RegistryClient>& client) {
+    try {
+        std::string local;
+        if (is_regular_file(accel.file)) local = accel.file;
+        if (local.empty() && !accel.dir.empty()) {
+            const std::string p = accel.dir + "/trace";
+            if (is_regular_file(p)) local = p;
+        }
+        if (!local.empty()) {
+            auto src = co_await source::LocalFileSource::open(local);
+            co_return co_await read_trace_blob(*src);
+        }
+        if (cfg.repo_blob_url.empty()) {
+            ELIO_LOG_WARNING("acceleration layer has no local trace and no "
+                             "repoBlobUrl; prefetch disabled");
+            co_return std::vector<uint8_t>{};
+        }
+        const std::string url = cfg.repo_blob_url + "/" + accel.digest;
+        auto reg = co_await source::RegistrySource::open(client, url);
+        auto untarred = co_await source::TarOffsetSource::open(std::move(reg));
+        co_return co_await read_trace_blob(*untarred);
+    } catch (const std::exception& e) {
+        ELIO_LOG_WARNING("trace layer load failed ({}); prefetch disabled",
+                         e.what());
+        co_return std::vector<uint8_t>{};
+    }
+}
+
 }  // namespace
 
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
@@ -87,9 +149,32 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     }
     auto client = std::make_shared<source::RegistryClient>(creds, rcc);
 
+    // Trace layer recognition (ADR-0013, proposed; trace-format.md §6):
+    // `accelerationLayer: true` marks the UPPERMOST lower as the
+    // acceleration layer. It is NOT a data layer: set it aside from the
+    // merge and load its trace blob best-effort (a missing/unreadable
+    // blob only disables prefetch, never assembly).
+    std::span<const LowerConfig> data_lowers(cfg.lowers);
+    std::vector<uint8_t> trace_blob;
+    if (cfg.acceleration_layer) {
+        if (cfg.lowers.size() < 2) {
+            throw error(EINVAL, "accelerationLayer set but the image has no "
+                                "data lower beneath it");
+        }
+        data_lowers = data_lowers.first(cfg.lowers.size() - 1);
+        trace_blob =
+            co_await load_trace_blob(cfg.lowers.back(), cfg, client);
+    }
+
     std::vector<std::unique_ptr<format::LsmtLayer>> layers;
-    layers.reserve(cfg.lowers.size());
-    for (const auto& lower : cfg.lowers) {
+    layers.reserve(data_lowers.size());
+    // Stored-blob-level source of each data lower (the TarOffsetSource
+    // view — the byte space trace record offsets address, matching
+    // upstream's PrefetchFile position below decompression). Non-owning;
+    // the objects are owned by the layer chain built below.
+    std::vector<source::BlobSource*> warm_targets;
+    warm_targets.reserve(data_lowers.size());
+    for (const auto& lower : data_lowers) {
         source::BlobSourcePtr raw;
         const std::string local_path = probe_local_blob(lower);
         if (!local_path.empty()) {
@@ -126,6 +211,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         }
 
         auto untarred = co_await source::TarOffsetSource::open(std::move(raw));
+        warm_targets.push_back(untarred.get());
         source::BlobSourcePtr view;
         if (co_await format::is_zfile(*untarred)) {
             view = co_await format::ZFileSource::open(std::move(untarred),
@@ -137,12 +223,21 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             co_await format::LsmtLayer::open(std::move(view)));
     }
 
+    // Trace replay (ADR-0013): warm the data lowers from the recorded
+    // access pattern before the merge takes ownership of the layer chain.
+    // Opportunistic — failures only disable prefetch.
+    TraceReplayStats trace_stats;
+    if (!trace_blob.empty()) {
+        trace_stats = co_await replay_trace(trace_blob, warm_targets);
+    }
+
     const size_t n = layers.size();
     if (!cfg.writable()) {
         auto merged = co_await format::MergedLsmt::open(std::move(layers));
         OpenedImage out;
         out.virtual_size = merged->size();
         out.layer_count = n;
+        out.trace = trace_stats;
         out.root = std::move(merged);
         ELIO_LOG_INFO("image assembled: {} layers, virtual size {} bytes", n,
                       out.virtual_size);
@@ -170,6 +265,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     out.layer_count = n + 1;
     out.writable = true;
     out.upper_path = upper_path;
+    out.trace = trace_stats;
     out.root = std::move(merged);
     ELIO_LOG_INFO("image assembled writable: {} lowers + {} upper, virtual "
                   "size {} bytes",

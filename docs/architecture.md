@@ -317,7 +317,10 @@ contracts above:
   drops the device instead of recovering it. Deferred — the isolation
   model (ADR-0004) bounds the blast radius meanwhile.
 - **Prefetch** (`prefetch` config section) is parsed-tolerated but not
-  honored; deferred.
+  honored; deferred. The upstream trace blob IS replayed through
+  `populate` when the image config marks an `accelerationLayer`
+  (ADR-0013, proposed — see `docs/image.md`); the dynamic prefetcher and
+  trace recording stay out.
 - **Supervisor auto-restart** of crashed devices is not implemented;
   devices stay `exited` until an explicit `destroy`/`create`. Deferred.
 - **Discard / punch-hole** are not advertised and are rejected with

@@ -66,6 +66,13 @@ struct ImageConfig {
     std::string result_file;          // informational in v0.1 (docs/config.md)
     source::DownloadConfig download;  // merged over the global defaults
 
+    /// accelerationLayer (ADR-0013, proposed): the snapshotter's signal
+    /// that the UPPERMOST lower is the acceleration (trace) layer, not a
+    /// data layer (trace-format.md §6 — upstream backstore config.v1.json
+    /// carries the same field). Assembly sets that lower aside from the
+    /// merge and replays its trace blob.
+    bool acceleration_layer = false;
+
     /// Writable upper; engaged when `upper.dir` is non-empty (ADR-0008).
     UpperConfig upper;
     bool writable() const noexcept { return !upper.dir.empty(); }

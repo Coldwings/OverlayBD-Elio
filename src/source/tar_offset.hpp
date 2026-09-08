@@ -35,6 +35,12 @@ public:
     elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                     uint64_t offset) override;
 
+    /// Warms [offset, offset+len) in the PAYLOAD byte space: translated by
+    /// the tar base offset and forwarded to the wrapped source (so a
+    /// populate on this view reaches the LayerStore below, ADR-0013 trace
+    /// replay). Clamped at the payload size like pread.
+    elio::coro::task<ssize_t> populate(uint64_t offset, size_t len) override;
+
     uint64_t size() const noexcept override { return size_; }
     std::string_view label() const noexcept override { return label_; }
 

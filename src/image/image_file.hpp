@@ -21,9 +21,17 @@
 // With a non-empty `upper` (ADR-0008) the root instead becomes a
 // MergedWritable whose topmost layer is the writable upper — reads fall
 // through to the lowers, writes land in the upper.
+//
+// Trace layer (ADR-0013, proposed): when the config carries
+// `accelerationLayer: true`, the UPPERMOST lower is the acceleration
+// (trace) layer — it is set aside from the merge (not a data layer) and
+// its trace blob is replayed as populate() warm-up on the data lowers'
+// source chains (trace-format.md §6). Replay is opportunistic: a
+// missing/malformed trace never fails assembly.
 #pragma once
 
 #include "image/config.hpp"
+#include "image/trace_replay.hpp"
 #include "source/blob_source.hpp"
 
 #include <elio/coro/task.hpp>
@@ -37,9 +45,11 @@ namespace obd::image {
 struct OpenedImage {
     source::BlobSourcePtr root;  // MergedLsmt or MergedWritable
     uint64_t virtual_size = 0;
-    size_t layer_count = 0;
+    size_t layer_count = 0;      // data layers (trace layer excluded)
     bool writable = false;       // root is a WritableBlobSource (ADR-0008)
     std::string upper_path;      // the writable layer file, when writable
+    TraceReplayStats trace;      // ADR-0013 replay outcome (all zero when
+                                 // no acceleration layer was configured)
 };
 
 /// Assembles the merged read-only view for an image. Throws obd::error /
