@@ -855,4 +855,71 @@ elio::coro::task<int> LsmtRwLayer::seal_file(const std::string& path,
     co_return 0;
 }
 
+elio::coro::task<int> create_empty_lsmt_layer(const std::string& path,
+                                              uint64_t vsize,
+                                              const std::string& user_tag) {
+    if (vsize == 0 || vsize % kSector != 0) co_return -EINVAL;
+    const int fd =
+        ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) co_return -errno;
+
+    // ADR-0014 content-digest rule (see seal()): sha256(vsize as LE u64 ||
+    // packed data || packed index). An empty layer has no data and no
+    // index entries, so the digest is a pure function of vsize — the
+    // sealed uuid below is derived from it, making the file bytes a pure
+    // function of vsize (identical vsize → identical file).
+    common::Sha256 content_hash;
+    uint8_t vsize_le[8];
+    bytes::store_u64_le(vsize_le, vsize);
+    content_hash.update(vsize_le, sizeof(vsize_le));
+    const std::string uuid =
+        uuid_from_content_digest(content_hash.final_hex());
+
+    // Layout: header region (sectors 0..7) | trailer region (the file's
+    // last 4096 bytes) at index_offset = 4096. index_size = 0 with
+    // index_offset at the first allowed position keeps every reader bound
+    // check (LsmtLayer::open) satisfiable and byte-matches seal()'s output
+    // for an upper that never received a write (index_sector = 8).
+    constexpr uint64_t index_offset = kHeaderSectors * kSector;  // 4096
+    struct UnlinkOnError {
+        const std::string& path;
+        bool ok = true;
+        ~UnlinkOnError() {
+            if (!ok) ::unlink(path.c_str());
+        }
+    } cleanup{path};
+    uint8_t region[4096];
+    std::memset(region, 0, sizeof(region));
+    const auto header =
+        make_ht(/*header=*/true, /*sealed=*/true, index_offset,
+                /*index_size=*/0, vsize, uuid, user_tag);
+    header.serialize(region);
+    int rc = co_await write_all(fd, region, sizeof(region), 0);
+    if (rc != 0) {
+        cleanup.ok = false;
+        ::close(fd);
+        co_return rc;
+    }
+
+    std::memset(region, 0, sizeof(region));
+    const auto trailer =
+        make_ht(/*header=*/false, /*sealed=*/true, index_offset,
+                /*index_size=*/0, vsize, uuid, user_tag);
+    trailer.serialize(region);
+    rc = co_await write_all(fd, region, sizeof(region), index_offset);
+    if (rc != 0) {
+        cleanup.ok = false;
+        ::close(fd);
+        co_return rc;
+    }
+    if (::fdatasync(fd) != 0) {
+        cleanup.ok = false;
+        const int e = -errno;
+        ::close(fd);
+        co_return e;
+    }
+    ::close(fd);
+    co_return 0;
+}
+
 }  // namespace obd::format
