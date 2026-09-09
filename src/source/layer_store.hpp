@@ -36,6 +36,7 @@
 // an active fill first: stop_fill() + fill_status() reaching kDone/kStopped.
 #pragma once
 
+#include "source/admission.hpp"
 #include "source/blob_source.hpp"
 
 #include <elio/coro/task.hpp>
@@ -66,8 +67,10 @@ public:
 
         /// Background fill — the `download` config contract (docs/config.md):
         /// a scavenger-class bulk walk that warms every missing extent
-        /// without readers. Fill traffic runs at concurrency 1 (one walk);
-        /// the ADR-0012 admission funnel governs it once merged.
+        /// without readers. Fill traffic runs at concurrency 1 (one walk)
+        /// and, when `funnel` is set, enters the remote only through the
+        /// ADR-0012 admission funnel (class Fill); its per-second max_mbps
+        /// bandwidth throttle is separate and stays.
         struct Fill {
             bool enable = false;
             uint32_t delay_sec = 300;        // start delay after open
@@ -75,6 +78,13 @@ public:
             uint32_t max_mbps = 100;         // throughput throttle, MiB/s
             uint32_t block_size = 256 * 1024;  // range-read coalescing cap
         } fill;
+
+        /// The device's shared read admission funnel (ADR-0012). When
+        /// set, every remote fetch passes it: pread misses as OnDemand,
+        /// populate as Prefetch, background fill as Fill. Null bypasses
+        /// admission (hand-composed chains and unit tests; assembled
+        /// devices always thread one — see image assembly).
+        AdmissionFunnelPtr funnel;
     };
 
     enum class State : int {
@@ -199,7 +209,12 @@ private:
     // Hot-path helpers (coroutines, -errno results, never throw).
     elio::coro::task<ssize_t> read_fd_loop(int fd, void* buf, size_t count,
                                            uint64_t offset);
-    elio::coro::task<FetchResult> join_or_fetch(uint64_t extent_id);
+    // Joins-or-starts the fetch of one extent. `cls` is the ADR-0012
+    // traffic class the starter admits at the funnel with (only the
+    // starter issues a remote request; joiners wait on the in-flight
+    // fetch, whatever class started it — extent-granular dedup).
+    elio::coro::task<FetchResult> join_or_fetch(uint64_t extent_id,
+                                                ReadClass cls);
     void enqueue_write(uint64_t extent_id,
                        std::shared_ptr<const std::vector<uint8_t>> data,
                        size_t data_offset = 0);

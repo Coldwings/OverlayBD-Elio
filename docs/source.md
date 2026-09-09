@@ -1,8 +1,9 @@
 # Source Module (`src/source`)
 
 Pluggable blob sources behind one async byte-source interface: local files,
-OCI registry HTTP range reads, a DART P2P proxy front-end, and a sparse-file
-layer store with background fill.
+OCI registry HTTP range reads, a DART P2P proxy front-end, a sparse-file
+layer store with background fill, and the read admission funnel that meters
+all remote traffic by class.
 
 ## Overview
 
@@ -32,6 +33,11 @@ blob gets its own source stack, assembled bottom-up from these pieces:
   `RegistrySource` for every remote layer with a per-layer directory; its
   optional background fill (the `download` config contract) warms the whole
   layer without readers.
+- **AdmissionFunnel / AdmissionSource** (`admission.hpp`) — the ADR-0012
+  read admission funnel: one instance per device that every remote range
+  request passes before reaching the source client, plus the decorator
+  that routes sources without their own funnel wiring (the remote-only
+  paths) through it.
 - **CredentialStore** — registry credentials from the overlaybd-compatible
   credential file, with longest-prefix matching.
 - **base64** (`base64.hpp`) — a minimal RFC 4648 codec used for Basic-auth
@@ -162,12 +168,15 @@ onto the ADR-0011 machinery):
 - the ADR-0011 bulk path: contiguous missing extents are coalesced into
   larger range reads (capped near 1 MiB; `blockSize` tunes the cap) and the
   result is split back into extents for persistence accounting;
-- a per-second throughput budget (`maxMBps` MiB/s) throttles fill traffic;
-- fill is the ADR-0012 `Fill` scavenger class: it runs at concurrency 1 and
-  back-pressures itself when the write-behind queue is full — readers are
-  never queued behind fill traffic. (The ADR-0012 admission funnel governs
-  fill admission once it lands; until then the single-walk concurrency is
-  the conservative default.)
+- a per-second throughput budget (`maxMBps` MiB/s) throttles fill traffic —
+  a bandwidth cap, separate from the admission funnel: the budget bounds
+  fill's byte rate, the funnel governs WHEN fill's requests may enter the
+  source at all (both apply; fill keeps its throttle);
+- fill is the ADR-0012 `Fill` scavenger class: it runs at concurrency 1,
+  enters the remote only through the device's admission funnel behind both
+  OnDemand and Prefetch traffic, and back-pressures itself when the
+  write-behind queue is full — readers are never queued behind fill
+  traffic.
 - transient remote errors back off (2 s doubling, capped at 64 s) and the
   walk resumes — persisted extents survive in the sidecar, so progress is
   never lost;
@@ -211,6 +220,73 @@ every remote layer with a non-empty `dir`:
 - when the commit file binds at open, any stale `.download.*`/`.bitmap.*`
   pair left beside it (a previous run that died between record writes and
   the rename) is swept — it could never win the probe.
+
+### Read admission funnel (ADR-0012)
+
+Three traffic classes compete for one QoS-less resource — the throughput of
+the same remote source (a registry, object storage behind it, or DART
+peers). Since no source can be asked to serve one class first, priority is
+enforced entirely client-side: **every remote range request of a device
+passes one shared `AdmissionFunnel` before reaching the source client**.
+Image assembly creates the funnel at open and threads it through every
+lower's `LayerStore` (`LayerStore::Config::funnel`) and through an
+`AdmissionSource` wrapper on the remote-only paths (a lower without a
+`dir`, the ADR-0016 degrade path, the trace blob fetch), so the funnel is
+per-device: all of a device's lowers compete at a single gate. Registry
+and DART clients stay class-agnostic — the funnel governs admission,
+never source selection (the ADR-0005 fallback is untouched).
+
+The class taxonomy and admission rules:
+
+- **OnDemand** — a ublk miss blocking a guest (`LayerStore::pread` of a
+  missing extent, remote-only `pread`s, assembly probes). Admitted
+  **immediately and unconditionally**, even if that momentarily exceeds
+  the concurrency window; delaying a guest-visible miss to protect a
+  window is never correct.
+- **Prefetch** — trace-replay warm-up (`LayerStore::populate`, ADR-0013).
+  A scavenger: admitted only when **no on-demand request is in flight**
+  AND total in-flight requests are **below the AIMD window**.
+- **Fill** — the background layer fill (`LayerStore::run_fill`). Same
+  scavenger gate, but the funnel keeps two FIFO queues and drains
+  **Prefetch before Fill**: traced data is needed soon, fill has the
+  whole runtime.
+
+Scavenger requests are **size-capped near 1 MiB**
+(`AdmissionFunnel::cap_request`): the funnel caps and the caller splits.
+`LayerStore::populate` fetches extent-granular (64 KiB, naturally under
+the cap); fill's coalesced range reads are clamped to the same cap (the
+ADR-0011 bulk path already assembles contiguous missing extents into
+larger reads). The cap bounds the head-of-line delay an arriving
+on-demand read can suffer behind an already-issued scavenger request.
+Extent-granular dedup is NOT the funnel's job: it lives one layer down in
+the LayerStore's in-flight map — a scavenger request for an extent
+already being fetched joins that fetch (whatever class started it) and
+never reaches the funnel.
+
+The window is **not operator-configured**; it is AIMD-managed from
+observed on-demand latency, a LEDBAT-style scavenger that consumes only
+spare capacity and yields on the first congestion signal. The exact
+signals (defaults in `AdmissionFunnel::Config`):
+
+- **sample** — the acquire-to-release wall-clock latency of each OnDemand
+  request (the funnel permit brackets exactly one remote fetch);
+- **baseline** — an EMA (α = 1/8) of past samples, anchored by the first
+  sample and floored at 1 ms (local-speed samples carry no congestion
+  signal);
+- **flat** (sample ≤ baseline × 3/2) — additive increase: window += 1,
+  capped at `window_max` (default 32);
+- **rise** (sample > baseline × 3/2) — multiplicative decrease: window
+  halved, floored at `window_min` (default 1);
+- the window starts at `window_init` (default 2).
+
+Consequences: on-demand latency is invariant under prefetch load by
+construction (an on-demand request never queues at the funnel, and waits
+behind at most `window` size-capped scavenger requests at the source);
+scavenger throughput expands into idle capacity as the window grows and
+collapses under contention as the gate closes and AIMD shrinks the
+window. In-flight scavenger requests are not cancelled on a competing
+miss in v1 — the size cap bounds their damage (cancellation remains a
+documented refinement, ADR-0012).
 
 ### Credentials
 
@@ -518,6 +594,77 @@ prefix is `/dart`).
   `check_accelerate_url()`: on `false` the caller falls back to direct
   registry reads instead of failing the device.
 
+### `admission.hpp` — ReadClass, AdmissionFunnel, AdmissionSource
+
+```cpp
+enum class ReadClass : int { OnDemand = 0, Prefetch = 1, Fill = 2 };
+
+class AdmissionFunnel final {
+public:
+    struct Config {
+        uint32_t window_init = 2;
+        uint32_t window_min = 1;
+        uint32_t window_max = 32;
+        uint32_t ai_step = 1;
+        uint32_t md_percent = 50;
+        uint32_t rise_percent = 150;
+        std::chrono::nanoseconds baseline_floor{1000 * 1000};
+        size_t scavenger_size_cap = 1024 * 1024;
+    };
+    AdmissionFunnel();
+    explicit AdmissionFunnel(Config cfg);
+    class Permit;  // move-only RAII admission slot
+    elio::coro::task<Permit> acquire(ReadClass cls);
+    size_t cap_request(ReadClass cls, size_t bytes) const;
+    void note_on_demand_latency(std::chrono::nanoseconds sample);
+    uint32_t window() const;
+    uint64_t inflight_on_demand() const;
+    uint64_t inflight_total() const;
+    uint64_t on_demand_admissions() const;
+    uint64_t scavenger_admissions() const;
+    uint64_t scavenger_waits() const;
+};
+using AdmissionFunnelPtr = std::shared_ptr<AdmissionFunnel>;
+
+class AdmissionSource final : public BlobSource {
+public:
+    AdmissionSource(BlobSourcePtr inner, AdmissionFunnelPtr funnel);
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                    uint64_t offset) override;
+    elio::coro::task<ssize_t> populate(uint64_t offset,
+                                       size_t len) override;
+    uint64_t size() const noexcept override;
+    std::string_view label() const noexcept override;
+};
+```
+
+`src/source/admission.hpp::AdmissionFunnel` — the per-device read
+admission funnel (ADR-0012; see Concepts §"Read admission funnel").
+
+- `acquire(cls)` — admits one request. OnDemand never suspends; a
+  scavenger (Prefetch/Fill) suspends until no on-demand request is in
+  flight and the AIMD window has room, queueing FIFO with Prefetch
+  drained before Fill. The returned `Permit` holds the reserved slot;
+  the caller's remote fetch must happen while holding it — the permit's
+  lifetime is the fetch, and for OnDemand its wall-clock latency is the
+  AIMD sample fed at release. Releasing may wake queued scavengers; it
+  never blocks.
+- `cap_request(cls, bytes)` — clamps scavenger requests to
+  `scavenger_size_cap` (~1 MiB; the caller splits); OnDemand is uncapped.
+- `note_on_demand_latency(sample)` — feeds a synthetic AIMD sample
+  directly (tests); production samples flow through `Permit`.
+- The counters are relaxed atomic snapshots, safe to poll from any
+  thread; `scavenger_waits()` counts queue events — the observable "the
+  funnel is throttling" signal.
+- The `Config` window parameters are internal (the ADR-0012 window is
+  not operator-configured); image assembly uses the defaults.
+
+`src/source/admission.hpp::AdmissionSource` — a decorator routing a
+source without its own funnel wiring through a shared funnel: `pread` is
+admitted OnDemand, `populate` is split at the scavenger size cap and
+admitted Prefetch per chunk. `size()`/`label()` pass through. Image
+assembly wraps every remote-only read path with it.
+
 ### `layer_store.hpp` — LayerStore
 
 ```cpp
@@ -534,6 +681,7 @@ public:
             uint32_t max_mbps = 100;
             uint32_t block_size = 256 * 1024;
         } fill;
+        AdmissionFunnelPtr funnel;  // null = no admission governance
     };
     enum class State : int { Filling = 0, Complete = 1, Bypass = 2 };
     enum class FillStatus : int { kDisabled, kWaiting, kFilling, kDone,
@@ -595,15 +743,19 @@ remote bytes into a sparse local staging file with a sidecar extent map
   `Bypass`) is fetched whole from the remote with in-flight coalescing —
   concurrent readers of the same missing extent join one fetch
   (`coalesced_joins`) — and the fetched bytes are enqueued for write-behind
-  (not in `Bypass`). Returns the clamped count, or a negative `-errno` /
-  `-EIO` on remote error/short fill. Never throws.
+  (not in `Bypass`). With `Config::funnel` set, the fetch is admitted as
+  the ADR-0012 OnDemand class. Returns the clamped count, or a negative
+  `-errno` / `-EIO` on remote error/short fill. Never throws.
 - `src/source/layer_store.hpp::LayerStore::populate` — warms every missing
   extent in `[offset, offset+len)` through the same coalesced fetch and
-  write-behind path without delivering data; returns 0 or a negative
-  `-errno`. No-op (0) in `Complete` and `Bypass`.
+  write-behind path without delivering data; with `Config::funnel` set the
+  fetches are admitted as the ADR-0012 Prefetch scavenger class. Returns 0
+  or a negative `-errno`. No-op (0) in `Complete` and `Bypass`.
 - Background fill (`Config::fill`) — one scavenger coroutine walking the
   extent map and fetching contiguous missing runs as coalesced range reads
-  (cap `max(fill.block_size, extent_size)`, ≤ 1 MiB), split back into
+  (cap `max(fill.block_size, extent_size)`, ≤ 1 MiB; with a funnel, the
+  funnel's scavenger size cap is authoritative) admitted Fill-class at the
+  funnel, split back into
   extents for the write-behind queue. Fill waits for queue room instead of
   dropping its own work (a reader's write stays droppable — the walk would
   just re-fetch it). Start delay `delay_sec + random(0, delay_extra_sec)`,
@@ -684,6 +836,13 @@ Callers may rely on:
   a crash or torn write degrades to a re-fetch, never to bad data.
 - **Registry byte-exactness** — `RegistryClient::get_data` returns `count`
   or an error, never a short count; a server short body maps to `-EIO`.
+- **Admission funnel priority (ADR-0012)** — an OnDemand request never
+  suspends at the funnel; a scavenger (Prefetch/Fill) request enters the
+  source only when no on-demand request is in flight and total in-flight
+  requests are below the AIMD window, and is size-capped near 1 MiB.
+  Every remote read of an assembled device passes the funnel — the
+  LayerStore fetch paths (miss/populate/fill) and the `AdmissionSource`
+  wrappers are the only remote-fetch call sites below the format layers.
 
 ## Concurrency & Call Permissions
 
@@ -706,7 +865,10 @@ Callers may rely on:
   readers stay latency-bounded while fill is active.
 - **Instance state** — mutable state per instance: `RegistryClient` (token
   and URL-info caches), `LayerStore` (extent map, write-behind queue,
-  state/counter/fill atomics). No
+  state/counter/fill atomics), `AdmissionFunnel` (window, in-flight
+  counters, scavenger queues — `std::mutex`-guarded, safe from any Elio
+  worker thread; the funnel is shared by all of a device's sources).
+  No
   hidden global mutable state anywhere in the module.
 - **Buffer ownership** — `buf` arguments are borrowed for the duration of
   the `co_await`; sources never retain pointers into caller buffers.
@@ -766,7 +928,8 @@ additive status/observability APIs.
 ## Testing
 
 Unit tests live in `tests/unit/test_source.cpp`,
-`tests/unit/test_layer_store.cpp`, and
+`tests/unit/test_layer_store.cpp`,
+`tests/unit/test_admission.cpp`, and
 `tests/unit/test_registry.cpp` (Catch2; the registry tests run against an
 in-process mock registry speaking the auth/redirect/DART contract), plus
 `common: base64 round-trips and decodes cred.json form` in
@@ -904,6 +1067,31 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   lifetime mapping itself: 80% of the declared value, 0 for
   `expires_in=0`, the 30 s fallback for absent/negative values, and the
   7-day cap for absurd ones.
+- `source: admission funnel admits on-demand unconditionally under a full window` —
+  with the window fully occupied by scavengers, on-demand acquires still
+  complete immediately and the in-flight count exceeds the window
+  (ADR-0012).
+- `source: admission funnel blocks scavengers while on-demand is in flight` —
+  queued Prefetch/Fill requests stay parked while an on-demand request is
+  in flight (even with window room) and enter once it completes.
+- `source: admission funnel grows additively on flat latency and halves on rise` —
+  flat samples at the EMA baseline raise the window by one each; a sample
+  above 150% of the baseline halves it (AIMD, ADR-0012).
+- `source: admission funnel respects window floor and ceiling` — sustained
+  flat samples stop at `window_max`; samples that keep outrunning the EMA
+  baseline drive the window to `window_min`, not below.
+- `source: admission funnel admits prefetch before fill` — with room for
+  exactly one scavenger, a queued Prefetch is admitted ahead of a queued
+  Fill (two-level scavenger queue, ADR-0012).
+- `source: admission funnel caps scavenger request size` — scavenger
+  requests clamp to the ~1 MiB cap (custom caps honored); OnDemand is
+  uncapped.
+- `source: admission source splits populate at the scavenger size cap` —
+  `AdmissionSource::populate` forwards successive ≤ 1 MiB chunks at
+  successive offsets (Prefetch class), and `pread` is counted OnDemand.
+- `source: layer store populate waits at the admission funnel while reads pass` —
+  with the window held full, a store `pread` (OnDemand) completes anyway
+  while a `populate` (Prefetch) queues, proceeding when a slot frees.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → LayerStore → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same chain image
@@ -933,6 +1121,18 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `integration: completed layer store commit binds read-only without remote reads` —
   a store driven to completion installs `overlaybd.commit`, which the next
   assembly binds locally with zero remote data reads.
+- `integration: admission funnel bounds on-demand latency under scavenger load` —
+  against a serialized, latency-injected mock registry (capacity 1,
+  25 ms), with a six-coroutine populate storm plus the background fill
+  running, twelve sequential on-demand image reads each complete within a
+  bounded 2 s, byte-exactly, and the funnel's `scavenger_waits` counter
+  proves the storm was really throttled (ADR-0012).
+- `integration: admission funnel collapses scavenger traffic under on-demand contention` —
+  two lowers sharing the one per-device funnel: while eight concurrent
+  on-demand readers stream cold extents of the top layer, the shadowed
+  bottom layer's fill makes essentially no progress (≤ 6 fetches vs
+  dozens of on-demand fetches), and resumes once the contention stops
+  (ADR-0012).
 
 No golden external files: blob contents are deterministic patterned bytes
 generated in-test; the mock registry implements the RFC 7233 / OCI subset
@@ -942,12 +1142,17 @@ directly.
 
 - **The no-dir path has no local caching at all.** A remote layer without
   `lower.dir` is served remote-only (the snapshotter always sets `dir`;
-  the empty case is the compatibility path). DART, when enabled, is the
-  shared on-node cache in front of such reads.
-- **Fill runs without admission governance (ADR-0012 pending).** The
-  background fill is the `Fill` scavenger class but the admission funnel
-  that should meter it against on-demand reads is not merged yet; until
-  then fill runs at conservative concurrency 1 per store.
+  the empty case is the compatibility path). Its reads still pass the
+  device's admission funnel (ADR-0012) through `AdmissionSource`. DART,
+  when enabled, is the shared on-node cache in front of such reads.
+- **In-flight scavenger requests are not cancelled on a competing miss.**
+  ADR-0012 defers cancellation: the ~1 MiB scavenger size cap bounds the
+  head-of-line delay an on-demand read can suffer behind an
+  already-issued prefetch or fill request.
+- **Construction-time probes bypass the funnel.** Registry size probes
+  (`get_length`, one per remote layer at open) and the DART reachability
+  probe are cold-path control traffic, not repeatable request flow; the
+  funnel governs `pread`/`populate` traffic.
 - **Single-request size bound** — one registry Range read is bounded by
   `RegistryClientConfig::max_response_size` (64 MiB default); larger single
   requests must be split by the caller (the format readers already read in
@@ -960,9 +1165,10 @@ directly.
 - **Prefetch is trace-replay only** — overlaybd's dynamic prefetcher and
   TurboOCI paths are out of scope (ADR-0007). The upstream-compatible
   trace blob IS replayed through `populate` (ADR-0013, proposed — the
-  trace layer is recognized in image assembly; see `docs/image.md`);
-  trace recording, the dynamic file-list fallback, and the B-phase
-  admission funnel (ADR-0012) remain open.
+  trace layer is recognized in image assembly; see `docs/image.md`) at
+  the ADR-0012 Prefetch scavenger class; trace recording, the dynamic
+  file-list fallback, the structural head/tail warm-up, and detaching
+  replay off the bring-up path (now safe under the funnel) remain open.
 - **credentialConfig mode=file only** — inline/secret credential modes are
   ignored (see `docs/image.md` / `docs/config.md`).
 - **Fill teardown goes through `park_image_fills`** — destroying a store

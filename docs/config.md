@@ -83,6 +83,18 @@ concurrency 1 per layer, and back-pressures itself — readers are never
 queued behind it. Locality grows with reads regardless of
 `download.enable`; the knob only controls the proactive whole-layer warm.
 
+### `prefetch` (ADR-0012/0013)
+
+Trace-replay warm-up. **Only `enable` is honored** — previously the whole
+section was parsed-tolerated (ignored); with the ADR-0012 admission
+funnel the master switch became meaningful. The funnel's AIMD window is
+deliberately **not** operator-configured (ADR-0012 rejects static
+budgets), so no window or AIMD fields are exposed.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enable` | bool | `true` | Master switch for trace-replay prefetch: when false, an acceleration layer's trace blob is neither loaded nor replayed (the layer is still set aside from the merge — recognition is structural). Replayed traffic rides the funnel's Prefetch scavenger class either way. |
+
 ### `logConfig`
 
 | Field | Type | Default | Meaning |
@@ -97,9 +109,10 @@ queued behind it. Locality grows with reads regardless of
 
 ### Recognized but not honored
 
-`cacheConfig`, `ioEngine`, and `prefetch` are parsed-tolerated (ignored
-as unknown sections) in the current version; see *Limitations & TODO* in
-`docs/architecture.md`.
+`cacheConfig` and `ioEngine` are parsed-tolerated (ignored as unknown
+sections) in the current version; see *Limitations & TODO* in
+`docs/architecture.md`. (`prefetch` was in this list until the ADR-0012
+admission funnel landed; its `enable` field is now honored — see above.)
 
 ## Per-image config: `config.json`
 

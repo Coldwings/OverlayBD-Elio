@@ -7,6 +7,7 @@
 #include "format/merged_writable.hpp"
 #include "format/sparse_rw.hpp"
 #include "format/zfile.hpp"
+#include "source/admission.hpp"
 #include "source/dart.hpp"
 #include "source/layer_store.hpp"
 #include "source/local_file.hpp"
@@ -76,11 +77,14 @@ elio::coro::task<std::vector<uint8_t>> read_trace_blob(
 /// (trace-format.md §6): locally the extracted member `<dir>/trace` (the
 /// upstream lookup name) or an explicit `file`; remotely the layer blob
 /// through the tar wrapper (a plain RegistrySource — the blob is small
-/// and needs no LayerStore persistence). NEVER fails assembly: every
+/// and needs no LayerStore persistence — behind an AdmissionSource so
+/// the fetch passes the device's funnel, ADR-0012; it rides the
+/// bring-up critical path, hence OnDemand). NEVER fails assembly: every
 /// error path logs and returns an empty vector.
 elio::coro::task<std::vector<uint8_t>> load_trace_blob(
     const LowerConfig& accel, const ImageConfig& cfg,
-    const std::shared_ptr<source::RegistryClient>& client) {
+    const std::shared_ptr<source::RegistryClient>& client,
+    const source::AdmissionFunnelPtr& funnel) {
     try {
         std::string local;
         if (is_regular_file(accel.file)) local = accel.file;
@@ -99,7 +103,10 @@ elio::coro::task<std::vector<uint8_t>> load_trace_blob(
         }
         const std::string url = cfg.repo_blob_url + "/" + accel.digest;
         auto reg = co_await source::RegistrySource::open(client, url);
-        auto untarred = co_await source::TarOffsetSource::open(std::move(reg));
+        auto gated = std::make_unique<source::AdmissionSource>(
+            std::move(reg), funnel);
+        auto untarred =
+            co_await source::TarOffsetSource::open(std::move(gated));
         co_return co_await read_trace_blob(*untarred);
     } catch (const std::exception& e) {
         ELIO_LOG_WARNING("trace layer load failed ({}); prefetch disabled",
@@ -150,11 +157,21 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     }
     auto client = std::make_shared<source::RegistryClient>(creds, rcc);
 
+    // The read admission funnel (ADR-0012): ONE instance per device
+    // open, shared by every lower's LayerStore and by the remote-only
+    // source wrappers below, so all remote reads of the device compete
+    // at a single gate. Its AIMD window is internal (not
+    // operator-configured).
+    auto funnel = std::make_shared<source::AdmissionFunnel>();
+
     // Trace layer recognition (ADR-0013; trace-format.md §6):
     // `accelerationLayer: true` marks the UPPERMOST lower as the
     // acceleration layer. It is NOT a data layer: set it aside from the
     // merge and load its trace blob best-effort (a missing/unreadable
-    // blob only disables prefetch, never assembly).
+    // blob only disables prefetch, never assembly). The global
+    // `prefetch.enable` switch gates the trace load/replay alone —
+    // recognition (setting the layer aside) is structural and always
+    // applies.
     std::span<const LowerConfig> data_lowers(cfg.lowers);
     std::vector<uint8_t> trace_blob;
     if (cfg.acceleration_layer) {
@@ -163,8 +180,10 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                 "data lower beneath it");
         }
         data_lowers = data_lowers.first(cfg.lowers.size() - 1);
-        trace_blob =
-            co_await load_trace_blob(cfg.lowers.back(), cfg, client);
+        if (global.prefetch_enable) {
+            trace_blob = co_await load_trace_blob(cfg.lowers.back(), cfg,
+                                                  client, funnel);
+        }
     }
 
     std::vector<std::unique_ptr<format::LsmtLayer>> layers;
@@ -214,10 +233,14 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 // served remote-only (no local caching at all; the kernel
                 // page cache has nothing to work on). The snapshotter
                 // always sets dir, so this is the compatibility path.
+                // The AdmissionSource routes its reads through the
+                // device's funnel (ADR-0012) like every other remote
+                // path.
                 ELIO_LOG_WARNING("layer {} has no dir; serving remotely "
                                  "without persistence",
                                  lower.digest);
-                raw = std::move(reg);
+                raw = std::make_unique<source::AdmissionSource>(
+                    std::move(reg), funnel);
             } else {
                 // ADR-0011: one remote source per layer; the LayerStore
                 // reads through it and persists every served extent into
@@ -234,6 +257,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 lsc.fill.delay_extra_sec = cfg.download.delay_extra_sec;
                 lsc.fill.max_mbps = cfg.download.max_mbps;
                 lsc.fill.block_size = cfg.download.block_size;
+                lsc.funnel = funnel;  // ADR-0012: shared across all lowers
                 bool store_opened = false;
                 try {
                     raw = co_await source::LayerStore::open(
@@ -252,9 +276,11 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 }
                 if (!store_opened) {
                     // The moved-from `reg` died with the failed open;
-                    // re-open the plain registry source (cold path).
+                    // re-open the plain registry source (cold path),
+                    // behind the same funnel wrapper as the no-dir path.
                     reg = co_await source::RegistrySource::open(client, url);
-                    raw = std::move(reg);
+                    raw = std::make_unique<source::AdmissionSource>(
+                        std::move(reg), funnel);
                 }
             }
         }
@@ -289,6 +315,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         out.trace = trace_stats;
         out.root = std::move(merged);
         out.layer_stores = std::move(stores);
+        out.funnel = std::move(funnel);
         ELIO_LOG_INFO("image assembled: {} layers, virtual size {} bytes", n,
                       out.virtual_size);
         co_return out;
@@ -318,6 +345,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     out.trace = trace_stats;
     out.root = std::move(merged);
     out.layer_stores = std::move(stores);
+    out.funnel = std::move(funnel);
     ELIO_LOG_INFO("image assembled writable: {} lowers + {} upper, virtual "
                   "size {} bytes",
                   n, cfg.upper.type, out.virtual_size);

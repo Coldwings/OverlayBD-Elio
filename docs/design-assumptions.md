@@ -117,3 +117,31 @@ sparse-file `LayerStore` (ADR-0011). The cross-module rules:
   layer without a directory has no persistence at all. The
   completed-layer file is `<dir>/overlaybd.commit`, installed by atomic
   rename after sha256 verification.
+
+## A12. All remote reads pass one admission funnel; prefetch/fill are scavengers
+
+Every remote range request of a device is admitted through a single
+per-device funnel before reaching the source client (ADR-0012). Priority
+is enforced entirely client-side — registries, object storage, and DART
+peers offer no QoS, and splitting traffic classes across sources is
+rejected (ADR-0012 records the maintainer's decision: every class must
+keep flowing through P2P). The rules:
+
+- **On-demand reads are unconditional** — a guest-blocking miss is
+  admitted immediately, even past the concurrency window; it is never
+  delayed to protect the window.
+- **Prefetch (trace replay) and fill are a scavenger class** — admitted
+  only when no on-demand request is in flight and total in-flight
+  requests are below an AIMD window. Trace replay outranks fill within
+  the class. The window is not operator-configured: it grows additively
+  while observed on-demand latency stays flat against an EMA baseline
+  and shrinks multiplicatively on a latency rise (LEDBAT-style — consume
+  spare capacity, yield on the first congestion signal).
+- **Scavenger requests are size-capped near 1 MiB**, bounding the
+  head-of-line delay an arriving on-demand read can suffer behind an
+  already-issued scavenger request.
+- **Extent-granular dedup happens below the funnel** (A11's in-flight
+  map): a request for an extent already being fetched joins that fetch,
+  whatever class started it.
+- **Source clients stay class-agnostic** — the funnel governs admission,
+  never source selection (A9's fallback semantics are untouched).

@@ -6,10 +6,12 @@
 // stored-blob-level source of the corresponding lower (the
 // TarOffsetSource view — the same byte space upstream's PrefetchFile
 // wraps, i.e. the layer blob file below decompression), executed in
-// recorded order. Until the admission funnel lands (B1), replay is
-// awaited INLINE during device bring-up, bounded by the wall-time
-// budget below; the funnel will then detach it into scavenger-class
-// warm-up.
+// recorded order. Replay is awaited INLINE during device bring-up,
+// bounded by the wall-time budget below; every populate it issues
+// passes the device's read admission funnel (ADR-0012) as the Prefetch
+// scavenger class. Detaching replay off the bring-up path — now safe,
+// since the funnel yields to on-demand reads — is a documented
+// follow-up, not part of the funnel's landing.
 //
 // Replay is OPPORTUNISTIC: a missing, malformed, or stale trace and any
 // individual populate failure are logged and skipped — never a device

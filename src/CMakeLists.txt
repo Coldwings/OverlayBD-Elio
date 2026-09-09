@@ -20,6 +20,7 @@ add_library(obd_core STATIC
     source/credentials.cpp
     source/dart.cpp
     source/registry.cpp
+    source/admission.cpp
     source/layer_store.cpp
     image/config.cpp
     image/image_file.cpp

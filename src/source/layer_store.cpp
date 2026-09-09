@@ -459,7 +459,7 @@ elio::coro::task<ssize_t> LayerStore::read_fd_loop(int fd, void* buf,
 }
 
 elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
-    uint64_t extent_id) {
+    uint64_t extent_id, ReadClass cls) {
     std::shared_ptr<InFlight> f;
     bool starter = false;
     co_await inflight_mu_.lock();
@@ -484,6 +484,14 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
         std::min<uint64_t>(cfg_.extent_size, size_ - ebase));
     auto buf = std::make_shared<std::vector<uint8_t>>(elen);
     remote_fetches_.fetch_add(1, std::memory_order_relaxed);
+    // ADR-0012: the starter's remote fetch enters the source only
+    // through the device's admission funnel (the permit's lifetime is
+    // the fetch — its wall-clock latency is the AIMD sample for
+    // OnDemand). One extent is 64 KiB, under the scavenger size cap.
+    AdmissionFunnel::Permit permit;
+    if (cfg_.funnel) {
+        permit = co_await cfg_.funnel->acquire(cls);
+    }
     const ssize_t r = co_await remote_->pread(buf->data(), elen, ebase);
     if (r < 0) {
         f->error = static_cast<int>(-r);
@@ -595,7 +603,9 @@ elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
             }
         }
         if (!served) {
-            const FetchResult fr = co_await join_or_fetch(eid);
+            // A guest-blocking miss: the ADR-0012 OnDemand class.
+            const FetchResult fr =
+                co_await join_or_fetch(eid, ReadClass::OnDemand);
             if (fr.error != 0) {
                 co_return done > 0 ? static_cast<ssize_t>(done)
                                    : -fr.error;
@@ -622,7 +632,9 @@ elio::coro::task<ssize_t> LayerStore::populate(uint64_t offset, size_t len) {
         if (records_[eid].load(std::memory_order_acquire) & kFlagPresent) {
             continue;
         }
-        const FetchResult fr = co_await join_or_fetch(eid);
+        // Warm-up (trace replay): the ADR-0012 Prefetch scavenger class.
+        const FetchResult fr =
+            co_await join_or_fetch(eid, ReadClass::Prefetch);
         if (fr.error != 0) co_return -fr.error;
         if (state() == State::Filling &&
             !(records_[eid].load(std::memory_order_acquire) &
@@ -655,8 +667,8 @@ elio::coro::task<bool> LayerStore::wait_queue_room(size_t len) {
 
 elio::coro::task<void> LayerStore::run_fill() {
     // Fill is the ADR-0012 `Fill` scavenger class: conservative
-    // concurrency 1 (this single walk) until the admission funnel (#B1)
-    // merges and governs it.
+    // concurrency 1 (this single walk), admitted at the device's funnel
+    // (when configured) behind both OnDemand and Prefetch traffic.
     fill_status_.store(static_cast<int>(FillStatus::kWaiting),
                        std::memory_order_release);
     uint32_t delay = cfg_.fill.delay_sec;
@@ -687,9 +699,15 @@ elio::coro::task<void> LayerStore::run_fill() {
 
     const uint64_t es = cfg_.extent_size;
     // Coalescing cap: the bulk-path rule — contiguous misses are fetched
-    // with larger range reads, capped near 1 MiB.
-    const uint64_t cap = std::min<uint64_t>(
+    // with larger range reads, capped near 1 MiB. With a funnel the cap
+    // is the funnel's scavenger size cap (ADR-0012: the funnel caps, the
+    // caller splits — one fill range read is one scavenger admission).
+    uint64_t cap = std::min<uint64_t>(
         std::max<uint64_t>(cfg_.fill.block_size, es), 1024 * 1024);
+    if (cfg_.funnel) {
+        cap = cfg_.funnel->cap_request(ReadClass::Fill,
+                                       static_cast<size_t>(cap));
+    }
     const uint64_t budget =
         static_cast<uint64_t>(std::max(cfg_.fill.max_mbps, 1u)) << 20;
     uint64_t window_used = 0;
@@ -722,6 +740,13 @@ elio::coro::task<void> LayerStore::run_fill() {
             std::min((run_end - e) * es, size_ - e * es);
         auto buf = std::make_shared<std::vector<uint8_t>>(
             static_cast<size_t>(run_len));
+        // ADR-0012: fill's range read is one Fill-class scavenger
+        // admission; it may suspend here until no on-demand request is
+        // in flight and the AIMD window has room.
+        AdmissionFunnel::Permit permit;
+        if (cfg_.funnel) {
+            permit = co_await cfg_.funnel->acquire(ReadClass::Fill);
+        }
         const ssize_t r =
             co_await remote_->pread(buf->data(), buf->size(), e * es);
         if (r < 0 || static_cast<uint64_t>(r) != run_len) {
