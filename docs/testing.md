@@ -181,7 +181,7 @@ Every test, grouped by area, with the property it guards.
   data (mask semantics, ADR-0009).
 - `format: trace crc32c golden vectors match the spec` — the trace blob's
   raw-chaining CRC-32C matches the trace-format.md §4 golden vectors,
-  including the chaining property (ADR-0013, proposed).
+  including the chaining property (ADR-0013).
 - `format: trace decodes the spec worked example byte-for-byte` — the
   golden 72-byte blob from the trace-format.md §13 appendix decodes to
   the documented header fields and records, and the conforming writer
@@ -398,7 +398,7 @@ Every test, grouped by area, with the property it guards.
   back writes (ADR-0008).
 - `image: trace replay populates traced extents in recorded order` —
   records interleaving two lowers issue `populate` on the right target in
-  the trace's exact order (ADR-0013, proposed).
+  the trace's exact order (ADR-0013).
 - `image: trace replay skips unknown ops, layers and bad records` —
   non-READ ops, unknown/null layer indexes, zero and > 1 MiB counts, and
   negative offsets skip silently; a failing populate and a malformed blob
@@ -406,6 +406,52 @@ Every test, grouped by area, with the property it guards.
 - `image: trace replay enforces record, byte and time budgets` — the
   `max_records` / `max_bytes` / `max_wall_time` bounds each stop replay
   early with `budget_exhausted` set.
+- `image: trace recording round-trips through the codec reader` — a
+  recorded blob parses with the C2 reader (header checksum rewritten on
+  finalize) and the finalize stats match the file (ADR-0013).
+- `image: trace recording coalesces adjacent records and preserves order`
+  — same-layer continuations merge within the 1 MiB cap; disjoint reads
+  keep their exact order.
+- `image: trace recording splits reads beyond the conforming count cap` —
+  an oversized read lands as consecutive ≤ 1 MiB records.
+- `image: trace recording drops and counts records when the buffer fills`
+  — overflow sheds whole chunks, `dropped` is surfaced, and the blob
+  stays valid and replayable.
+- `image: trace recording skips partial and failed reads` — short reads
+  and read errors record nothing.
+- `image: trace recording is pass-through and error-clean when idle` — an
+  idle tap reads and reports errors exactly like the wrapped source.
+- `image: trace recording stop is idempotent and reports expiry stats` —
+  the device-side timer finalizes with no client call; a late stop
+  returns the same stats.
+- `image: trace recording captures only remote fetches through the layer store`
+  — local hits record nothing; misses record exactly the fetched
+  extents.
+- `image: trace recording translates offsets out of the tar wrapper` —
+  records address payload space; header-spanning fetches clamp to their
+  payload overlap.
+- `image: trace recording finalizes an empty window to a valid header-only blob` —
+  a stop before any record still runs the header checksum rewrite; the
+  24-byte blob parses with the C2 reader.
+- `image: trace recording restarts cleanly after a stop` —
+  start→stop→start opens a fresh window (queue/drop counter reset) and
+  both blobs stay valid.
+- `image: trace recording rejects start while a finalize is in flight` —
+  a start meeting an in-flight finalize (held open by the test hook) is
+  rejected with "already in progress" and the finalize completes with
+  its records and stats intact.
+- `image: trace recording rejected start never truncates existing files` —
+  the state gate runs BEFORE the output open: a rejected start leaves
+  a previous recording's valid blob byte-identical and the active
+  window's own finalize complete.
+- `image: trace recording start race truncates the output exactly once` —
+  two concurrent starts on the same path (made deterministic by the
+  test-only start hook): the loser is rejected without touching the
+  file, only the winner truncates (under the state lock), and the
+  winner's finalize produces a complete valid blob.
+- `image: trace recording drops out-of-range offsets instead of corrupting` —
+  an offset past INT64_MAX (or one whose count overflows int64) is
+  dropped + counted, never cast into a negative blob offset.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` image with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merged view and the trace fully
@@ -490,6 +536,29 @@ Every test, grouped by area, with the property it guards.
   field types are parse-time protocol errors, not handler exceptions),
   ignores unknown fields, and the `hello` reply pins the `protocol` field
   plus the `commit` feature advertisement (ADR-0014).
+- `supervisor: device trace control answers malformed-typed fields with clean errors` —
+  the device-side trace command loop (`src/supervisor/device_control.hpp`)
+  over a real socketpair: a `trace_start` with a wrong-typed `path` or
+  `duration_sec` (including a float, a negative, and a huge integer)
+  gets a clean error reply (with the `seq` correlation echoed) instead
+  of an escaping `type_error` killing the loop, and a valid start/stop
+  cycle afterwards proves the loop stayed alive (ADR-0013).
+- `supervisor: device trace control skips an oversized line and stays alive` —
+  the same loop over a real socketpair: a command line larger than the
+  64 KiB cap (no newline inside) is discarded rather than mistaken for
+  channel EOF, and a valid start/stop cycle afterwards proves the loop
+  stayed alive (ADR-0013).
+- `supervisor: control channel writer loops short writes and never throws` —
+  the serialized channel writer loops ::write until the whole line is
+  out (a short write would truncate/fuse protocol lines); a line larger
+  than half the capacity of a nonblocking pipe (filled to capacity,
+  drained halfway — no fixed pipe size assumed) deterministically
+  short-writes then EAGAINs and is reported (false), never thrown,
+  while a normal line over a socketpair lands intact (ADR-0013).
+- `supervisor: control channel writer survives a closed peer without SIGPIPE` —
+  an EPIPE (the supervisor vanishing mid-write) is reported as a dropped
+  line (false) instead of SIGPIPE-terminating the process: sockets are
+  written via `send(MSG_NOSIGNAL)` (ADR-0013).
 
 ### integration
 
@@ -594,6 +663,33 @@ Every test, grouped by area, with the property it guards.
   succeeds, the loser gets a precise error ("commit already in progress"
   or "already sealed"), and the sealed file is intact (no interleaved
   tmp-file writes) (ADR-0014). Runs without privileges.
+- `integration: trace recording captures remote reads end to end` — a
+  real daemon with the extended fake obd-device (opens a REAL image
+  against the mock registry, speaks the real device-side trace protocol,
+  and runs a scripted read workload when recording starts): start →
+  workload → stop returns `{path,sha256,size,records,dropped}`, the
+  additive `trace` status field reports recording then stopped, and the
+  blob parses with the codec reader to exactly the workload's coalesced
+  record (ADR-0013). Runs without privileges.
+- `integration: trace recording duration expiry finalizes without a client call` —
+  the device-side timer finalizes on its own; `status` reports
+  `"state":"stopped","reason":"expired"` and a late stop returns the
+  same stats (ADR-0013). Runs without privileges.
+- `integration: trace recording survives client disconnect mid-record` —
+  a client that sends `trace_start` and vanishes without reading the
+  reply cannot leak a recording device: the duration bound still
+  finalizes and the supervisor keeps serving (ADR-0013). Runs without
+  privileges.
+- `integration: trace recording crash mid-record marks the trace lost` —
+  a SIGKILLed device's `trace` status flips to
+  `"state":"lost","reason":"device_exit"`, the never-finalized output
+  file stays a 0-byte non-blob, and the daemon keeps serving
+  (ADR-0013). Runs without privileges.
+- `integration: trace recording rejects bad requests cleanly` — missing
+  or wrong-typed fields (protocol parse), unknown ids, idle stops,
+  out-of-bounds durations, and double starts are precise errors that
+  leave the daemon and the active recording unaffected (ADR-0013). Runs
+  without privileges.
 - `integration: ublk device serves sector reads from a blob` — the
   privileged E2E: a real ublk device backed by an in-memory blob
   returns correct sectors through `/dev/ublkb<N>` (self-skips without

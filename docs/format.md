@@ -29,10 +29,12 @@ images built by upstream `overlaybd-*` tools load identically here:
   `obd-mkimage` and the test fixtures. The data plane never writes through
   these.
 - **Trace codec** (`trace.hpp`) — the upstream OverlayBD prefetch trace
-  blob (ADR-0013, proposed): an in-memory parser and conforming writer for
+  blob (ADR-0013): an in-memory parser and conforming writer for
   the raw-struct wire format specified in
-  [trace-format.md](./trace-format.md). The codec exists and is tested;
-  record/replay against live devices is **not wired yet**.
+  [trace-format.md](./trace-format.md). Replay is wired into device
+  bring-up (`src/image/trace_replay.hpp`, docs/image.md) and recording
+  into the supervisor's trace commands (`src/image/trace_record.hpp`,
+  docs/supervisor.md).
 
 Everything async in this module is an `elio::coro::task` running on the Elio
 scheduler over the `source::BlobSource` abstraction; the writers are plain
@@ -124,7 +126,7 @@ implementations exist: a sparse file with identity mapping
 (`LsmtRwLayer`), which `seal()` compacts into a standard sealed LSMT RO
 file.
 
-### Trace blob (ADR-0013, proposed)
+### Trace blob (ADR-0013)
 
 The prefetch trace blob is a 24-byte header (magic, `data_size`,
 CRC-32C checksum) followed by fixed 24-byte records, an LP64
@@ -994,9 +996,12 @@ writers and readers agree on the same bytes.
   read back as the on-disk zeros).
 - **Merged index rebuild is O(index) per write.** `MergedWritable` rebuilds
   after every `pwrite`; write-heavy workloads should batch writes.
-- **Trace record/replay is not wired.** The trace codec (`trace.hpp`) is
-  implemented and tested, but no device path records or replays traces yet,
-  and the blob is not packaged as an image layer (ADR-0013, proposed).
+- **Trace packaging is external.** The trace codec (`trace.hpp`) is
+  implemented and tested; replay is wired into device bring-up
+  (`trace_replay.hpp`, ADR-0013) and recording into the supervisor's
+  trace commands (`trace_record.hpp`, supervisor protocol v3) — but
+  packaging the recorded blob as an image layer stays with the external
+  CLI (ADR-0014 boundary).
 - **Writers are single-shot fixtures.** `write_lsmt_single_layer` covers the
   whole input contiguously (no sparse/zero segments); general-purpose image
   authoring belongs to upstream tools.

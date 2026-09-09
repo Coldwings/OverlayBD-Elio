@@ -49,12 +49,18 @@ these are the real field names):
 {"cmd":"status","id":"<name>"}
 {"cmd":"list"}
 {"cmd":"commit","id":"<name>","user_tag":"<optional string>"}
+
+{"cmd":"trace_start","id":"<name>","path":"<absolute output file>",
+ "duration_sec":<int 1..3600>}
+{"cmd":"trace_stop","id":"<name>"}
 ```
 
 Validation: the message must be a JSON object with a string `cmd`;
 `create` requires string `id` and `config`; `destroy`/`status`/`commit`
 require a string `id`; `commit`'s optional `user_tag` must be a string;
-`hello` and `list` take no fields; anything else is "unknown cmd". Field
+`trace_start` requires a string `id`, a string `path`, and an integer
+`duration_sec`; `trace_stop` requires a string `id`; `hello` and `list`
+take no fields; anything else is "unknown cmd". Field
 TYPES are validated at parse time: a wrong-typed field is answered with a
 clean protocol error, never an exception escaping the handler. Malformed
 input is answered, not dropped.
@@ -66,19 +72,28 @@ command (`src/supervisor/daemon.cpp`):
 
 - **hello**: `{"ok":true,"protocol":<int>,"version":"<project version>",
   "features":[...]}` — the handshake. `protocol` is the control-protocol
-  revision (`kProtocolVersion`, currently 2; 1 = initial command set,
-  2 = added `commit`); `version` is the project version string wired from
-  CMake (`kProjectVersion`); `features` is a JSON array of strings — the
-  capability gate for optional commands, currently `["commit"]`.
+  revision (`kProtocolVersion`, currently 3; 1 = initial command set,
+  2 = added `commit`, 3 = added `trace_start`/`trace_stop` and the
+  additive `trace` status field); `version` is the project version
+  string wired from CMake (`kProjectVersion`); `features` is a JSON
+  array of strings — the capability gate for optional commands,
+  currently `["commit","trace"]`.
 - **create**: `{"ok":true,"id","pid","device"}` — `device` is the child's
   reported `/dev/ublkb<N>`.
 - **destroy**: `{"ok":true,"id"}`.
 - **list**: `{"ok":true,"devices":[{"id","pid","state","device","error"}, ...]}`.
 - **status**: `{"ok":true,"id","pid","state","device","error","exit_code"}`
-  (`exit_code` is -1 until the child is reaped).
+  (`exit_code` is -1 until the child is reaped). Both `status` and
+  `list` replies carry the additive **`trace`** object once a recording
+  was started on the device (see "Trace recording" below).
 - **commit** (ADR-0014): `{"ok":true,"id","path","sha256","size"}`
   — the sealed upper's file path, the hex sha256 of the sealed file, and
   its byte size. See "Offline commit" below for the full contract.
+- **trace_start** (ADR-0013): `{"ok":true,"id","path","duration_sec"}` —
+  the device is recording. See "Trace recording" below.
+- **trace_stop** (ADR-0013): `{"ok":true,"id","path","sha256","size",
+  "records","dropped"}` — the finalized trace blob's path, hex sha256,
+  byte size, written record count, and dropped-record count.
 
 ### Additive-only evolution rule
 
@@ -147,15 +162,104 @@ is being sealed. Contract:
   already-sealed upper, a missing or invalid shutdown checkpoint (device
   crashed), and stop-timeout.
 
+### Trace recording (ADR-0013)
+
+`trace_start` / `trace_stop` control the record path of ADR-0013: the
+device process records the layer-blob access pattern of its remote reads
+into an upstream-compatible prefetch trace blob (docs/trace-format.md;
+the tap and recorder live in `src/image/trace_record.hpp`, the access
+surface is `OpenedImage::recorder`). Unlike `commit`, these commands are
+**device-executed**: the supervisor only forwards them to the live
+device over channel 2 and relays the reply. Contract:
+
+- **Forwarding.** The supervisor sends
+  `{"cmd":"trace_start","path":...,"duration_sec":N,"seq":N}` /
+  `{"cmd":"trace_stop","seq":N}` to the device and waits (bounded, 30 s)
+  for the device's `{"reply":"trace_start"|"trace_stop", ...}` line.
+  `seq` is a per-command correlation token, fresh for every forwarded
+  command and echoed by the device in its reply (additive: older
+  supervisors omit it, older devices do not echo); a reply whose `seq`
+  does not match the pending command is dropped and logged, so a LATE
+  reply to a timed-out command can never complete the next command with
+  the wrong fields. One device command is outstanding per device at a
+  time; a wedged or ancient device answers as "device control channel
+  timeout". A dead device (channel EOF) fails a pending command
+  immediately.
+- **Server-side duration bound.** The duration timer lives in the
+  DEVICE process: expiry finalizes the recording exactly like an
+  explicit stop, so a dead, crashed, or disconnected CLI can never leak
+  a recording device. `duration_sec` is bounded to 1..3600 s (the
+  device rejects out-of-bounds values).
+- **Finalize = the conforming-writer contract.** Stop, expiry, and
+  device shutdown all finalize identically: queued records drain into
+  the codec's `format::trace::TraceWriter` (24×N framing, raw-chaining
+  CRC-32C, ≤ 1 MiB counts, zero padding) whose `finalize()` rewrites the
+  header checksum; the blob is written and fsynced; the reply reports
+  `{path, sha256, size, records, dropped}`.
+- **Expiry surface.** After a duration expiry the device emits an
+  unsolicited `{"reply":"trace_event","event":"expired", ...stats...}`
+  line; the supervisor records it and both `status` and `list` replies
+  carry the additive **`trace`** object from then on:
+  `{"state":"recording"|"stopped"|"lost","path","duration_sec"?,
+  "reason":"stopped"|"expired"|"device_exit","sha256"?,"size"?,
+  "records"?,"dropped"?}`. Expiry events apply ONLY while the entry's
+  trace state is "recording" — a stale expiry landing after a new
+  recording started is logged and ignored, never overwriting the fresh
+  recording's status. **Crash mid-record** (device exit with a
+  recording open) marks the trace `"state":"lost",
+  "reason":"device_exit"`: queued records are memory-only and die with
+  the device, and the mark — not a stale "recording" — is what a
+  recovery respawn starts from.
+- **Idempotent stop.** A `trace_stop` that races (or follows) an expiry
+  returns the same finalized stats, never an error — a CLI can always
+  learn the outcome of its recording. A stop with no recording ever
+  started is the error "no trace recording in progress".
+- **Errors** (precise reasons, via the error envelope): unknown id,
+  missing/wrong-typed fields (protocol parse), a concurrent device
+  command ("another device command is in flight"), an unavailable
+  channel ("device control channel unavailable"), a double start
+  ("trace recording already in progress"), an out-of-bounds or
+  non-absolute path/duration (device-rejected), a wedged device
+  ("device control channel timeout").
+- **Recording captures REMOTE reads only.** Records fire per
+  fully-satisfied pread on a lower's remote source — LayerStore local
+  hits produce no record. Structural warm-up, trace replay, and
+  background-fill traffic ARE remote reads and are recorded when they
+  fall inside the window (the runbook records with prefetch/download
+  off; docs/operations.md).
+
 ### Channel 2: obd-device → supervisor (status channel, fd 3)
 
 A `socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC)` created before fork.
 The child end is dup2'd to **fd 3**, cleared of CLOEXEC, and survives
 `execve`; the device binary receives `--control-fd 3` on its argv. Same
-JSON-lines framing, same 64 KiB cap. The channel is **one-directional**:
-the device writes status lines, the supervisor only reads; the supervisor
-controls the child via **signals** (SIGTERM = shutdown request, SIGKILL =
-force).
+JSON-lines framing, same 64 KiB cap. Device → supervisor traffic is
+lifecycle **status lines** plus, since protocol 3, `reply`-discriminated
+command replies/events (see "Trace recording" above; the supervisor
+routes on the `reply` field and treats everything else as a status
+line). Supervisor → device traffic is **signals** (SIGTERM = shutdown
+request, SIGKILL = force) plus, since protocol 3, JSON-lines trace
+commands on the same socketpair. Devices that predate trace control
+never read the channel, so a new-supervisor/old-device pairing degrades
+to "device control channel timeout" on trace commands; the reverse
+pairing simply never receives them. Device shutdown must not leave the
+device's command reader parked (obd-device `shutdown(2)`s the channel on
+its way out — a parked coroutine would stall the scheduler's teardown
+drain). All device-side WRITERS (status reports, trace replies, the
+expiry event — different coroutines on different workers) go through
+one shared serialized writer (`ControlChannelWriter`,
+src/supervisor/device_control.hpp): AF_UNIX SOCK_STREAM has no PIPE_BUF
+atomicity, so without serialization two concurrent small writes could
+interleave into a corrupted line — and every write loops until the
+whole line is out, since a short write would fuse lines just as well.
+The device's control fd is `O_NONBLOCK` and the writer DROPS a line
+(never blocks a scheduler worker) if the supervisor stalls long enough
+to fill the socket buffer. Framing consequence is bounded and
+self-healing: a partial prefix fuses with the next complete line and is
+dropped by the reader as one malformed (non-JSON) line, after which
+framing is clean again — the channel tolerates the loss of at most one
+line per stall episode (command replies carry a 30 s timeout; status is
+re-queryable).
 
 Status lines (`DeviceStatus` / `make_device_status`):
 
@@ -421,6 +525,28 @@ needing a real ublk device or root.
   `path`/`sha256`/`size`; a second commit fails with "already sealed";
   the sealed file re-opens as a valid LSMT RO layer with the
   checkpointed content (ADR-0014). Runs without privileges.
+- `supervisor: device trace control answers malformed-typed fields with clean errors` —
+  the device-side trace command loop over a real socketpair:
+  wrong-typed `trace_start` fields get a clean error reply (seq echoed)
+  and the loop keeps serving (never-throws contract, ADR-0013).
+- Trace recording (ADR-0013; integration,
+  `tests/integration/test_trace_record.cpp`; the fake device opens a
+  REAL image against a mock registry and serves the real device-side
+  trace protocol): `integration: trace recording captures remote reads
+  end to end` — full start → scripted workload → stop flow, reply
+  fields, additive `trace` status field, and a blob the codec reader
+  accepts with exactly the workload's coalesced record; `integration:
+  trace recording duration expiry finalizes without a client call` —
+  the device-side timer finalizes on its own and a late stop returns
+  the same stats; `integration: trace recording survives client
+  disconnect mid-record` — a CLI that vanishes mid-command cannot leak
+  a recording device; `integration: trace recording crash mid-record
+  marks the trace lost` — a SIGKILLed device's trace status flips to
+  "lost"/"device_exit" and the never-finalized output file stays a
+  0-byte non-blob; `integration: trace recording rejects bad requests
+  cleanly` — protocol validation, unknown ids, idle stops,
+  out-of-bounds durations, and double starts are precise errors that
+  leave the daemon and the active recording unaffected.
 
 Run: `ctest --test-dir build --output-on-failure` (no privileges needed;
 the spawn tests create their fake binaries under a temporary directory).

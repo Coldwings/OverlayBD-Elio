@@ -179,6 +179,72 @@ Contract and runbook notes:
 - The sealed file is a standard LSMT layer: reference it as a `lowers[]`
   entry (with its sha256 as the digest) in subsequent image configs.
 
+## Recording a prefetch trace (ADR-0013)
+
+`trace_start` records the layer-blob access pattern of a device's remote
+reads into an upstream-compatible prefetch trace blob
+(docs/trace-format.md); a replay-capable image build can later warm the
+same extents without touching the network:
+
+```bash
+obdctl trace_start myimg /var/lib/overlaybd-elio/traces/myimg.trace --duration 300
+# → {"ok":true,"id":"myimg","path":"...","duration_sec":300}
+obdctl status myimg
+# → {"ok":true, ..., "trace":{"state":"recording","path":"...","duration_sec":300}}
+obdctl trace_stop myimg
+# → {"ok":true,"id":"myimg","path":"...","sha256":"<hex>",
+#    "size":<bytes>,"records":<n>,"dropped":<n>}
+obdctl status myimg
+# → {"ok":true, ..., "trace":{"state":"stopped","reason":"stopped",
+#    "sha256":"...", ...}}
+```
+
+Runbook notes:
+
+- **Record from a throwaway container.** The recording is only as clean
+  as the workload: run the cold-path you want warmed later (app start,
+  dependency load) once, then stop. Structural warm-up, trace replay,
+  and background-fill traffic are remote reads too and would be recorded
+  — for a pristine workload trace, create the recording device with
+  `prefetch_enable: false` and `download.enable: false` in the global
+  config.
+- **The duration bound is enforced device-side** (1..3600 s, default
+  300). A crashed or disconnected CLI can never leak a recording: on
+  expiry the device finalizes exactly like an explicit stop, and the
+  `trace` object in `status`/`list` reports `"state":"stopped",
+  "reason":"expired"` with the finalize stats.
+- **Stopping is idempotent.** A stop that races (or follows) an expiry
+  returns the same `{sha256,size,records,dropped}` — operators can
+  always learn the outcome of their recording. A stop with no recording
+  in progress fails with "no trace recording in progress".
+- **The blob is finalized by the codec's conforming writer** (header
+  checksum rewritten on finalize, records pre-split to the 1 MiB count
+  cap, zero padding), so it replays against overlaybd and against this
+  project's own `prefetch.trace` path. `dropped` counts reads shed
+  under extreme pressure (bounded in-memory buffer); the blob remains
+  valid and replayable, just with holes in its coverage.
+- **Only fully-satisfied REMOTE reads are recorded** (local cache hits
+  produce no record); offsets are payload offsets (the tar wrapper is
+  translated out) matching what the replay path consumes.
+- **Packaging into an image is external** (ADR-0014's tar bundle,
+  member name `trace`, plus an `acceleration-layer` config entry); the
+  daemon deliberately never rewrites image configs. When deriving a new
+  image from one that already embeds a trace, remove the old trace
+  member and acceleration-layer entry first — a stale trace references
+  layer indices that no longer match.
+- `obdctl trace_start <id> <output.trace> [--duration SEC]` and
+  `obdctl trace_stop <id>` require supervisor protocol ≥ 3 (`hello`'s
+  `features` lists `"trace"`). obdctl performs no handshake gate of its
+  own: against an older supervisor the command is sent and the daemon
+  answers a clean `unknown cmd 'trace_start'` protocol error.
+- **Crash mid-record loses the window.** Queued records live in device
+  memory until finalize, so a device crash or SIGKILL mid-recording
+  loses them: the supervisor marks the `trace` status `"state":"lost",
+  "reason":"device_exit"` (never a stale "recording" — the mark also
+  survives a recovery respawn, which records nothing), and the output
+  file — created O_TRUNC at start — remains a 0-byte non-blob. Treat a
+  lost window as "no trace" and record again.
+
 ## Logging
 
 Logging goes to stderr (journald when run under systemd). The level comes

@@ -58,6 +58,29 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
             error = "commit 'user_tag' must be a string";
             return std::nullopt;
         }
+    } else if (cmd == "trace_start") {
+        if (!j.contains("id") || !j.contains("path") ||
+            !j.contains("duration_sec")) {
+            error = "trace_start requires 'id', 'path' and 'duration_sec'";
+            return std::nullopt;
+        }
+        if (!j["id"].is_string() || !j["path"].is_string()) {
+            error = "trace_start 'id' and 'path' must be strings";
+            return std::nullopt;
+        }
+        if (!j["duration_sec"].is_number_integer()) {
+            error = "trace_start 'duration_sec' must be an integer";
+            return std::nullopt;
+        }
+    } else if (cmd == "trace_stop") {
+        if (!j.contains("id")) {
+            error = "trace_stop requires 'id'";
+            return std::nullopt;
+        }
+        if (!j["id"].is_string()) {
+            error = "trace_stop 'id' must be a string";
+            return std::nullopt;
+        }
     } else if (cmd != "list" && cmd != "hello") {
         error = "unknown cmd '" + cmd + "'";
         return std::nullopt;
@@ -83,8 +106,9 @@ std::string reply_hello() {
     fields["protocol"] = kProtocolVersion;
     fields["version"] = kProjectVersion;
     // Capability gate (additive-only rule): "commit" = the ADR-0014
-    // offline commit command is served.
-    fields["features"] = nlohmann::json::array({"commit"});
+    // offline commit command is served; "trace" = the ADR-0013 record
+    // path (trace_start/trace_stop) is served.
+    fields["features"] = nlohmann::json::array({"commit", "trace"});
     return reply_ok(fields);
 }
 
@@ -111,6 +135,10 @@ std::string make_device_status(const DeviceStatus& st) {
     if (!st.device.empty()) j["device"] = st.device;
     if (!st.error.empty()) j["error"] = st.error;
     return j.dump() + "\n";
+}
+
+bool is_device_reply_line(const nlohmann::json& j) {
+    return j.is_object() && j.contains("reply") && j["reply"].is_string();
 }
 
 int dev_id_from_bdev_path(const std::string& path) {

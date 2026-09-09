@@ -50,6 +50,32 @@ bool file_exists(const std::string& path) {
     return ::stat(path.c_str(), &st) == 0;
 }
 
+// Defensive field readers for DEVICE-provided protocol JSON: value()
+// throws type_error on a present-but-wrong-typed key, and a corrupted
+// device reply must never tear down a routing coroutine. These return
+// the default when the key is absent OR not of the expected type.
+std::string str_or(const nlohmann::json& j, const char* key,
+                   std::string def = "") {
+    const auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>()
+                                              : std::move(def);
+}
+uint64_t uint_or(const nlohmann::json& j, const char* key,
+                 uint64_t def = 0) {
+    const auto it = j.find(key);
+    if (it != j.end() && it->is_number_unsigned()) {
+        return it->get<uint64_t>();
+    }
+    if (it != j.end() && it->is_number_integer() && it->get<int64_t>() >= 0) {
+        return static_cast<uint64_t>(it->get<int64_t>());
+    }
+    return def;
+}
+bool bool_or(const nlohmann::json& j, const char* key, bool def = false) {
+    const auto it = j.find(key);
+    return (it != j.end() && it->is_boolean()) ? it->get<bool>() : def;
+}
+
 /// Reads a small control-plane text file through the async IO backend
 /// (image configs are a few KiB). Throws obd::error on failure.
 elio::coro::task<std::string> read_text_file(const std::string& path) {
@@ -130,6 +156,26 @@ class Daemon {
         bool image_config_ok = false;  // config parsed at create time
         bool committing = false;      // a commit is in flight
         elio::sync::mutex op_mu;      // commit/destroy vs recovery respawn
+
+        // ADR-0013 trace recording (protocol v3). control_fd is the
+        // supervisor end of the device command channel, published by
+        // supervise_entry under mu_ (-1 when unavailable). One device
+        // command is outstanding at a time: cmd_pending is guarded by
+        // mu_; the reply waiter is a FRESH event per command (manual-
+        // reset events have no reset race this way). `trace` is the
+        // additive status/list field: null until the first trace_start.
+        int control_fd = -1;
+        bool cmd_pending = false;
+        nlohmann::json pending_reply;
+        std::shared_ptr<elio::sync::event> reply_waiter;
+        // L2 correlation: every forwarded command carries a fresh
+        // `seq`; the device echoes it in the reply. A late reply to a
+        // TIMED-OUT command would otherwise complete the NEXT pending
+        // command with the wrong fields — mismatches are dropped
+        // (logged), the pending command times out on its own.
+        uint64_t cmd_seq = 0;
+        uint64_t pending_seq = 0;
+        nlohmann::json trace;
     };
 
 public:
@@ -263,6 +309,10 @@ private:
                 if (c == "create") reply = co_await cmd_create(*cmd);
                 else if (c == "destroy") reply = co_await cmd_destroy(*cmd);
                 else if (c == "commit") reply = co_await cmd_commit(*cmd);
+                else if (c == "trace_start")
+                    reply = co_await cmd_trace_start(*cmd);
+                else if (c == "trace_stop")
+                    reply = co_await cmd_trace_stop(*cmd);
                 else if (c == "list") reply = co_await cmd_list();
                 else if (c == "hello") reply = reply_hello();
                 else reply = co_await cmd_status(*cmd);
@@ -285,10 +335,26 @@ private:
                                            int fd) {
         for (;;) {
             {
+                {
+                    co_await mu_.lock();
+                    entry->control_fd = fd;
+                    mu_.unlock();
+                }
                 LineReader reader(fd);
                 for (;;) {
                     auto line = co_await reader.next();
                     if (!line) break;
+                    // ADR-0013: command replies and trace events carry
+                    // the "reply" discriminator; everything else is a
+                    // lifecycle status line as before.
+                    {
+                        nlohmann::json j = nlohmann::json::parse(
+                            *line, nullptr, false);
+                        if (!j.is_discarded() && is_device_reply_line(j)) {
+                            co_await route_device_reply(entry, std::move(j));
+                            continue;
+                        }
+                    }
                     auto st = parse_device_status(*line);
                     if (!st) {
                         ELIO_LOG_WARNING("device {}: malformed status line",
@@ -312,6 +378,28 @@ private:
                     }
                     ELIO_LOG_INFO("device {} state: {} {}", entry->spec.id,
                                   st->state, st->device);
+                }
+                {
+                    co_await mu_.lock();
+                    entry->control_fd = -1;
+                    if (entry->cmd_pending) {
+                        entry->cmd_pending = false;
+                        entry->pending_reply =
+                            {{"ok", false},
+                             {"error", "device control channel closed"}};
+                        if (entry->reply_waiter) entry->reply_waiter->set();
+                    }
+                    // Crash/exit mid-record: queued records were
+                    // memory-only and died with the device — never
+                    // leave "recording" standing (it would survive a
+                    // recovery respawn of a device that records
+                    // nothing).
+                    if (entry->trace.is_object() &&
+                        entry->trace.value("state", "") == "recording") {
+                        entry->trace["state"] = "lost";
+                        entry->trace["reason"] = "device_exit";
+                    }
+                    mu_.unlock();
                 }
                 // EOF: the process is gone (or closing); mark exited if not
                 // reaped yet. The reaper fills in the exit code on SIGCHLD.
@@ -482,6 +570,254 @@ private:
         fields["pid"] = child->pid();
         fields["device"] = st.device;
         co_return reply_ok(fields);
+    }
+
+    /// Routes a device "reply"-discriminated line (ADR-0013): command
+    /// replies complete the pending cmd handler; trace events update the
+    /// additive `trace` status field.
+    elio::coro::task<void> route_device_reply(
+        const std::shared_ptr<DeviceEntry>& entry, nlohmann::json j) {
+        // All fields below come from the DEVICE: protocol input. value()
+        // throws type_error on a present-but-wrong-typed key, and a
+        // corrupted/wedged device must not tear down the routing
+        // coroutine (which would strand every later control command).
+        // Parse defensively everywhere below.
+        const std::string kind = j["reply"].get<std::string>();
+        if (kind == "trace_event") {
+            // Unsolicited (duration expiry): the recording is over.
+            nlohmann::json t;
+            t["state"] = "stopped";
+            const auto eit = j.find("event");
+            t["reason"] = (eit != j.end() && eit->is_string())
+                              ? eit->get<std::string>()
+                              : "expired";
+            const auto pit = j.find("path");
+            t["path"] = (pit != j.end() && pit->is_string())
+                            ? pit->get<std::string>()
+                            : "";
+            t["sha256"] = str_or(j, "sha256");
+            t["size"] = uint_or(j, "size");
+            t["records"] = uint_or(j, "records");
+            t["dropped"] = uint_or(j, "dropped");
+            const auto oit = j.find("ok");
+            const bool ok = (oit != j.end() && oit->is_boolean())
+                                ? oit->get<bool>()
+                                : false;
+            if (!ok) t["error"] = str_or(j, "error");
+            co_await mu_.lock();
+            // Only the recording the event belongs to: a stale expiry
+            // landing after a NEW recording started must not flip the
+            // fresh "recording" status back to "stopped". (trace is
+            // null json until the first trace_start — value() on null
+            // throws.)
+            if (entry->trace.is_object() &&
+                entry->trace.value("state", "") == "recording") {
+                entry->trace = std::move(t);
+            } else {
+                ELIO_LOG_WARNING(
+                    "device {}: stale trace event ignored (state {})",
+                    entry->spec.id,
+                    entry->trace.is_object()
+                        ? entry->trace.value("state", "none")
+                        : "none");
+            }
+            mu_.unlock();
+            co_return;
+        }
+        // trace_start/trace_stop reply (or garbage): hand to the pending
+        // command handler if there is one — but only when the reply's
+        // echoed `seq` matches the pending command's. A LATE reply to a
+        // timed-out command carries an old seq and is dropped, never
+        // completing the wrong command.
+        co_await mu_.lock();
+        if (entry->cmd_pending) {
+            // Protocol input: parse `seq` defensively — a wrong-typed
+            // value() would throw type_error and tear down the routing
+            // coroutine. Missing or non-integer seq never matches.
+            uint64_t echoed = 0;
+            const auto sit = j.find("seq");
+            if (sit != j.end() && sit->is_number_unsigned()) {
+                echoed = sit->get<uint64_t>();
+            }
+            if (echoed == entry->pending_seq) {
+                entry->cmd_pending = false;
+                entry->pending_reply = std::move(j);
+                if (entry->reply_waiter) entry->reply_waiter->set();
+            } else {
+                ELIO_LOG_WARNING(
+                    "device {}: dropping stale command reply (seq {}, "
+                    "pending seq {})",
+                    entry->spec.id, echoed, entry->pending_seq);
+            }
+        }
+        mu_.unlock();
+        co_return;
+    }
+
+    /// Shared forward-and-await for device-executed trace commands
+    /// (ADR-0013): sends `cmd` to the device over the control channel
+    /// and waits (bounded) for its reply line. The duration bound is
+    /// enforced DEVICE-side, so a client disconnect is harmless — this
+    /// timeout only covers a wedged/dead device.
+    elio::coro::task<std::string> forward_trace_command(
+        const std::string& id, nlohmann::json cmd) {
+        std::shared_ptr<DeviceEntry> entry;
+        std::shared_ptr<elio::sync::event> waiter =
+            std::make_shared<elio::sync::event>();
+        int fd;
+        uint64_t seq = 0;  // captured under mu_: never read the member
+                           // unlocked (only this path writes it, but
+                           // keep the lock discipline exact)
+        {
+            co_await mu_.lock();
+            auto it = children_.find(id);
+            if (it != children_.end()) entry = it->second;
+            if (entry && !entry->cmd_pending && entry->control_fd >= 0) {
+                entry->cmd_pending = true;
+                entry->reply_waiter = waiter;
+                entry->pending_seq = ++entry->cmd_seq;
+                seq = entry->pending_seq;
+                fd = entry->control_fd;
+            } else {
+                fd = -1;
+            }
+            mu_.unlock();
+        }
+        if (!entry) co_return reply_error("no such device: " + id);
+        if (fd < 0) {
+            co_return reply_error(
+                entry->cmd_pending
+                    ? "another device command is in flight: " + id
+                    : "device control channel unavailable: " + id);
+        }
+        auto fail_pending = [&]() -> elio::coro::task<void> {
+            co_await mu_.lock();
+            entry->cmd_pending = false;
+            entry->reply_waiter.reset();
+            mu_.unlock();
+        };
+        cmd["seq"] = seq;  // the device echoes it back
+        const std::string line = cmd.dump() + "\n";
+        // Loop the write: a short write on SOCK_STREAM is legal and
+        // retryable (buffer pressure), not a hard failure — same rule
+        // as the device side's ControlChannelWriter.
+        size_t sent = 0;
+        while (sent < line.size()) {
+            const auto w = co_await elio::io::async_write(
+                fd, line.data() + sent, line.size() - sent, -1);
+            if (w.result < 0) {
+                co_await fail_pending();
+                co_return reply_error("cannot reach the device control "
+                                      "channel: " + id);
+            }
+            if (w.result == 0) {
+                co_await fail_pending();
+                co_return reply_error("cannot reach the device control "
+                                      "channel (short write): " + id);
+            }
+            sent += static_cast<size_t>(w.result);
+        }
+        auto got = co_await elio::with_timeout(
+            std::chrono::seconds(30),
+            [&waiter](elio::coro::cancel_token tok)
+                -> elio::coro::task<void> {
+                co_await waiter->wait(std::move(tok));
+            });
+        nlohmann::json reply;
+        {
+            // ONE lock scope for timeout and success cleanup alike: the
+            // timeout path previously reset reply_waiter here and only
+            // cleared cmd_pending later (fail_pending), leaving a window
+            // where a late matching reply was accepted into pending_reply
+            // with nobody signaled and cmd_pending still true. Clearing
+            // everything atomically makes a late reply fall into the
+            // ordinary "cmd_pending == false → stale, drop" path.
+            co_await mu_.lock();
+            reply = entry->pending_reply;
+            entry->pending_reply = nlohmann::json();
+            entry->reply_waiter.reset();
+            if (!got) entry->cmd_pending = false;
+            mu_.unlock();
+        }
+        if (!got) {
+            co_return reply_error("device control channel timeout: " + id);
+        }
+        if (!bool_or(reply, "ok", false)) {
+            co_return reply_error(str_or(
+                reply, "error", "device rejected the trace command"));
+        }
+        // The device reply fields INCLUDING the "reply" discriminator;
+        // cmd_trace_start/stop erase it before forwarding to the
+        // client.
+        co_return reply.dump();
+    }
+
+    /// ADR-0013 record path: start a server-side-duration-bounded trace
+    /// recording in the device process. The reply carries the device's
+    /// fields plus id; the additive `trace` status field starts
+    /// tracking the recording.
+    elio::coro::task<std::string> cmd_trace_start(const nlohmann::json& j) {
+        const std::string id = j["id"].get<std::string>();
+        nlohmann::json cmd = {{"cmd", "trace_start"},
+                              {"path", j["path"]},
+                              {"duration_sec", j["duration_sec"]}};
+        std::string r = co_await forward_trace_command(id, std::move(cmd));
+        auto rj = nlohmann::json::parse(r, nullptr, false);
+        if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
+            co_await mu_.lock();
+            auto it = children_.find(id);
+            if (it != children_.end()) {
+                it->second->trace = {{"state", "recording"},
+                                     {"path", str_or(rj, "path")},
+                                     {"duration_sec", uint_or(rj, "duration_sec")}};
+            }
+            mu_.unlock();
+            rj.erase("reply");
+            rj.erase("seq");  // internal routing token, not client API
+            rj["id"] = id;
+            rj["ok"] = true;
+            co_return rj.dump() + "\n";
+        }
+        co_return r;
+    }
+
+    elio::coro::task<std::string> cmd_trace_stop(const nlohmann::json& j) {
+        const std::string id = j["id"].get<std::string>();
+        // Named local: a brace-init json temporary as a coroutine
+        // argument trips GCC 12's "array used as initializer" bug.
+        nlohmann::json cmd = {{"cmd", "trace_stop"}};
+        std::string r = co_await forward_trace_command(id, std::move(cmd));
+        auto rj = nlohmann::json::parse(r, nullptr, false);
+        if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
+            co_await mu_.lock();
+            auto it = children_.find(id);
+            if (it != children_.end()) {
+                // A stop after the duration already finalized the
+                // recording is a no-op: the expiry event has already
+                // recorded the true cause, and overwriting it would
+                // misreport a late trace_stop as the reason.
+                const bool already_expired =
+                    it->second->trace.is_object() &&
+                    it->second->trace.value("state", "") == "stopped" &&
+                    it->second->trace.value("reason", "") == "expired";
+                nlohmann::json t;
+                t["state"] = "stopped";
+                t["reason"] = already_expired ? "expired" : "stopped";
+                t["path"] = str_or(rj, "path");
+                t["sha256"] = str_or(rj, "sha256");
+                t["size"] = uint_or(rj, "size");
+                t["records"] = uint_or(rj, "records");
+                t["dropped"] = uint_or(rj, "dropped");
+                it->second->trace = std::move(t);
+            }
+            mu_.unlock();
+            rj.erase("reply");
+            rj.erase("seq");  // internal routing token, not client API
+            rj["id"] = id;
+            rj["ok"] = true;
+            co_return rj.dump() + "\n";
+        }
+        co_return r;
     }
 
     elio::coro::task<std::string> cmd_destroy(const nlohmann::json& j) {
@@ -666,12 +1002,14 @@ private:
         co_await mu_.lock();
         for (auto& [id, entry] : children_) {
             const Child::Status st = entry->child->status();
-            arr.push_back({{"id", id},
-                           {"pid", entry->child->pid()},
-                           {"state", st.state},
-                           {"device", st.device},
-                           {"error", st.error},
-                           {"recoveries", entry->recoveries}});
+            auto dj = nlohmann::json{{"id", id},
+                                     {"pid", entry->child->pid()},
+                                     {"state", st.state},
+                                     {"device", st.device},
+                                     {"error", st.error},
+                                     {"recoveries", entry->recoveries}};
+            if (!entry->trace.is_null()) dj["trace"] = entry->trace;
+            arr.push_back(std::move(dj));
         }
         mu_.unlock();
         co_return reply_ok({{"devices", arr}});
@@ -696,6 +1034,7 @@ private:
         fields["error"] = st.error;
         fields["exit_code"] = st.exit_code;
         fields["recoveries"] = entry->recoveries;
+        if (!entry->trace.is_null()) fields["trace"] = entry->trace;
         co_return reply_ok(fields);
     }
 

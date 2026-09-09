@@ -2,6 +2,7 @@
 #include "image/image_file.hpp"
 
 #include "common/errors.hpp"
+#include "image/trace_record.hpp"
 #include "format/lsmt.hpp"
 #include "format/lsmt_rw.hpp"
 #include "format/merged_writable.hpp"
@@ -202,8 +203,18 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     std::vector<source::BlobSource*> warm_targets;
     warm_targets.reserve(data_lowers.size());
     std::vector<source::LayerStore*> stores;
-    for (const auto& lower : data_lowers) {
+    // The trace recorder (ADR-0013, record path): created idle; the
+    // supervisor's trace_start arms it. Every REMOTE lower's registry
+    // source is wrapped in a record tap (trace_record.hpp — a pread on
+    // that source IS a remote read by construction, so local LayerStore
+    // hits record nothing). Local lowers get no tap but still occupy
+    // their layer_index slot.
+    auto recorder = std::make_shared<TraceRecorder>();
+    for (size_t layer_index = 0; layer_index < data_lowers.size();
+         ++layer_index) {
+        const auto& lower = data_lowers[layer_index];
         source::BlobSourcePtr raw;
+        TraceRecordSource* tap = nullptr;
         const std::string local_path = probe_local_blob(lower);
         if (!local_path.empty()) {
             ELIO_LOG_INFO("layer {} from local file {}", lower.digest,
@@ -234,6 +245,10 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             }
             const std::string url = cfg.repo_blob_url + "/" + lower.digest;
             auto reg = co_await source::RegistrySource::open(client, url);
+            auto tapped = std::make_unique<TraceRecordSource>(
+                std::move(reg), recorder,
+                static_cast<uint32_t>(layer_index));
+            tap = tapped.get();
             if (lower.dir.empty()) {
                 // No persistence directory configured: a LayerStore needs
                 // a writable per-layer dir to stage into, so the layer is
@@ -247,7 +262,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                  "without persistence",
                                  lower.digest);
                 raw = std::make_unique<source::AdmissionSource>(
-                    std::move(reg), funnel);
+                    std::move(tapped), funnel);
             } else {
                 // ADR-0011: one remote source per layer; the LayerStore
                 // reads through it and persists every served extent into
@@ -273,7 +288,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 bool store_opened = false;
                 try {
                     raw = co_await source::LayerStore::open(
-                        std::move(reg), lower.dir, sha, std::move(lsc));
+                        std::move(tapped), lower.dir, sha, std::move(lsc));
                     stores.push_back(
                         static_cast<source::LayerStore*>(raw.get()));
                     store_opened = true;
@@ -288,16 +303,31 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 }
                 if (!store_opened) {
                     // The moved-from `reg` died with the failed open;
-                    // re-open the plain registry source (cold path),
-                    // behind the same funnel wrapper as the no-dir path.
+                    // re-open the registry source (cold path) behind a
+                    // fresh tap and the same funnel wrapper as the
+                    // no-dir path.
                     reg = co_await source::RegistrySource::open(client, url);
+                    auto retap = std::make_unique<TraceRecordSource>(
+                        std::move(reg), recorder,
+                        static_cast<uint32_t>(layer_index));
+                    tap = retap.get();
                     raw = std::make_unique<source::AdmissionSource>(
-                        std::move(reg), funnel);
+                        std::move(retap), funnel);
                 }
             }
         }
 
         auto untarred = co_await source::TarOffsetSource::open(std::move(raw));
+        if (tap != nullptr) {
+            // Recorded offsets address the payload space (the replay
+            // contract); the tar base is known only after this probe and
+            // no read traffic exists yet (assembly is sequential).
+            if (const auto* tos =
+                    dynamic_cast<const source::TarOffsetSource*>(
+                        untarred.get())) {
+                tap->set_base(tos->base_offset());
+            }
+        }
         warm_targets.push_back(untarred.get());
         source::BlobSourcePtr view;
         if (co_await format::is_zfile(*untarred)) {
@@ -358,6 +388,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         out.root = std::move(merged);
         out.layer_stores = std::move(stores);
         out.funnel = std::move(funnel);
+        out.recorder = std::move(recorder);
         ELIO_LOG_INFO("image assembled: {} layers, virtual size {} bytes", n,
                       out.virtual_size);
         co_return out;
@@ -389,6 +420,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     out.root = std::move(merged);
     out.layer_stores = std::move(stores);
     out.funnel = std::move(funnel);
+    out.recorder = std::move(recorder);
     ELIO_LOG_INFO("image assembled writable: {} lowers + {} upper, virtual "
                   "size {} bytes",
                   n, cfg.upper.type, out.virtual_size);

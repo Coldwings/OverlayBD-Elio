@@ -3,11 +3,18 @@
 //
 // Two channels, both JSON-lines (one message per line, UTF-8, <= 64KiB):
 //
-//   obdctl ──UDS──▶ supervisor:    {"cmd":"hello"|"create"|"destroy"|"list"|"status"|"commit", ...}
-//   supervisor ──▶ obdctl:         {"ok":true,...} | {"ok":false,"error":"..."}
+//   obdctl --UDS--> supervisor:    {"cmd":"hello"|"create"|"destroy"|"list"|"status"|"commit"|"trace_start"|"trace_stop", ...}
+//   supervisor --> obdctl:         {"ok":true,...} | {"ok":false,"error":"..."}
 //
-//   obd-device ──socketpair──▶ supervisor: {"state":"starting"|"ready"|"failed"|"stopped", ...}
-//   supervisor ──▶ obd-device:     signals only (SIGTERM = shutdown)
+//   obd-device --socketpair--> supervisor: {"state":"starting"|"ready"|"failed"|"stopped", ...}
+//                                        | {"reply":"trace_start"|"trace_stop"|"trace_event", ...}
+//   supervisor --> obd-device:     signals (SIGTERM = shutdown), plus
+//                                  JSON-lines commands on the same
+//                                  socketpair: {"cmd":"trace_start"|"trace_stop", ...}
+//                                  (ADR-0013 record path; devices that
+//                                  predate trace control never read the
+//                                  channel, so old pairings degrade to
+//                                  "device control channel timeout")
 //
 // Additive-only evolution rule (current law; governing decision ADR-0014,
 // currently proposed):
@@ -37,7 +44,10 @@ inline constexpr size_t kMaxMessageBytes = 64 * 1024;
 /// with the `features` list from the `hello` reply.
 ///   1 — hello/create/destroy/list/status.
 ///   2 — adds commit (ADR-0014 offline seal; feature "commit").
-inline constexpr int kProtocolVersion = 2;
+///   3 — adds trace_start/trace_stop (ADR-0013 record path; feature
+///       "trace"), the bidirectional supervisor-to-device command
+///       channel, and the additive "trace" field in status/list replies.
+inline constexpr int kProtocolVersion = 3;
 
 /// Project version string, wired from CMake `project(... VERSION ...)` so
 /// it cannot drift; "dev" is the fallback for non-CMake builds.
@@ -66,6 +76,43 @@ struct CommitCommand {  // commit (ADR-0014: offline seal of the upper)
     std::string id;
     std::string user_tag;  // optional; recorded in the sealed header
 };
+
+// Trace recording (ADR-0013 record path): wire shapes.
+//
+//   obdctl -> supervisor:
+//     {"cmd":"trace_start","id":"<device>","path":"<abs output file>",
+//      "duration_sec":<1..3600>}
+//     {"cmd":"trace_stop","id":"<device>"}
+//   supervisor -> device (control socketpair):
+//     {"cmd":"trace_start","path":"...","duration_sec":N,"seq":N}
+//     {"cmd":"trace_stop","seq":N}
+//     ("seq" is the supervisor's per-command correlation token, fresh
+//      per forwarded command; additive — older supervisors omit it)
+//   device -> supervisor (same socketpair, "reply" discriminator):
+//     {"reply":"trace_start","ok":true,"path":"...","duration_sec":N,
+//      "seq":N}
+//     {"reply":"trace_stop","ok":true,"path":"...","sha256":"<hex>",
+//      "size":N,"records":N,"dropped":N,"seq":N}
+//     (replies echo the command's "seq" when present; the supervisor
+//      drops a reply whose seq does not match the pending command — a
+//      late reply to a timed-out command never completes the next one)
+//     {"reply":"trace_event","event":"expired","path":"...",
+//      "sha256":"<hex>","size":N,"records":N,"dropped":N}
+//     (unsolicited, no seq; applied only while the entry's trace state
+//      is "recording", so a stale expiry cannot overwrite a NEW
+//      recording's status)
+//     (error shape for the two replies: {"reply":"<cmd>","ok":false,
+//      "error":"..."})
+//   obdctl <- supervisor: the device reply fields plus "id"; an additive
+//     "trace" object in status/list replies carries the latest state:
+//     {"state":"recording"|"stopped"|"lost","path":...,
+//      "duration_sec":...,
+//      "reason":"stopped"|"expired"|"device_exit","sha256":...,"size":...,
+//      "records":...,"dropped":...}
+
+/// True when a device-to-supervisor line is a command reply/event (the
+/// "reply" discriminator) rather than a lifecycle status.
+bool is_device_reply_line(const nlohmann::json& j);
 
 /// Parses one command line. Returns nullopt when the message is not a
 /// valid command object; `error` receives a human-readable reason.

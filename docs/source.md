@@ -350,7 +350,7 @@ interface every layer of the read stack is built on.
   valid without implementing it. Implementations: `LayerStore::populate`
   fetches and persists the covering extents; `TarOffsetSource::populate`
   translates by the tar base offset and forwards. Consumer: trace replay
-  (ADR-0013, proposed; `src/image/trace_replay.hpp::replay_trace`) drives
+  (ADR-0013; `src/image/trace_replay.hpp::replay_trace`) drives
   it on the data lowers' stored-blob-level sources.
 - `size` — total blob size in bytes; constant for the source's lifetime.
 - `label` — human-readable identity for logs (path, URL, digest); the
@@ -1250,7 +1250,7 @@ directly.
 - **Prefetch is structural warm-up plus trace replay** — overlaybd's
   dynamic prefetcher and TurboOCI paths are out of scope (ADR-0007). The
   structural head/tail warm-up (ADR-0012's cold-start floor) and the
-  upstream-compatible trace blob (ADR-0013, proposed — the trace layer
+  upstream-compatible trace blob (ADR-0013 — the trace layer
   is recognized in image assembly; see `docs/image.md`) both ride
   `populate` at the ADR-0012 Prefetch scavenger class; trace recording,
   the dynamic file-list fallback, and detaching warm-up/replay off the

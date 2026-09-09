@@ -9,7 +9,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -25,8 +27,10 @@ void usage(const char* argv0) {
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
-                 "  %s [--socket PATH] commit <id> [--tag TAG]\n",
-                 argv0, argv0, argv0, argv0, argv0, argv0);
+                 "  %s [--socket PATH] commit <id> [--tag TAG]\n"
+                 "  %s [--socket PATH] trace_start <id> <output.trace> [--duration SEC]\n"
+                 "  %s [--socket PATH] trace_stop <id>\n",
+                 argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 bool send_all(int fd, const std::string& data) {
@@ -95,6 +99,51 @@ int main(int argc, char** argv) {
                 usage(argv[0]);
                 return 2;
             }
+        }
+    } else if (cmd == "trace_start") {
+        if (i + 2 > argc) {
+            usage(argv[0]);
+            return 2;
+        }
+        req["id"] = argv[i++];
+        req["path"] = argv[i++];
+        req["duration_sec"] = 300;  // runbook default (docs/operations.md)
+        while (i < argc) {
+            const std::string a = argv[i++];
+            if (a == "--duration" && i < argc) {
+                // std::stoi would abort the CLI on bad input; validate
+                // fully, mirroring the device-side bound [1, 3600]
+                // (TraceRecorder::kMin/MaxDurationSec) for a fast,
+                // clear error instead of a device rejection.
+                const char* v = argv[i++];
+                char* end = nullptr;
+                errno = 0;
+                const long dur = std::strtol(v, &end, 10);
+                if (errno != 0 || end == v || *end != '\0' || dur < 1 ||
+                    dur > 3600) {
+                    std::fprintf(stderr,
+                                 "invalid --duration '%s' "
+                                 "(want an integer in 1..3600 seconds)\n",
+                                 v);
+                    return 2;
+                }
+                req["duration_sec"] = dur;
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
+        }
+    } else if (cmd == "trace_stop") {
+        if (i >= argc) {
+            usage(argv[0]);
+            return 2;
+        }
+        req["id"] = argv[i++];
+        if (i != argc) {
+            // Silent extra-arg acceptance would mask typos (trace_start
+            // validates its full remainder too).
+            usage(argv[0]);
+            return 2;
         }
     } else if (cmd == "list" || cmd == "hello") {
         // no fields
