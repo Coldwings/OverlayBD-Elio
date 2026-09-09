@@ -297,3 +297,183 @@ TEST_CASE("supervisor: control channel writer survives a closed peer without SIG
     REQUIRE(!ok);  // EPIPE reported as a dropped line, process alive
     ::close(fds[1]);
 }
+
+TEST_CASE("supervisor: device resize executor grows and rejects shrink or no-op",
+          "[supervisor]") {
+    // D3 grow-only resize: the device-side executor (run_device_control's
+    // "resize" branch) compares the request against the executor seam's
+    // current size BEFORE any kernel IO. A grow is applied (once, with
+    // the seq echoed and the new size reported); an equal (no-op) or
+    // smaller (shrink) request is a clean ok:false reply that never
+    // reaches the apply seam. Runs with a recorder-less device, so it
+    // also pins the loop's null-recorder tolerance for resize.
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
+    nlohmann::json grow, equal, shrink, misalign, trace_unavail;
+    auto cur = std::make_shared<uint64_t>(512 * 64);   // 32 KiB
+    auto calls = std::make_shared<int>(0);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto channel =
+            std::make_shared<supervisor::ControlChannelWriter>(fds[1]);
+        supervisor::DeviceControlHooks hooks;
+        hooks.resize.current_size = [cur]() -> uint64_t { return *cur; };
+        hooks.resize.apply_resize = [cur, calls](uint64_t bytes) {
+            ++*calls;
+            *cur = bytes;
+            return bytes;
+        };
+        elio::go([channel, hooks]() -> elio::coro::task<void> {
+            // recorder = nullptr: resize needs no recorder (trace cmds
+            // on the same loop still get clean "unavailable" errors).
+            co_await supervisor::run_device_control(channel, nullptr, hooks);
+        });
+        nlohmann::json cmd_grow = {{"cmd", "resize"},
+                                   {"size", 65536},
+                                   {"seq", 1}};
+        nlohmann::json cmd_equal = {{"cmd", "resize"},
+                                    {"size", 65536},
+                                    {"seq", 2}};
+        nlohmann::json cmd_shrink = {{"cmd", "resize"},
+                                     {"size", 512 * 64},
+                                     {"seq", 3}};
+        nlohmann::json cmd_misalign = {{"cmd", "resize"},
+                                       {"size", 1000},
+                                       {"seq", 4}};
+        nlohmann::json cmd_trace = {{"cmd", "trace_start"},
+                                    {"path", "/tmp/x.trace"},
+                                    {"duration_sec", 300},
+                                    {"seq", 5}};
+        grow = co_await rpc_exchange(fds[0], cmd_grow);
+        equal = co_await rpc_exchange(fds[0], cmd_equal);
+        shrink = co_await rpc_exchange(fds[0], cmd_shrink);
+        misalign = co_await rpc_exchange(fds[0], cmd_misalign);
+        trace_unavail = co_await rpc_exchange(fds[0], cmd_trace);
+        ::shutdown(fds[1], SHUT_RDWR);
+        // Let the detached loop observe the EOF before teardown.
+        co_await elio::time::sleep_for(300ms);
+        co_return 0;
+    });
+    ::close(fds[0]);
+    ::close(fds[1]);
+    REQUIRE(rc == 0);
+
+    // The executor checks are order-independent of the scheduler: assert
+    // the exact semantics via the reply shapes.
+    REQUIRE(grow.value("reply", "") == "resize");
+    REQUIRE(grow.value("ok", false) == true);
+    REQUIRE(grow.value("size", 0) == 65536);
+    REQUIRE(grow.value("seq", 0) == 1);
+    REQUIRE(*calls == 1);  // the grow reached the apply seam exactly once
+    REQUIRE(*cur == 65536);
+    REQUIRE(equal.value("reply", "") == "resize");
+    REQUIRE(equal.value("ok", true) == false);
+    REQUIRE(equal.value("error", "").find("grow-only") !=
+            std::string::npos);
+    REQUIRE(equal.value("seq", 0) == 2);
+    REQUIRE(shrink.value("reply", "") == "resize");
+    REQUIRE(shrink.value("ok", true) == false);
+    REQUIRE(shrink.value("error", "").find("grow-only") !=
+            std::string::npos);
+    REQUIRE(shrink.value("seq", 0) == 3);
+    REQUIRE(misalign.value("reply", "") == "resize");
+    REQUIRE(misalign.value("ok", true) == false);
+    REQUIRE(misalign.value("error", "").find("multiple of 512") !=
+            std::string::npos);
+    REQUIRE(misalign.value("seq", 0) == 4);
+    // The loop is recorder-less: trace commands are answered, never
+    // dereferenced (never-throws contract).
+    REQUIRE(trace_unavail.value("reply", "") == "trace_start");
+    REQUIRE(trace_unavail.value("ok", true) == false);
+    REQUIRE(trace_unavail.value("error", "").find("unavailable") !=
+            std::string::npos);
+}
+
+TEST_CASE("supervisor: device resize answers unsupported without a seam and survives malformed sizes",
+          "[supervisor]") {
+    // Two properties on one loop: (1) a device without a resize executor
+    // seam answers resize with a clean "unsupported" error; (2) wrong
+    // field TYPES (float / negative size) are clean error replies — the
+    // never-throws contract (a type_error escaping would strand every
+    // later command on the supervisor's 30 s timeout).
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
+    nlohmann::json unsup, bad_float, bad_neg, ok_grow;
+    auto cur = std::make_shared<uint64_t>(512 * 64);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto channel =
+            std::make_shared<supervisor::ControlChannelWriter>(fds[1]);
+        // The resize executor is created on the SECOND loop below; this
+        // first loop runs with hooks but no resize seam (unsupported).
+        elio::go([channel]() -> elio::coro::task<void> {
+            co_await supervisor::run_device_control(channel, nullptr, {});
+        });
+        nlohmann::json cmd_unsup = {{"cmd", "resize"},
+                                    {"size", 65536},
+                                    {"seq", 1}};
+        unsup = co_await rpc_exchange(fds[0], cmd_unsup);
+        ::shutdown(fds[1], SHUT_RDWR);
+        co_await elio::time::sleep_for(200ms);
+        co_return 0;
+    });
+    ::close(fds[0]);
+    ::close(fds[1]);
+    REQUIRE(rc == 0);
+    REQUIRE(unsup.value("reply", "") == "resize");
+    REQUIRE(unsup.value("ok", true) == false);
+    REQUIRE(unsup.value("error", "").find("unsupported") !=
+            std::string::npos);
+
+    // Second loop: a seam IS present; malformed sizes get clean errors
+    // and the loop stays alive for a valid grow.
+    int fds2[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds2) == 0);
+    const int rc2 = test::run_coro([&]() -> elio::coro::task<int> {
+        auto channel =
+            std::make_shared<supervisor::ControlChannelWriter>(fds2[1]);
+        supervisor::DeviceControlHooks hooks;
+        hooks.resize.current_size = [cur]() -> uint64_t { return *cur; };
+        hooks.resize.apply_resize = [cur](uint64_t bytes) {
+            *cur = bytes;
+            return bytes;
+        };
+        elio::go([channel, hooks]() -> elio::coro::task<void> {
+            co_await supervisor::run_device_control(channel, nullptr, hooks);
+        });
+        nlohmann::json cmd_float = {{"cmd", "resize"},
+                                    {"size", 65536.5},
+                                    {"seq", 2}};
+        nlohmann::json cmd_neg = {{"cmd", "resize"},
+                                  {"size", -1},
+                                  {"seq", 3}};
+        nlohmann::json cmd_missing = {{"cmd", "resize"}, {"seq", 4}};
+        nlohmann::json cmd_grow = {{"cmd", "resize"},
+                                   {"size", 65536},
+                                   {"seq", 5}};
+        bad_float = co_await rpc_exchange(fds2[0], cmd_float);
+        bad_neg = co_await rpc_exchange(fds2[0], cmd_neg);
+        const auto missing = co_await rpc_exchange(fds2[0], cmd_missing);
+        bad_neg["_missing"] = missing.value("error", "");
+        ok_grow = co_await rpc_exchange(fds2[0], cmd_grow);
+        ::shutdown(fds2[1], SHUT_RDWR);
+        co_await elio::time::sleep_for(300ms);
+        co_return 0;
+    });
+    ::close(fds2[0]);
+    ::close(fds2[1]);
+    REQUIRE(rc2 == 0);
+    REQUIRE(bad_float.value("reply", "") == "resize");
+    REQUIRE(bad_float.value("ok", true) == false);
+    REQUIRE(bad_float.value("error", "").find("non-negative integer") !=
+            std::string::npos);
+    REQUIRE(bad_float.value("seq", 0) == 2);
+    REQUIRE(bad_neg.value("reply", "") == "resize");
+    REQUIRE(bad_neg.value("ok", true) == false);
+    REQUIRE(bad_neg.value("seq", 0) == 3);
+    // Missing 'size': also a clean error (never an exception).
+    REQUIRE(bad_neg.value("_missing", "").find("non-negative integer") !=
+            std::string::npos);
+    REQUIRE(ok_grow.value("reply", "") == "resize");
+    REQUIRE(ok_grow.value("ok", false) == true);
+    REQUIRE(ok_grow.value("size", 0) == 65536);
+    REQUIRE(ok_grow.value("seq", 0) == 5);
+}

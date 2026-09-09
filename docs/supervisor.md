@@ -43,24 +43,30 @@ these are the real field names):
 {"cmd":"create","id":"<name>","config":"<config.json path>",
  "global":"<overlaybd.json path, optional>",
  "device_bin":"<obd-device path, optional>",
- "dev_id":<int, optional, -1/absent = auto>}
+ "dev_id":<int, optional, -1/absent = auto>,
+ "virtual_size":<bytes, optional — D3 headroom override>}
 
 {"cmd":"destroy","id":"<name>"}
 {"cmd":"status","id":"<name>"}
 {"cmd":"list"}
-{"cmd":"commit","id":"<name>","user_tag":"<optional string>"}
+{"cmd":"commit","id":"<name>","user_tag":"<optional string>",
+ "virtual_size":<bytes, optional — D3 re-baseline override>}
 
 {"cmd":"trace_start","id":"<name>","path":"<absolute output file>",
  "duration_sec":<int 1..3600>}
 {"cmd":"trace_stop","id":"<name>"}
+
+{"cmd":"resize","id":"<name>","size":<bytes>}
 ```
 
 Validation: the message must be a JSON object with a string `cmd`;
 `create` requires string `id` and `config`; `destroy`/`status`/`commit`
 require a string `id`; `commit`'s optional `user_tag` must be a string;
 `trace_start` requires a string `id`, a string `path`, and an integer
-`duration_sec`; `trace_stop` requires a string `id`; `hello` and `list`
-take no fields; anything else is "unknown cmd". Field
+`duration_sec`; `trace_stop` requires a string `id`; `resize` requires a
+string `id` and a non-negative integer `size`; `create` and `commit`
+accept optional non-negative integer `virtual_size` fields; `hello` and
+`list` take no fields; anything else is "unknown cmd". Field
 TYPES are validated at parse time: a wrong-typed field is answered with a
 clean protocol error, never an exception escaping the handler. Malformed
 input is answered, not dropped.
@@ -72,14 +78,17 @@ command (`src/supervisor/daemon.cpp`):
 
 - **hello**: `{"ok":true,"protocol":<int>,"version":"<project version>",
   "features":[...]}` — the handshake. `protocol` is the control-protocol
-  revision (`kProtocolVersion`, currently 3; 1 = initial command set,
+  revision (`kProtocolVersion`, currently 4; 1 = initial command set,
   2 = added `commit`, 3 = added `trace_start`/`trace_stop` and the
-  additive `trace` status field); `version` is the project version
-  string wired from CMake (`kProjectVersion`); `features` is a JSON
-  array of strings — the capability gate for optional commands,
-  currently `["commit","trace"]`.
+  additive `trace` status field, 4 = added `resize` and the
+  `virtual_size` create/commit fields — D3); `version` is the project
+  version string wired from CMake (`kProjectVersion`); `features` is a
+  JSON array of strings — the capability gate for optional commands,
+  currently `["commit","trace","resize"]`.
 - **create**: `{"ok":true,"id","pid","device"}` — `device` is the child's
-  reported `/dev/ublkb<N>`.
+  reported `/dev/ublkb<N>`. With an optional `virtual_size` (bytes > 0)
+  the device is created with that capacity instead of the image's
+  declared size (D3 headroom, "Online resize" below).
 - **destroy**: `{"ok":true,"id"}`.
 - **list**: `{"ok":true,"devices":[{"id","pid","state","device","error"}, ...]}`.
 - **status**: `{"ok":true,"id","pid","state","device","error","exit_code"}`
@@ -88,12 +97,16 @@ command (`src/supervisor/daemon.cpp`):
   was started on the device (see "Trace recording" below).
 - **commit** (ADR-0014): `{"ok":true,"id","path","sha256","size"}`
   — the sealed upper's file path, the hex sha256 of the sealed file, and
-  its byte size. See "Offline commit" below for the full contract.
+  its byte size. With an optional `virtual_size` the sealed layer's
+  declared size is re-baselined to that value (D3, "Offline commit"
+  below).
 - **trace_start** (ADR-0013): `{"ok":true,"id","path","duration_sec"}` —
   the device is recording. See "Trace recording" below.
 - **trace_stop** (ADR-0013): `{"ok":true,"id","path","sha256","size",
   "records","dropped"}` — the finalized trace blob's path, hex sha256,
   byte size, written record count, and dropped-record count.
+- **resize** (D3): `{"ok":true,"id","size"}` — `size` is the device's
+  new capacity in bytes. See "Online resize" below.
 
 ### Additive-only evolution rule
 
@@ -154,13 +167,73 @@ is being sealed. Contract:
   respawn completes first and commit stops the recovery child too, or the
   respawn aborts on the `destroying` flag — a seal never runs while a
   device child is booting or alive.
+- **Re-baseline (D3).** An optional `virtual_size` (bytes, 0 = keep the
+  checkpointed size) overrides the virtual size written into the sealed
+  header/trailer — and therefore the size a next `create` from this
+  layer derives — so a commit can declare the larger device. Validated
+  in the seal path (grow-only): a positive multiple of 512, and at
+  least both the layer's declared size and its content extent; a
+  smaller override is rejected with a precise reason BEFORE any
+  compaction, so the upper stays committable at its declared size.
 - **Errors** (via the `{"ok":false,"error"}` envelope, precise reasons):
   unknown id ("no such device"), a config without `upper` ("no writable
   upper"), a sparse upper ("sparse uppers cannot be sealed" — upstream
   parity, ADR-0014), a concurrent commit ("commit already in progress"),
   a config unreadable at create time, a missing upper file, an
   already-sealed upper, a missing or invalid shutdown checkpoint (device
-  crashed), and stop-timeout.
+  crashed), a rejected `virtual_size` re-baseline (grow-only or
+  misaligned), and stop-timeout.
+
+### Online resize (D3, ADR-0014 dev_size model)
+
+`resize` grows a live device: the supervisor forwards the byte count to
+the device process, whose command-loop executor (the same control
+channel trace commands ride) enforces the **grow-only** rule and issues
+the ublk `UBLK_U_CMD_UPDATE_SIZE` (docs/ublk.md) through
+`elio::spawn_blocking` (a kernel control call may sleep on our own data
+plane — never run on an Elio worker). Wire shapes:
+
+- obdctl → supervisor: `{"cmd":"resize","id":"<name>","size":<bytes>}`.
+  `size` must be a positive multiple of 512 (validated supervisor-side
+  before forwarding — ublk sector granularity).
+- supervisor → device (channel 2): `{"cmd":"resize","size":...,"seq":N}`,
+  using the same bounded (30 s) forward-and-await with `seq`
+  correlation as `trace_start`/`trace_stop`.
+- device → supervisor: `{"reply":"resize","ok":true,"size":<new bytes>,
+  "seq":N}` or `{"reply":"resize","ok":false,"error":"...","seq":N}`.
+- obdctl ← supervisor: the device reply fields plus `id`:
+  `{"ok":true,"id","size"}`.
+
+Contract:
+
+- **Grow-only.** A request at or below the device's current size (a
+  no-op or a shrink) is rejected by the DEVICE with
+  `ok:false` + a "grow-only" message BEFORE any kernel IO — the current
+  size is known only there. Shrink is rejected cleanly at every layer
+  that can compare sizes: the resize executor, `create --virtual-size`
+  against the assembled image size, and `commit --virtual-size` in the
+  seal path.
+- **Runtime dev-size only.** A resize changes the block device's
+  capacity (`dev_size`, the ADR-0014 quota boundary) at runtime. It
+  does NOT touch layer metadata — growth is not persisted, and a crash
+  recovery respawn (ADR-0010) re-attaches at the original create-time
+  size. Content writes beyond the data plane's extent are out of the
+  resize command's scope: to make headroom durable, follow the
+  three-step chain in docs/operations.md (resize → grow the
+  filesystem → commit with `--virtual-size` and re-create from the
+  sealed layer).
+- **Headroom at create.** `create --virtual-size <bytes>` sizes the
+  device to the override (sanctioned headroom); the default remains the
+  image's declared size. Grow-only vs the assembled image size is
+  validated device-side (single rule:
+  `image::device_capacity_bytes`), so a create that would shrink the
+  device below its content fails cleanly.
+- **Errors**: unknown id, no live device control channel (a stopped/
+  dead device: "device control channel unavailable"), a device whose
+  executor has no resize seam ("resize unsupported on this device"),
+  misaligned/zero size, a grow-only rejection, and a kernel rejection
+  of `UBLK_U_CMD_UPDATE_SIZE` (drivers before the 6.16 cycle return
+  -EINVAL — surfaced as the command's error).
 
 ### Trace recording (ADR-0013)
 

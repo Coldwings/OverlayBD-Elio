@@ -130,6 +130,17 @@ are now honored — see above.)
 One file per device, passed to `obdctl create <id> <config.json>` and
 through to the `obd-device` child.
 
+**Device size (D3).** A device's `dev_size` defaults to the image's
+declared virtual size (the assembled merged size of `lowers[]`; the
+`config.json` does not carry a size field). `obdctl create` accepts a
+CLI-level `--virtual-size <bytes>` headroom override that sizes the
+device larger than the image (grow-only: the override must be at least
+the image's declared size, validated by the device after assembly;
+docs/operations.md) — no config field is added, so existing images and
+snapshotter output are unaffected. The writable `upper`'s sealed
+declared size can likewise be re-baselined at commit time with
+`obdctl commit --virtual-size` (docs/supervisor.md, "Offline commit").
+
 ### `repoBlobUrl`
 
 String, default `""`. The registry blob base URL for this repo, e.g.

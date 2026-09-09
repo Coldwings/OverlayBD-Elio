@@ -186,6 +186,99 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("integration: ublk device grows online and serves the new capacity",
+          "[ublk]") {
+    // D3 grow-only online resize: Device::resize_blocking issues
+    // UBLK_U_CMD_UPDATE_SIZE and the kernel gendisk grows. Self-skipping
+    // twice: no /dev/ublk-control at all, or a kernel whose driver lacks
+    // the UPDATE_SIZE command (it landed in the 6.16 development cycle) —
+    // both degrade to SKIP, never a failure.
+    if (!ublk_available()) {
+        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
+    }
+    int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto data = test::pattern_bytes(512 * 64, 85);
+        source::BlobSourcePtr src =
+            std::make_unique<test::VectorSource>(data);
+        ublk::DeviceParams params;
+        params.dev_sectors = data.size() / 512;
+        params.enable_recovery = false;
+        stage("grow: create");
+        auto dev = co_await ublk::Device::create(params, std::move(src));
+        REQUIRE(dev->size_bytes() == data.size());
+        const int fd = co_await bdev_io([&] {
+            return ::open(dev->bdev_path().c_str(), O_RDONLY);
+        });
+        REQUIRE(fd >= 0);
+
+        // Grow-only is enforced device-side BEFORE any kernel IO: a
+        // shrink (or no-op) attempt throws EINVAL even on kernels without
+        // UPDATE_SIZE support.
+        bool shrink_rejected = false;
+        try {
+            co_await elio::spawn_blocking([&] {
+                return dev->resize_blocking(data.size() / 2);
+            });
+        } catch (const std::exception&) {
+            shrink_rejected = true;
+        }
+        if (!shrink_rejected) co_return 2;
+
+        // The real grow (kernel UPDATE_SIZE).
+        uint64_t new_size = 0;
+        try {
+            new_size = co_await elio::spawn_blocking([&] {
+                return dev->resize_blocking(data.size() * 2);
+            });
+        } catch (const std::exception&) {
+            co_return 3;  // kernel without UBLK_U_CMD_UPDATE_SIZE
+        }
+        if (new_size != data.size() * 2) co_return 4;
+        if (dev->size_bytes() != new_size) co_return 4;
+
+        // The kernel gendisk reports the new capacity.
+        unsigned long long cap = 0;
+        const int ir = co_await bdev_io([&] {
+            return ::ioctl(fd, BLKGETSIZE64, &cap);
+        });
+        if (ir != 0 || cap != new_size) co_return 5;
+
+        // The grown device still serves the original content.
+        std::vector<uint8_t> buf(4096);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pread(fd, buf.data(), buf.size(),
+                                   data.size() / 2);
+                }) == 4096);
+        REQUIRE(buf ==
+                std::vector<uint8_t>(data.begin() + static_cast<long>(
+                                                          data.size() / 2),
+                                     data.begin() +
+                                         static_cast<long>(data.size() / 2) +
+                                         4096));
+
+        // A shrink after the grow is rejected too (no-op <= current).
+        bool post_shrink_rejected = false;
+        try {
+            co_await elio::spawn_blocking([&] {
+                return dev->resize_blocking(data.size());
+            });
+        } catch (const std::exception&) {
+            post_shrink_rejected = true;
+        }
+        if (!post_shrink_rejected) co_return 6;
+
+        co_await bdev_io([&] { return ::close(fd); });
+        dev->stop();
+        dev.reset();
+        co_return 0;
+    });
+    if (rc == 3) {
+        SKIP("kernel driver lacks UBLK_U_CMD_UPDATE_SIZE (needs the 6.16 "
+             "cycle update)");
+    }
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
           "[ublk]") {
     if (!ublk_available()) {

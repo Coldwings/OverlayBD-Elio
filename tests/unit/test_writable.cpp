@@ -775,3 +775,100 @@ TEST_CASE("image: writable upper assembles and serves writes", "[image]") {
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("format: offline seal rejects a virtual_size below the declared size",
+          "[format]") {
+    // D3 commit re-baseline, rejection side: seal_file with a
+    // virtual_size override smaller than the layer's declared size (the
+    // image-declared size at create) is rejected with -EINVAL and a
+    // precise reason BEFORE any compaction — the upper stays unsealed
+    // and remains committable at its declared size.
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto payload = sectors_pattern(0, 16, 701);
+    std::string reject;
+    std::string sha;
+    uint64_t size = 0;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+            const ssize_t r =
+                co_await layer->pwrite(payload.data(), payload.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(payload.size()));
+            const int crc = co_await layer->checkpoint();
+            REQUIRE(crc == 0);
+        }
+        // Smaller than declared (512*32 < 512*64): grow-only rejection.
+        int src = co_await format::LsmtRwLayer::seal_file(
+            path, "", &sha, &size, 512 * 32, &reject);
+        REQUIRE(src == -EINVAL);
+        REQUIRE(reject.find("declared size") != std::string::npos);
+        REQUIRE(reject.find("grow-only") != std::string::npos);
+        // Misaligned: alignment rejection with its own reason.
+        src = co_await format::LsmtRwLayer::seal_file(
+            path, "", &sha, &size, 1000, &reject);
+        REQUIRE(src == -EINVAL);
+        REQUIRE(reject.find("multiple of 512") != std::string::npos);
+        // The upper was NOT sealed by the rejected attempts: a plain
+        // seal (no override) still succeeds with the declared size and
+        // the full payload.
+        src = co_await format::LsmtRwLayer::seal_file(path, "", &sha,
+                                                      &size);
+        REQUIRE(src == 0);
+        auto ro = co_await source::LocalFileSource::open(path);
+        source::BlobSourcePtr base = std::move(ro);
+        auto layer = co_await format::LsmtLayer::open(std::move(base));
+        REQUIRE(layer->virtual_size() == 512 * 64);
+        std::vector<uint8_t> buf(payload.size());
+        const ssize_t r = co_await layer->data_source().pread(
+            buf.data(), buf.size(), 8 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), payload.data(), buf.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: offline seal re-baselines the sealed virtual size grow-only",
+          "[format]") {
+    // D3 commit re-baseline, acceptance side: a virtual_size override
+    // >= both the declared size and the content extent is written into
+    // the sealed header/trailer (and content digest), so the next create
+    // from this layer yields the larger device. The content itself is
+    // untouched and still reads back byte-exactly.
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto payload = sectors_pattern(0, 16, 702);
+    std::string reject;
+    std::string sha;
+    uint64_t size = 0;
+    const uint64_t kRebased = 512 * 96;  // 1.5x the declared 512*64
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+            const ssize_t r =
+                co_await layer->pwrite(payload.data(), payload.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(payload.size()));
+            const int crc = co_await layer->checkpoint();
+            REQUIRE(crc == 0);
+        }
+        const int src = co_await format::LsmtRwLayer::seal_file(
+            path, "rebase", &sha, &size, kRebased, &reject);
+        REQUIRE(src == 0);
+        REQUIRE(reject.empty());
+        REQUIRE(sha.size() == 64);
+        auto ro = co_await source::LocalFileSource::open(path);
+        source::BlobSourcePtr base = std::move(ro);
+        auto layer = co_await format::LsmtLayer::open(std::move(base));
+        REQUIRE(layer->virtual_size() == kRebased);
+        REQUIRE(layer->header().user_tag == "rebase");
+        REQUIRE(layer->segments().size() == 1);
+        std::vector<uint8_t> buf(payload.size());
+        const ssize_t r = co_await layer->data_source().pread(
+            buf.data(), buf.size(), 8 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), payload.data(), buf.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}

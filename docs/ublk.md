@@ -134,12 +134,31 @@ queue, `END_USER_RECOVERY` (same EBUSY polling as `START_DEV`). `ADD_DEV`
 falls back to a non-recoverable device (with a warning) when the kernel
 rejects the flags with `EINVAL`.
 
+### Online resize (D3)
+
+A live device can grow through `Ctrl::update_size` (D3):
+`UBLK_U_CMD_UPDATE_SIZE` tells the driver the new capacity — the size
+rides `ublksrv_ctrl_cmd.data[0]`, in 512-byte sectors (kernel ABI,
+ublk_cmd.h) — and the driver updates the gendisk capacity. The command
+landed in the 6.16 development cycle: an older driver rejects it with
+`-EINVAL`, which the caller surfaces as a clean error. The command is
+**grow-only by contract**: `Device::resize_blocking` rejects a request
+at or below the current size before any kernel IO, and the supervisor's
+`resize` executor enforces the same rule against the device's tracked
+size (docs/supervisor.md). Like every control call it is a blocking
+cold-path call: `Device::resize_blocking` documents that it must be run
+through `elio::spawn_blocking` (the device command loop does so), never
+on an Elio worker.
+
 ## Public API
 
 ### `src/ublk/uapi_compat.hpp`
 
 - `#ifndef UBLK_F_URING_CMD_COMP_IN_TASK` → defined as `(1ULL << 1)` for
-  pre-6.0 headers. This is the *only* compat addition today.
+  pre-6.0 headers.
+- `#ifndef UBLK_U_CMD_UPDATE_SIZE` → defined as the ioctl-encoded
+  command (D3 online resize; added to the uapi in the 6.16 cycle) for
+  older headers — same shape as the in-header definition.
 - `constexpr uint64_t obd::ublk::cmd_buf_stride(uint32_t io_desc_size)` —
   per-queue mmap window stride: `round_up(UBLK_MAX_QUEUE_DEPTH *
   io_desc_size, 4096)`.
@@ -177,6 +196,10 @@ and remembers the added device for best-effort cleanup. Non-copyable.
   process as the ublk server (pid passed in `data[0]`). Throws `obd::error`;
   the kernel answers `EBUSY` until every queue tag has a parked FETCH —
   callers poll (see `Device::create`).
+- `void update_size(uint32_t dev_id, uint64_t sectors)` — D3 online
+  resize: `UBLK_U_CMD_UPDATE_SIZE` with the new capacity (sectors) in
+  `data[0]`. Throws `obd::error` (a kernel without the command returns
+  `-EINVAL`). Blocking; see the spawn_blocking rule below.
 - `void stop_dev(uint32_t) noexcept`, `void del_dev(uint32_t) noexcept` —
   best-effort teardown commands; errors are deliberately ignored.
 - `static std::string cdev_path(uint32_t)` → `/dev/ublkc<N>`;
@@ -262,6 +285,14 @@ Full lifecycle of one image as one ublk device. Non-copyable.
   `obd::error(EINVAL)` for a null source or `dev_sectors == 0`, and
   `obd::error` on any setup failure (partial state is torn down via
   `stop()` first).
+- `uint64_t size_bytes() const` — the current device capacity in bytes
+  (the D3 grow-only resize baseline; the size this process
+  created/attached, updated by `resize_blocking`).
+- `uint64_t resize_blocking(uint64_t bytes)` — D3 grow-only online
+  resize: `Ctrl::update_size` after validating positivity, 512-byte
+  alignment, and growth over `size_bytes()`. Returns the new capacity.
+  BLOCKING — route through `elio::spawn_blocking` (the device command
+  loop does; docs/supervisor.md).
 - `uint32_t dev_id() const`, `std::string bdev_path() const` →
   `/dev/ublkb<N>`.
 - `bool started() const` — true once the kernel gendisk is live

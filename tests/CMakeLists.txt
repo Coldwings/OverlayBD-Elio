@@ -41,7 +41,8 @@ add_executable(obd_integration_tests
     integration/test_recovery.cpp
     integration/test_commit.cpp
     integration/test_trace_record.cpp
-    integration/test_hello.cpp)
+    integration/test_hello.cpp
+    integration/test_resize.cpp)
 target_include_directories(obd_integration_tests
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_integration_tests

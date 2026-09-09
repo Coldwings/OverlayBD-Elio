@@ -135,31 +135,54 @@ elio::coro::task<int> fake_main(Args args) {
         }
         report(channel, DeviceStatus{"ready", "/dev/ublkb70", ""});
 
-        // Trace command channel (protocol v3), like the real obd-device.
-        // The workload hook runs inside the recording window: a
-        // deterministic read pattern through the merged root. The offsets
-        // target MIDDLE extents (assembly probes pre-warm the header
-        // extent and the trailer/index extents; reads there would be
-        // local hits and record nothing).
-        if (opened.has_value() && args.control_fd >= 0) {
-            auto* root = opened->root.get();
+        // Serve the supervisor's device commands on the control channel
+        // (trace record path + D3 resize), exactly like the real
+        // obd-device. The resize executor mirrors the real device's
+        // grow-only semantics without a kernel: the loop enforces
+        // grow-only against the fake's current size; apply records the
+        // grow. A shared_ptr keeps `fake_size` alive for the detached
+        // loop (which may outlive this coroutine's frame).
+        if (args.control_fd >= 0) {
+            // The fake's declared device size: the --virtual-size
+            // override when given, else its declared image size.
+            const uint64_t declared = opened.has_value()
+                                          ? opened->virtual_size
+                                          : (img.writable() ? kVsize : 0);
+            const uint64_t base_size =
+                args.virtual_size > 0 ? args.virtual_size : declared;
+            auto fake_size = std::make_shared<uint64_t>(base_size);
             obd::supervisor::DeviceControlHooks hooks;
-            hooks.on_start = [root]() {
-                elio::go([root]() -> elio::coro::task<void> {
-                    char buf[4096];
-                    for (const uint64_t off : {uint64_t{65536},
-                                               uint64_t{131072},
-                                               uint64_t{196608}}) {
-                        const ssize_t r =
-                            co_await root->pread(buf, sizeof(buf), off);
-                        if (r < 0) {
-                            ELIO_LOG_WARNING("fake workload read at {} "
-                                             "failed: {}", off, (int)-r);
+            if (opened.has_value()) {
+                auto* root = opened->root.get();
+                hooks.on_start = [root]() {
+                    elio::go([root]() -> elio::coro::task<void> {
+                        char buf[4096];
+                        for (const uint64_t off : {uint64_t{65536},
+                                                   uint64_t{131072},
+                                                   uint64_t{196608}}) {
+                            const ssize_t r =
+                                co_await root->pread(buf, sizeof(buf), off);
+                            if (r < 0) {
+                                ELIO_LOG_WARNING(
+                                    "fake workload read at {} failed: {}",
+                                    off, (int)-r);
+                            }
                         }
-                    }
-                });
+                    });
+                };
+            }
+            // D3 resize executor seam (no kernel): current_size returns
+            // the fake's tracked size; apply records the growth.
+            hooks.resize.current_size = [fake_size]() -> uint64_t {
+                return *fake_size;
             };
-            elio::go([channel, rec = opened->recorder,
+            hooks.resize.apply_resize = [fake_size](uint64_t bytes) {
+                *fake_size = bytes;
+                return bytes;
+            };
+            elio::go([channel, rec = opened.has_value()
+                                     ? opened->recorder
+                                     : obd::image::TraceRecorderPtr{},
                       hooks = std::move(hooks)]() mutable
                      -> elio::coro::task<void> {
                 co_await obd::supervisor::run_device_control(

@@ -200,7 +200,17 @@ Every test, grouped by area, with the property it guards.
 - `format: trace writer enforces the conforming-writer contract` — count 0
   and > 1 MiB, op 'W', and negative offsets are rejected
   (trace-format.md §10 rule 4).
-
+- `format: offline seal rejects a virtual_size below the declared size` —
+  the D3 commit re-baseline rejection side: `seal_file` with a
+  `virtual_size` override smaller than the layer's declared size (or
+  misaligned) returns `-EINVAL` with a precise reason BEFORE any
+  compaction, and the upper stays committable at its declared size
+  (ADR-0014).
+- `format: offline seal re-baselines the sealed virtual size grow-only` —
+  the D3 commit re-baseline acceptance side: an override at least the
+  declared size (and content extent) is written into the sealed
+  header/trailer and content digest, and the sealed layer re-opens with
+  the larger declared size and byte-exact content (ADR-0014).
 ### source
 
 - `source: tar adapter detects ustar wrapper and skips the header` — a
@@ -498,7 +508,11 @@ Every test, grouped by area, with the property it guards.
   `prefetch.enable = false` no structural warm-up runs (stats zero)
   while the device assembles and reads byte-exactly; enabled, the local
   lower's merged window is populated (ADR-0012).
-
+- `image: device capacity honors the virtual_size headroom override grow-only` —
+  `device_capacity_bytes` (D3 create-time headroom): no override = the
+  image's declared size; an override >= the image size is sanctioned
+  headroom (equal is a no-op); a smaller override is rejected with a
+  grow-only reason (ADR-0014).
 ### ublk
 
 - `ublk: command buffer geometry matches the driver layout` — the
@@ -509,7 +523,13 @@ Every test, grouped by area, with the property it guards.
 - `ublk: recovery feature flags follow device params` — `dev_info_flags`
   adds `UBLK_F_USER_RECOVERY | _REISSUE` exactly when
   `DeviceParams::enable_recovery` is set (ADR-0010).
-
+- `integration: ublk device grows online and serves the new capacity` —
+  the D3 privileged E2E: `Device::resize_blocking` issues
+  `UBLK_U_CMD_UPDATE_SIZE`, the kernel gendisk reports the new
+  capacity, and the original content still reads back; shrink attempts
+  are rejected device-side before any kernel IO. Self-skips without
+  `/dev/ublk-control` or on kernels whose driver lacks the command (it
+  landed in the 6.16 cycle).
 ### supervisor
 
 - `supervisor: protocol commands parse and reject garbage` — the
@@ -559,7 +579,33 @@ Every test, grouped by area, with the property it guards.
   an EPIPE (the supervisor vanishing mid-write) is reported as a dropped
   line (false) instead of SIGPIPE-terminating the process: sockets are
   written via `send(MSG_NOSIGNAL)` (ADR-0013).
-
+- `supervisor: resize command parses and validates its fields` — the D3
+  resize command requires a string `id` and a non-negative integer
+  `size` (bytes); wrong-typed, negative, or float `size` are clean
+  parse-time protocol errors, and the `hello` reply advertises the
+  `resize` feature with the protocol version bumped by the D3 batch
+  (ADR-0014).
+- `supervisor: create virtual_size override parses and validates` — the
+  D3 headroom override is an optional non-negative integer on `create`;
+  other types are clean parse-time errors (grow-only/alignment live in
+  the handlers) (ADR-0014).
+- `supervisor: commit virtual_size override parses and validates` — the
+  D3 re-baseline override is an optional non-negative integer on
+  `commit`; other types are clean parse-time errors (the grow-only
+  rules need the checkpoint, so they live in the seal path)
+  (ADR-0014).
+- `supervisor: device resize executor grows and rejects shrink or no-op` —
+  the device-side `run_device_control` "resize" branch over a real
+  socketpair: a grow is applied once (seq echoed, new size reported),
+  an equal (no-op) or smaller (shrink) request is a clean ok:false
+  "grow-only" reply that never reaches the apply seam, misaligned
+  sizes are clean errors, and a recorder-less device still serves
+  resize while trace commands answer "unavailable" (D3; ADR-0014).
+- `supervisor: device resize answers unsupported without a seam and survives malformed sizes` —
+  the same loop: a device without a resize executor seam answers resize
+  with a clean "unsupported" error; wrong-typed `size` (float, negative,
+  missing) are clean error replies — never an exception escaping the
+  loop — and a valid grow afterwards proves the loop stayed alive (D3).
 ### integration
 
 - `integration: layered stack stages over a mock registry` — the full
@@ -704,3 +750,22 @@ Every test, grouped by area, with the property it guards.
   START/END_USER_RECOVERY handshake and keeps serving reads
   (ADR-0010; self-skips without ublk or on kernels without the
   feature).
+- `supervisor: resize grows a device and rejects shrink or no-op cleanly` —
+  a real daemon with the fake obd-device (which serves the device
+  command channel and executes resize grow-only without a kernel):
+  unknown ids, wrong-typed `size`, and misaligned sizes are clean
+  errors; a grow replies with the new size and id; a resize to the
+  current size or smaller is rejected grow-only (D3; ADR-0014). Runs
+  without privileges.
+- `supervisor: create virtual_size headroom override is validated grow-only` —
+  the same daemon/fake pair: a create override smaller than the image's
+  declared size fails create with the grow-only message (the device
+  validates, where the assembled size is known), an override larger
+  than the image creates fine and that device stays grow-only
+  (D3; ADR-0014). Runs without privileges.
+- `supervisor: commit virtual_size re-baselines the sealed layer grow-only` —
+  the same daemon/fake pair: a commit override below the layer's
+  declared size is rejected with a precise grow-only reason, and an
+  override at least the declared size seals with the override in the
+  header (verified by re-opening the sealed layer) (D3; ADR-0014).
+  Runs without privileges.

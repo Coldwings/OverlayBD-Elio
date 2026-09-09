@@ -172,6 +172,113 @@ TEST_CASE("supervisor: commit command parses and validates its fields",
             features.end());
 }
 
+TEST_CASE("supervisor: resize command parses and validates its fields",
+          "[supervisor]") {
+    // D3 additive protocol: resize requires a string `id` and a
+    // non-negative integer `size` (bytes); unknown fields are ignored.
+    // Semantic rules (positive, 512-aligned, grow-only) live in the
+    // handlers, where the current size is known.
+    std::string err;
+    auto j = supervisor::parse_command(
+        R"({"cmd":"resize","id":"a","size":65536})", err);
+    REQUIRE(j.has_value());
+    REQUIRE((*j)["cmd"] == "resize");
+    REQUIRE((*j)["size"] == 65536);
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"resize","id":"a","size":1,"future":1})", err)
+                .has_value());
+    REQUIRE(!supervisor::parse_command(R"({"cmd":"resize","id":"a"})", err)
+                 .has_value());
+    REQUIRE(err.find("resize requires 'id' and 'size'") !=
+            std::string::npos);
+    REQUIRE(!supervisor::parse_command(R"({"cmd":"resize","size":1})", err)
+                 .has_value());
+    REQUIRE(err.find("resize requires 'id' and 'size'") !=
+            std::string::npos);
+
+    // Malformed field TYPES are clean parse-time errors: a string or
+    // float `size`, or a negative size (a shrink cannot even be
+    // expressed), never reach the handler. (A small positive integer is
+    // fine at parse time — positivity/alignment are handler rules.)
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"resize","id":"a","size":123})", err)
+                .has_value());
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"resize","id":"a","size":"big"})", err)
+                 .has_value());
+    REQUIRE(err.find("non-negative integer") != std::string::npos);
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"resize","id":"a","size":1.5})", err)
+                 .has_value());
+    REQUIRE(err.find("non-negative integer") != std::string::npos);
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"resize","id":"a","size":-1})", err)
+                 .has_value());
+    REQUIRE(err.find("non-negative integer") != std::string::npos);
+
+    // The hello handshake advertises the capability gate for resize,
+    // with the protocol version bumped by the D3 batch.
+    const auto hello = nlohmann::json::parse(supervisor::reply_hello());
+    REQUIRE(hello.value("ok", false) == true);
+    REQUIRE(hello["protocol"].get<int>() == supervisor::kProtocolVersion);
+    const auto features =
+        hello["features"].get<std::vector<std::string>>();
+    REQUIRE(std::find(features.begin(), features.end(), "resize") !=
+            features.end());
+}
+
+TEST_CASE("supervisor: create virtual_size override parses and validates",
+          "[supervisor]") {
+    // D3 headroom: create's optional `virtual_size` (bytes) must be a
+    // non-negative integer; other types are clean parse-time errors.
+    std::string err;
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"create","id":"a","config":"/c.json",
+                    "virtual_size":65536})",
+                err)
+                .has_value());
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"create","id":"a","config":"/c.json"})", err)
+                .has_value());
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"create","id":"a","config":"/c.json",
+                    "virtual_size":"big"})",
+                err)
+                 .has_value());
+    REQUIRE(err.find("non-negative integer") != std::string::npos);
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"create","id":"a","config":"/c.json",
+                    "virtual_size":-1})",
+                err)
+                 .has_value());
+    REQUIRE(err.find("non-negative integer") != std::string::npos);
+}
+
+TEST_CASE("supervisor: commit virtual_size override parses and validates",
+          "[supervisor]") {
+    // D3 commit re-baseline: commit's optional `virtual_size` (bytes)
+    // must be a non-negative integer; other types are clean parse-time
+    // errors (the grow-only rules need the checkpoint, so they live in
+    // the seal path).
+    std::string err;
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"commit","id":"a","virtual_size":65536})", err)
+                .has_value());
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"commit","id":"a","user_tag":"v1",
+                    "virtual_size":65536})",
+                err)
+                .has_value());
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"commit","id":"a","virtual_size":"big"})", err)
+                 .has_value());
+    REQUIRE(err.find("non-negative integer") != std::string::npos);
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"commit","id":"a","virtual_size":-1})", err)
+                 .has_value());
+    REQUIRE(err.find("non-negative integer") != std::string::npos);
+}
+
 TEST_CASE("supervisor: bdev path parses to device id", "[supervisor]") {
     REQUIRE(supervisor::dev_id_from_bdev_path("/dev/ublkb7") == 7);
     REQUIRE(supervisor::dev_id_from_bdev_path("/dev/ublkb0") == 0);

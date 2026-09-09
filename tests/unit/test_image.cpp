@@ -189,3 +189,27 @@ TEST_CASE("image: assembly picks the ZFile view for compressed layers",
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("image: device capacity honors the virtual_size headroom override grow-only",
+          "[image]") {
+    // D3 create-time headroom rule (device_capacity_bytes): no override
+    // = the image's declared size; an override >= the image size is
+    // sanctioned headroom (equal is a no-op); a smaller override would
+    // shrink the device below its content and is rejected with a reason.
+    std::string err;
+    REQUIRE(image::device_capacity_bytes(512 * 64, 0, &err) == 512 * 64);
+    REQUIRE(err.empty());
+    REQUIRE(image::device_capacity_bytes(512 * 64, 512 * 64, &err) ==
+            512 * 64);
+    REQUIRE(err.empty());
+    REQUIRE(image::device_capacity_bytes(512 * 64, 512 * 96, &err) ==
+            512 * 96);
+    REQUIRE(err.empty());
+    // Null error pointer is safe on the rejection path.
+    REQUIRE(image::device_capacity_bytes(512 * 64, 512 * 32, nullptr) == 0);
+    const uint64_t rejected =
+        image::device_capacity_bytes(512 * 64, 512 * 32, &err);
+    REQUIRE(rejected == 0);
+    REQUIRE(err.find("grow-only") != std::string::npos);
+    REQUIRE(err.find("smaller than the image") != std::string::npos);
+}
