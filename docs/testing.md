@@ -331,8 +331,9 @@ Every test, grouped by area, with the property it guards.
   issue #35: with the gate held closed, the bounded acquire returns
   `std::nullopt` after its timeout and leaves no ghost reservation
   (counters and a subsequent acquire prove the dequeue); admitted
-  immediately when the gate is open, and admitted mid-wait when the
-  gate opens before the timeout.
+  immediately when the gate is open, admitted mid-wait when the gate
+  opens before the timeout, and refused outright (`std::nullopt`, no
+  slot taken) when mis-called with OnDemand.
 - `source: admission funnel grows additively on flat latency and halves on rise` —
   flat samples at the EMA baseline raise the window by one each; a
   sample above 150% of the baseline halves it; the drifted baseline

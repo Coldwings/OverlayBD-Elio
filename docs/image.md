@@ -141,7 +141,9 @@ closed past the per-extent admit bound (2 s,
 `LayerStore::Config::populate_admit_timeout`, issue #35) skips its
 window outright the same way — blocked or slow windows are skipped,
 never awaited, overshoot bounded by one admit bound plus one extent
-fetch, and every skipped extent is simply served on demand later.
+fetch per in-flight extent (a view-space slice spans two extents at an
+unaligned tar base, so the worst case is two of each), and every
+skipped extent is simply served on demand later.
 (The same admit bound also covers trace replay's populates, which share
 the LayerStore populate path.) Combined with replay's
 identical budget, structural warm-up plus trace replay add at most

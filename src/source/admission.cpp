@@ -3,9 +3,9 @@
 #include "source/admission.hpp"
 
 #include <elio/coro/with_timeout.hpp>
+#include <elio/log/macros.hpp>
 
 #include <algorithm>
-#include <cassert>
 
 namespace obd::source {
 
@@ -120,8 +120,16 @@ elio::coro::task<AdmissionFunnel::Permit> AdmissionFunnel::acquire(
 elio::coro::task<std::optional<AdmissionFunnel::Permit>>
 AdmissionFunnel::acquire_scavenger_bounded(
     ReadClass cls, std::chrono::milliseconds timeout) {
-    assert(cls != ReadClass::OnDemand &&
-           "OnDemand admission is unconditional by contract");
+    if (cls == ReadClass::OnDemand) {
+        // Precondition violation (a real check, not an assert — release
+        // builds compile asserts out): bounded OnDemand admission would
+        // break the unconditional-admission contract. A bounded
+        // on-demand call is always a caller bug; refuse it as "not
+        // admitted" rather than silently bounding a guest-blocking read.
+        ELIO_LOG_ERROR("acquire_scavenger_bounded called with OnDemand; "
+                       "refused (on-demand admission is unconditional)");
+        co_return std::nullopt;
+    }
     const auto start = std::chrono::steady_clock::now();
     {
         std::lock_guard lk(mu_);

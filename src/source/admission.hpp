@@ -167,8 +167,9 @@ public:
     /// ADOPTS the slot (returns a Permit) instead of leaking it; a
     /// waiter still queued is removed under mu_ before returning. The
     /// AIMD/latency accounting is untouched (no Permit, no sample).
-    /// OnDemand must never use this path — unconditional admission is
-    /// its contract.
+    /// OnDemand is refused outright (`std::nullopt`, logged) —
+    /// unconditional admission is its contract, so a bounded on-demand
+    /// call is always a caller bug.
     elio::coro::task<std::optional<Permit>> acquire_scavenger_bounded(
         ReadClass cls, std::chrono::milliseconds timeout);
 
@@ -223,8 +224,11 @@ private:
         /// Set under mu_ when admit_locked pops the waiter and reserves
         /// its slot; once true the slot is the waiter's to adopt even if
         /// its bounded wait has already timed out (the reconciliation
-        /// that makes acquire_scavenger_bounded cancel-safe).
-        bool reserved = false;
+        /// that makes acquire_scavenger_bounded cancel-safe). Atomic:
+        /// the bounded acquire reads it again under mu_ after the timed
+        /// wait, but also once lock-free between its own admit_locked
+        /// and that wait.
+        std::atomic<bool> reserved{false};
     };
 
     void release(ReadClass cls, std::chrono::nanoseconds latency);

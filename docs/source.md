@@ -679,8 +679,10 @@ admission funnel (ADR-0012; see Concepts §"Read admission funnel").
   windows are skipped, never awaited" contract). Cancel-safe where
   `acquire()` is not: a waiter whose slot was already reserved when the
   timeout fires adopts the slot rather than leaking it; a still-queued
-  waiter is removed under the funnel mutex. OnDemand must not use it —
-  unconditional admission is the OnDemand contract.
+  waiter is removed under the funnel mutex. OnDemand is refused
+  outright (`std::nullopt`, logged — a real runtime check, not an
+  assert): unconditional admission is the OnDemand contract, and a
+  bounded on-demand call is always a caller bug.
 - `cap_request(cls, bytes)` — clamps scavenger requests to
   `scavenger_size_cap` (~1 MiB; the caller splits); OnDemand is uncapped.
 - `note_on_demand_latency(sample)` — feeds a synthetic AIMD sample
@@ -1121,8 +1123,9 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   in flight (even with window room) and enter once it completes.
 - `source: admission funnel bounded scavenger acquire times out and dequeues` —
   issue #35: a bounded scavenger acquire whose gate stays closed returns
-  `std::nullopt` at its timeout, dequeues without leaking a slot, and is
-  still admitted when the gate opens before the deadline.
+  `std::nullopt` at its timeout, dequeues without leaking a slot, is
+  still admitted when the gate opens before the deadline, and refuses
+  OnDemand outright.
 - `source: admission funnel grows additively on flat latency and halves on rise` —
   flat samples at the EMA baseline raise the window by one each; a sample
   above 150% of the baseline halves it (AIMD, ADR-0012).

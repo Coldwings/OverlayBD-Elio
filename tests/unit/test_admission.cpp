@@ -164,6 +164,16 @@ TEST_CASE("source: admission funnel bounded scavenger acquire times out and dequ
                 ReadClass::Prefetch, milliseconds(60));
             REQUIRE(p.has_value());
         }
+        {
+            // OnDemand is refused outright (real check, not an assert —
+            // release builds compile asserts out): unconditional
+            // admission is the OnDemand contract, and a bounded
+            // on-demand call is always a caller bug. No slot is taken.
+            auto bad = co_await funnel.acquire_scavenger_bounded(
+                ReadClass::OnDemand, milliseconds(60));
+            REQUIRE(!bad.has_value());
+            REQUIRE(funnel.inflight_total() == 0);
+        }
         // Hold the gate closed with an on-demand request.
         auto od = co_await funnel.acquire(ReadClass::OnDemand);
         const auto t0 = std::chrono::steady_clock::now();
