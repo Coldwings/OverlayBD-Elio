@@ -38,15 +38,28 @@ public:
                 co_return line;
             }
             if (buf_.size() > kMaxMessageBytes) {
-                // Skip the oversized line: drain to its '\n', then loop.
-                do {
+                // Skip the oversized line WITHOUT growing buf_ any
+                // further (the 64 KiB cap exists to bound memory: an
+                // endless no-newline stream must not accumulate).
+                // Scan incoming chunks for the terminating '\n' and drop
+                // each junk chunk in place; only the bytes trailing the
+                // newline are kept.
+                for (;;) {
                     char tmp[4096];
                     const auto r = co_await elio::io::async_read(
                         fd_, tmp, sizeof(tmp), -1);
                     if (r.result <= 0) co_return std::nullopt;
-                    buf_.append(tmp, static_cast<size_t>(r.result));
-                } while (buf_.find('\n') == std::string::npos);
-                buf_.erase(0, buf_.find('\n') + 1);
+                    const auto chunk =
+                        std::string_view(tmp, static_cast<size_t>(r.result));
+                    const auto nl = chunk.find('\n');
+                    if (nl != std::string_view::npos) {
+                        // Junk ends here; the rest of the chunk may hold
+                        // the start of the next (valid) line.
+                        buf_.assign(chunk.substr(nl + 1));
+                        break;
+                    }
+                    // Whole chunk is more junk: drop it, buf_ untouched.
+                }
                 continue;
             }
             char tmp[4096];

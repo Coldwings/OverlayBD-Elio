@@ -590,7 +590,14 @@ private:
         // completing the wrong command.
         co_await mu_.lock();
         if (entry->cmd_pending) {
-            const uint64_t echoed = j.value("seq", uint64_t{0});
+            // Protocol input: parse `seq` defensively — a wrong-typed
+            // value() would throw type_error and tear down the routing
+            // coroutine. Missing or non-integer seq never matches.
+            uint64_t echoed = 0;
+            const auto sit = j.find("seq");
+            if (sit != j.end() && sit->is_number_unsigned()) {
+                echoed = sit->get<uint64_t>();
+            }
             if (echoed == entry->pending_seq) {
                 entry->cmd_pending = false;
                 entry->pending_reply = std::move(j);
