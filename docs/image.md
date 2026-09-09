@@ -626,19 +626,23 @@ Concepts → "The trace layer".
 ```cpp
 class TraceRecorder {  // one per opened image (OpenedImage::recorder)
     static constexpr size_t kMaxPendingRecords = 65536;
-    static constexpr int kMinDurationSec = 1, kMaxDurationSec = 3600;
+    static constexpr uint32_t kMinDurationSec = 1;
+    static constexpr uint32_t kMaxDurationSec = 3600;
     struct FinalizeResult {
-        bool ok; std::string error, path, sha256, reason;
+        bool ok = false;
+        std::string error, path, sha256, reason;
         uint64_t size = 0, records = 0, dropped = 0;
     };
-    bool recording() const;   // hot-path gate (one atomic load)
-    void record(char op, uint32_t layer_index, uint64_t count,
-                uint64_t offset) noexcept;   // bounded append, drop-counted
-    elio::coro::task<bool> start(std::string path, int duration_sec,
+    bool recording() const noexcept;  // hot-path gate (one atomic load)
+    // bounded append, drop-counted, noexcept:
+    void record(uint32_t layer_index, uint64_t offset,
+                uint64_t count) noexcept;
+    elio::coro::task<bool> start(
+        std::string path, uint32_t duration_sec,
         std::function<void(const FinalizeResult&)> on_expire,
-        std::string* error);
+        std::string& error);
     elio::coro::task<FinalizeResult> stop(std::string reason);
-    FinalizeResult last_result() const;
+    std::optional<FinalizeResult> last_result() const;
 };
 
 class TraceRecordSource : public source::BlobSource {

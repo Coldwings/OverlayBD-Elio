@@ -524,6 +524,13 @@ Every test, grouped by area, with the property it guards.
   field types are parse-time protocol errors, not handler exceptions),
   ignores unknown fields, and the `hello` reply pins the `protocol` field
   plus the `commit` feature advertisement (ADR-0014).
+- `supervisor: device trace control answers malformed-typed fields with clean errors` —
+  the device-side trace command loop (`src/supervisor/device_control.hpp`)
+  over a real socketpair: a `trace_start` with a wrong-typed `path` or
+  `duration_sec` gets a clean error reply (with the `seq` correlation
+  echoed) instead of an escaping `type_error` killing the loop, and a
+  valid start/stop cycle afterwards proves the loop stayed alive
+  (ADR-0013).
 
 ### integration
 

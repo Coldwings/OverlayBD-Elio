@@ -318,12 +318,15 @@ contracts above:
 - **ublk `USER_RECOVERY`** is not implemented; a device process crash
   drops the device instead of recovering it. Deferred — the isolation
   model (ADR-0004) bounds the blast radius meanwhile.
-- **Prefetch** is trace-replay only: the upstream trace blob IS replayed
-  through `populate` when the image config marks an `accelerationLayer`
-  (ADR-0013 — see `docs/image.md`), admitted at the device's
-  ADR-0012 funnel as the Prefetch scavenger class; the `prefetch` config
-  section's `enable` switch is honored. The dynamic prefetcher, trace
-  recording, and the structural head/tail warm-up stay out.
+- **Prefetch** covers the structural head/tail warm-up (ADR-0012),
+  trace replay (the upstream trace blob IS replayed through `populate`
+  when the image config marks an `accelerationLayer`, ADR-0013 — see
+  `docs/image.md`), and trace recording (the supervisor's
+  `trace_start`/`trace_stop` commands drive the record path, ADR-0013 —
+  see `docs/supervisor.md`); replay and recording traffic is admitted
+  at the device's ADR-0012 funnel as the Prefetch scavenger class, and
+  the `prefetch` config section's `enable` switch is honored. The
+  dynamic prefetcher stays out.
 - **Supervisor auto-restart** of crashed devices is not implemented;
   devices stay `exited` until an explicit `destroy`/`create`. Deferred.
 - **Discard / punch-hole** are not advertised and are rejected with

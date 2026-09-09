@@ -6,10 +6,13 @@
 // v3). This loop reads them, drives the image's TraceRecorder, and
 // writes reply lines back with the "reply" discriminator:
 //
-//   {"reply":"trace_start","ok":true,"path":...,"duration_sec":N}
+//   {"reply":"trace_start","ok":true,"path":...,"duration_sec":N,"seq":N}
 //   {"reply":"trace_stop","ok":true,"path":...,"sha256":...,"size":N,
-//    "records":N,"dropped":N}
+//    "records":N,"dropped":N,"seq":N}
 //   {"reply":"trace_event","event":"expired", ...same stats...}
+//
+// Replies echo the command's `seq` when present (the supervisor's
+// correlation token); the unsolicited expiry event carries none.
 //
 // The duration bound is enforced HERE, in the device process (a timer
 // armed by TraceRecorder::start) — a dead or disconnected CLI can never
@@ -36,8 +39,11 @@ struct TraceControlHooks {
 /// Serves trace commands from `control_fd` until EOF (the supervisor
 /// closed or died — the device keeps serving its block device; any
 /// active recording is still finalized by its duration timer or by the
-/// device shutdown path). Never throws; malformed lines are logged and
-/// skipped. Spawn with elio::go after the image is open.
+/// device shutdown path). Never throws: structurally malformed lines
+/// are logged and skipped, while parsed commands with missing or
+/// wrong-typed fields get a clean error REPLY (the supervisor awaits a
+/// reply — a skip would cost it a 30 s timeout). Spawn with elio::go
+/// after the image is open.
 elio::coro::task<void> run_trace_control(
     int control_fd, std::shared_ptr<image::TraceRecorder> recorder,
     TraceControlHooks hooks = {});

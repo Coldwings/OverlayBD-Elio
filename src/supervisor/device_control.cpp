@@ -93,8 +93,26 @@ elio::coro::task<void> run_trace_control(
         }
         const std::string cmd = j["cmd"].get<std::string>();
         if (cmd == "trace_start") {
-            const std::string path = j.value("path", "");
-            const uint32_t duration = j.value("duration_sec", 0);
+            // Field TYPES are validated, never assumed: value() on a
+            // present-but-wrong-typed key throws type_error, and this
+            // loop must answer malformed input, not die on it (the
+            // never-throws contract — an escaping exception would kill
+            // the detached control coroutine).
+            const auto pit = j.find("path");
+            const auto dit = j.find("duration_sec");
+            if (pit == j.end() || !pit->is_string() ||
+                dit == j.end() || !dit->is_number()) {
+                nlohmann::json rj = {{"reply", "trace_start"},
+                                     {"ok", false},
+                                     {"error", "trace_start requires a "
+                                               "string path and an "
+                                               "integer duration_sec"}};
+                echo_seq(j, rj);
+                reply_line(control_fd, rj);
+                continue;
+            }
+            const std::string path = pit->get<std::string>();
+            const uint32_t duration = dit->get<uint32_t>();
             std::string error;
             // The expiry report rides the same control channel.
             auto on_expire = [fd = control_fd](
