@@ -34,6 +34,7 @@
 
 #include "image/config.hpp"
 #include "image/trace_replay.hpp"
+#include "source/admission.hpp"
 #include "source/blob_source.hpp"
 #include "source/layer_store.hpp"
 
@@ -59,6 +60,10 @@ struct OpenedImage {
     /// before the chain is destroyed on any path other than process
     /// exit — see the LayerStore lifetime contract.
     std::vector<source::LayerStore*> layer_stores;
+    /// The device's read admission funnel (ADR-0012), shared by every
+    /// LayerStore and remote-only source of this image (kept alive by
+    /// the chains; this handle is for observability and tests).
+    source::AdmissionFunnelPtr funnel;
 };
 
 /// Assembles the merged read-only view for an image. Throws obd::error /

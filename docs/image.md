@@ -74,7 +74,11 @@ For each lower, in order:
    so this is the compatibility path), and a `lower.dir` the store
    cannot open (unwritable, full, blocked by a non-directory) degrades
    to the same remote-only chain with a warning instead of failing
-   assembly.
+   assembly. All remote reads of the whole image pass one per-device
+   read admission funnel (ADR-0012): the `LayerStore`s take it through
+   `Config::funnel` (misses = OnDemand, populate = Prefetch, background
+   fill = Fill), and the remote-only chains are wrapped in an
+   `AdmissionSource` (pread = OnDemand) — see `docs/source.md`.
 3. **TarOffsetSource** — auto-detects and removes the tar wrapper.
 4. **ZFile detection** — when `format::is_zfile()` recognizes the ZFile
    magic, the view becomes a `ZFileSource` (with caller-side digest
@@ -115,10 +119,14 @@ and is logged and ignored.
 `populate(offset, count)` on the corresponding data lower's
 **stored-blob-level** source (the `TarOffsetSource` view — the same byte
 space upstream's `PrefetchFile` wraps, below decompression), executed in
-recorded order. **Until the admission funnel lands (B1), replay is
-awaited inline during device bring-up**, bounded by the 30 s wall-time
-budget below; the funnel will then detach it into scavenger-class
-warm-up (Fill-class by design). Skip rules follow upstream replay parity
+recorded order. Replay is **awaited inline during device bring-up**,
+bounded by the 30 s wall-time budget below; every populate it issues
+passes the device's read admission funnel (ADR-0012) as the **Prefetch
+scavenger class**, outranking background fill. Detaching replay off the
+bring-up path — now safe, since the funnel yields to on-demand reads —
+is a documented follow-up. The global `prefetch.enable` switch
+(`docs/config.md`) gates the trace load/replay. Skip rules follow
+upstream replay parity
 (trace-format.md §5/§8): non-READ ops, unknown layer indexes, zero
 counts, counts above the 1 MiB conforming-writer cap, and negative
 offsets are silently skipped. Replay is **opportunistic**: a missing,
@@ -174,6 +182,7 @@ struct GlobalConfig {
     bool p2p_enable = false;
     std::string p2p_address;
     DownloadConfig download;
+    bool prefetch_enable = true;
     int log_level = 1;
 
     static GlobalConfig from_file(const std::string& path);
@@ -197,12 +206,16 @@ struct GlobalConfig {
   see `docs/config.md`).
 - `src/image/config.hpp::log_level` — `logConfig.logLevel`:
   0=debug, 1=info (default), 2=warn, 3=error.
+- `src/image/config.hpp::prefetch_enable` — `prefetch.enable` (default
+  true): the trace-replay master switch (ADR-0012/0013; the funnel's
+  AIMD window is not operator-configured, so the section exposes nothing
+  else — see `docs/config.md`).
 - `from_file(path)` — reads and parses the file. Throws `obd::error` on IO
   failure, `src/common/errors.hpp::format_error` on malformed JSON.
 - `src/image/config.hpp::from_json_text` — same, from an in-memory string
   (tests, the supervisor's config channel).
-- `cacheConfig`, `ioEngine`, and `prefetch` sections are intentionally not
-  honored in v0.1; unknown fields are ignored per the operator contract.
+- `cacheConfig` and `ioEngine` sections are intentionally not honored in
+  v0.1; unknown fields are ignored per the operator contract.
 
 ### `config.hpp` — LowerConfig, UpperConfig, ImageConfig
 
@@ -288,6 +301,7 @@ struct OpenedImage {
     std::string upper_path;
     TraceReplayStats trace;       // ADR-0013 replay outcome
     std::vector<source::LayerStore*> layer_stores;  // non-owning
+    source::AdmissionFunnelPtr funnel;  // the device's ADR-0012 funnel
 };
 
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
@@ -316,6 +330,11 @@ elio::coro::task<void> park_image_fills(const OpenedImage& opened);
   pass early. All zero when no `accelerationLayer` was configured.
 - `src/image/image_file.hpp::layer_stores` — non-owning handles to every
   `LayerStore` in the chain (owned by `root`), for lifecycle operations.
+- `funnel` — the device's read admission funnel (ADR-0012), created at
+  open and shared by every lower's `LayerStore` and by the remote-only
+  source wrappers (no-dir lowers, ADR-0016 degrade, the trace blob
+  fetch): all remote reads of the device compete at this single gate.
+  The handle is for observability and tests; the chains keep it alive.
 - `src/image/image_file.hpp::park_image_fills` — stops every background
   fill in the chain (`stop_fill` + a bounded wait for a terminal
   `fill_status`). Must be called before `root` is destroyed on any path
@@ -570,6 +589,10 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   `accelerationLayer: true` config with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merge (layer count, virtual
   size, byte-exact content) and the trace fully replayed.
+- `image: prefetch enable false skips trace replay but keeps recognition` —
+  `prefetch.enable = false` skips the trace load/replay (stats zero)
+  while the acceleration layer is still set aside from the merge
+  (ADR-0012).
 - `image: garbage trace layer never fails assembly` — a garbage trace
   blob still yields a working device (opportunistic replay).
 - `image: writable image with a trace layer assembles and replays` — a
@@ -591,6 +614,14 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   prefix while the `LayerStore` background fill warms every remaining
   extent to `overlaybd.commit`; a second open binds the commit with zero
   additional remote reads.
+- `integration: admission funnel bounds on-demand latency under scavenger load` —
+  through `open_image` against a serialized, latency-injected mock: a
+  populate storm plus the background fill cannot push any of twelve
+  on-demand image reads past a bounded 2 s each (ADR-0012).
+- `integration: admission funnel collapses scavenger traffic under on-demand contention` —
+  two lowers sharing the one per-device funnel threaded by `open_image`:
+  the shadowed bottom layer's fill stalls while eight concurrent
+  on-demand readers stream the top layer, and resumes after (ADR-0012).
 - `image: malformed remote lower digest fails assembly` — a remote lower
   with a malformed `sha256:` digest fails `open_image` with
   `obd::error(EINVAL)` before any registry I/O — structural config errors
@@ -613,16 +644,18 @@ single Range-capable blob. No external golden files.
   remote-only (the snapshotter always sets `dir`; the empty case is the
   compatibility path).
 - **Honored config surface is a subset** — `cacheConfig`, `ioEngine`,
-  `prefetch`, non-file `credentialConfig` modes, and `resultFile` handling
-  are parsed-as-ignored / informational in v0.1 (see `docs/config.md` for
+  non-file `credentialConfig` modes, and `resultFile` handling
+  are parsed-as-ignored / informational in v0.1; of `prefetch`, only
+  `enable` is honored (see `docs/config.md` for
   the full compatibility matrix). The trace layer IS recognized and
   replayed (ADR-0013, proposed; see Concepts → "The trace layer"), with
   these gaps: trace **recording** is not implemented; the
   dynamic-prefetch file-list fallback is rejected by design; the tar
   member name (`trace`) is not checked — recognition is the config flag
   plus the blob magic; remote lowers without `dir` are not warmed
-  (populate is a no-op on the bare `RegistrySource`); and replay
-  runs at normal priority until the B-phase admission funnel exists.
+  (populate is a no-op on the bare `RegistrySource`); and replay is
+  still awaited inline during bring-up — detaching it into background
+  scavenger warm-up is a follow-up the ADR-0012 funnel now makes safe.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically** — the

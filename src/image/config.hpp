@@ -44,6 +44,12 @@ struct GlobalConfig {
     /// Global download defaults (per-image download sections override).
     DownloadConfig download;
 
+    /// prefetch: trace-replay warm-up master switch (ADR-0012/0013).
+    /// When false, an acceleration layer's trace blob is neither loaded
+    /// nor replayed. The funnel's AIMD window is NOT operator-configured
+    /// (ADR-0012); this is the only honored field of the section.
+    bool prefetch_enable = true;
+
     /// logConfig.logLevel: 0=debug, 1=info, 2=warn, 3=error.
     int log_level = 1;
 

@@ -20,6 +20,7 @@ TEST_CASE("image: global config parses overlaybd.json fields", "[image]") {
         "credentialConfig": {"mode": "file", "path": "/tmp/cred.json"},
         "p2pConfig": {"enable": true, "address": "localhost:19145/dart"},
         "download": {"enable": true, "delay": 120, "maxMBps": 50},
+        "prefetch": {"enable": false},
         "logConfig": {"logLevel": 0},
         "cacheConfig": {"ignored": true}
     })";
@@ -31,7 +32,11 @@ TEST_CASE("image: global config parses overlaybd.json fields", "[image]") {
     REQUIRE(g.download.delay_sec == 120);
     REQUIRE(g.download.max_mbps == 50);
     REQUIRE(g.download.try_count == 5);  // defaults preserved
+    REQUIRE(!g.prefetch_enable);  // prefetch.enable honored (ADR-0012)
     REQUIRE(g.log_level == 0);
+    // Absent prefetch section: the default is enabled.
+    const auto g2 = image::GlobalConfig::from_json_text("{}");
+    REQUIRE(g2.prefetch_enable);
 }
 
 TEST_CASE("image: per-image download overrides merge over global defaults",

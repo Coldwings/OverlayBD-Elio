@@ -79,7 +79,13 @@ GlobalConfig GlobalConfig::from_json_text(const std::string& text) {
     if (const auto it = j.find("logConfig"); it != j.end() && it->is_object()) {
         cfg.log_level = it->value("logLevel", 1);
     }
-    // cacheConfig / ioEngine / prefetch: intentionally not honored in v0.1
+    if (const auto it = j.find("prefetch"); it != j.end() && it->is_object()) {
+        // ADR-0012/0013: the honored subset of the upstream prefetch
+        // section is the master switch alone — the admission funnel's
+        // AIMD window is deliberately not operator-configured.
+        cfg.prefetch_enable = it->value("enable", true);
+    }
+    // cacheConfig / ioEngine: intentionally not honored in v0.1
     // (docs/config.md).
     return cfg;
 }

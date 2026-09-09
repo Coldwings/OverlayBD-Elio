@@ -11,6 +11,7 @@ add_executable(obd_unit_tests
     unit/test_trace.cpp
     unit/test_trace_replay.cpp
     unit/test_source.cpp
+    unit/test_admission.cpp
     unit/test_layer_store.cpp
     unit/test_registry.cpp
     unit/test_image.cpp

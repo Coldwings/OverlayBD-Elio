@@ -266,6 +266,11 @@ void LayerStore::set_test_write_hook(
     write_hook_ = std::move(hook);
 }
 
+void LayerStore::set_test_fetch_done_hook(std::function<void()> hook) {
+    // Armed before any coroutine runs (tests only), so no locking.
+    fetch_done_hook_ = std::move(hook);
+}
+
 // ---------------------------------------------------------------------------
 // Setup / recovery (cold paths)
 // ---------------------------------------------------------------------------
@@ -459,7 +464,7 @@ elio::coro::task<ssize_t> LayerStore::read_fd_loop(int fd, void* buf,
 }
 
 elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
-    uint64_t extent_id) {
+    uint64_t extent_id, ReadClass cls) {
     std::shared_ptr<InFlight> f;
     bool starter = false;
     co_await inflight_mu_.lock();
@@ -484,7 +489,21 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
         std::min<uint64_t>(cfg_.extent_size, size_ - ebase));
     auto buf = std::make_shared<std::vector<uint8_t>>(elen);
     remote_fetches_.fetch_add(1, std::memory_order_relaxed);
+    // ADR-0012: the starter's remote fetch enters the source only
+    // through the device's admission funnel (the permit's lifetime is
+    // the fetch — its wall-clock latency is the AIMD sample for
+    // OnDemand). One extent is 64 KiB, under the scavenger size cap.
+    AdmissionFunnel::Permit permit;
+    if (cfg_.funnel) {
+        permit = co_await cfg_.funnel->acquire(cls);
+    }
     const ssize_t r = co_await remote_->pread(buf->data(), elen, ebase);
+    // The permit covers the remote fetch alone — its lifetime is the
+    // latency sample (the same contract as run_fill's): release the
+    // window slot before the completion bookkeeping below, so a queued
+    // scavenger never waits behind the in-flight map update.
+    permit.reset();
+    if (fetch_done_hook_) fetch_done_hook_();  // test-only
     if (r < 0) {
         f->error = static_cast<int>(-r);
     } else if (static_cast<size_t>(r) != elen) {
@@ -493,11 +512,22 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
         f->data = std::move(buf);
     }
     co_await inflight_mu_.lock();
+    // Signal completion BEFORE retiring the entry, in the same critical
+    // section: a same-extent caller then either finds the entry (done
+    // already signaled — its wait returns immediately with the result)
+    // or finds nothing (the fetch is complete and its joiners were
+    // released). The previous erase-then-set order left a window —
+    // hittable once the scheduler runs several workers — in which a
+    // caller missed the retired entry and started a duplicate remote
+    // fetch for bytes just fetched, the waste extent dedup exists to
+    // prevent (ADR-0012). done.set() only collects and schedules
+    // waiters (never blocks, leaf mutex), so signaling under
+    // inflight_mu_ cannot deadlock. Joiners hold their own
+    // shared_ptr<InFlight>, so the event stays alive until every waiter
+    // has been scheduled away from it.
+    f->done.set();
     inflight_.erase(extent_id);
     inflight_mu_.unlock();
-    // Joiners hold their own shared_ptr<InFlight>, so the event stays alive
-    // until every waiter has been scheduled away from it.
-    f->done.set();
     co_return FetchResult{f->data, f->error};
 }
 
@@ -595,7 +625,9 @@ elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
             }
         }
         if (!served) {
-            const FetchResult fr = co_await join_or_fetch(eid);
+            // A guest-blocking miss: the ADR-0012 OnDemand class.
+            const FetchResult fr =
+                co_await join_or_fetch(eid, ReadClass::OnDemand);
             if (fr.error != 0) {
                 co_return done > 0 ? static_cast<ssize_t>(done)
                                    : -fr.error;
@@ -622,7 +654,9 @@ elio::coro::task<ssize_t> LayerStore::populate(uint64_t offset, size_t len) {
         if (records_[eid].load(std::memory_order_acquire) & kFlagPresent) {
             continue;
         }
-        const FetchResult fr = co_await join_or_fetch(eid);
+        // Warm-up (trace replay): the ADR-0012 Prefetch scavenger class.
+        const FetchResult fr =
+            co_await join_or_fetch(eid, ReadClass::Prefetch);
         if (fr.error != 0) co_return -fr.error;
         if (state() == State::Filling &&
             !(records_[eid].load(std::memory_order_acquire) &
@@ -655,8 +689,8 @@ elio::coro::task<bool> LayerStore::wait_queue_room(size_t len) {
 
 elio::coro::task<void> LayerStore::run_fill() {
     // Fill is the ADR-0012 `Fill` scavenger class: conservative
-    // concurrency 1 (this single walk) until the admission funnel (#B1)
-    // merges and governs it.
+    // concurrency 1 (this single walk), admitted at the device's funnel
+    // (when configured) behind both OnDemand and Prefetch traffic.
     fill_status_.store(static_cast<int>(FillStatus::kWaiting),
                        std::memory_order_release);
     uint32_t delay = cfg_.fill.delay_sec;
@@ -687,9 +721,15 @@ elio::coro::task<void> LayerStore::run_fill() {
 
     const uint64_t es = cfg_.extent_size;
     // Coalescing cap: the bulk-path rule — contiguous misses are fetched
-    // with larger range reads, capped near 1 MiB.
-    const uint64_t cap = std::min<uint64_t>(
+    // with larger range reads, capped near 1 MiB. With a funnel the cap
+    // is the funnel's scavenger size cap (ADR-0012: the funnel caps, the
+    // caller splits — one fill range read is one scavenger admission).
+    uint64_t cap = std::min<uint64_t>(
         std::max<uint64_t>(cfg_.fill.block_size, es), 1024 * 1024);
+    if (cfg_.funnel) {
+        cap = cfg_.funnel->cap_request(ReadClass::Fill,
+                                       static_cast<size_t>(cap));
+    }
     const uint64_t budget =
         static_cast<uint64_t>(std::max(cfg_.fill.max_mbps, 1u)) << 20;
     uint64_t window_used = 0;
@@ -722,8 +762,21 @@ elio::coro::task<void> LayerStore::run_fill() {
             std::min((run_end - e) * es, size_ - e * es);
         auto buf = std::make_shared<std::vector<uint8_t>>(
             static_cast<size_t>(run_len));
+        // ADR-0012: fill's range read is one Fill-class scavenger
+        // admission; it may suspend here until no on-demand request is
+        // in flight and the AIMD window has room.
+        AdmissionFunnel::Permit permit;
+        if (cfg_.funnel) {
+            permit = co_await cfg_.funnel->acquire(ReadClass::Fill);
+        }
         const ssize_t r =
             co_await remote_->pread(buf->data(), buf->size(), e * es);
+        // The permit's lifetime is the remote fetch alone (the latency
+        // sample): release the window slot BEFORE the write-behind
+        // back-pressure, the error backoff, and the max_mbps throttle
+        // sleep below — those are fill-local delays, and a queued
+        // Prefetch (which outranks Fill) must not wait behind them.
+        permit.reset();
         if (r < 0 || static_cast<uint64_t>(r) != run_len) {
             // Transient remote trouble: back off (1s doubling, capped at
             // 60s) and resume the walk — persisted extents survive in the

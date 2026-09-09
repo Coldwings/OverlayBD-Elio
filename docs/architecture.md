@@ -71,7 +71,11 @@ A read travels through four ownership boundaries:
    persistence per layer; extents already persisted are served locally,
    and a completed layer is renamed to `overlaybd.commit` for the local
    probe to bind on the next open) — or, for a layer without a configured
-   `dir`, served remote-only (ADR-0016). When
+   `dir`, served remote-only (ADR-0016). Every remote fetch of every
+   lower passes one per-device read admission funnel (ADR-0012):
+   guest-blocking misses are admitted unconditionally, while prefetch and
+   background fill are scavenger classes gated by an AIMD concurrency
+   window (see `docs/source.md`). When
    DART is enabled and reachable, the registry client's requests go
    through the DART prefix proxy instead (ADR-0005). This assembly is
    built once at open time in `open_image` (see `src/image/image_file.cpp`).
@@ -314,11 +318,12 @@ contracts above:
 - **ublk `USER_RECOVERY`** is not implemented; a device process crash
   drops the device instead of recovering it. Deferred — the isolation
   model (ADR-0004) bounds the blast radius meanwhile.
-- **Prefetch** (`prefetch` config section) is parsed-tolerated but not
-  honored; deferred. The upstream trace blob IS replayed through
-  `populate` when the image config marks an `accelerationLayer`
-  (ADR-0013, proposed — see `docs/image.md`); the dynamic prefetcher and
-  trace recording stay out.
+- **Prefetch** is trace-replay only: the upstream trace blob IS replayed
+  through `populate` when the image config marks an `accelerationLayer`
+  (ADR-0013, proposed — see `docs/image.md`), admitted at the device's
+  ADR-0012 funnel as the Prefetch scavenger class; the `prefetch` config
+  section's `enable` switch is honored. The dynamic prefetcher, trace
+  recording, and the structural head/tail warm-up stay out.
 - **Supervisor auto-restart** of crashed devices is not implemented;
   devices stay `exited` until an explicit `destroy`/`create`. Deferred.
 - **Discard / punch-hole** are not advertised and are rejected with

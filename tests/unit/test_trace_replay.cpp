@@ -282,6 +282,55 @@ TEST_CASE("image: local trace layer is set aside and replayed at open",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("image: prefetch enable false skips trace replay but keeps recognition",
+          "[image]") {
+    // The global `prefetch.enable` switch (ADR-0012) gates the trace
+    // load/replay alone — recognition (setting the acceleration layer
+    // aside from the merge) is structural and must still apply,
+    // otherwise the trace blob would be merged as a data layer.
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 32, 37);
+    const std::string l1 = dir / "layer.lsmt";
+    {
+        const std::string r1 = test::write_file(dir / "r.img", raw);
+        const int fd = ::open(r1.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        format::write_lsmt_single_layer(fd, raw.size(), l1, {});
+        ::close(fd);
+    }
+    const std::string accel_dir = dir / "accel";
+    {
+        REQUIRE(std::filesystem::create_directories(accel_dir));
+        const auto blob = writer_blob({{'R', 0, 4096, 0}});
+        test::write_file(accel_dir + "/trace", blob);
+    }
+    nlohmann::json cfgj;
+    cfgj["accelerationLayer"] = true;
+    cfgj["lowers"] = nlohmann::json::array(
+        {nlohmann::json{{"digest", "sha256:b"}, {"file", l1}},
+         nlohmann::json{{"digest", "sha256:a"}, {"dir", accel_dir}}});
+    const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+        auto opened = co_await image::open_image(cfg, global);
+        // Recognition still applies: the trace layer is not merged.
+        REQUIRE(opened.layer_count == 1);
+        REQUIRE(opened.virtual_size == raw.size());
+        // ...but nothing was loaded or replayed.
+        REQUIRE(!opened.trace.trace_present);
+        REQUIRE(opened.trace.records_total == 0);
+        REQUIRE(opened.trace.records_replayed == 0);
+        std::vector<uint8_t> buf(raw.size());
+        const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        REQUIRE(buf == raw);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("image: garbage trace layer never fails assembly", "[image]") {
     TempDir dir;
     const auto raw = test::pattern_bytes(512 * 32, 41);

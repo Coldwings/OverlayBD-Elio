@@ -39,7 +39,12 @@ endpoints plus a bearer-token endpoint; the token endpoint counts
 exchanges and can issue `expires_in`, per-exchange serial tokens, and
 selective rejections, so single-flight and cache-lifetime behavior is
 observable. The integration tests reuse the
-same style of in-process server, so no test touches the network.
+same style of in-process server, so no test touches the network; the
+multi-blob variant (`BlobMapServer` in
+`tests/integration/test_integration.cpp`) adds per-blob GET/extent
+counters, per-request latency injection, and an optional serialized
+service mode (source capacity 1) for the ADR-0012 admission-funnel
+tests.
 
 ## Naming convention
 
@@ -316,11 +321,56 @@ Every test, grouped by area, with the property it guards.
   pure mapping: 80% of the declared lifetime, 0 for `expires_in=0`, 30 s
   fallback for absent/negative values, and the 7-day cap for absurd ones
   (2^62, int64 max, and around the ceiling) (ADR-0015).
+- `source: admission funnel admits on-demand unconditionally under a full window` —
+  with the window fully occupied by scavengers, on-demand acquires
+  complete immediately and in-flight exceeds the window (ADR-0012).
+- `source: admission funnel blocks scavengers while on-demand is in flight` —
+  queued Prefetch/Fill requests stay parked while an on-demand request
+  is in flight, even with window room, and enter once it completes.
+- `source: admission funnel grows additively on flat latency and halves on rise` —
+  flat samples at the EMA baseline raise the window by one each; a
+  sample above 150% of the baseline halves it; the drifted baseline
+  reclassifies subsequent samples (AIMD, ADR-0012).
+- `source: admission funnel respects window floor and ceiling` — sustained
+  flat samples stop at `window_max`; samples that keep outrunning the
+  EMA baseline drive the window to `window_min`, never below.
+- `source: admission funnel admits prefetch before fill` — with room for
+  exactly one scavenger, a queued Prefetch wins the freed slot over a
+  queued Fill (two-level scavenger queue, ADR-0012).
+- `source: admission funnel caps scavenger request size` — scavenger
+  requests clamp to the ~1 MiB cap (custom caps honored); OnDemand is
+  uncapped.
+- `source: admission source splits populate at the scavenger size cap` —
+  `AdmissionSource::populate` forwards successive ≤ 1 MiB chunks at
+  successive offsets as Prefetch admissions; `pread` is OnDemand.
+- `source: layer store populate waits at the admission funnel while reads pass` —
+  the LayerStore class wiring end to end: with the window held full, a
+  miss `pread` (OnDemand) completes anyway while a `populate`
+  (Prefetch) queues until a slot frees (ADR-0012).
+- `source: admission funnel re-checks the gate when queueing a scavenger` —
+  lost-wakeup regression: with the check-then-queue gap injected by the
+  test hook (a slot freed against empty queues inside it), the
+  push+re-admit critical section still admits the scavenger — without
+  the re-check the acquire never wakes (ADR-0012).
+- `source: layer store fill frees the funnel window before throttling` —
+  fill's Fill-class permit covers the remote fetch alone: a Prefetch
+  queued behind the full window is admitted immediately after fill's
+  fetch completes, not after fill's 1 s `maxMBps` throttle sleep
+  (prefetch outranks fill; throttle and funnel stay separate).
+- `source: populate joining an in-flight fetch bypasses the funnel` —
+  dedup ordering (ADR-0012): a `populate` for an extent already being
+  fetched joins the in-flight fetch (coalesced join) and consumes no
+  scavenger admission and no queue event at the funnel.
+- `source: layer store fetch frees the funnel slot before retiring the fetch` —
+  the starter's funnel permit covers exactly the remote fetch: the
+  fetch-done hook observes the slot already released before the
+  completion bookkeeping (in-flight map retire) runs (ADR-0012).
 
 ### image
 
 - `image: global config parses overlaybd.json fields` — credential,
-  p2p, download, and log sections parse with the documented defaults.
+  p2p, download, prefetch (`enable` honored, ADR-0012), and log
+  sections parse with the documented defaults.
 - `image: per-image download overrides merge over global defaults` —
   only fields present in the image's `download` section override.
 - `image: upper config parses; unknown type rejected` — `lsmt`/`sparse`
@@ -347,6 +397,10 @@ Every test, grouped by area, with the property it guards.
   `accelerationLayer: true` image with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merged view and the trace fully
   replayed (ADR-0013).
+- `image: prefetch enable false skips trace replay but keeps recognition` —
+  with `prefetch.enable = false` the trace blob is neither loaded nor
+  replayed (stats zero), yet the acceleration layer is still excluded
+  from the merge — recognition is structural, not gated (ADR-0012).
 - `image: garbage trace layer never fails assembly` — a garbage trace
   blob still yields a working, byte-exact device (opportunistic replay).
 - `image: writable image with a trace layer assembles and replays` — a
@@ -432,6 +486,17 @@ Every test, grouped by area, with the property it guards.
   with `download.enable` set, the first open reads a prefix while the
   background fill warms every remaining extent to `overlaybd.commit`; the
   second open binds the commit with zero additional remote reads.
+- `integration: admission funnel bounds on-demand latency under scavenger load` —
+  a serialized, latency-injected mock registry (capacity 1, 25 ms
+  service) under a six-coroutine populate storm plus the background
+  fill: twelve sequential on-demand image reads each complete within a
+  bounded 2 s, byte-exactly, and the funnel's `scavenger_waits` counter
+  proves the storm was really throttled (ADR-0012 acceptance).
+- `integration: admission funnel collapses scavenger traffic under on-demand contention` —
+  two lowers sharing the one per-device funnel: while eight concurrent
+  on-demand readers stream cold extents of the top layer, the shadowed
+  bottom layer's fill makes essentially no progress, and resumes once
+  the contention stops (ADR-0012 acceptance).
 - `image: malformed remote lower digest fails assembly` — a malformed
   `sha256:` lower digest fails assembly with `EINVAL` before any registry
   I/O (ADR-0016 boundary: structural config errors fail loud).
