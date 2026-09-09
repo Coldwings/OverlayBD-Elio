@@ -128,8 +128,11 @@ that side; an empty blob gets no windows.
 **Bring-up position and class.** Warm-up runs awaited inline during
 bring-up, **after the layer chains are built and before trace replay**
 (the floor first; replay refines it), bounded by a 30 s wall-time budget
-(the same pattern and default as replay — detaching both off the
-bring-up path is the same documented follow-up). Every populate rides
+(the same pattern and default as replay). Combined with replay's
+identical budget, structural warm-up plus trace replay add at most
+**~60 s** to the worst-case device bring-up; detaching both off the
+bring-up path — now safe, since the funnel yields to on-demand reads —
+is the documented follow-up. Every populate rides
 the device's admission funnel as the **Prefetch scavenger class**
 (populate's wiring, ADR-0012), so it yields to on-demand reads
 automatically, and dedup against the open-time format probes, replay,
@@ -721,8 +724,9 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   window sizes are 0, and stops early on the wall-time budget.
 - `image: prefetch config parses structural window knobs` — the
   `prefetch` section's honored subset parses with the documented
-  defaults (enabled, 1024/1024), a 0 window size is kept, and partial
-  sections default field by field.
+  defaults (enabled, 1024/1024), a 0 window size is kept, partial
+  sections default field by field, and out-of-range window sizes
+  (negative, or above the uint32 range) are rejected with `EINVAL`.
 - `image: prefetch enable false skips structural warm-up` — with
   `prefetch.enable = false` no structural warm-up runs (stats zero)
   while the device still assembles and reads byte-exactly; with it
@@ -731,7 +735,9 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   against the multi-blob mock with 256 KiB windows: with warm-up
   enabled, `open_image` alone (no device read) fetches a head extent and
   a tail extent that only the warm-up can reach, while a middle extent
-  stays cold; with `prefetch.enable = false` the same extents stay cold
+  stays cold; extent 4 — reachable only through the +512 tar-base
+  translation of the head window — pins the windows to the tar-VIEW
+  byte space; with `prefetch.enable = false` the same extents stay cold
   and the device still reads byte-exactly (ADR-0012 cold-start floor).
 - `integration: trace layer replays warm-up through the layer store` —
   end to end against the multi-blob mock: a tar-wrapped trace layer is

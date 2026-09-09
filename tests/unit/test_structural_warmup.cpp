@@ -212,6 +212,21 @@ TEST_CASE("image: prefetch config parses structural window knobs",
         REQUIRE(g.prefetch_head_kb == 2048);
         REQUIRE(g.prefetch_tail_kb == 1024);
     }
+    // Out-of-range window sizes are rejected fail-loud: a negative value
+    // would otherwise wrap to ~4 TiB through the uint32 conversion and
+    // silently warm every layer whole at each bring-up.
+    REQUIRE_THROWS(image::GlobalConfig::from_json_text(
+        R"({"prefetch": {"head_kb": -1}})"));
+    REQUIRE_THROWS(image::GlobalConfig::from_json_text(
+        R"({"prefetch": {"tail_kb": -1024}})"));
+    REQUIRE_THROWS(image::GlobalConfig::from_json_text(
+        R"({"prefetch": {"tail_kb": 4294967296}})"));
+    // The range edges are accepted (4294967295 = uint32 max).
+    {
+        const auto g = image::GlobalConfig::from_json_text(
+            R"({"prefetch": {"head_kb": 4294967295}})");
+        REQUIRE(g.prefetch_head_kb == 4294967295u);
+    }
 }
 
 TEST_CASE("image: prefetch enable false skips structural warm-up",

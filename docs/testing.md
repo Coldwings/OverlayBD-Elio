@@ -420,7 +420,8 @@ Every test, grouped by area, with the property it guards.
 - `image: prefetch config parses structural window knobs` — the
   `prefetch` section's honored subset (`enable`, `head_kb`, `tail_kb`)
   parses with the documented defaults; 0 window sizes are kept; partial
-  sections default field by field.
+  sections default field by field; out-of-range window sizes (negative,
+  or above the uint32 range) are rejected with `EINVAL` at parse time.
 - `image: prefetch enable false skips structural warm-up` — with
   `prefetch.enable = false` no structural warm-up runs (stats zero)
   while the device assembles and reads byte-exactly; enabled, the local
@@ -521,7 +522,9 @@ Every test, grouped by area, with the property it guards.
   (256 KiB windows), `open_image` alone — no device read — fetches a
   head extent and a tail extent only the warm-up can reach (per-extent
   attribution on the multi-blob mock), while a middle extent stays cold;
-  with `prefetch.enable = false` the same extents stay cold and the
+  extent 4, reachable only through the +512 tar-base translation of the
+  head window, pins the windows to the tar-VIEW byte space; with
+  `prefetch.enable = false` the same extents stay cold and the
   device still reads byte-exactly.
 - `image: malformed remote lower digest fails assembly` — a malformed
   `sha256:` lower digest fails assembly with `EINVAL` before any registry

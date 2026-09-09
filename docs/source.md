@@ -1133,9 +1133,10 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `integration: structural warm-up fetches head and tail extents at bring-up` —
   the ADR-0012 cold-start floor end to end: with warm-up enabled,
   `open_image` alone (no device read) fetches head/tail window extents
-  only the warm-up can reach (per-extent attribution on the mock), a
-  middle extent stays cold, and with `prefetch.enable = false` nothing
-  is warmed.
+  only the warm-up can reach (per-extent attribution on the mock;
+  extent 4 pins the windows to the tar-VIEW byte space via the +512
+  translation), a middle extent stays cold, and with
+  `prefetch.enable = false` nothing is warmed.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → LayerStore → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same chain image

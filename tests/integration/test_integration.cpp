@@ -849,9 +849,15 @@ TEST_CASE("integration: trace layer replays warm-up through the layer store",
              nlohmann::json{{"digest", accel_digest},
                             {"size", trace_blob.size()}}});
         const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
-        const image::GlobalConfig global;
+        // Structural warm-up windows at 0 (ADR-0012): this test pins the
+        // REPLAY's extent attribution (an extent only the replay can
+        // reach) — the default 1 MiB head/tail windows would warm this
+        // small fixture blob whole and make the assertions below
+        // attribution-blind.
+        image::GlobalConfig global;
+        global.prefetch_head_kb = 0;
+        global.prefetch_tail_kb = 0;
         auto opened = co_await image::open_image(cfg, global);
-
         // The trace layer is set aside: one data layer, full content.
         REQUIRE(opened.layer_count == 1);
         REQUIRE(opened.virtual_size == raw.size());
@@ -1012,6 +1018,8 @@ TEST_CASE("integration: structural warm-up fetches head and tail extents at brin
     const uint64_t mid_extent_on = (payload_on.size() / 2 + 512) / kExtent;
     REQUIRE(mid_extent_off > head_probe_extent);
     REQUIRE(mid_extent_off < tail_extent_off);
+    REQUIRE(mid_extent_on > 4);  // head warm-up reaches extent 4 (below)
+    REQUIRE(mid_extent_on < tail_extent_on);
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         BlobMapServer server(
@@ -1068,6 +1076,15 @@ TEST_CASE("integration: structural warm-up fetches head and tail extents at brin
             REQUIRE(opened.warmup.windows_populated == 2);
             REQUIRE(opened.warmup.windows_failed == 0);
             REQUIRE(server.served_extent(digest_on, head_probe_extent));
+            // The windows are computed in the tar VIEW byte space: view
+            // [0, 256 KiB) translates through the +512 tar base to
+            // underlying [512, 262656), reaching 512 bytes into extent
+            // 4 — blob-space windows would stop at extent 3. Extent 4 is
+            // touched by nothing else (probes: extent 0 and the last ~2
+            // payload extents; the tail window starts far above it), so
+            // this pins the view-space choice, not just warm-up
+            // presence.
+            REQUIRE(server.served_extent(digest_on, 4));
             REQUIRE(server.served_extent(digest_on, tail_extent_on));
             REQUIRE(!server.served_extent(digest_on, mid_extent_on));
             // The warmed extents answer device reads without new remote
