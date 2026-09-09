@@ -84,6 +84,58 @@ lower wins on overlaps), or — with a configured `upper` — `MergedWritable`,
 whose topmost layer is the writable upper and whose reads fall through to
 the merged lowers.
 
+### The trace layer (ADR-0013, proposed)
+
+When the image config carries `accelerationLayer: true`, the **uppermost
+lower is the acceleration (trace) layer**, not a data layer
+([trace-format.md](./trace-format.md) §6). Assembly sets it aside — it is
+excluded from the LSMT merge, so device reads never see trace bytes — and
+replays its trace blob as cache warm-up.
+
+**Recognition chain finding.** Upstream's identification chain is: layer
+annotation `containerd.io/snapshot/overlaybd/acceleration-layer=yes` →
+containerd snapshot label → the overlaybd snapshotter writes the backstore
+config (`config.v1.json`) with `accelerationLayer: true` and appends the
+acceleration layer as the last lower → the backstore pops the last lower
+and looks for `<dir>/trace`. Our `ImageConfig` **is** the backstore config
+equivalent, so the signal surfaces as the top-level `accelerationLayer`
+boolean (added with this feature; see `docs/config.md`). Recognition
+therefore = the config flag + the blob's magic check: the trace layer is
+the last lower; its blob is loaded (locally `<dir>/trace` — the upstream
+lookup name — or `lower.file`; remotely the tar-wrapped layer blob read
+through `TarOffsetSource`) and validated by the trace codec
+(`src/format/trace.hpp`). A magic mismatch means the layer carries a
+dynamic-prefetch file list instead — unsupported by design (ADR-0013) —
+and is logged and ignored.
+
+**Replay.** Each READ record `{layer_index, offset, count}` becomes
+`populate(offset, count)` on the corresponding data lower's
+**stored-blob-level** source (the `TarOffsetSource` view — the same byte
+space upstream's `PrefetchFile` wraps, below decompression), executed in
+recorded order. **Until the admission funnel lands (B1), replay is
+awaited inline during device bring-up**, bounded by the 30 s wall-time
+budget below; the funnel will then detach it into scavenger-class
+warm-up (Fill-class by design). Skip rules follow upstream replay parity
+(trace-format.md §5/§8): non-READ ops, unknown layer indexes, zero
+counts, counts above the 1 MiB conforming-writer cap, and negative
+offsets are silently skipped. Replay is **opportunistic**: a missing,
+malformed, or stale trace and any individual populate failure are logged
+and never fail device bring-up.
+
+**Replay bounds** (`src/image/trace_replay.hpp::TraceReplayOptions`) keep
+a hostile or stale trace from amplifying registry traffic or delaying
+bring-up without limit:
+
+| Bound | Default | Rationale |
+|---|---|---|
+| `max_records` | 65536 | Real recorded traces carry thousands of records (one per pread during container start); 64k is far above legitimate sizes yet bounds the loop. |
+| `max_bytes` | 1 GiB | Warm-up beyond ~1 GiB delays the cold start more than it saves; with the 1 MiB per-record cap this also bounds extent-rounding amplification. |
+| `max_wall_time` | 30 s | Replay is awaited during bring-up; this caps the worst-case bring-up delay. |
+| `max_record_count` | 1 MiB | The upstream replay buffer cap (trace-format.md §8/§10); larger records come only from non-conforming writers and are skipped, not clamped. |
+
+The trace blob itself is read with a 64 MiB cap (a conforming trace is
+~1.5 MiB at the record bound).
+
 ### The writable mode (ADR-0008)
 
 A non-empty `upper` object in the image config engages the writable device
@@ -168,6 +220,7 @@ struct ImageConfig {
     std::vector<LowerConfig> lowers;   // bottom-up
     std::string result_file;
     source::DownloadConfig download;   // merged over the global defaults
+    bool acceleration_layer = false;   // uppermost lower is the trace layer
     UpperConfig upper;
     bool writable() const noexcept;
 
@@ -192,6 +245,11 @@ names a local blob file (empty = the layer is remote).
 `src/image/config.hpp::dir` holds the layer file; `src/image/config.hpp::type`
 selects `overlaybd.rw` (`"lsmt"`, default) or `overlaybd.sparse`
 (`"sparse"`).
+
+`src/image/config.hpp::ImageConfig::acceleration_layer` — from the
+top-level `accelerationLayer` boolean (ADR-0013, proposed): marks the
+uppermost lower as the acceleration (trace) layer; see Concepts → "The
+trace layer".
 
 `src/image/config.hpp::ImageConfig` — the per-image `config.json`.
 
@@ -221,9 +279,10 @@ selects `overlaybd.rw` (`"lsmt"`, default) or `overlaybd.sparse`
 struct OpenedImage {
     source::BlobSourcePtr root;   // MergedLsmt or MergedWritable
     uint64_t virtual_size = 0;
-    size_t layer_count = 0;
+    size_t layer_count = 0;       // data layers (trace layer excluded)
     bool writable = false;
     std::string upper_path;
+    TraceReplayStats trace;       // ADR-0013 replay outcome
 };
 
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
@@ -239,11 +298,16 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
   `writable` is set.
 - `src/image/image_file.hpp::virtual_size` — the device size in bytes (the
   merged view's size).
-- `src/image/image_file.hpp::layer_count` — number of lowers, or lowers + 1
-  in writable mode (the upper counts as a layer).
+- `src/image/image_file.hpp::layer_count` — number of DATA lowers (the
+  trace layer is excluded), or data lowers + 1 in writable mode (the
+  upper counts as a layer).
 - `writable` / `src/image/image_file.hpp::upper_path` — whether the root is
   writable, and the writable layer's file path when it is
   (`<upper.dir>/overlaybd.rw` or `<upper.dir>/overlaybd.sparse`).
+- `trace` — the `src/image/trace_replay.hpp::TraceReplayStats` outcome of
+  trace replay (ADR-0013): whether a valid trace was present, records
+  replayed/skipped, bytes warmed, and whether a replay bound stopped the
+  pass early. All zero when no `accelerationLayer` was configured.
 
 `open_image(cfg, global)` — assembles the merged view. Cold path; runs on
 the calling Elio coroutine during device setup.
@@ -259,10 +323,18 @@ Behavior, in order:
    client's accelerate prefix. Malformed addresses and unreachable proxies
    log a warning and fall back to direct registry reads (ADR-0005). One
    `RegistryClient` is shared by all layers of the image.
-4. Builds each lower per the chain in Concepts. A lower with **no local
+4. When `accelerationLayer` is set: requires at least one data lower
+   beneath the trace layer (`obd::error(EINVAL)` otherwise), sets the
+   uppermost lower aside, and loads its trace blob best-effort — every
+   load failure only disables prefetch (ADR-0013).
+5. Builds each lower per the chain in Concepts. A lower with **no local
    file and an empty `repoBlobUrl`** fails with `obd::error(EINVAL)` —
    there is nowhere to read it from.
-5. Read-only: merges with `MergedLsmt` and returns. Writable
+6. Replays the trace blob (when loaded) via
+   `src/image/trace_replay.hpp::replay_trace`: `populate()` on the data
+   lowers' stored-blob-level sources, in recorded order, sequentially
+   awaited, bounded by `TraceReplayOptions`. Never fails assembly.
+7. Read-only: merges with `MergedLsmt` and returns. Writable
    (`cfg.writable()`): creates `upper.dir` if needed, opens/creates the
    upper (`LsmtRwLayer::create` for `lsmt`, `SparseRwLayer::open` for
    `sparse`) sized to the maximum lower virtual size, merges with
@@ -276,6 +348,43 @@ not come up half-broken. `open_image` never returns a partially assembled
 image. It requires a running Elio scheduler (the DART probe, the registry
 size probes, and `LayerStore::open`'s blocking setup via
 `elio::spawn_blocking`).
+
+### `trace_replay.hpp` — TraceReplayOptions, TraceReplayStats, replay_trace
+
+```cpp
+struct TraceReplayOptions {
+    size_t max_records = 65536;
+    uint64_t max_bytes = uint64_t{1} << 30;        // 1 GiB
+    std::chrono::milliseconds max_wall_time{30000};
+    uint64_t max_record_count = 1048576;           // 1 MiB
+};
+
+struct TraceReplayStats {
+    bool trace_present = false;
+    size_t records_total = 0;
+    size_t records_replayed = 0;
+    size_t records_skipped = 0;
+    uint64_t bytes_warmed = 0;
+    bool budget_exhausted = false;
+};
+
+elio::coro::task<TraceReplayStats> replay_trace(
+    std::span<const uint8_t> blob,
+    const std::vector<source::BlobSource*>& warm_targets,
+    const TraceReplayOptions& opts = {});
+```
+
+`src/image/trace_replay.hpp::replay_trace` — parses `blob` with the trace
+codec and replays it against `warm_targets` (one stored-blob-level source
+per data lower; `layer_index` addresses the vector directly, a nullptr
+entry counts as unknown layer). Records are processed in recorded order,
+each `populate()` sequentially awaited. **Never throws**: a blob the
+codec rejects yields `{trace_present = false}`; non-READ ops, unknown
+layer indexes, zero/oversized counts, and negative offsets are skipped
+silently (upstream parity); a failed populate is logged and skipped.
+Processing stops early on any `TraceReplayOptions` bound
+(`budget_exhausted` set). The bounds and their rationale are tabulated in
+Concepts → "The trace layer".
 
 ## Invariants & Guarantees
 
@@ -366,8 +475,9 @@ metadata fields.
 ## Testing
 
 Unit tests live in `tests/unit/test_image.cpp` (config parsing and local
-assembly) and `tests/unit/test_writable.cpp` (the writable upper through
-`open_image`); integration coverage lives in
+assembly), `tests/unit/test_trace_replay.cpp` (trace replay and local
+trace-layer assembly, ADR-0013), and `tests/unit/test_writable.cpp` (the
+writable upper through `open_image`); integration coverage lives in
 `tests/integration/test_integration.cpp` (remote assembly against a mock
 registry). Run with `ctest --test-dir build --output-on-failure` (see
 `docs/testing.md`).
@@ -418,6 +528,36 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
 - `integration: enabled-but-unreachable DART falls back to direct reads` —
   with `p2pConfig` enabled against a dead address, `open_image` still opens
   and serves the full image directly from the registry (ADR-0005).
+- `image: trace replay populates traced extents in recorded order` —
+  records interleaving two lowers issue `populate` on the right target in
+  the trace's exact order, with stats accounting (ADR-0013).
+- `image: trace replay skips unknown ops, layers and bad records` — 'W'
+  and arbitrary op bytes, unknown/null layer indexes, zero and > 1 MiB
+  counts, and negative offsets are skipped silently; a failing populate
+  and a malformed blob degrade to "no prefetch", never an error.
+- `image: trace replay enforces record, byte and time budgets` — the
+  `max_records` / `max_bytes` / `max_wall_time` bounds each stop replay
+  early with `budget_exhausted` set.
+- `image: local trace layer is set aside and replayed at open` — an
+  `accelerationLayer: true` config with a local `<dir>/trace` blob opens
+  with the trace layer excluded from the merge (layer count, virtual
+  size, byte-exact content) and the trace fully replayed.
+- `image: garbage trace layer never fails assembly` — a garbage trace
+  blob still yields a working device (opportunistic replay).
+- `image: writable image with a trace layer assembles and replays` — a
+  writable (`upper`) image with `accelerationLayer` still sets the trace
+  layer aside, replays it, and serves copy-on-write reads/writes.
+- `integration: trace layer replays warm-up through the layer store` —
+  end to end against the multi-blob mock: a tar-wrapped trace layer is
+  recognized, set aside, and its records warm the data layer through
+  `TarOffsetSource::populate` → `LayerStore::populate` — the tar-header
+  translation is pinned by attributing fetched extents on the mock (an
+  extent only the replay can reach), and the device serves the data
+  layer byte-exactly (ADR-0013 acceptance).
+- `integration: trace replay warms the lower addressed by layer index` —
+  two remote dir-configured data layers: a `layer_index` 1 record warms
+  an otherwise-untouched extent of layer 1's blob only, pinning the
+  warm-target ordering end to end.
 
 Fixture data is generated in-test (`obd-mkimage`-equivalent writers from
 `src/format`, deterministic patterned bytes); the mock registry serves a
@@ -439,9 +579,14 @@ single Range-capable blob. No external golden files.
 - **Honored config surface is a subset** — `cacheConfig`, `ioEngine`,
   `prefetch`, non-file `credentialConfig` modes, and `resultFile` handling
   are parsed-as-ignored / informational in v0.1 (see `docs/config.md` for
-  the full compatibility matrix). A trace layer carried as the uppermost
-  layer is not yet recognized or replayed (proposed ADR-0013; byte-exact
-  specification in [trace-format.md](./trace-format.md)).
+  the full compatibility matrix). The trace layer IS recognized and
+  replayed (ADR-0013, proposed; see Concepts → "The trace layer"), with
+  these gaps: trace **recording** is not implemented; the
+  dynamic-prefetch file-list fallback is rejected by design; the tar
+  member name (`trace`) is not checked — recognition is the config flag
+  plus the blob magic; remote lowers without `dir` are not warmed
+  (populate is a no-op on the legacy in-memory `ChunkCache`); and replay
+  runs at normal priority until the B-phase admission funnel exists.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically** — the

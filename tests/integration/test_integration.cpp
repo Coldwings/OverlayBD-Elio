@@ -6,6 +6,7 @@
 // test_ublk_e2e.cpp and self-skips). See docs/testing.md.
 #include "common/sha256.hpp"
 #include "format/lsmt.hpp"
+#include "format/trace.hpp"
 #include "format/writer.hpp"
 #include "format/zfile.hpp"
 #include "image/image_file.hpp"
@@ -31,6 +32,8 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <set>
 
@@ -119,10 +122,13 @@ private:
 };
 
 /// RAII stop: an exception mid-test must not leave the accept loop pending
-/// (a pending detached task hangs scheduler shutdown).
+/// (a pending detached task hangs scheduler shutdown). Works with any
+/// server exposing stop().
 struct BlobGuard {
-    BlobServer& server;
-    ~BlobGuard() { server.stop(); }
+    template <typename Server>
+    explicit BlobGuard(Server& server) : stop_([&server] { server.stop(); }) {}
+    ~BlobGuard() { stop_(); }
+    std::function<void()> stop_;
 };
 
 std::string sha256_hex_of(const std::vector<uint8_t>& data) {
@@ -210,6 +216,112 @@ long sidecar_present_count(const std::string& layer_dir) {
         return present;
     }
     return -1;
+}
+
+
+/// Range-capable server hosting MULTIPLE blobs, addressed by the URL path
+/// component after /v2/ (the layer digest). Tracks per-blob data GETs and
+/// served 64 KiB extents so warm-up traffic can be attributed to the
+/// right layer (ADR-0013 trace replay test).
+class BlobMapServer {
+public:
+    BlobMapServer(std::map<std::string, std::vector<uint8_t>> blobs,
+                  uint16_t port)
+        : blobs_(std::move(blobs)), port_(port) {
+        for (const auto& [name, blob] : blobs_) {
+            stats_[name] = std::make_unique<Stats>();
+        }
+        http::router r;
+        r.add_route(http::method::GET, "/v2/*",
+                    [this](http::context& ctx) { return handler(ctx); });
+        server_ = std::make_unique<http::server>(std::move(r));
+    }
+    elio::coro::task<void> run() {
+        co_await server_->listen(elio::net::socket_address(
+            elio::net::ipv4_address("127.0.0.1", port_)));
+    }
+    void stop() { server_->stop(); }
+    std::string repo_base() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/v2";
+    }
+    uint64_t data_gets(const std::string& name) const {
+        return stats_.at(name)->data_gets.load(std::memory_order_relaxed);
+    }
+    bool served_extent(const std::string& name, uint64_t extent) const {
+        const auto* st = stats_.at(name).get();
+        std::lock_guard lk(st->extents_mu);
+        return st->extents.count(extent) != 0;
+    }
+
+private:
+    struct Stats {
+        std::atomic<uint64_t> data_gets{0};
+        mutable std::mutex extents_mu;
+        std::set<uint64_t> extents;
+    };
+
+    elio::coro::task<http::response> handler(http::context& ctx) {
+        const std::string name(ctx.req().path().substr(4));  // "/v2/" + name
+        const auto it = blobs_.find(name);
+        if (it == blobs_.end()) {
+            http::response resp(http::status::not_found);
+            resp.set_header("Content-Length", "0");
+            co_return resp;
+        }
+        const auto& blob = it->second;
+        auto* st = stats_.at(name).get();
+        const std::string_view range = ctx.req().header("Range");
+        uint64_t first = 0, last = blob.size() - 1;
+        bool partial = false;
+        if (range.starts_with("bytes=")) {
+            const auto dash = range.find('-', 6);
+            first = std::stoull(std::string(range.substr(6, dash - 6)));
+            last = std::min<uint64_t>(
+                std::stoull(std::string(range.substr(dash + 1))),
+                blob.size() - 1);
+            partial = true;
+        }
+        if (first >= blob.size() || first > last) {
+            http::response resp(http::status::range_not_satisfiable);
+            resp.set_header("Content-Length", "0");
+            co_return resp;
+        }
+        if (last > first) {  // more than the 1-byte size probe
+            st->data_gets.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard lk(st->extents_mu);
+            for (uint64_t e = first / (64 * 1024); e * 64 * 1024 <= last;
+                 ++e) {
+                st->extents.insert(e);
+            }
+        }
+        http::response resp(
+            partial ? http::status::partial_content : http::status::ok,
+            std::string_view(
+                reinterpret_cast<const char*>(blob.data() + first),
+                last - first + 1));
+        if (partial) {
+            resp.set_header("Content-Range",
+                            "bytes " + std::to_string(first) + "-" +
+                                std::to_string(last) + "/" +
+                                std::to_string(blob.size()));
+        }
+        co_return resp;
+    }
+
+    std::map<std::string, std::vector<uint8_t>> blobs_;
+    uint16_t port_;
+    std::unique_ptr<http::server> server_;
+    std::map<std::string, std::unique_ptr<Stats>> stats_;
+};
+
+/// Wraps a payload as a single-member ustar blob (the shape overlaybd
+/// registry layers take; the acceleration layer's member is named `trace`
+/// upstream — our TarOffsetSource keys on the wrapper, not the name).
+std::vector<uint8_t> tar_wrap(const std::vector<uint8_t>& payload) {
+    auto out = test::make_tar_header(payload.size());
+    out.insert(out.end(), payload.begin(), payload.end());
+    out.resize((out.size() + 511) / 512 * 512, 0);
+    return out;
 }
 
 }  // namespace
@@ -607,6 +719,171 @@ TEST_CASE("integration: completed layer store commit binds read-only without rem
             REQUIRE(buf == raw);
         }
         REQUIRE(server.data_gets() == served_gets);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: trace layer replays warm-up through the layer store",
+          "[integration]") {
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 384, 71);
+    const auto data_payload = make_zfile_blob(dir, raw);
+    // The third record's range must fit in the payload.
+    REQUIRE(data_payload.size() > 131072 + 4096);
+    const auto data_blob = tar_wrap(data_payload);
+
+    // Trace records in PAYLOAD byte space — the byte space upstream's
+    // PrefetchFile records (the layer blob file below decompression; the
+    // tar wrapper is invisible to it). With the 512B tar header the
+    // records land on underlying extents 0, 1, 2:
+    //   [0, 4096)       -> underlying [512, 4608)        extent 0
+    //   [65024, +512)   -> underlying [65536, 66048)     extent 1 ONLY
+    //   [131072, +4096) -> underlying [131584, 135680)   extent 2
+    // The second record pins the tar-base translation against the key
+    // mutation: translated it touches ONLY extent 1 (fresh — assembly
+    // probes read the zfile header in extent 0 and the trailer/index in
+    // the last extents), while an untranslated populate would touch ONLY
+    // extent 0 (65024..65536), which probe traffic already covers. With
+    // the translation dropped, extent 1 is never served and the
+    // assertion below fails.
+    format::trace::TraceWriter tw;
+    REQUIRE(tw.append({'R', 0, 4096, 0}));
+    REQUIRE(tw.append({'R', 0, 512, 65024}));
+    REQUIRE(tw.append({'R', 0, 4096, 131072}));
+    const auto trace_span = tw.finalize();
+    const auto trace_blob =
+        tar_wrap({trace_span.begin(), trace_span.end()});
+
+    const std::string data_digest = "sha256:" + sha256_hex_of(data_blob);
+    const std::string accel_digest = "sha256:" + sha256_hex_of(trace_blob);
+    const std::string layer_dir = dir / "layer_traced";
+    std::filesystem::create_directories(layer_dir);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server(
+            {{data_digest, data_blob}, {accel_digest, trace_blob}}, 19201);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        nlohmann::json cfgj;
+        cfgj["repoBlobUrl"] = server.repo_base();
+        cfgj["accelerationLayer"] = true;
+        cfgj["lowers"] = nlohmann::json::array(
+            {nlohmann::json{{"digest", data_digest},
+                            {"size", data_blob.size()},
+                            {"dir", layer_dir}},
+             nlohmann::json{{"digest", accel_digest},
+                            {"size", trace_blob.size()}}});
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        const image::GlobalConfig global;
+        auto opened = co_await image::open_image(cfg, global);
+
+        // The trace layer is set aside: one data layer, full content.
+        REQUIRE(opened.layer_count == 1);
+        REQUIRE(opened.virtual_size == raw.size());
+        // The trace was recognized and replayed end to end.
+        REQUIRE(opened.trace.trace_present);
+        REQUIRE(opened.trace.records_total == 3);
+        REQUIRE(opened.trace.records_replayed == 3);
+        REQUIRE(opened.trace.bytes_warmed == 2 * 4096 + 512);
+        // The acceleration layer blob itself was fetched (small, direct).
+        REQUIRE(server.data_gets(accel_digest) >= 1);
+        // Warm-up reached the data layer through LayerStore::populate with
+        // the tar-base translation: extents 1 and 2 are fetched ONLY by
+        // the replay (assembly probes touch the zfile header in extent 0
+        // and the trailer/index in the last extents), and extent 1 in
+        // particular is reachable only WITH the +512 translation (see the
+        // record layout above).
+        REQUIRE(server.served_extent(data_digest, 0));
+        REQUIRE(server.served_extent(data_digest, 1));
+        REQUIRE(server.served_extent(data_digest, 2));
+
+        // Device reads never see trace bytes.
+        std::vector<uint8_t> buf(raw.size());
+        const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        REQUIRE(buf == raw);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: trace replay warms the lower addressed by layer index",
+          "[integration]") {
+    // Two remote dir-configured data layers: a layer_index off-by-one or
+    // a reversed warm_targets vector would warm the WRONG blob — pinned
+    // here by a record for layer 1 whose extent nothing else touches.
+    TempDir dir;
+    // Large enough that extent 1 is a MIDDLE extent (assembly probes
+    // touch extent 0 and the last extents only).
+    const auto raw0 = test::pattern_bytes(512 * 384, 73);
+    const auto raw1 = test::pattern_bytes(512 * 384, 79);
+    const auto blob0 = make_zfile_blob(dir, raw0);
+    const auto blob1 = make_zfile_blob(dir, raw1);
+    REQUIRE(blob0.size() > 2 * 64 * 1024);
+    REQUIRE(blob1.size() > 2 * 64 * 1024);
+    // Plain (non-tar) blobs: record offsets map 1:1 to extent space.
+    format::trace::TraceWriter tw;
+    REQUIRE(tw.append({'R', 1, 4096, 65536}));  // layer 1, extent 1
+    REQUIRE(tw.append({'R', 0, 4096, 0}));      // layer 0, extent 0
+    const auto trace_span = tw.finalize();
+    const auto trace_blob =
+        tar_wrap({trace_span.begin(), trace_span.end()});
+
+    const std::string digest0 = "sha256:" + sha256_hex_of(blob0);
+    const std::string digest1 = "sha256:" + sha256_hex_of(blob1);
+    const std::string accel_digest = "sha256:" + sha256_hex_of(trace_blob);
+    const std::string layer_dir0 = dir / "layer0";
+    const std::string layer_dir1 = dir / "layer1";
+    std::filesystem::create_directories(layer_dir0);
+    std::filesystem::create_directories(layer_dir1);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server(
+            {{digest0, blob0}, {digest1, blob1}, {accel_digest, trace_blob}},
+            19202);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        nlohmann::json cfgj;
+        cfgj["repoBlobUrl"] = server.repo_base();
+        cfgj["accelerationLayer"] = true;
+        cfgj["lowers"] = nlohmann::json::array(
+            {nlohmann::json{{"digest", digest0},
+                            {"size", blob0.size()},
+                            {"dir", layer_dir0}},
+             nlohmann::json{{"digest", digest1},
+                            {"size", blob1.size()},
+                            {"dir", layer_dir1}},
+             nlohmann::json{{"digest", accel_digest},
+                            {"size", trace_blob.size()}}});
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        const image::GlobalConfig global;
+        auto opened = co_await image::open_image(cfg, global);
+
+        REQUIRE(opened.layer_count == 2);
+        REQUIRE(opened.trace.trace_present);
+        REQUIRE(opened.trace.records_replayed == 2);
+        // layer_index 1 must warm ONLY layer 1's blob: extent 1 is
+        // unreachable by assembly probes (header in extent 0, trailer and
+        // index in the last extents), so it is served exactly when the
+        // right lower is populated — and must NOT appear on layer 0.
+        REQUIRE(server.served_extent(digest1, 1));
+        REQUIRE(!server.served_extent(digest0, 1));
+
+        // The merged view is the two data layers: the top one wins.
+        REQUIRE(opened.virtual_size == raw1.size());
+        std::vector<uint8_t> buf(raw1.size());
+        const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw1.size()));
+        REQUIRE(buf == raw1);
         co_return 0;
     });
     REQUIRE(rc == 0);

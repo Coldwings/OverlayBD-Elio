@@ -137,6 +137,20 @@ exists as a regular file, in this order (`src/image/image_file.cpp::probe_local_
 
 Otherwise the lower is fetched remotely through `repoBlobUrl`.
 
+### `accelerationLayer` (optional; trace prefetch, ADR-0013 proposed)
+
+Boolean, default `false`. The snapshotter's signal that the **uppermost
+lower is the acceleration (trace) layer**, not a data layer — the same
+field upstream's backstore config (`config.v1.json`) carries
+([trace-format.md](./trace-format.md) §6). When true, image assembly sets
+the last lower aside from the merge and replays its trace blob as
+`populate` warm-up on the data lowers (see `docs/image.md` → "The trace
+layer"). Setting it requires at least one data lower beneath the trace
+layer (`EINVAL` otherwise); a missing or malformed trace blob only
+disables prefetch, never device bring-up. `recordTracePath` (upstream's
+recording trigger) is parsed-tolerated but ignored: trace **recording**
+is not implemented.
+
 ### `upper` (optional; writable mode, ADR-0008)
 
 Object. When present with a non-empty `dir`, the device becomes

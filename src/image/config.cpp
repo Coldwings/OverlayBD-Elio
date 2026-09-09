@@ -125,6 +125,9 @@ ImageConfig ImageConfig::from_json_text(const std::string& text,
         }
     }
     cfg.result_file = j.value("resultFile", "");
+    // ADR-0013: the upstream backstore config field marking the uppermost
+    // lower as the acceleration (trace) layer (trace-format.md §6).
+    cfg.acceleration_layer = j.value("accelerationLayer", false);
     if (const auto it = j.find("download"); it != j.end()) {
         apply_download_json(*it, cfg.download);
     }

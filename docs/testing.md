@@ -311,6 +311,25 @@ Every test, grouped by area, with the property it guards.
 - `image: writable upper assembles and serves writes` — a config with
   `upper.dir` opens a `MergedWritable` root that accepts and serves
   back writes (ADR-0008).
+- `image: trace replay populates traced extents in recorded order` —
+  records interleaving two lowers issue `populate` on the right target in
+  the trace's exact order (ADR-0013, proposed).
+- `image: trace replay skips unknown ops, layers and bad records` —
+  non-READ ops, unknown/null layer indexes, zero and > 1 MiB counts, and
+  negative offsets skip silently; a failing populate and a malformed blob
+  degrade to "no prefetch", never an error.
+- `image: trace replay enforces record, byte and time budgets` — the
+  `max_records` / `max_bytes` / `max_wall_time` bounds each stop replay
+  early with `budget_exhausted` set.
+- `image: local trace layer is set aside and replayed at open` — an
+  `accelerationLayer: true` image with a local `<dir>/trace` blob opens
+  with the trace layer excluded from the merged view and the trace fully
+  replayed (ADR-0013).
+- `image: garbage trace layer never fails assembly` — a garbage trace
+  blob still yields a working, byte-exact device (opportunistic replay).
+- `image: writable image with a trace layer assembles and replays` — a
+  writable (`upper`) image with `accelerationLayer` still sets the trace
+  layer aside, replays it, and serves copy-on-write reads/writes.
 
 ### ublk
 
@@ -367,6 +386,18 @@ Every test, grouped by area, with the property it guards.
   a remote lower with a configured `dir` assembles through
   RegistrySource → LayerStore and reads back byte-exactly, leaving
   read-through persistence state in the layer dir (ADR-0011).
+- `integration: trace layer replays warm-up through the layer store` — an
+  `accelerationLayer: true` image with a tar-wrapped trace layer on a
+  multi-blob mock registry: the trace is recognized, set aside from the
+  merge, and its records warm the data layer through
+  TarOffsetSource::populate → LayerStore::populate — the tar-header
+  translation is pinned by attributing fetched extents only the replay can
+  reach — and the device serves the data layer byte-exactly (ADR-0013,
+  proposed).
+- `integration: trace replay warms the lower addressed by layer index` —
+  two remote dir-configured data layers: a `layer_index` 1 record warms
+  an otherwise-untouched extent of layer 1's blob only, pinning the
+  warm-target ordering end to end (ADR-0013).
 - `integration: layer store restart serves warmed extents without remote reads` —
   a partially-warmed staging pair is resumed by a second `open_image`:
   repeated reads are served locally and the mock registry's remote-read

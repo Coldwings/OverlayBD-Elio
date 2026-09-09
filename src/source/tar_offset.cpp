@@ -118,4 +118,12 @@ elio::coro::task<ssize_t> TarOffsetSource::pread(void* buf, size_t count,
     co_return r;
 }
 
+elio::coro::task<ssize_t> TarOffsetSource::populate(uint64_t offset,
+                                                    size_t len) {
+    if (offset >= size_) co_return 0;
+    if (len > size_ - offset) len = static_cast<size_t>(size_ - offset);
+    if (len == 0) co_return 0;
+    co_return co_await src_->populate(offset + base_, len);
+}
+
 }  // namespace obd::source
