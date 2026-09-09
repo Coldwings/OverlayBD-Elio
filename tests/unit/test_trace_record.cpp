@@ -794,3 +794,39 @@ TEST_CASE("image: trace recording start race truncates the output exactly once",
     REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
     REQUIRE(records[1] == format::trace::TraceRecord{'R', 0, 8192, 65536});
 }
+
+TEST_CASE("image: trace recording drops out-of-range offsets instead of corrupting",
+          "[image]") {
+    // The wire record's offset is int64_t: an offset past INT64_MAX
+    // would silently cast into a negative blob offset. record() drops
+    // + counts such a range instead (same policy as buffer overflow).
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 99);
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        res = co_await with_recording(
+            *rec, out, [&]() -> elio::coro::task<void> {
+                // Direct bad-caller injection (the tap's offsets come
+                // from real blob sizes and can never reach this).
+                rec->record(0, static_cast<uint64_t>(INT64_MAX) + 1,
+                            4096);
+                rec->record(0, static_cast<uint64_t>(INT64_MAX) - 100,
+                            4096);  // offset+count overflows int64 too
+                co_await read_at(tap, 0, 4096);  // legitimate read
+            });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 1);   // only the legitimate read
+    REQUIRE(res.dropped == 2);   // both out-of-range calls counted
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
+}

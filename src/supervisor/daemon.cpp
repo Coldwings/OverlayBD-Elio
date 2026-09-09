@@ -650,12 +650,24 @@ private:
         };
         cmd["seq"] = seq;  // the device echoes it back
         const std::string line = cmd.dump() + "\n";
-        const auto w = co_await elio::io::async_write(fd, line.data(),
-                                                      line.size(), -1);
-        if (w.result < 0 || static_cast<size_t>(w.result) != line.size()) {
-            co_await fail_pending();
-            co_return reply_error("cannot reach the device control "
-                                  "channel: " + id);
+        // Loop the write: a short write on SOCK_STREAM is legal and
+        // retryable (buffer pressure), not a hard failure — same rule
+        // as the device side's ControlChannelWriter.
+        size_t sent = 0;
+        while (sent < line.size()) {
+            const auto w = co_await elio::io::async_write(
+                fd, line.data() + sent, line.size() - sent, -1);
+            if (w.result < 0) {
+                co_await fail_pending();
+                co_return reply_error("cannot reach the device control "
+                                      "channel: " + id);
+            }
+            if (w.result == 0) {
+                co_await fail_pending();
+                co_return reply_error("cannot reach the device control "
+                                      "channel (short write): " + id);
+            }
+            sent += static_cast<size_t>(w.result);
         }
         auto got = co_await elio::with_timeout(
             std::chrono::seconds(30),

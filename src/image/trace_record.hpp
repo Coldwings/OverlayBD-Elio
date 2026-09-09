@@ -92,7 +92,9 @@ public:
     /// IO: a short mutex section coalesces into or appends to the bounded
     /// queue; overflow increments the drop counter. count is split into
     /// <= 1 MiB record chunks (conforming-writer MUST, trace-format.md
-    /// §10 rule 4).
+    /// §10 rule 4). A range the int64 wire offset cannot represent
+    /// (offset/count past INT64_MAX) is dropped + counted rather than
+    /// silently corrupting into a negative blob offset.
     void record(uint32_t layer_index, uint64_t offset,
                 uint64_t count) noexcept;
 

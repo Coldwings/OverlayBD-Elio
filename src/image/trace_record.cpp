@@ -21,6 +21,15 @@ void TraceRecorder::record(uint32_t layer_index, uint64_t offset,
                            uint64_t count) noexcept {
     if (!recording()) return;  // fast path: disabled = one atomic load
     if (count == 0) return;
+    // The wire record's offset is int64_t; an out-of-range offset must
+    // not silently corrupt into a negative — drop + count it, exactly
+    // like a buffer-overflow drop (real blobs never reach 2^63; this
+    // guards a bad caller).
+    if (offset > static_cast<uint64_t>(INT64_MAX) ||
+        count > static_cast<uint64_t>(INT64_MAX) - offset) {
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     try {
         std::lock_guard<std::mutex> lk(mu_);
         if (state_ != State::Recording) return;  // finalized concurrently

@@ -10,6 +10,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -128,13 +129,25 @@ elio::coro::task<void> run_trace_control(
             // (1.5 -> 1) and a negative/huge integer wraps in
             // get<uint32_t> (2^40 + 300 would alias to 300). The bound
             // constants come from the recorder — single source.
+            // Signed JSON integers are read SIGNED first so a negative
+            // is rejected explicitly instead of depending on unsigned-
+            // conversion wrap; the recorder's bound constants are the
+            // single source for the accepted range.
             uint32_t duration = 0;
-            if (dit != j.end() && (dit->is_number_integer() ||
-                                   dit->is_number_unsigned())) {
-                const uint64_t u = dit->get<uint64_t>();
-                if (u >= image::TraceRecorder::kMinDurationSec &&
-                    u <= image::TraceRecorder::kMaxDurationSec) {
-                    duration = static_cast<uint32_t>(u);
+            if (dit != j.end() && dit->is_number()) {
+                int64_t v = -1;
+                if (dit->is_number_unsigned()) {
+                    const uint64_t u = dit->get<uint64_t>();
+                    if (u <= uint64_t{image::TraceRecorder::
+                                      kMaxDurationSec}) {
+                        v = static_cast<int64_t>(u);
+                    }
+                } else if (dit->is_number_integer()) {
+                    v = dit->get<int64_t>();
+                }
+                if (v >= int64_t{image::TraceRecorder::kMinDurationSec} &&
+                    v <= int64_t{image::TraceRecorder::kMaxDurationSec}) {
+                    duration = static_cast<uint32_t>(v);
                 }
             }
             if (pit == j.end() || !pit->is_string() || duration == 0) {

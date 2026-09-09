@@ -449,6 +449,9 @@ Every test, grouped by area, with the property it guards.
   test-only start hook): the loser is rejected without touching the
   file, only the winner truncates (under the state lock), and the
   winner's finalize produces a complete valid blob.
+- `image: trace recording drops out-of-range offsets instead of corrupting` —
+  an offset past INT64_MAX (or one whose count overflows int64) is
+  dropped + counted, never cast into a negative blob offset.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` image with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merged view and the trace fully

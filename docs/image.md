@@ -863,7 +863,10 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   destroy a previous valid blob or the active window;
   `image: trace recording start race truncates the output exactly once`
   — only the state winner truncates (under the lock); the loser of a
-  same-path start race touches no filesystem.
+  same-path start race touches no filesystem;
+  `image: trace recording drops out-of-range offsets instead of corrupting`
+  — an out-of-int64 range is drop-counted, never a negative blob
+  offset.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` config with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merge (layer count, virtual
