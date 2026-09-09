@@ -749,6 +749,12 @@ elio::coro::task<void> LayerStore::run_fill() {
         }
         const ssize_t r =
             co_await remote_->pread(buf->data(), buf->size(), e * es);
+        // The permit's lifetime is the remote fetch alone (the latency
+        // sample): release the window slot BEFORE the write-behind
+        // back-pressure, the error backoff, and the max_mbps throttle
+        // sleep below — those are fill-local delays, and a queued
+        // Prefetch (which outranks Fill) must not wait behind them.
+        permit.reset();
         if (r < 0 || static_cast<uint64_t>(r) != run_len) {
             // Transient remote trouble: back off (1s doubling, capped at
             // 60s) and resume the walk — persisted extents survive in the

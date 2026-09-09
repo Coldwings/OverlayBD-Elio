@@ -66,6 +66,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -186,6 +187,14 @@ public:
         return scavenger_waits_.load(std::memory_order_relaxed);
     }
 
+    /// Test-only hook invoked on the scavenger slow path between the
+    /// fast-path gate check and the waiter queue push — the window in
+    /// which a concurrent release could otherwise be lost. Never set in
+    /// production (same precedent as LayerStore's write_hook_).
+    void set_gap_hook_for_test(std::function<void()> hook) {
+        gap_hook_ = std::move(hook);
+    }
+
 private:
     struct Waiter {
         elio::sync::event admitted;
@@ -212,6 +221,7 @@ private:
     std::atomic<uint64_t> on_demand_admissions_{0};
     std::atomic<uint64_t> scavenger_admissions_{0};
     std::atomic<uint64_t> scavenger_waits_{0};
+    std::function<void()> gap_hook_;  // test-only, see set_gap_hook_for_test
 };
 
 using AdmissionFunnelPtr = std::shared_ptr<AdmissionFunnel>;

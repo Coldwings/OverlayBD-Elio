@@ -347,6 +347,20 @@ Every test, grouped by area, with the property it guards.
   the LayerStore class wiring end to end: with the window held full, a
   miss `pread` (OnDemand) completes anyway while a `populate`
   (Prefetch) queues until a slot frees (ADR-0012).
+- `source: admission funnel re-checks the gate when queueing a scavenger` —
+  lost-wakeup regression: with the check-then-queue gap injected by the
+  test hook (a slot freed against empty queues inside it), the
+  push+re-admit critical section still admits the scavenger — without
+  the re-check the acquire never wakes (ADR-0012).
+- `source: layer store fill frees the funnel window before throttling` —
+  fill's Fill-class permit covers the remote fetch alone: a Prefetch
+  queued behind the full window is admitted immediately after fill's
+  fetch completes, not after fill's 1 s `maxMBps` throttle sleep
+  (prefetch outranks fill; throttle and funnel stay separate).
+- `source: populate joining an in-flight fetch bypasses the funnel` —
+  dedup ordering (ADR-0012): a `populate` for an extent already being
+  fetched joins the in-flight fetch (coalesced join) and consumes no
+  scavenger admission and no queue event at the funnel.
 
 ### image
 

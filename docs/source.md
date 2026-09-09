@@ -623,6 +623,7 @@ public:
     uint64_t on_demand_admissions() const;
     uint64_t scavenger_admissions() const;
     uint64_t scavenger_waits() const;
+    void set_gap_hook_for_test(std::function<void()> hook);  // test-only
 };
 using AdmissionFunnelPtr = std::shared_ptr<AdmissionFunnel>;
 
@@ -1092,6 +1093,19 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: layer store populate waits at the admission funnel while reads pass` —
   with the window held full, a store `pread` (OnDemand) completes anyway
   while a `populate` (Prefetch) queues, proceeding when a slot frees.
+- `source: admission funnel re-checks the gate when queueing a scavenger` —
+  lost-wakeup regression: the scavenger slow path pushes its waiter and
+  re-runs admission in one critical section, so a release landing in the
+  check-then-queue gap (injected via the test hook) cannot strand a
+  queued waiter.
+- `source: layer store fill frees the funnel window before throttling` —
+  fill's permit covers the remote fetch alone: a queued Prefetch is
+  admitted as soon as fill's fetch completes, not after fill's 1 s
+  `maxMBps` throttle sleep.
+- `source: populate joining an in-flight fetch bypasses the funnel` — a
+  `populate` for an extent already being fetched joins the in-flight
+  fetch and consumes no scavenger admission (dedup below the funnel,
+  ADR-0012).
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → LayerStore → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same chain image

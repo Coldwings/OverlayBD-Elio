@@ -20,10 +20,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <elio/runtime/spawn.hpp>
+#include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <optional>
 #include <vector>
 
 using namespace obd;
@@ -35,6 +38,12 @@ using source::AdmissionFunnel;
 using source::ReadClass;
 
 constexpr milliseconds kSample{100};
+
+std::vector<uint8_t> slice(const std::vector<uint8_t>& v, size_t off,
+                           size_t len) {
+    return {v.begin() + static_cast<ptrdiff_t>(off),
+            v.begin() + static_cast<ptrdiff_t>(off + len)};
+}
 
 /// Polls `pred` with 1 ms coroutine sleeps; bounded.
 template <typename Pred>
@@ -60,6 +69,33 @@ public:
     std::string_view label() const noexcept override { return "rec"; }
 
     std::vector<std::pair<uint64_t, size_t>> calls;
+};
+
+/// A source whose reads block until `gate` is set (the deterministic
+/// "remote request in flight" fixture, same shape as the LayerStore
+/// tests' GatedSource).
+class GatedSource final : public source::BlobSource {
+public:
+    explicit GatedSource(std::vector<uint8_t> data)
+        : data_(std::move(data)) {}
+
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                    uint64_t offset) override {
+        co_await gate.wait();
+        if (offset >= data_.size()) co_return 0;
+        const size_t n =
+            std::min(count, static_cast<size_t>(data_.size() - offset));
+        std::memcpy(buf, data_.data() + offset, n);
+        co_return static_cast<ssize_t>(n);
+    }
+
+    uint64_t size() const noexcept override { return data_.size(); }
+    std::string_view label() const noexcept override { return "gated"; }
+
+    elio::sync::event gate;
+
+private:
+    std::vector<uint8_t> data_;
 };
 
 }  // namespace
@@ -306,6 +342,179 @@ TEST_CASE("source: layer store populate waits at the admission funnel while read
         REQUIRE(done);
         REQUIRE(populate_rc.load() == 0);
         REQUIRE(vec->reads() == 2);  // one miss + one warm fetch
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: admission funnel re-checks the gate when queueing a scavenger",
+          "[source]") {
+    // Regression: the scavenger slow path once had TWO critical sections
+    // (gate check, then waiter push) with wakeups firing only from
+    // release paths. A release landing in the gap — gate opened against
+    // empty queues — left the about-to-be-queued waiter asleep forever
+    // (lost wakeup). The gap is injected deterministically with the
+    // test hook: inside it, the slot is freed with no queued waiters.
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        AdmissionFunnel::Config cfg;
+        cfg.window_init = 1;  // room for exactly one request
+        cfg.window_min = 1;
+        cfg.window_max = 1;
+        AdmissionFunnel funnel(cfg);
+
+        auto held = co_await funnel.acquire(ReadClass::Fill);  // slot taken
+        std::atomic<bool> hook_fired{false};
+        funnel.set_gap_hook_for_test([&] {
+            hook_fired.store(true, std::memory_order_relaxed);
+            held.reset();  // gate opens against EMPTY queues
+        });
+
+        // This acquire takes the slow path (window full), the hook frees
+        // the slot in the gap, and the push+re-admit must still admit.
+        std::atomic<bool> admitted{false};
+        std::optional<AdmissionFunnel::Permit> child_permit;
+        elio::go([&]() -> elio::coro::task<void> {
+            child_permit.emplace(
+                co_await funnel.acquire(ReadClass::Prefetch));
+            admitted.store(true, std::memory_order_relaxed);
+        });
+        const bool done = co_await poll_until(
+            [&] { return admitted.load(); }, 2000);
+        REQUIRE(done);  // without the re-check this never fires
+        REQUIRE(hook_fired.load());
+        REQUIRE(funnel.inflight_total() == 1);  // the permit holds the slot
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store fill frees the funnel window before throttling",
+          "[source]") {
+    // Regression: fill's Fill-class permit once lived for the whole loop
+    // iteration — including the write-behind back-pressure and the
+    // max_mbps 1 s throttle sleep — so a queued Prefetch (documented to
+    // strictly outrank Fill) waited behind fill-local delays. The permit
+    // must cover the remote fetch alone. Deterministic shape: window 1,
+    // the fill's first coalesced fetch held open at the source gate,
+    // then a populate queues behind it; after the gate opens the
+    // populate must complete long before fill's 1 s throttle sleep ends.
+    test::TempDir dir;
+    constexpr size_t kExtent = 64 * 1024;
+    auto blob = test::pattern_bytes(32 * kExtent, 29);  // 2 MiB, 32 extents
+    const std::string digest = common::Sha256::hex(blob.data(), blob.size());
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        AdmissionFunnel::Config fcfg;
+        fcfg.window_init = 1;
+        fcfg.window_min = 1;
+        fcfg.window_max = 1;
+        auto funnel = std::make_shared<AdmissionFunnel>(fcfg);
+
+        auto* gated = new GatedSource(blob);
+        source::LayerStore::Config lsc;
+        lsc.funnel = funnel;
+        lsc.fill.enable = true;
+        lsc.fill.delay_sec = 0;
+        lsc.fill.delay_extra_sec = 0;
+        lsc.fill.max_mbps = 1;          // 1 MiB fetch -> 1 s throttle sleep
+        lsc.fill.block_size = 1024 * 1024;
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(gated), dir.str(), digest, lsc);
+
+        // The fill admits its first 1 MiB coalesced fetch (extents
+        // 0-15) and parks at the closed gate, holding the only slot.
+        const bool filling = co_await poll_until(
+            [&] { return funnel->inflight_total() == 1; });
+        REQUIRE(filling);
+
+        // A populate of a later extent is a Prefetch: it queues behind
+        // the full window.
+        std::atomic<bool> populated{false};
+        elio::go([&]() -> elio::coro::task<void> {
+            const ssize_t pr =
+                co_await store->populate(20 * kExtent, kExtent);
+            if (pr == 0) populated.store(true, std::memory_order_relaxed);
+        });
+        co_await elio::time::sleep_for(milliseconds(50));
+        REQUIRE(!populated.load());
+        REQUIRE(funnel->scavenger_waits() == 1);
+
+        // Open the gate: fill's fetch completes, its slot is released
+        // IMMEDIATELY (not after the ~1 s throttle sleep), and the
+        // queued Prefetch takes it. 700 ms << the 1 s throttle sleep.
+        gated->gate.set();
+        const bool done = co_await poll_until(
+            [&] { return populated.load(); }, 700);
+        REQUIRE(done);
+        REQUIRE(funnel->scavenger_admissions() == 2);
+
+        store->stop_fill();
+        const bool parked = co_await poll_until([&] {
+            const auto s = store->fill_status();
+            return s == source::LayerStore::FillStatus::kDone ||
+                   s == source::LayerStore::FillStatus::kStopped;
+        });
+        REQUIRE(parked);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: populate joining an in-flight fetch bypasses the funnel",
+          "[source]") {
+    // Pins the ADR-0012 dedup ordering: the in-flight join (under the
+    // LayerStore's extent map) happens BEFORE the starter's funnel
+    // acquire, so a populate for an extent already being fetched joins
+    // that fetch and never consumes a scavenger admission — whatever
+    // class started the fetch.
+    test::TempDir dir;
+    constexpr size_t kExtent = 64 * 1024;
+    auto blob = test::pattern_bytes(4 * kExtent, 31);
+    const std::string digest = common::Sha256::hex(blob.data(), blob.size());
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto funnel = std::make_shared<AdmissionFunnel>();
+        auto* gated = new GatedSource(blob);  // gate closed
+        source::LayerStore::Config lsc;
+        lsc.funnel = funnel;
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(gated), dir.str(), digest, lsc);
+
+        // An on-demand miss starts the fetch of extent 1 and parks at
+        // the closed gate.
+        std::vector<uint8_t> buf(4096);
+        std::atomic<ssize_t> read_rc{-1};
+        elio::go([&]() -> elio::coro::task<void> {
+            const ssize_t r = co_await store->pread(
+                buf.data(), buf.size(), kExtent);
+            read_rc.store(r, std::memory_order_relaxed);
+        });
+        const bool fetching = co_await poll_until(
+            [&] { return store->remote_fetches() == 1; });
+        REQUIRE(fetching);
+        REQUIRE(funnel->on_demand_admissions() == 1);
+
+        // A populate of the SAME extent joins the in-flight fetch.
+        std::atomic<bool> populated{false};
+        elio::go([&]() -> elio::coro::task<void> {
+            const ssize_t pr = co_await store->populate(kExtent, kExtent);
+            if (pr == 0) populated.store(true, std::memory_order_relaxed);
+        });
+        const bool joined = co_await poll_until(
+            [&] { return store->coalesced_joins() == 1; });
+        REQUIRE(joined);
+        // The join never reached the funnel: no scavenger admission,
+        // no queue event — and the fetch itself is still the single
+        // on-demand one.
+        REQUIRE(funnel->scavenger_admissions() == 0);
+        REQUIRE(funnel->scavenger_waits() == 0);
+
+        gated->gate.set();
+        const bool done = co_await poll_until(
+            [&] { return populated.load() && read_rc.load() >= 0; });
+        REQUIRE(done);
+        REQUIRE(read_rc.load() == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == slice(blob, kExtent, buf.size()));
         co_return 0;
     });
     REQUIRE(rc == 0);

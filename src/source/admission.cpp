@@ -93,11 +93,20 @@ elio::coro::task<AdmissionFunnel::Permit> AdmissionFunnel::acquire(
     // slot for us. The event is one-shot per waiter; waiters on these
     // paths are never cancelled (see the header contract).
     scavenger_waits_.fetch_add(1, std::memory_order_relaxed);
+    if (gap_hook_) gap_hook_();  // test-only: injects the lost-wakeup gap
     auto w = std::make_shared<Waiter>();
+    std::vector<std::shared_ptr<Waiter>> wake;
     {
         std::lock_guard lk(mu_);
         (cls == ReadClass::Prefetch ? prefetch_q_ : fill_q_).push_back(w);
+        // Push and re-admit in ONE critical section: a release that
+        // opened the gate between the fast-path check above and this
+        // push then pops our own waiter right here (FIFO order is
+        // preserved — our push precedes the admit) instead of leaving
+        // it queued with nobody left to wake it (lost wakeup).
+        admit_locked(wake);
     }
+    for (auto& wk : wake) wk->admitted.set();
     co_await w->admitted.wait();
     co_return Permit(this, cls, start);
 }
