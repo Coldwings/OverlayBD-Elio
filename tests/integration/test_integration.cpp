@@ -260,6 +260,13 @@ public:
         std::lock_guard lk(st->extents_mu);
         return st->extents.count(extent) != 0;
     }
+    /// Ordered data GETs across ALL blobs as (blob name, range first
+    /// byte) — pins cross-blob request ORDER (the
+    /// warm-up-before-trace-load test).
+    std::vector<std::pair<std::string, uint64_t>> data_get_log() const {
+        std::lock_guard lk(log_mu_);
+        return log_;
+    }
     /// Per-data-GET service latency (0 = none). Size probes stay fast.
     void set_latency(std::chrono::milliseconds d) {
         latency_ms_.store(d.count(), std::memory_order_relaxed);
@@ -313,6 +320,10 @@ private:
                     st->extents.insert(e);
                 }
             }
+            {
+                std::lock_guard lk(log_mu_);
+                log_.emplace_back(name, first);
+            }
             const int64_t lat = latency_ms_.load(std::memory_order_relaxed);
             if (lat > 0) {
                 if (serialized_.load(std::memory_order_relaxed)) {
@@ -344,6 +355,8 @@ private:
     uint16_t port_;
     std::unique_ptr<http::server> server_;
     std::map<std::string, std::unique_ptr<Stats>> stats_;
+    mutable std::mutex log_mu_;
+    std::vector<std::pair<std::string, uint64_t>> log_;
     std::atomic<int64_t> latency_ms_{0};
     std::atomic<bool> serialized_{false};
     elio::sync::mutex service_mu_;
@@ -1095,6 +1108,97 @@ TEST_CASE("integration: structural warm-up fetches head and tail extents at brin
             REQUIRE(r == static_cast<ssize_t>(raw_on.size()));
             REQUIRE(buf == raw_on);
         }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: structural warm-up runs before the trace blob load",
+          "[integration]") {
+    // ADR-0012 "the floor first": the acceleration layer's trace blob
+    // load/replay must not delay the structural warm-up — a slow or
+    // unhealthy trace layer's fetch time sits outside both warm-up
+    // budgets, so the floor runs BEFORE the first trace-blob byte is
+    // fetched. Pinned via the mock's ordered request log: a warm-up-only
+    // head extent (extent 2, beyond the open-time probes' extent 0) of
+    // the data blob is served before the FIRST data GET of the trace
+    // blob. Under the pre-fix order (trace load ahead of layer
+    // construction) the trace blob's GETs would lead the log instead.
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 384 * 6, 95);
+    const auto data_payload = make_zfile_blob(dir, raw);
+    REQUIRE(data_payload.size() > 3 * 256 * 1024);
+    const auto data_blob = tar_wrap(data_payload);
+    // One replay record into a MIDDLE extent (outside both 256 KiB
+    // windows), so replay traffic is distinguishable from warm-up
+    // traffic — and proves replay still works after the reorder.
+    format::trace::TraceWriter tw;
+    REQUIRE(tw.append({'R', 0, 4096, 640 * 1024}));
+    const auto trace_span = tw.finalize();
+    const auto trace_blob =
+        tar_wrap({trace_span.begin(), trace_span.end()});
+
+    const std::string data_digest = "sha256:" + sha256_hex_of(data_blob);
+    const std::string accel_digest = "sha256:" + sha256_hex_of(trace_blob);
+    const std::string layer_dir = dir / "layer_data";
+    std::filesystem::create_directories(layer_dir);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server(
+            {{data_digest, data_blob}, {accel_digest, trace_blob}}, 19206);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        nlohmann::json cfgj;
+        cfgj["repoBlobUrl"] = server.repo_base();
+        cfgj["accelerationLayer"] = true;
+        cfgj["lowers"] = nlohmann::json::array(
+            {nlohmann::json{{"digest", data_digest},
+                            {"size", data_blob.size()},
+                            {"dir", layer_dir}},
+             nlohmann::json{{"digest", accel_digest},
+                            {"size", trace_blob.size()}}});
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        image::GlobalConfig global;
+        global.prefetch_head_kb = 256;
+        global.prefetch_tail_kb = 256;
+        auto opened = co_await image::open_image(cfg, global);
+
+        // Both warm-up kinds ran end to end.
+        REQUIRE(opened.warmup.windows_populated == 2);
+        REQUIRE(opened.trace.trace_present);
+        REQUIRE(opened.trace.records_replayed == 1);
+
+        // The order pin: the data blob's warm-up-only head extent was
+        // served BEFORE the trace blob's first data GET.
+        const auto log = server.data_get_log();
+        size_t first_accel = log.size();
+        for (size_t i = 0; i < log.size(); ++i) {
+            if (log[i].first == accel_digest) {
+                first_accel = i;
+                break;
+            }
+        }
+        REQUIRE(first_accel < log.size());
+        bool head_extent_before = false;
+        for (size_t i = 0; i < first_accel; ++i) {
+            if (log[i].first == data_digest &&
+                log[i].second / (64 * 1024) == 2) {
+                head_extent_before = true;
+            }
+        }
+        REQUIRE(head_extent_before);
+
+        // The replay warmed the traced middle extent, and the device
+        // reads byte-exactly.
+        REQUIRE(server.served_extent(data_digest, 640 * 1024 / (64 * 1024)));
+        std::vector<uint8_t> buf(raw.size());
+        const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        REQUIRE(buf == raw);
         co_return 0;
     });
     REQUIRE(rc == 0);

@@ -126,11 +126,15 @@ into `[0, size)` so no byte is populated twice; a 0 window size disables
 that side; an empty blob gets no windows.
 
 **Bring-up position and class.** Warm-up runs awaited inline during
-bring-up, **after the layer chains are built and before trace replay**
-(the floor first; replay refines it), bounded by a 30 s wall-time budget
+bring-up, **after the layer chains are built and before the trace blob
+load and replay** (the floor first; the trace path refines it — and a
+slow trace layer's fetch time sits outside both warm-up budgets, so the
+floor must not wait on it), bounded by a 30 s wall-time budget
 (the same pattern and default as replay). Combined with replay's
 identical budget, structural warm-up plus trace replay add at most
-**~60 s** to the worst-case device bring-up; detaching both off the
+**~60 s** to the worst-case device bring-up (plus the trace blob load,
+bounded only by the registry client's timeouts — see "The trace layer");
+detaching both off the
 bring-up path — now safe, since the funnel yields to on-demand reads —
 is the documented follow-up. Every populate rides
 the device's admission funnel as the **Prefetch scavenger class**
@@ -171,12 +175,19 @@ and is logged and ignored.
 `populate(offset, count)` on the corresponding data lower's
 **stored-blob-level** source (the `TarOffsetSource` view — the same byte
 space upstream's `PrefetchFile` wraps, below decompression), executed in
-recorded order. Replay is **awaited inline during device bring-up**,
-bounded by the 30 s wall-time budget below; every populate it issues
-passes the device's read admission funnel (ADR-0012) as the **Prefetch
-scavenger class**, outranking background fill. Detaching replay off the
-bring-up path — now safe, since the funnel yields to on-demand reads —
-is a documented follow-up. The global `prefetch.enable` switch
+recorded order. The trace blob load and the replay are **awaited inline
+during device bring-up, after the structural warm-up** (ADR-0012's floor
+runs first — a slow or unhealthy trace layer must not delay it); replay
+is bounded by the 30 s wall-time budget below, and every populate it
+issues passes the device's read admission funnel (ADR-0012) as the
+**Prefetch scavenger class**, outranking background fill. Detaching
+replay off the bring-up path — now safe, since the funnel yields to
+on-demand reads — is a documented follow-up. The blob **load** itself
+carries no wall-clock budget: its only time bound is the registry
+client's connect (10 s) / read (30 s) timeouts with up to 3 attempts per
+request (worst case minutes for a hanging registry — bounding the load
+phase itself is a documented follow-up, needing cancellation the funnel
+paths deliberately lack). The global `prefetch.enable` switch
 (`docs/config.md`) gates the trace load/replay. Skip rules follow
 upstream replay parity
 (trace-format.md §5/§8): non-READ ops, unknown layer indexes, zero
@@ -424,9 +435,9 @@ Behavior, in order:
    log a warning and fall back to direct registry reads (ADR-0005). One
    `RegistryClient` is shared by all layers of the image.
 4. When `accelerationLayer` is set: requires at least one data lower
-   beneath the trace layer (`obd::error(EINVAL)` otherwise), sets the
-   uppermost lower aside, and loads its trace blob best-effort — every
-   load failure only disables prefetch (ADR-0013).
+   beneath the trace layer (`obd::error(EINVAL)` otherwise) and sets the
+   uppermost lower aside. Recognition is structural and always applies;
+   the trace blob itself is **not** loaded yet (see step 7).
 5. Builds each lower per the chain in Concepts. A lower with **no local
    file and an empty `repoBlobUrl`** fails with `obd::error(EINVAL)` —
    there is nowhere to read it from.
@@ -435,7 +446,10 @@ Behavior, in order:
    `prefetch.enable`): head/tail windows on the data lowers'
    stored-blob-level sources, sequentially awaited under a wall-time
    budget, Prefetch scavenger class. Never fails assembly.
-7. Replays the trace blob (when loaded) via
+7. With the floor warmed, loads the acceleration layer's trace blob
+   best-effort (when `accelerationLayer` is set and `prefetch.enable`) —
+   every load failure only disables prefetch (ADR-0013) — and replays it
+   via
    `src/image/trace_replay.hpp::replay_trace`: `populate()` on the data
    lowers' stored-blob-level sources, in recorded order, sequentially
    awaited, bounded by `TraceReplayOptions`. Never fails assembly.
@@ -739,6 +753,11 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   translation of the head window — pins the windows to the tar-VIEW
   byte space; with `prefetch.enable = false` the same extents stay cold
   and the device still reads byte-exactly (ADR-0012 cold-start floor).
+- `integration: structural warm-up runs before the trace blob load` —
+  the mock's ordered cross-blob request log pins ADR-0012's "floor
+  first": a warm-up-only head extent of the data blob is served before
+  the trace blob's first data GET, and replay of a traced middle extent
+  still completes (a slow trace layer must not delay the floor).
 - `integration: trace layer replays warm-up through the layer store` —
   end to end against the multi-blob mock: a tar-wrapped trace layer is
   recognized, set aside, and its records warm the data layer through

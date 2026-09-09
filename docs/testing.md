@@ -526,6 +526,11 @@ Every test, grouped by area, with the property it guards.
   head window, pins the windows to the tar-VIEW byte space; with
   `prefetch.enable = false` the same extents stay cold and the
   device still reads byte-exactly.
+- `integration: structural warm-up runs before the trace blob load` —
+  ADR-0012 "floor first": via the mock's ordered cross-blob request log,
+  a warm-up-only head extent of the data blob is served BEFORE the
+  trace blob's first data GET, while replay of a traced middle extent
+  still completes and the device reads byte-exactly.
 - `image: malformed remote lower digest fails assembly` — a malformed
   `sha256:` lower digest fails assembly with `EINVAL` before any registry
   I/O (ADR-0016 boundary: structural config errors fail loud).

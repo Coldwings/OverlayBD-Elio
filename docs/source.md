@@ -1137,6 +1137,10 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   extent 4 pins the windows to the tar-VIEW byte space via the +512
   translation), a middle extent stays cold, and with
   `prefetch.enable = false` nothing is warmed.
+- `integration: structural warm-up runs before the trace blob load` —
+  ADR-0012 "floor first", pinned via the mock's ordered request log: a
+  warm-up-only head extent of the data blob is served before the trace
+  blob's first data GET, so a slow trace layer cannot delay the floor.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → LayerStore → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same chain image

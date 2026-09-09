@@ -167,23 +167,19 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     // Trace layer recognition (ADR-0013; trace-format.md §6):
     // `accelerationLayer: true` marks the UPPERMOST lower as the
     // acceleration layer. It is NOT a data layer: set it aside from the
-    // merge and load its trace blob best-effort (a missing/unreadable
-    // blob only disables prefetch, never assembly). The global
-    // `prefetch.enable` switch gates the trace load/replay alone —
-    // recognition (setting the layer aside) is structural and always
-    // applies.
+    // merge. Recognition is structural and always applies — but the
+    // trace blob itself is loaded only AFTER the structural warm-up
+    // below (ADR-0012's floor runs first: a slow or unhealthy trace
+    // layer must not delay it; the load's only time bound is the
+    // registry client's connect/read timeouts and retries, which sits
+    // outside both warm-up budgets).
     std::span<const LowerConfig> data_lowers(cfg.lowers);
-    std::vector<uint8_t> trace_blob;
     if (cfg.acceleration_layer) {
         if (cfg.lowers.size() < 2) {
             throw error(EINVAL, "accelerationLayer set but the image has no "
                                 "data lower beneath it");
         }
         data_lowers = data_lowers.first(cfg.lowers.size() - 1);
-        if (global.prefetch_enable) {
-            trace_blob = co_await load_trace_blob(cfg.lowers.back(), cfg,
-                                                  client, funnel);
-        }
     }
 
     std::vector<std::unique_ptr<format::LsmtLayer>> layers;
@@ -320,12 +316,19 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         warmup_stats = co_await warmup_structural(warm_targets, wopts);
     }
 
-    // Trace replay (ADR-0013): warm the data lowers from the recorded
-    // access pattern before the merge takes ownership of the layer chain.
-    // Opportunistic — failures only disable prefetch.
+    // Trace replay (ADR-0013): with the floor warmed, load the
+    // acceleration layer's trace blob best-effort (a missing, unreadable,
+    // or slow blob only disables prefetch — the device is already fully
+    // functional, C3's contract; `prefetch.enable` gates the load/replay)
+    // and warm the data lowers from the recorded access pattern before
+    // the merge takes ownership of the layer chain.
     TraceReplayStats trace_stats;
-    if (!trace_blob.empty()) {
-        trace_stats = co_await replay_trace(trace_blob, warm_targets);
+    if (cfg.acceleration_layer && global.prefetch_enable) {
+        const std::vector<uint8_t> trace_blob = co_await load_trace_blob(
+            cfg.lowers.back(), cfg, client, funnel);
+        if (!trace_blob.empty()) {
+            trace_stats = co_await replay_trace(trace_blob, warm_targets);
+        }
     }
 
     const size_t n = layers.size();
