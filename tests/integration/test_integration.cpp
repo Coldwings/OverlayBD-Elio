@@ -260,6 +260,13 @@ public:
         std::lock_guard lk(st->extents_mu);
         return st->extents.count(extent) != 0;
     }
+    /// Ordered data GETs across ALL blobs as (blob name, range first
+    /// byte) — pins cross-blob request ORDER (the
+    /// warm-up-before-trace-load test).
+    std::vector<std::pair<std::string, uint64_t>> data_get_log() const {
+        std::lock_guard lk(log_mu_);
+        return log_;
+    }
     /// Per-data-GET service latency (0 = none). Size probes stay fast.
     void set_latency(std::chrono::milliseconds d) {
         latency_ms_.store(d.count(), std::memory_order_relaxed);
@@ -313,6 +320,10 @@ private:
                     st->extents.insert(e);
                 }
             }
+            {
+                std::lock_guard lk(log_mu_);
+                log_.emplace_back(name, first);
+            }
             const int64_t lat = latency_ms_.load(std::memory_order_relaxed);
             if (lat > 0) {
                 if (serialized_.load(std::memory_order_relaxed)) {
@@ -344,6 +355,8 @@ private:
     uint16_t port_;
     std::unique_ptr<http::server> server_;
     std::map<std::string, std::unique_ptr<Stats>> stats_;
+    mutable std::mutex log_mu_;
+    std::vector<std::pair<std::string, uint64_t>> log_;
     std::atomic<int64_t> latency_ms_{0};
     std::atomic<bool> serialized_{false};
     elio::sync::mutex service_mu_;
@@ -676,7 +689,13 @@ TEST_CASE("integration: layer store restart serves warmed extents without remote
         const auto cfgj = remote_image_config_with_dir(
             server.repo_base(), digest_hex, blob.size(), layer_dir);
         const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
-        const image::GlobalConfig global;
+        // Structural warm-up windows at 0 (ADR-0012): this test pins
+        // read-through persistence accounting across a restart — the
+        // default 1 MiB head/tail windows would warm this small blob
+        // whole at the first open and drive the store to completion.
+        image::GlobalConfig global;
+        global.prefetch_head_kb = 0;
+        global.prefetch_tail_kb = 0;
 
         // Run 1 (cold): open and read only a prefix of the image, then wait
         // until every remotely-served extent has been persisted — teardown
@@ -843,9 +862,15 @@ TEST_CASE("integration: trace layer replays warm-up through the layer store",
              nlohmann::json{{"digest", accel_digest},
                             {"size", trace_blob.size()}}});
         const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
-        const image::GlobalConfig global;
+        // Structural warm-up windows at 0 (ADR-0012): this test pins the
+        // REPLAY's extent attribution (an extent only the replay can
+        // reach) — the default 1 MiB head/tail windows would warm this
+        // small fixture blob whole and make the assertions below
+        // attribution-blind.
+        image::GlobalConfig global;
+        global.prefetch_head_kb = 0;
+        global.prefetch_tail_kb = 0;
         auto opened = co_await image::open_image(cfg, global);
-
         // The trace layer is set aside: one data layer, full content.
         REQUIRE(opened.layer_count == 1);
         REQUIRE(opened.virtual_size == raw.size());
@@ -929,7 +954,13 @@ TEST_CASE("integration: trace replay warms the lower addressed by layer index",
              nlohmann::json{{"digest", accel_digest},
                             {"size", trace_blob.size()}}});
         const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
-        const image::GlobalConfig global;
+        // Structural warm-up windows at 0 (ADR-0012): this test pins
+        // trace-replay attribution — which exact extents the REPLAY
+        // fetches — so the default 1 MiB head/tail windows (which would
+        // warm these small blobs whole) must stay out of the way.
+        image::GlobalConfig global;
+        global.prefetch_head_kb = 0;
+        global.prefetch_tail_kb = 0;
         auto opened = co_await image::open_image(cfg, global);
 
         REQUIRE(opened.layer_count == 2);
@@ -948,6 +979,244 @@ TEST_CASE("integration: trace replay warms the lower addressed by layer index",
         const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
         REQUIRE(r == static_cast<ssize_t>(raw1.size()));
         REQUIRE(buf == raw1);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: structural warm-up fetches head and tail extents at bring-up",
+          "[integration]") {
+    // ADR-0012's cold-start floor: with warm-up enabled, open_image alone
+    // (NO device read) persists the head/tail window extents of each
+    // lower; with `prefetch.enable = false` the same extents stay cold.
+    // The two phases run against DIFFERENT blobs on one mock server so
+    // per-blob extent attribution stays phase-local. Windows are 256 KiB
+    // per side (4 extents) to keep the fixture small; the blob is large
+    // enough that a middle extent sits outside both windows and outside
+    // the open-time probes (which touch the tar/zfile headers in extent
+    // 0 and the zfile trailer/jump table plus the LSMT index in the
+    // last ~2 payload extents).
+    TempDir dir;
+    const auto raw_off = test::pattern_bytes(512 * 384 * 6, 91);
+    const auto raw_on = test::pattern_bytes(512 * 384 * 6, 92);
+    const auto payload_off = make_zfile_blob(dir, raw_off);
+    const auto payload_on = make_zfile_blob(dir, raw_on);
+    const auto blob_off = tar_wrap(payload_off);
+    const auto blob_on = tar_wrap(payload_on);
+    constexpr uint64_t kWindow = 256 * 1024;
+    constexpr uint64_t kExtent = 64 * 1024;
+    REQUIRE(payload_off.size() > 3 * kWindow);
+    REQUIRE(payload_on.size() > 3 * kWindow);
+
+    const std::string digest_off = "sha256:" + sha256_hex_of(blob_off);
+    const std::string digest_on = "sha256:" + sha256_hex_of(blob_on);
+    const std::string dir_off = dir / "layer_off";
+    const std::string dir_on = dir / "layer_on";
+    std::filesystem::create_directories(dir_off);
+    std::filesystem::create_directories(dir_on);
+
+    // ustar base offset 512: the head window [0, 256 KiB) of the view
+    // maps to underlying extents 0..4; extent 2 is reachable ONLY by the
+    // head warm-up. The tail window [size-256 KiB, size) of the view
+    // maps to underlying [size-256 KiB+512, size+512); its first extent
+    // sits ~4 extents back from the payload end, beyond the probes'
+    // reach. The middle extent must stay cold in BOTH phases (bounded
+    // windows — warm-up must not flood the whole blob).
+    const uint64_t head_probe_extent = 2;
+    const uint64_t tail_extent_off =
+        (payload_off.size() + 512 - kWindow) / kExtent;
+    const uint64_t tail_extent_on =
+        (payload_on.size() + 512 - kWindow) / kExtent;
+    const uint64_t mid_extent_off = (payload_off.size() / 2 + 512) / kExtent;
+    const uint64_t mid_extent_on = (payload_on.size() / 2 + 512) / kExtent;
+    REQUIRE(mid_extent_off > head_probe_extent);
+    REQUIRE(mid_extent_off < tail_extent_off);
+    REQUIRE(mid_extent_on > 4);  // head warm-up reaches extent 4 (below)
+    REQUIRE(mid_extent_on < tail_extent_on);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server(
+            {{digest_off, blob_off}, {digest_on, blob_on}}, 19205);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        auto make_cfg = [&](const std::string& digest, uint64_t size,
+                            const std::string& layer_dir) {
+            nlohmann::json cfgj;
+            cfgj["repoBlobUrl"] = server.repo_base();
+            cfgj["lowers"] = nlohmann::json::array(
+                {nlohmann::json{{"digest", digest},
+                                {"size", size},
+                                {"dir", layer_dir}}});
+            return image::ImageConfig::from_json_text(cfgj.dump(), {});
+        };
+
+        // Phase 1 — warm-up disabled: after bring-up, the head/tail
+        // window extents were NOT fetched (only the open-time probes
+        // ran), yet the device serves byte-exactly on demand.
+        {
+            const auto cfg = make_cfg(digest_off, blob_off.size(), dir_off);
+            image::GlobalConfig global;
+            global.prefetch_enable = false;
+            auto opened = co_await image::open_image(cfg, global);
+            REQUIRE(opened.warmup.windows_populated == 0);
+            REQUIRE(!server.served_extent(digest_off, head_probe_extent));
+            REQUIRE(!server.served_extent(digest_off, tail_extent_off));
+            REQUIRE(!server.served_extent(digest_off, mid_extent_off));
+            std::vector<uint8_t> buf(raw_off.size());
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(raw_off.size()));
+            REQUIRE(buf == raw_off);
+        }
+
+        // Phase 2 — warm-up enabled: after bring-up and BEFORE any
+        // device read, the head window's extents (extent 2, beyond the
+        // header probes) and the tail window's first extent (beyond the
+        // trailer/index probes) are already fetched through the
+        // LayerStore; the middle extent is not.
+        {
+            const auto cfg = make_cfg(digest_on, blob_on.size(), dir_on);
+            image::GlobalConfig global;
+            global.prefetch_head_kb = 256;
+            global.prefetch_tail_kb = 256;
+            auto opened = co_await image::open_image(cfg, global);
+            REQUIRE(opened.warmup.layers_total == 1);
+            REQUIRE(opened.warmup.layers_warmed == 1);
+            REQUIRE(opened.warmup.windows_populated == 2);
+            REQUIRE(opened.warmup.windows_failed == 0);
+            REQUIRE(server.served_extent(digest_on, head_probe_extent));
+            // The windows are computed in the tar VIEW byte space: view
+            // [0, 256 KiB) translates through the +512 tar base to
+            // underlying [512, 262656), reaching 512 bytes into extent
+            // 4 — blob-space windows would stop at extent 3. Extent 4 is
+            // touched by nothing else (probes: extent 0 and the last ~2
+            // payload extents; the tail window starts far above it), so
+            // this pins the view-space choice, not just warm-up
+            // presence.
+            REQUIRE(server.served_extent(digest_on, 4));
+            REQUIRE(server.served_extent(digest_on, tail_extent_on));
+            REQUIRE(!server.served_extent(digest_on, mid_extent_on));
+            // The warmed extents answer device reads without new remote
+            // traffic, and the full image reads back byte-exactly.
+            std::vector<uint8_t> buf(raw_on.size());
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(raw_on.size()));
+            REQUIRE(buf == raw_on);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: structural warm-up runs before the trace blob load",
+          "[integration]") {
+    // ADR-0012 "the floor first": the acceleration layer's trace blob
+    // load/replay must not delay the structural warm-up — a slow or
+    // unhealthy trace layer's fetch time sits outside both warm-up
+    // budgets, so the floor runs BEFORE the first trace-blob byte is
+    // fetched. Pinned via the mock's ordered request log: BOTH warm-up
+    // windows of the data blob — the warm-up-only head extent 2 (beyond
+    // the open-time probes' extent 0) AND the tail window's first
+    // extent (beyond the probes' last ~2 payload extents) — are served
+    // before the FIRST data GET of the trace blob. Requiring both
+    // windows closes the loophole a head→trace→tail regression order
+    // would otherwise slip through. Under the pre-fix order (trace
+    // load ahead of layer construction) the trace blob's GETs would
+    // lead the log instead.
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 384 * 6, 95);
+    const auto data_payload = make_zfile_blob(dir, raw);
+    REQUIRE(data_payload.size() > 3 * 256 * 1024);
+    const auto data_blob = tar_wrap(data_payload);
+    // ustar base offset 512 (same arithmetic as the extent-4 pin): the
+    // tail window [size-256 KiB, size) of the view maps to underlying
+    // [size-256 KiB+512, size+512); its first extent sits ~4 extents
+    // back from the payload end, past the probes' reach.
+    const uint64_t tail_extent =
+        (data_payload.size() + 512 - 256 * 1024) / (64 * 1024);
+    // Distinct from the head pin (extent 2) and from the traced middle
+    // extent (640 KiB) below, so each pin attributes to its own cause.
+    REQUIRE(tail_extent > 640 * 1024 / (64 * 1024));
+    // One replay record into a MIDDLE extent (outside both 256 KiB
+    // windows), so replay traffic is distinguishable from warm-up
+    // traffic — and proves replay still works after the reorder.
+    format::trace::TraceWriter tw;
+    REQUIRE(tw.append({'R', 0, 4096, 640 * 1024}));
+    const auto trace_span = tw.finalize();
+    const auto trace_blob =
+        tar_wrap({trace_span.begin(), trace_span.end()});
+
+    const std::string data_digest = "sha256:" + sha256_hex_of(data_blob);
+    const std::string accel_digest = "sha256:" + sha256_hex_of(trace_blob);
+    const std::string layer_dir = dir / "layer_data";
+    std::filesystem::create_directories(layer_dir);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server(
+            {{data_digest, data_blob}, {accel_digest, trace_blob}}, 19206);
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        nlohmann::json cfgj;
+        cfgj["repoBlobUrl"] = server.repo_base();
+        cfgj["accelerationLayer"] = true;
+        cfgj["lowers"] = nlohmann::json::array(
+            {nlohmann::json{{"digest", data_digest},
+                            {"size", data_blob.size()},
+                            {"dir", layer_dir}},
+             nlohmann::json{{"digest", accel_digest},
+                            {"size", trace_blob.size()}}});
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        image::GlobalConfig global;
+        global.prefetch_head_kb = 256;
+        global.prefetch_tail_kb = 256;
+        auto opened = co_await image::open_image(cfg, global);
+
+        // Both warm-up kinds ran end to end.
+        REQUIRE(opened.warmup.windows_populated == 2);
+        REQUIRE(opened.trace.trace_present);
+        REQUIRE(opened.trace.records_replayed == 1);
+
+        // The order pin: BOTH of the data blob's warm-up-only extents
+        // (head window, tail window) were served BEFORE the trace
+        // blob's first data GET — a head→trace→tail order fails red on
+        // the tail check.
+        const auto log = server.data_get_log();
+        size_t first_accel = log.size();
+        for (size_t i = 0; i < log.size(); ++i) {
+            if (log[i].first == accel_digest) {
+                first_accel = i;
+                break;
+            }
+        }
+        REQUIRE(first_accel < log.size());
+        bool head_extent_before = false;
+        bool tail_extent_before = false;
+        for (size_t i = 0; i < first_accel; ++i) {
+            if (log[i].first != data_digest) continue;
+            if (log[i].second / (64 * 1024) == 2) head_extent_before = true;
+            if (log[i].second / (64 * 1024) == tail_extent) {
+                tail_extent_before = true;
+            }
+        }
+        REQUIRE(head_extent_before);
+        REQUIRE(tail_extent_before);
+
+        // The replay warmed the traced middle extent, and the device
+        // reads byte-exactly.
+        REQUIRE(server.served_extent(data_digest, 640 * 1024 / (64 * 1024)));
+        std::vector<uint8_t> buf(raw.size());
+        const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        REQUIRE(buf == raw);
         co_return 0;
     });
     REQUIRE(rc == 0);
@@ -1091,7 +1360,12 @@ TEST_CASE("integration: admission funnel collapses scavenger traffic under on-de
         cfgj["download"] = nlohmann::json{
             {"enable", true}, {"delay", 0}, {"delayExtra", 0}};
         const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
-        const image::GlobalConfig global;
+        // Structural warm-up windows at 0 (ADR-0012): the phase-1
+        // on-demand fetch counts below assume every read extent is cold;
+        // pre-warmed head/tail extents would shrink them.
+        image::GlobalConfig global;
+        global.prefetch_head_kb = 0;
+        global.prefetch_tail_kb = 0;
         auto opened = co_await image::open_image(cfg, global);
         REQUIRE(opened.layer_stores.size() == 2);
         source::LayerStore* top = opened.layer_stores[1];

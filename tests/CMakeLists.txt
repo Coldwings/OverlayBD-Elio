@@ -10,6 +10,7 @@ add_executable(obd_unit_tests
     unit/test_format.cpp
     unit/test_trace.cpp
     unit/test_trace_replay.cpp
+    unit/test_structural_warmup.cpp
     unit/test_source.cpp
     unit/test_admission.cpp
     unit/test_layer_store.cpp

@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 namespace obd::image {
@@ -46,6 +47,26 @@ void apply_download_json(const nlohmann::json& j,
         base.block_size = j["blockSize"].get<uint32_t>();
 }
 
+/// prefetch.head_kb / prefetch.tail_kb: one structural warm-up window
+/// size in KiB (default 1024 when the key is absent). A negative value
+/// would wrap to ~4 TiB through the uint32 conversion and silently warm
+/// every layer whole at each bring-up, so out-of-range values are
+/// rejected fail-loud — structural config errors fail loud (the same
+/// ruling as the malformed lower digest, ADR-0016's boundary).
+uint32_t prefetch_window_kb(const nlohmann::json& j, const char* key) {
+    if (!j.contains(key)) return 1024;
+    const int64_t v = j[key].get<int64_t>();
+    if (v < 0 || v > std::numeric_limits<uint32_t>::max()) {
+        throw error(EINVAL,
+                    std::string("prefetch.") + key + " out of range: " +
+                        std::to_string(v) + " (want 0.." +
+                        std::to_string(
+                            std::numeric_limits<uint32_t>::max()) +
+                        ")");
+    }
+    return static_cast<uint32_t>(v);
+}
+
 }  // namespace
 
 GlobalConfig GlobalConfig::from_file(const std::string& path) {
@@ -81,9 +102,12 @@ GlobalConfig GlobalConfig::from_json_text(const std::string& text) {
     }
     if (const auto it = j.find("prefetch"); it != j.end() && it->is_object()) {
         // ADR-0012/0013: the honored subset of the upstream prefetch
-        // section is the master switch alone — the admission funnel's
-        // AIMD window is deliberately not operator-configured.
+        // section is the master switch plus the structural head/tail
+        // window sizes — the admission funnel's AIMD window is
+        // deliberately not operator-configured.
         cfg.prefetch_enable = it->value("enable", true);
+        cfg.prefetch_head_kb = prefetch_window_kb(*it, "head_kb");
+        cfg.prefetch_tail_kb = prefetch_window_kb(*it, "tail_kb");
     }
     // cacheConfig / ioEngine: intentionally not honored in v0.1
     // (docs/config.md).

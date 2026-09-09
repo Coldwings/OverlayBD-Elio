@@ -85,15 +85,25 @@ queued behind it. Locality grows with reads regardless of
 
 ### `prefetch` (ADR-0012/0013)
 
-Trace-replay warm-up. **Only `enable` is honored** — previously the whole
-section was parsed-tolerated (ignored); with the ADR-0012 admission
-funnel the master switch became meaningful. The funnel's AIMD window is
-deliberately **not** operator-configured (ADR-0012 rejects static
-budgets), so no window or AIMD fields are exposed.
+Bring-up warm-up: the structural head/tail prefetch (ADR-0012's
+cold-start floor) and trace replay (ADR-0013). **Honored fields:
+`enable`, `head_kb`, `tail_kb`** — previously the whole section was
+parsed-tolerated (ignored); with the ADR-0012 admission funnel the
+master switch became meaningful, and the structural window sizes landed
+with the warm-up itself. The funnel's AIMD window is deliberately
+**not** operator-configured (ADR-0012 rejects static budgets), so no
+window or AIMD fields are exposed.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `enable` | bool | `true` | Master switch for trace-replay prefetch: when false, an acceleration layer's trace blob is neither loaded nor replayed (the layer is still set aside from the merge — recognition is structural). Replayed traffic rides the funnel's Prefetch scavenger class either way. |
+| `enable` | bool | `true` | Master switch for BOTH warm-up kinds: when false, no warm-up traffic is issued at bring-up — an acceleration layer's trace blob is neither loaded nor replayed (the layer is still set aside from the merge — recognition is structural), and the structural head/tail windows are not populated. Warm-up traffic rides the funnel's Prefetch scavenger class either way. |
+| `head_kb` | uint | `1024` | Structural warm-up head window, in KiB: the first `head_kb` KiB of every data lower's stored blob (the tar-stripped payload byte space — ZFile/LSMT headers and first data blocks; the tar header itself sits in the same first underlying extents) are populated at bring-up. `0` disables the head window. Accepted range 0..4294967295 (uint32) — out-of-range values are rejected with `EINVAL` at parse time (a negative would otherwise wrap to ~4 TiB and silently warm whole layers). |
+| `tail_kb` | uint | `1024` | Structural warm-up tail window, in KiB: the last `tail_kb` KiB of every data lower's stored blob payload — the region carrying the ZFile jump table + trailer and the LSMT index — are populated at bring-up. `0` disables the tail window. Accepted range and rejection as for `head_kb`. |
+
+A blob smaller than `head_kb + tail_kb` is warmed whole (the clamped
+windows merge — no byte is populated twice). Warm-up is opportunistic:
+failures are logged and skipped, never a bring-up error; see
+`docs/image.md` → "Structural warm-up".
 
 ### `logConfig`
 
@@ -112,7 +122,8 @@ budgets), so no window or AIMD fields are exposed.
 `cacheConfig` and `ioEngine` are parsed-tolerated (ignored as unknown
 sections) in the current version; see *Limitations & TODO* in
 `docs/architecture.md`. (`prefetch` was in this list until the ADR-0012
-admission funnel landed; its `enable` field is now honored — see above.)
+admission funnel landed; its `enable`, `head_kb`, and `tail_kb` fields
+are now honored — see above.)
 
 ## Per-image config: `config.json`
 

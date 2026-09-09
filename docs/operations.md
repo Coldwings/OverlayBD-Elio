@@ -67,7 +67,11 @@ keep their overlaybd meaning):
 1. **Global `overlaybd.json`** (default `/etc/overlaybd-elio/overlaybd.json`,
    overridable with obd-supervisor `--global`): registry credentials
    (`credentialConfig`, `mode=file` only), the DART P2P proxy
-   (`p2pConfig`), download defaults, and `logConfig.logLevel`.
+   (`p2pConfig`), download defaults, bring-up warm-up (`prefetch`:
+   `enable` plus the structural `head_kb`/`tail_kb` windows — the
+   defaults warm 1 MiB at each end of every layer at scavenger priority;
+   shrink them on very small layers or when bring-up time matters more
+   than first-read latency), and `logConfig.logLevel`.
 2. **Per-image `config.json`** (as written by the overlaybd-snapshotter;
    passed via `obdctl create <id> <config.json>`): `repoBlobUrl`,
    `lowers[]` (digest/size/file), optional per-image `download` overrides,

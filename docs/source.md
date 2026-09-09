@@ -243,9 +243,11 @@ The class taxonomy and admission rules:
   **immediately and unconditionally**, even if that momentarily exceeds
   the concurrency window; delaying a guest-visible miss to protect a
   window is never correct.
-- **Prefetch** — trace-replay warm-up (`LayerStore::populate`, ADR-0013).
-  A scavenger: admitted only when **no on-demand request is in flight**
-  AND total in-flight requests are **below the AIMD window**.
+- **Prefetch** — warm-up `populate` traffic (`LayerStore::populate`):
+  the structural head/tail warm-up at bring-up (ADR-0012's cold-start
+  floor) and trace replay (ADR-0013). A scavenger: admitted only when
+  **no on-demand request is in flight** AND total in-flight requests are
+  **below the AIMD window**.
 - **Fill** — the background layer fill (`LayerStore::run_fill`). Same
   scavenger gate, but the funnel keeps two FIFO queues and drains
   **Prefetch before Fill**: traced data is needed soon, fill has the
@@ -262,6 +264,18 @@ Extent-granular dedup is NOT the funnel's job: it lives one layer down in
 the LayerStore's in-flight map — a scavenger request for an extent
 already being fetched joins that fetch (whatever class started it) and
 never reaches the funnel.
+
+The structural warm-up itself (ADR-0012's cold-start floor) is driven
+from image assembly (`src/image/structural_warmup.hpp`, documented in
+`docs/image.md`): at device bring-up, a bounded window at the head and
+the tail of every data lower's stored-blob view — the regions carrying
+the tar header neighborhood, the ZFile/LSMT headers, and the format
+indexes (ZFile jump table + trailer, LSMT index, all at the payload
+tail) — is populated before trace replay. It needs no trace and no
+format parsing (windows come from the blob's byte layout alone), rides
+this funnel as the Prefetch class like every populate, and is
+opportunistic: failures are logged and skipped, never a bring-up error,
+and on a bypassed/degraded LayerStore populate is a no-op.
 
 The window is **not operator-configured**; it is AIMD-managed from
 observed on-demand latency, a LEDBAT-style scavenger that consumes only
@@ -1116,6 +1130,18 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   the starter's funnel permit covers exactly the remote fetch: the slot
   is already released when the completion bookkeeping (in-flight map
   retire) runs.
+- `integration: structural warm-up fetches head and tail extents at bring-up` —
+  the ADR-0012 cold-start floor end to end: with warm-up enabled,
+  `open_image` alone (no device read) fetches head/tail window extents
+  only the warm-up can reach (per-extent attribution on the mock;
+  extent 4 pins the windows to the tar-VIEW byte space via the +512
+  translation), a middle extent stays cold, and with
+  `prefetch.enable = false` nothing is warmed.
+- `integration: structural warm-up runs before the trace blob load` —
+  ADR-0012 "floor first", pinned via the mock's ordered request log:
+  both warm-up windows of the data blob (head extent, tail window's
+  first extent) are served before the trace blob's first data GET, so a
+  slow trace layer cannot delay the floor.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → LayerStore → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same chain image
@@ -1186,13 +1212,14 @@ directly.
   `expires_in`, ADR-0015; redirect responses carry no comparable declared
   lifetime). Registries issuing shorter-lived redirect targets rely on the
   401-drop-and-re-resolve path.
-- **Prefetch is trace-replay only** — overlaybd's dynamic prefetcher and
-  TurboOCI paths are out of scope (ADR-0007). The upstream-compatible
-  trace blob IS replayed through `populate` (ADR-0013, proposed — the
-  trace layer is recognized in image assembly; see `docs/image.md`) at
-  the ADR-0012 Prefetch scavenger class; trace recording, the dynamic
-  file-list fallback, the structural head/tail warm-up, and detaching
-  replay off the bring-up path (now safe under the funnel) remain open.
+- **Prefetch is structural warm-up plus trace replay** — overlaybd's
+  dynamic prefetcher and TurboOCI paths are out of scope (ADR-0007). The
+  structural head/tail warm-up (ADR-0012's cold-start floor) and the
+  upstream-compatible trace blob (ADR-0013, proposed — the trace layer
+  is recognized in image assembly; see `docs/image.md`) both ride
+  `populate` at the ADR-0012 Prefetch scavenger class; trace recording,
+  the dynamic file-list fallback, and detaching warm-up/replay off the
+  bring-up path (now safe under the funnel) remain open.
 - **credentialConfig mode=file only** — inline/secret credential modes are
   ignored (see `docs/image.md` / `docs/config.md`).
 - **Fill teardown goes through `park_image_fills`** — destroying a store

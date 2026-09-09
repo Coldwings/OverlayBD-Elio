@@ -7,7 +7,8 @@
 //     unconditionally, even if that momentarily exceeds the concurrency
 //     window. Delaying a guest-visible miss to protect a window is never
 //     correct.
-//   * Prefetch (trace replay) and Fill (background layer fill) — the
+//   * Prefetch (warm-up: structural head/tail prefetch and trace
+//     replay) and Fill (background layer fill) — the
 //     scavenger class: admitted only when no on-demand request is in
 //     flight AND total in-flight requests are below the AIMD window.
 //     Within the class, Prefetch outranks Fill (two FIFO queues drained
@@ -76,7 +77,7 @@ namespace obd::source {
 /// The traffic class of one remote range request (ADR-0012).
 enum class ReadClass : int {
     OnDemand = 0,  // guest-blocking miss: unconditional admission
-    Prefetch = 1,  // trace-replay warm-up: scavenger, outranks Fill
+    Prefetch = 1,  // warm-up (structural, trace replay): scavenger, outranks Fill
     Fill = 2,      // background layer fill: scavenger, lowest priority
 };
 
