@@ -163,8 +163,13 @@ elio::coro::task<bool> TraceRecorder::start(
         last_.reset();
         cancel = std::make_shared<elio::coro::cancel_source>();
         timer_cancel_ = cancel;
+        // Enable the hot-path gate INSIDE the lock, as the last step
+        // after every field the gate's fast path reads is consistent:
+        // a record() arriving between this store and the unlock must not
+        // be missed (the pre-fix order released the lock first, leaving
+        // a window where the first reads of the recording were dropped).
+        active_.store(true, std::memory_order_release);
     }
-    active_.store(true, std::memory_order_release);
     ELIO_LOG_INFO("trace recording to {} for {}s", path_, duration_sec);
     elio::go([this, generation, duration_sec,
               cancel = std::move(cancel)]() -> elio::coro::task<void> {
@@ -230,8 +235,13 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
         fd_ = -1;
         path = path_;
         if (timer_cancel_) timer_cancel_->cancel();  // immediate exit
+        // Drop the hot-path gate inside the same lock hold: no record()
+        // must slip into pending_ after the drain below has copied it
+        // (the pre-fix order released the lock first, leaving a window
+        // where a late record() appended into the drained queue and was
+        // silently lost).
+        active_.store(false, std::memory_order_release);
     }
-    active_.store(false, std::memory_order_release);
     FinalizeResult res =
         co_await finalize_locked_state(fd, std::move(path), reason);
     {
