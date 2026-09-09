@@ -617,6 +617,9 @@ private:
         std::shared_ptr<elio::sync::event> waiter =
             std::make_shared<elio::sync::event>();
         int fd;
+        uint64_t seq = 0;  // captured under mu_: never read the member
+                           // unlocked (only this path writes it, but
+                           // keep the lock discipline exact)
         {
             co_await mu_.lock();
             auto it = children_.find(id);
@@ -625,6 +628,7 @@ private:
                 entry->cmd_pending = true;
                 entry->reply_waiter = waiter;
                 entry->pending_seq = ++entry->cmd_seq;
+                seq = entry->pending_seq;
                 fd = entry->control_fd;
             } else {
                 fd = -1;
@@ -644,7 +648,7 @@ private:
             entry->reply_waiter.reset();
             mu_.unlock();
         };
-        cmd["seq"] = entry->pending_seq;  // the device echoes it back
+        cmd["seq"] = seq;  // the device echoes it back
         const std::string line = cmd.dump() + "\n";
         const auto w = co_await elio::io::async_write(fd, line.data(),
                                                       line.size(), -1);

@@ -24,9 +24,38 @@
 
 #include <elio/coro/task.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <functional>
+#include <memory>
+#include <mutex>
 
 namespace obd::supervisor {
+
+/// Serializes EVERY writer of the device control channel (fd 3). The
+/// lifecycle status report() path, the trace control loop's replies,
+/// and the expiry event run in different coroutines — potentially on
+/// different scheduler workers — and AF_UNIX SOCK_STREAM offers NO
+/// PIPE_BUF atomicity: two concurrent small writes can interleave into
+/// one corrupted line. Routing all of them through one shared writer
+/// makes every line a single serialized ::write.
+class ControlChannelWriter {
+public:
+    explicit ControlChannelWriter(int fd) : fd_(fd) {}
+    int fd() const { return fd_; }
+    /// Best-effort single serialized write of one JSON line (the
+    /// supervisor tolerates loss as a command timeout / EOF).
+    void write_line(const nlohmann::json& j);
+    /// Same for a pre-serialized line (the lifecycle status codec
+    /// produces a string, not a json object).
+    void write_line(const std::string& line);
+
+private:
+    int fd_;
+    std::mutex mu_;
+};
+
+using ControlChannelWriterPtr = std::shared_ptr<ControlChannelWriter>;
 
 struct TraceControlHooks {
     /// Invoked (coroutine context, best-effort) right after a recording
@@ -36,7 +65,7 @@ struct TraceControlHooks {
     std::function<void()> on_start;
 };
 
-/// Serves trace commands from `control_fd` until EOF (the supervisor
+/// Serves trace commands from `channel` until EOF (the supervisor
 /// closed or died — the device keeps serving its block device; any
 /// active recording is still finalized by its duration timer or by the
 /// device shutdown path). Never throws: structurally malformed lines
@@ -45,7 +74,8 @@ struct TraceControlHooks {
 /// reply — a skip would cost it a 30 s timeout). Spawn with elio::go
 /// after the image is open.
 elio::coro::task<void> run_trace_control(
-    int control_fd, std::shared_ptr<image::TraceRecorder> recorder,
+    ControlChannelWriterPtr channel,
+    std::shared_ptr<image::TraceRecorder> recorder,
     TraceControlHooks hooks = {});
 
 }  // namespace obd::supervisor

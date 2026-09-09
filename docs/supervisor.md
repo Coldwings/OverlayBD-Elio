@@ -245,7 +245,12 @@ to "device control channel timeout" on trace commands; the reverse
 pairing simply never receives them. Device shutdown must not leave the
 device's command reader parked (obd-device `shutdown(2)`s the channel on
 its way out — a parked coroutine would stall the scheduler's teardown
-drain).
+drain). All device-side WRITERS (status reports, trace replies, the
+expiry event — different coroutines on different workers) go through
+one shared serialized writer (`ControlChannelWriter`,
+src/supervisor/device_control.hpp): AF_UNIX SOCK_STREAM has no PIPE_BUF
+atomicity, so without serialization two concurrent small writes could
+interleave into a corrupted line.
 
 Status lines (`DeviceStatus` / `make_device_status`):
 

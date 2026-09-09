@@ -440,6 +440,10 @@ Every test, grouped by area, with the property it guards.
   a start meeting an in-flight finalize (held open by the test hook) is
   rejected with "already in progress" and the finalize completes with
   its records and stats intact.
+- `image: trace recording rejected start never truncates existing files` —
+  the state gate runs BEFORE the O_TRUNC open: a rejected start leaves
+  a previous recording's valid blob byte-identical and the active
+  window's own finalize complete.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` image with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merged view and the trace fully
@@ -527,10 +531,10 @@ Every test, grouped by area, with the property it guards.
 - `supervisor: device trace control answers malformed-typed fields with clean errors` —
   the device-side trace command loop (`src/supervisor/device_control.hpp`)
   over a real socketpair: a `trace_start` with a wrong-typed `path` or
-  `duration_sec` gets a clean error reply (with the `seq` correlation
-  echoed) instead of an escaping `type_error` killing the loop, and a
-  valid start/stop cycle afterwards proves the loop stayed alive
-  (ADR-0013).
+  `duration_sec` (including a float, a negative, and a huge integer)
+  gets a clean error reply (with the `seq` correlation echoed) instead
+  of an escaping `type_error` killing the loop, and a valid start/stop
+  cycle afterwards proves the loop stayed alive (ADR-0013).
 
 ### integration
 

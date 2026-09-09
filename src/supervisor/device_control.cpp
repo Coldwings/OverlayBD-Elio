@@ -45,15 +45,23 @@ private:
     std::string buf_;
 };
 
-/// Best-effort single short write of one reply line to the control fd
-/// (same pattern as the lifecycle report(); the supervisor tolerates
-/// loss as a command timeout). Well under PIPE_BUF, so concurrent
-/// status/report writes cannot interleave mid-line.
-void reply_line(int fd, const nlohmann::json& j) {
-    const std::string line = j.dump() + "\n";
-    const ssize_t w = ::write(fd, line.data(), line.size());
+}  // namespace
+
+void ControlChannelWriter::write_line(const nlohmann::json& j) {
+    write_line(j.dump() + "\n");
+}
+
+void ControlChannelWriter::write_line(const std::string& line) {
+    // SOCK_STREAM has no PIPE_BUF rule: serialization across ALL of the
+    // channel's writers (status reports, command replies, the expiry
+    // event — different coroutines, different workers) is what keeps
+    // one line one write.
+    std::lock_guard<std::mutex> lk(mu_);
+    const ssize_t w = ::write(fd_, line.data(), line.size());
     (void)w;
 }
+
+namespace {
 
 /// L2 correlation: the supervisor stamps a per-command `seq` into every
 /// forwarded command; replies echo it so the supervisor can drop a LATE
@@ -79,9 +87,10 @@ nlohmann::json finalize_fields(const image::TraceRecorder::FinalizeResult& r) {
 }  // namespace
 
 elio::coro::task<void> run_trace_control(
-    int control_fd, std::shared_ptr<image::TraceRecorder> recorder,
+    ControlChannelWriterPtr channel,
+    std::shared_ptr<image::TraceRecorder> recorder,
     TraceControlHooks hooks) {
-    LineReader reader(control_fd);
+    LineReader reader(channel->fd());
     for (;;) {
         auto line = co_await reader.next();
         if (!line) co_return;  // supervisor closed or died
@@ -100,22 +109,35 @@ elio::coro::task<void> run_trace_control(
             // the detached control coroutine).
             const auto pit = j.find("path");
             const auto dit = j.find("duration_sec");
-            if (pit == j.end() || !pit->is_string() ||
-                dit == j.end() || !dit->is_number()) {
+            // Strictly an INTEGER in the recorder's duration bound
+            // BEFORE any get<>(): a float would truncate silently
+            // (1.5 -> 1) and a negative/huge integer wraps in
+            // get<uint32_t> (2^40 + 300 would alias to 300). The bound
+            // constants come from the recorder — single source.
+            uint32_t duration = 0;
+            if (dit != j.end() && (dit->is_number_integer() ||
+                                   dit->is_number_unsigned())) {
+                const uint64_t u = dit->get<uint64_t>();
+                if (u >= image::TraceRecorder::kMinDurationSec &&
+                    u <= image::TraceRecorder::kMaxDurationSec) {
+                    duration = static_cast<uint32_t>(u);
+                }
+            }
+            if (pit == j.end() || !pit->is_string() || duration == 0) {
                 nlohmann::json rj = {{"reply", "trace_start"},
                                      {"ok", false},
                                      {"error", "trace_start requires a "
                                                "string path and an "
-                                               "integer duration_sec"}};
+                                               "integer duration_sec in "
+                                               "[1, 3600]"}};
                 echo_seq(j, rj);
-                reply_line(control_fd, rj);
+                channel->write_line(rj);
                 continue;
             }
             const std::string path = pit->get<std::string>();
-            const uint32_t duration = dit->get<uint32_t>();
             std::string error;
             // The expiry report rides the same control channel.
-            auto on_expire = [fd = control_fd](
+            auto on_expire = [channel](
                                  const image::TraceRecorder::FinalizeResult&
                                      r) {
                 nlohmann::json ev = finalize_fields(r);
@@ -123,7 +145,7 @@ elio::coro::task<void> run_trace_control(
                 ev["event"] = "expired";
                 ev["ok"] = r.ok;
                 if (!r.ok) ev["error"] = r.error;
-                reply_line(fd, ev);
+                channel->write_line(ev);
             };
             const bool started = co_await recorder->start(
                 path, duration, std::move(on_expire), error);
@@ -139,7 +161,7 @@ elio::coro::task<void> run_trace_control(
                       {"error", error}};
             }
             echo_seq(j, rj);
-            reply_line(control_fd, rj);
+            channel->write_line(rj);
             if (started && hooks.on_start) hooks.on_start();
         } else if (cmd == "trace_stop") {
             auto res = co_await recorder->stop("stopped");
@@ -154,13 +176,13 @@ elio::coro::task<void> run_trace_control(
                       {"error", res.error}};
             }
             echo_seq(j, rj);
-            reply_line(control_fd, rj);
+            channel->write_line(rj);
         } else {
             nlohmann::json rj = {{"reply", cmd},
                                  {"ok", false},
                                  {"error", "unknown device command"}};
             echo_seq(j, rj);
-            reply_line(control_fd, rj);
+            channel->write_line(rj);
         }
     }
 }

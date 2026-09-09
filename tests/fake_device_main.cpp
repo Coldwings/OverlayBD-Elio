@@ -46,17 +46,24 @@ struct Args {
     int control_fd = -1;
 };
 
-void report(const Args& args, const obd::supervisor::DeviceStatus& st) {
-    if (args.control_fd < 0) return;
-    const std::string line = obd::supervisor::make_device_status(st);
-    // Best-effort, single short write; the supervisor tolerates loss as EOF.
-    const ssize_t w = ::write(args.control_fd, line.data(), line.size());
-    (void)w;
+void report(const obd::supervisor::ControlChannelWriterPtr& channel,
+            const obd::supervisor::DeviceStatus& st) {
+    if (!channel) return;
+    // Serialized with the trace control loop's writes (SOCK_STREAM has
+    // no PIPE_BUF rule — see ControlChannelWriter).
+    channel->write_line(obd::supervisor::make_device_status(st));
 }
 
 elio::coro::task<int> fake_main(Args args) {
     using obd::supervisor::DeviceStatus;
-    report(args, DeviceStatus{"starting", "", ""});
+    // ONE serialized writer for every channel writer (status reports,
+    // trace replies, the expiry event) — see ControlChannelWriter.
+    const obd::supervisor::ControlChannelWriterPtr channel =
+        args.control_fd >= 0
+            ? std::make_shared<obd::supervisor::ControlChannelWriter>(
+                  args.control_fd)
+            : nullptr;
+    report(channel, DeviceStatus{"starting", "", ""});
     try {
         const obd::image::ImageConfig img = obd::image::ImageConfig::from_file(
             args.config, obd::image::DownloadConfig{});
@@ -91,7 +98,7 @@ elio::coro::task<int> fake_main(Args args) {
             const ssize_t w = co_await lsmt->pwrite(payload.data(),
                                                   payload.size(), 0);
             if (w != static_cast<ssize_t>(payload.size())) {
-                report(args, DeviceStatus{"failed", "", "payload write failed"});
+                report(channel, DeviceStatus{"failed", "", "payload write failed"});
                 co_return 1;
             }
         } else if (img.writable()) {
@@ -102,7 +109,7 @@ elio::coro::task<int> fake_main(Args args) {
                 img.upper.dir + "/overlaybd.sparse", kVsize);
             (void)sparse;
         }
-        report(args, DeviceStatus{"ready", "/dev/ublkb70", ""});
+        report(channel, DeviceStatus{"ready", "/dev/ublkb70", ""});
 
         // Trace command channel (protocol v3), like the real obd-device.
         // The workload hook runs inside the recording window: a
@@ -128,11 +135,11 @@ elio::coro::task<int> fake_main(Args args) {
                     }
                 });
             };
-            elio::go([fd = args.control_fd, rec = opened->recorder,
+            elio::go([channel, rec = opened->recorder,
                       hooks = std::move(hooks)]() mutable
                      -> elio::coro::task<void> {
-                co_await obd::supervisor::run_trace_control(fd, rec,
-                                                            std::move(hooks));
+                co_await obd::supervisor::run_trace_control(
+                    channel, rec, std::move(hooks));
             });
         }
 
@@ -162,12 +169,12 @@ elio::coro::task<int> fake_main(Args args) {
         if (lsmt) {
             const int crc = co_await lsmt->checkpoint();
             if (crc != 0) {
-                report(args, DeviceStatus{"failed", "",
+                report(channel, DeviceStatus{"failed", "",
                                           "checkpoint failed"});
                 co_return 1;
             }
         }
-        report(args, DeviceStatus{"stopped", "", ""});
+        report(channel, DeviceStatus{"stopped", "", ""});
         // Unblock the trace control loop (parked in a control-channel
         // read) only AFTER the checkpoint and the stopped report are
         // out: shutdown(2) gives the supervisor an immediate EOF, and
@@ -180,7 +187,7 @@ elio::coro::task<int> fake_main(Args args) {
         }
         co_return 0;
     } catch (const std::exception& e) {
-        report(args, DeviceStatus{"failed", "", e.what()});
+        report(channel, DeviceStatus{"failed", "", e.what()});
         co_return 1;
     }
 }

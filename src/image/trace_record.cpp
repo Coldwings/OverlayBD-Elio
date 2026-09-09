@@ -75,6 +75,16 @@ elio::coro::task<bool> TraceRecorder::start(
         error = "trace output path must be absolute";
         co_return false;
     }
+    // Gate BEFORE touching the filesystem: a rejected start must not
+    // O_TRUNC anything — least of all a previous recording's valid,
+    // already-finalized blob whose path the operator reused.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (state_ != State::Idle) {
+            error = "trace recording already in progress";
+            co_return false;
+        }
+    }
     // Fail fast on the output path before arming any tap.
     const int fd =
         ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -88,7 +98,8 @@ elio::coro::task<bool> TraceRecorder::start(
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (state_ != State::Idle) {
-            // Reject Finalizing too: a start slipping into an in-flight
+            // Re-check after the open (start-vs-start race): reject
+            // Finalizing too — a start slipping into an in-flight
             // finalize would wipe the draining queue (pending_.clear()),
             // corrupt the finalize's stats (dropped_.store(0)), and the
             // old stop's tail would stomp the NEW recording's state

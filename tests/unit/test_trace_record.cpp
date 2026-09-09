@@ -646,3 +646,68 @@ TEST_CASE("image: trace recording rejects start while a finalize is in flight",
     REQUIRE(records.size() == 1);
     REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
 }
+
+TEST_CASE("image: trace recording rejected start never truncates existing files",
+          "[image]") {
+    // Regression (PR #34 review): start() once opened its output with
+    // O_TRUNC BEFORE the state gate, so a REJECTED start truncated
+    // whatever path it was given — including a previous recording's
+    // valid finalized blob. Now the gate runs before any open: the
+    // first blob's bytes must survive the rejected start untouched,
+    // and the active recording's own finalize must produce its
+    // complete valid blob.
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 95);
+    const std::string out1 = dir / "one.trace";
+    const std::string out2 = dir / "two.trace";
+    image::TraceRecorder::FinalizeResult res1, res2;
+    bool second_ok = true, third_ok = true;
+    std::string second_err, third_err;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        // Window 1: a complete valid blob at out1.
+        res1 = co_await with_recording(
+            *rec, out1, [&]() -> elio::coro::task<void> {
+                co_await read_at(tap, 0, 4096);
+            });
+        // Window 2 active at out2; a rejected start aimed at out1 must
+        // not touch it, one aimed at out2 must not break the window.
+        std::string error;
+        const bool started = co_await rec->start(
+            out2, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!started) co_return 1;
+        co_await read_at(tap, 65536, 4096);
+        second_ok = co_await rec->start(
+            out1, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {},
+            second_err);
+        third_ok = co_await rec->start(
+            out2, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {}, third_err);
+        res2 = co_await rec->stop("stopped");
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(res1.ok);
+    REQUIRE(!second_ok);
+    REQUIRE(!third_ok);
+    REQUIRE(second_err.find("already in progress") != std::string::npos);
+    REQUIRE(third_err.find("already in progress") != std::string::npos);
+    // out1 survived both rejections byte-identically.
+    REQUIRE(res1.sha256 == file_sha256(out1));
+    const auto first = parse_file(out1);
+    REQUIRE(first.size() == 1);
+    REQUIRE(first[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
+    // The active window finalized its complete valid blob.
+    REQUIRE(res2.ok);
+    REQUIRE(res2.records == 1);
+    REQUIRE(res2.sha256 == file_sha256(out2));
+    const auto second = parse_file(out2);
+    REQUIRE(second.size() == 1);
+    REQUIRE(second[0] == format::trace::TraceRecord{'R', 0, 4096, 65536});
+}

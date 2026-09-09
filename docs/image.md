@@ -857,7 +857,10 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   window resets the queue and counters;
   `image: trace recording rejects start while a finalize is in flight`
   — the state-machine guard against queue wipe/stat corruption, pinned
-  with the test-only finalize hook.
+  with the test-only finalize hook;
+  `image: trace recording rejected start never truncates existing files`
+  — the gate runs before the O_TRUNC open, so a rejected start cannot
+  destroy a previous valid blob or the active window.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` config with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merge (layer count, virtual
