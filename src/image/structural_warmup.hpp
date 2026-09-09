@@ -42,7 +42,9 @@
 // re-checked between slices, and a window that cannot finish within the
 // budget is abandoned mid-window (windows_skipped) rather than awaited
 // to its end — 30 s of actual warm-up work, with overshoot bounded by
-// one extent fetch, and every skipped extent simply served on demand.
+// one extent fetch per in-flight extent (a view-space slice spans two
+// extents at an unaligned tar base, so the worst case is two), and
+// every skipped extent simply served on demand.
 #pragma once
 
 #include "source/blob_source.hpp"
@@ -85,7 +87,8 @@ struct StructuralWarmupOptions {
     /// bring-up, so this caps the worst-case bring-up delay it adds
     /// (same pattern and default as trace replay). Checked between
     /// 64 KiB populate slices; a single in-flight slice may carry the
-    /// pass past the deadline by at most one extent fetch.
+    /// pass past the deadline by at most its extents' fetches (two at an
+    /// unaligned tar base).
     std::chrono::milliseconds max_wall_time{30000};
 };
 

@@ -11,11 +11,14 @@ namespace {
 
 /// Populate slice size: one LayerStore extent (ADR-0011). The LayerStore
 /// populate path already suspends per extent between remote fetches, so
-/// slicing at this granularity adds no remote traffic and no extra
-/// funnel acquires — it only interposes the wall-budget check below,
-/// which bounds how far past the budget one slow source can carry
-/// warm-up (one extent fetch) and lets a window that cannot finish in
-/// time be abandoned mid-window instead of awaited to its end.
+/// slicing at this granularity adds no remote traffic (already-fetched
+/// extents are skipped via the present flags). Slices are computed in
+/// the TarOffsetSource VIEW byte space: at an unaligned tar base one
+/// view-space slice can span TWO underlying extents (two fetches and
+/// funnel acquires), so the wall-budget check below bounds how far past
+/// the budget one slow source can carry warm-up to at most two extent
+/// fetches — and lets a window that cannot finish in time be abandoned
+/// mid-window instead of awaited to its end.
 constexpr uint64_t kPopulateSliceBytes = 64 * 1024;
 
 }  // namespace
