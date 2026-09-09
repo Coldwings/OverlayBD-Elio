@@ -111,6 +111,14 @@ bool ControlChannelWriter::write_line(const std::string& line) {
     while (done < line.size()) {
         const ssize_t w =
             ::write(fd_, line.data() + done, line.size() - done);
+        if (w == 0) {
+            // A zero-byte write with bytes pending is not supposed to
+            // happen on a stream socket; looping would spin forever.
+            ELIO_LOG_ERROR("control channel zero-byte write ({} bytes "
+                           "pending); dropping line",
+                           line.size() - done);
+            return false;
+        }
         if (w < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
