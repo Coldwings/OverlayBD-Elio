@@ -99,9 +99,12 @@ elio::coro::task<bool> TraceRecorder::start(
     // WITHOUT O_TRUNC: two concurrent starts on the SAME path both get
     // here, and a loser's truncation would wipe the winner's file
     // under its feet (silent data loss behind a clean "already in
-    // progress"). Only the state winner truncates, below.
+    // progress"). Only the state winner truncates, below. O_NOFOLLOW:
+    // the path is operator-provided over the control channel; never
+    // follow a symlink and clobber an unrelated file.
     const int fd =
-        ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+        ::open(path.c_str(),
+               O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (fd < 0) {
         error = "cannot open trace output " + path + ": " +
                 std::strerror(errno);

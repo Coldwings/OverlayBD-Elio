@@ -52,6 +52,22 @@ elio::coro::task<nlohmann::json> rpc_exchange(int fd, const nlohmann::json& cmd)
     }
 }
 
+/// Reads the next buffered line as JSON; false on EOF/error.
+elio::coro::task<bool> rpc_read_line(int fd, std::string& rbuf,
+                                     nlohmann::json& out) {
+    char tmp[1024];
+    for (;;) {
+        if (const auto nl = rbuf.find('\n'); nl != std::string::npos) {
+            out = nlohmann::json::parse(rbuf.substr(0, nl));
+            rbuf.erase(0, nl + 1);
+            co_return true;
+        }
+        const auto r = co_await elio::io::async_read(fd, tmp, sizeof(tmp), -1);
+        if (r.result <= 0) co_return false;
+        rbuf.append(tmp, static_cast<size_t>(r.result));
+    }
+}
+
 }  // namespace
 
 TEST_CASE("supervisor: device trace control answers malformed-typed fields with clean errors",
@@ -178,4 +194,67 @@ TEST_CASE("supervisor: control channel writer loops short writes and never throw
             std::string::npos);
     ::close(sfd[0]);
     ::close(sfd[1]);
+}
+
+TEST_CASE("supervisor: device trace control skips an oversized line and stays alive",
+          "[supervisor]") {
+    // An oversized command line (> kMaxMessageBytes with no '\n') must be
+    // DISCARDED, not mistaken for channel EOF — the pre-fix code returned
+    // nullopt and ended the control loop, stranding every later command
+    // on a 30 s timeout. After skipping the junk, a valid command still
+    // gets its reply on the same channel.
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
+    test::TempDir dir;
+    const std::string out = dir / "out.trace";
+    nlohmann::json reply, reply2;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        auto channel =
+            std::make_shared<supervisor::ControlChannelWriter>(fds[1]);
+        elio::go([channel, rec]() -> elio::coro::task<void> {
+            co_await supervisor::run_trace_control(channel, rec);
+        });
+        // Junk line bigger than the 64 KiB cap (no '\n' inside), then a
+        // valid command. The DEVICE reader must discard the oversized
+        // line and still serve the command.
+        const std::string junk(70 * 1024, 'x');
+        const std::string line =
+            junk + "\n" +
+            (nlohmann::json{{"cmd", "trace_start"},
+                            {"path", out},
+                            {"duration_sec", 300},
+                            {"seq", 1}})
+                .dump() +
+            "\n";
+        const auto w = co_await elio::io::async_write(fds[0], line.data(),
+                                                      line.size(), -1);
+        if (w.result != static_cast<ssize_t>(line.size())) co_return 1;
+        std::string rbuf;
+        if (!co_await rpc_read_line(fds[0], rbuf, reply)) co_return 2;
+        // Stop the recording: the 300 s expiry timer armed by start is a
+        // DETACHED coroutine that must be cancelled by stop() before the
+        // scheduler drains, or run_coro teardown hangs.
+        const std::string stop =
+            (nlohmann::json{{"cmd", "trace_stop"}, {"seq", 2}}).dump() + "\n";
+        const auto w2 = co_await elio::io::async_write(fds[0], stop.data(),
+                                                       stop.size(), -1);
+        if (w2.result != static_cast<ssize_t>(stop.size())) co_return 3;
+        if (!co_await rpc_read_line(fds[0], rbuf, reply2)) co_return 4;
+        ::shutdown(fds[1], SHUT_RDWR);
+        // Give the detached loop ample time to observe the EOF and exit
+        // before run_coro returns (a short settle raced teardown and
+        // SEGFAULTed — the known live-coroutine-teardown hazard, #28).
+        co_await elio::time::sleep_for(300ms);
+        co_return 0;
+    });
+    ::close(fds[0]);
+    ::close(fds[1]);
+    REQUIRE(rc == 0);
+    REQUIRE(reply.value("reply", "") == "trace_start");
+    REQUIRE(reply.value("ok", false) == true);
+    REQUIRE(reply.value("seq", 0) == 1);
+    REQUIRE(reply2.value("reply", "") == "trace_stop");
+    REQUIRE(reply2.value("ok", false) == true);
+    REQUIRE(reply2.value("seq", 0) == 2);
 }

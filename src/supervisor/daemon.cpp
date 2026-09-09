@@ -737,9 +737,17 @@ private:
             co_await mu_.lock();
             auto it = children_.find(id);
             if (it != children_.end()) {
+                // A stop after the duration already finalized the
+                // recording is a no-op: the expiry event has already
+                // recorded the true cause, and overwriting it would
+                // misreport a late trace_stop as the reason.
+                const bool already_expired =
+                    it->second->trace.is_object() &&
+                    it->second->trace.value("state", "") == "stopped" &&
+                    it->second->trace.value("reason", "") == "expired";
                 nlohmann::json t;
                 t["state"] = "stopped";
-                t["reason"] = "stopped";
+                t["reason"] = already_expired ? "expired" : "stopped";
                 t["path"] = rj.value("path", "");
                 t["sha256"] = rj.value("sha256", "");
                 t["size"] = rj.value("size", 0);

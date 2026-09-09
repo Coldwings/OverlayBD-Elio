@@ -26,6 +26,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <fcntl.h>
+
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -41,7 +43,13 @@ namespace obd::supervisor {
 /// makes every line a single serialized ::write.
 class ControlChannelWriter {
 public:
-    explicit ControlChannelWriter(int fd) : fd_(fd) {}
+    explicit ControlChannelWriter(int fd) : fd_(fd) {
+        // Non-blocking: write_line runs on a scheduler worker and must
+        // never block it if the supervisor stalls (full socket buffer).
+        // A full buffer surfaces as EAGAIN, handled as a dropped line.
+        const int fl = ::fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
     int fd() const { return fd_; }
     /// Best-effort serialized write of one JSON line, LOOPED until all
     /// bytes are out (a single ::write on SOCK_STREAM may write short,

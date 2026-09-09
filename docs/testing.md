@@ -543,6 +543,11 @@ Every test, grouped by area, with the property it guards.
   gets a clean error reply (with the `seq` correlation echoed) instead
   of an escaping `type_error` killing the loop, and a valid start/stop
   cycle afterwards proves the loop stayed alive (ADR-0013).
+- `supervisor: device trace control skips an oversized line and stays alive` —
+  the same loop over a real socketpair: a command line larger than the
+  64 KiB cap (no newline inside) is discarded rather than mistaken for
+  channel EOF, and a valid start/stop cycle afterwards proves the loop
+  stayed alive (ADR-0013).
 - `supervisor: control channel writer loops short writes and never throws` —
   the serialized channel writer loops ::write until the whole line is
   out (a short write would truncate/fuse protocol lines); a 128 KiB

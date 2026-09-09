@@ -27,6 +27,9 @@ public:
     explicit LineReader(int fd) : fd_(fd) {}
 
     /// Next line without the trailing '\n'; std::nullopt on EOF or error.
+    /// An OVERSIZED line (no '\n' within kMaxMessageBytes) is discarded
+    /// through its newline and reading continues — it must never be
+    /// mistaken for channel EOF, which would end the control loop.
     elio::coro::task<std::optional<std::string>> next() {
         for (;;) {
             if (const auto nl = buf_.find('\n'); nl != std::string::npos) {
@@ -34,7 +37,18 @@ public:
                 buf_.erase(0, nl + 1);
                 co_return line;
             }
-            if (buf_.size() > kMaxMessageBytes) co_return std::nullopt;
+            if (buf_.size() > kMaxMessageBytes) {
+                // Skip the oversized line: drain to its '\n', then loop.
+                do {
+                    char tmp[4096];
+                    const auto r = co_await elio::io::async_read(
+                        fd_, tmp, sizeof(tmp), -1);
+                    if (r.result <= 0) co_return std::nullopt;
+                    buf_.append(tmp, static_cast<size_t>(r.result));
+                } while (buf_.find('\n') == std::string::npos);
+                buf_.erase(0, buf_.find('\n') + 1);
+                continue;
+            }
             char tmp[4096];
             const auto r =
                 co_await elio::io::async_read(fd_, tmp, sizeof(tmp), -1);
@@ -67,6 +81,15 @@ bool ControlChannelWriter::write_line(const std::string& line) {
             ::write(fd_, line.data() + done, line.size() - done);
         if (w < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Non-blocking fd, full buffer: the supervisor is not
+                // draining. Drop the line (best-effort channel — status
+                // is re-queryable) rather than block a scheduler worker.
+                ELIO_LOG_WARNING("control channel write would block ({} "
+                                 "of {} bytes pending); dropping line",
+                                 line.size() - done, line.size());
+                return false;
+            }
             ELIO_LOG_WARNING("control channel write failed after {} of "
                              "{} bytes: {}",
                              done, line.size(), std::strerror(errno));
