@@ -50,6 +50,32 @@ bool file_exists(const std::string& path) {
     return ::stat(path.c_str(), &st) == 0;
 }
 
+// Defensive field readers for DEVICE-provided protocol JSON: value()
+// throws type_error on a present-but-wrong-typed key, and a corrupted
+// device reply must never tear down a routing coroutine. These return
+// the default when the key is absent OR not of the expected type.
+std::string str_or(const nlohmann::json& j, const char* key,
+                   std::string def = "") {
+    const auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>()
+                                              : std::move(def);
+}
+uint64_t uint_or(const nlohmann::json& j, const char* key,
+                 uint64_t def = 0) {
+    const auto it = j.find(key);
+    if (it != j.end() && it->is_number_unsigned()) {
+        return it->get<uint64_t>();
+    }
+    if (it != j.end() && it->is_number_integer() && it->get<int64_t>() >= 0) {
+        return static_cast<uint64_t>(it->get<int64_t>());
+    }
+    return def;
+}
+bool bool_or(const nlohmann::json& j, const char* key, bool def = false) {
+    const auto it = j.find(key);
+    return (it != j.end() && it->is_boolean()) ? it->get<bool>() : def;
+}
+
 /// Reads a small control-plane text file through the async IO backend
 /// (image configs are a few KiB). Throws obd::error on failure.
 elio::coro::task<std::string> read_text_file(const std::string& path) {
@@ -551,18 +577,33 @@ private:
     /// additive `trace` status field.
     elio::coro::task<void> route_device_reply(
         const std::shared_ptr<DeviceEntry>& entry, nlohmann::json j) {
+        // All fields below come from the DEVICE: protocol input. value()
+        // throws type_error on a present-but-wrong-typed key, and a
+        // corrupted/wedged device must not tear down the routing
+        // coroutine (which would strand every later control command).
+        // Parse defensively everywhere below.
         const std::string kind = j["reply"].get<std::string>();
         if (kind == "trace_event") {
             // Unsolicited (duration expiry): the recording is over.
             nlohmann::json t;
             t["state"] = "stopped";
-            t["reason"] = j.value("event", "expired");
-            t["path"] = j.value("path", "");
-            t["sha256"] = j.value("sha256", "");
-            t["size"] = j.value("size", 0);
-            t["records"] = j.value("records", 0);
-            t["dropped"] = j.value("dropped", 0);
-            if (!j.value("ok", false)) t["error"] = j.value("error", "");
+            const auto eit = j.find("event");
+            t["reason"] = (eit != j.end() && eit->is_string())
+                              ? eit->get<std::string>()
+                              : "expired";
+            const auto pit = j.find("path");
+            t["path"] = (pit != j.end() && pit->is_string())
+                            ? pit->get<std::string>()
+                            : "";
+            t["sha256"] = str_or(j, "sha256");
+            t["size"] = uint_or(j, "size");
+            t["records"] = uint_or(j, "records");
+            t["dropped"] = uint_or(j, "dropped");
+            const auto oit = j.find("ok");
+            const bool ok = (oit != j.end() && oit->is_boolean())
+                                ? oit->get<bool>()
+                                : false;
+            if (!ok) t["error"] = str_or(j, "error");
             co_await mu_.lock();
             // Only the recording the event belongs to: a stale expiry
             // landing after a NEW recording started must not flip the
@@ -715,14 +756,13 @@ private:
                               {"duration_sec", j["duration_sec"]}};
         std::string r = co_await forward_trace_command(id, std::move(cmd));
         auto rj = nlohmann::json::parse(r, nullptr, false);
-        if (!rj.is_discarded() && rj.value("ok", false)) {
+        if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
             co_await mu_.lock();
             auto it = children_.find(id);
             if (it != children_.end()) {
                 it->second->trace = {{"state", "recording"},
-                                     {"path", rj.value("path", "")},
-                                     {"duration_sec",
-                                      rj.value("duration_sec", 0)}};
+                                     {"path", str_or(rj, "path")},
+                                     {"duration_sec", uint_or(rj, "duration_sec")}};
             }
             mu_.unlock();
             rj.erase("reply");
@@ -740,7 +780,7 @@ private:
         nlohmann::json cmd = {{"cmd", "trace_stop"}};
         std::string r = co_await forward_trace_command(id, std::move(cmd));
         auto rj = nlohmann::json::parse(r, nullptr, false);
-        if (!rj.is_discarded() && rj.value("ok", false)) {
+        if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
             co_await mu_.lock();
             auto it = children_.find(id);
             if (it != children_.end()) {
@@ -755,11 +795,11 @@ private:
                 nlohmann::json t;
                 t["state"] = "stopped";
                 t["reason"] = already_expired ? "expired" : "stopped";
-                t["path"] = rj.value("path", "");
-                t["sha256"] = rj.value("sha256", "");
-                t["size"] = rj.value("size", 0);
-                t["records"] = rj.value("records", 0);
-                t["dropped"] = rj.value("dropped", 0);
+                t["path"] = str_or(rj, "path");
+                t["sha256"] = str_or(rj, "sha256");
+                t["size"] = uint_or(rj, "size");
+                t["records"] = uint_or(rj, "records");
+                t["dropped"] = uint_or(rj, "dropped");
                 it->second->trace = std::move(t);
             }
             mu_.unlock();
