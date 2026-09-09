@@ -369,7 +369,8 @@ Every test, grouped by area, with the property it guards.
 ### image
 
 - `image: global config parses overlaybd.json fields` — credential,
-  p2p, download, prefetch (`enable` honored, ADR-0012), and log
+  p2p, download, prefetch (`enable` honored, ADR-0012; `head_kb`/
+  `tail_kb` pinned separately), and log
   sections parse with the documented defaults.
 - `image: per-image download overrides merge over global defaults` —
   only fields present in the image's `download` section override.
@@ -406,6 +407,24 @@ Every test, grouped by area, with the property it guards.
 - `image: writable image with a trace layer assembles and replays` — a
   writable (`upper`) image with `accelerationLayer` still sets the trace
   layer aside, replays it, and serves copy-on-write reads/writes.
+- `image: structural warm-up windows clamp and merge on small blobs` —
+  the pure window computation: disjoint head/tail windows at the exact
+  edges, per-side clamping, a single merged full window for any blob
+  smaller than head+tail (no double-population), 0 disabling a side,
+  and no windows for an empty blob.
+- `image: structural warm-up populates head and tail windows opportunistically` —
+  the driver issues head-before-tail per layer in layer order, merges a
+  small blob into one window, skips nullptr targets, counts failing and
+  throwing populates without propagating them, issues nothing with both
+  window sizes 0, and stops early on the wall-time budget.
+- `image: prefetch config parses structural window knobs` — the
+  `prefetch` section's honored subset (`enable`, `head_kb`, `tail_kb`)
+  parses with the documented defaults; 0 window sizes are kept; partial
+  sections default field by field.
+- `image: prefetch enable false skips structural warm-up` — with
+  `prefetch.enable = false` no structural warm-up runs (stats zero)
+  while the device assembles and reads byte-exactly; enabled, the local
+  lower's merged window is populated (ADR-0012).
 
 ### ublk
 
@@ -497,6 +516,13 @@ Every test, grouped by area, with the property it guards.
   on-demand readers stream cold extents of the top layer, the shadowed
   bottom layer's fill makes essentially no progress, and resumes once
   the contention stops (ADR-0012 acceptance).
+- `integration: structural warm-up fetches head and tail extents at bring-up` —
+  the ADR-0012 cold-start floor end to end: with warm-up enabled
+  (256 KiB windows), `open_image` alone — no device read — fetches a
+  head extent and a tail extent only the warm-up can reach (per-extent
+  attribution on the multi-blob mock), while a middle extent stays cold;
+  with `prefetch.enable = false` the same extents stay cold and the
+  device still reads byte-exactly.
 - `image: malformed remote lower digest fails assembly` — a malformed
   `sha256:` lower digest fails assembly with `EINVAL` before any registry
   I/O (ADR-0016 boundary: structural config errors fail loud).

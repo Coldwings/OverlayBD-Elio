@@ -24,6 +24,7 @@ add_library(obd_core STATIC
     source/layer_store.cpp
     image/config.cpp
     image/image_file.cpp
+    image/structural_warmup.cpp
     image/trace_replay.cpp
     supervisor/protocol.cpp
     supervisor/child.cpp

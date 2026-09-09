@@ -91,6 +91,55 @@ lower wins on overlaps), or — with a configured `upper` — `MergedWritable`,
 whose topmost layer is the writable upper and whose reads fall through to
 the merged lowers.
 
+### Structural warm-up (ADR-0012's cold-start floor)
+
+Before any trace replay, assembly warms a **bounded window at the head
+and the tail of every data lower** — no trace required. The windows are
+computed from the layer blob's byte layout alone (head = `[0, head_kb)`,
+tail = `[size-tail_kb, size)`; sizes from the `prefetch` section,
+`docs/config.md`) — deliberately **no format parsing** (the
+prioritized-files mode stays rejected, ADR-0013).
+
+**Window semantics — the tail of the tar VIEW, not of the blob.** The
+windows are computed in the stored-blob byte space of the
+`TarOffsetSource` view — the same space trace records address. The
+structures the warm-up is for (ADR-0012: "index regions, tar headers,
+filesystem metadata neighborhoods") sit there:
+
+- the **tar header** is at the underlying blob's head, just *below* the
+  view (base offset 512/1536) — inside the same first extents the head
+  window warms, and already fetched by the `TarOffsetSource::open` probe
+  during assembly;
+- the **ZFile header / LSMT header** are at the payload (= view) head —
+  the head window also covers the first data blocks, the filesystem
+  metadata neighborhood of uncompressed layers;
+- the **indexes** — the ZFile jump table + trailer and the LSMT index —
+  live at the tail of the *payload* (ZFile layout: `... | index |
+  Trailer (512B)`; LSMT keeps its index at the file tail). The bytes
+  past the payload end inside the blob are tar zero-padding, which holds
+  no data — so the correct tail window is the view's tail, which
+  `TarOffsetSource::populate` translates through the tar base offset
+  onto exactly the extents carrying the indexes.
+
+A blob smaller than head+tail is warmed whole: the clamped windows merge
+into `[0, size)` so no byte is populated twice; a 0 window size disables
+that side; an empty blob gets no windows.
+
+**Bring-up position and class.** Warm-up runs awaited inline during
+bring-up, **after the layer chains are built and before trace replay**
+(the floor first; replay refines it), bounded by a 30 s wall-time budget
+(the same pattern and default as replay — detaching both off the
+bring-up path is the same documented follow-up). Every populate rides
+the device's admission funnel as the **Prefetch scavenger class**
+(populate's wiring, ADR-0012), so it yields to on-demand reads
+automatically, and dedup against the open-time format probes, replay,
+and background fill is automatic via the LayerStore in-flight map and
+present flags — an already-warm extent is joined or skipped, never
+re-fetched. Warm-up is **opportunistic**: a failing populate is logged
+and skipped, never a bring-up error, and a bypassed/degraded LayerStore
+turns populate into a no-op. `prefetch.enable` is the master gate for
+both warm-up kinds.
+
 ### The trace layer (ADR-0013, proposed)
 
 When the image config carries `accelerationLayer: true`, the **uppermost
@@ -183,6 +232,8 @@ struct GlobalConfig {
     std::string p2p_address;
     DownloadConfig download;
     bool prefetch_enable = true;
+    uint32_t prefetch_head_kb = 1024;
+    uint32_t prefetch_tail_kb = 1024;
     int log_level = 1;
 
     static GlobalConfig from_file(const std::string& path);
@@ -207,9 +258,15 @@ struct GlobalConfig {
 - `src/image/config.hpp::log_level` — `logConfig.logLevel`:
   0=debug, 1=info (default), 2=warn, 3=error.
 - `src/image/config.hpp::prefetch_enable` — `prefetch.enable` (default
-  true): the trace-replay master switch (ADR-0012/0013; the funnel's
-  AIMD window is not operator-configured, so the section exposes nothing
-  else — see `docs/config.md`).
+  true): the master switch for BOTH bring-up warm-up kinds — the
+  structural head/tail prefetch (ADR-0012's cold-start floor) and trace
+  replay (ADR-0013).
+- `src/image/config.hpp::prefetch_head_kb` /
+  `src/image/config.hpp::prefetch_tail_kb` — `prefetch.head_kb` /
+  `prefetch.tail_kb` (default 1024 each; 0 disables that side): the
+  structural warm-up window sizes (see Concepts → "Structural warm-up").
+  The funnel's AIMD window is not operator-configured, so the section
+  exposes nothing else — see `docs/config.md`.
 - `from_file(path)` — reads and parses the file. Throws `obd::error` on IO
   failure, `src/common/errors.hpp::format_error` on malformed JSON.
 - `src/image/config.hpp::from_json_text` — same, from an in-memory string
@@ -300,6 +357,7 @@ struct OpenedImage {
     bool writable = false;
     std::string upper_path;
     TraceReplayStats trace;       // ADR-0013 replay outcome
+    StructuralWarmupStats warmup; // ADR-0012 structural warm-up outcome
     std::vector<source::LayerStore*> layer_stores;  // non-owning
     source::AdmissionFunnelPtr funnel;  // the device's ADR-0012 funnel
 };
@@ -328,6 +386,11 @@ elio::coro::task<void> park_image_fills(const OpenedImage& opened);
   trace replay (ADR-0013): whether a valid trace was present, records
   replayed/skipped, bytes warmed, and whether a replay bound stopped the
   pass early. All zero when no `accelerationLayer` was configured.
+- `warmup` — the
+  `src/image/structural_warmup.hpp::StructuralWarmupStats` outcome of the
+  structural head/tail warm-up (ADR-0012): layers/windows warmed, bytes
+  requested, windows failed, and whether the wall-time budget stopped the
+  pass early. All zero when `prefetch.enable` is false.
 - `src/image/image_file.hpp::layer_stores` — non-owning handles to every
   `LayerStore` in the chain (owned by `root`), for lifecycle operations.
 - `funnel` — the device's read admission funnel (ADR-0012), created at
@@ -364,11 +427,16 @@ Behavior, in order:
 5. Builds each lower per the chain in Concepts. A lower with **no local
    file and an empty `repoBlobUrl`** fails with `obd::error(EINVAL)` —
    there is nowhere to read it from.
-6. Replays the trace blob (when loaded) via
+6. Runs the structural warm-up via
+   `src/image/structural_warmup.hpp::warmup_structural` (when
+   `prefetch.enable`): head/tail windows on the data lowers'
+   stored-blob-level sources, sequentially awaited under a wall-time
+   budget, Prefetch scavenger class. Never fails assembly.
+7. Replays the trace blob (when loaded) via
    `src/image/trace_replay.hpp::replay_trace`: `populate()` on the data
    lowers' stored-blob-level sources, in recorded order, sequentially
    awaited, bounded by `TraceReplayOptions`. Never fails assembly.
-7. Read-only: merges with `MergedLsmt` and returns. Writable
+8. Read-only: merges with `MergedLsmt` and returns. Writable
    (`cfg.writable()`): creates `upper.dir` if needed, opens/creates the
    upper (`LsmtRwLayer::create` for `lsmt`, `SparseRwLayer::open` for
    `sparse`) sized to the maximum lower virtual size, merges with
@@ -385,6 +453,49 @@ remote-only reads with a warning — persistence is best-effort and never
 gates boot (ADR-0016). It requires a running Elio scheduler (the DART
 probe, the registry size probes, and `LayerStore::open`'s blocking setup
 via `elio::spawn_blocking`).
+
+### `structural_warmup.hpp` — StructuralWarmupOptions, StructuralWarmupStats, structural_windows, warmup_structural
+
+```cpp
+struct WarmWindow { uint64_t offset; uint64_t len; };
+
+std::vector<WarmWindow> structural_windows(
+    uint64_t blob_size, uint64_t head_bytes, uint64_t tail_bytes) noexcept;
+
+struct StructuralWarmupOptions {
+    uint64_t head_bytes = uint64_t{1} << 20;       // 1 MiB; 0 disables
+    uint64_t tail_bytes = uint64_t{1} << 20;       // 1 MiB; 0 disables
+    std::chrono::milliseconds max_wall_time{30000};
+};
+
+struct StructuralWarmupStats {
+    size_t layers_total = 0;
+    size_t layers_warmed = 0;
+    size_t windows_populated = 0;
+    size_t windows_failed = 0;
+    uint64_t bytes_warmed = 0;
+    bool budget_exhausted = false;
+};
+
+elio::coro::task<StructuralWarmupStats> warmup_structural(
+    const std::vector<source::BlobSource*>& warm_targets,
+    const StructuralWarmupOptions& opts = {});
+```
+
+`src/image/structural_warmup.hpp::structural_windows` — the pure window
+computation: head `[0, head_bytes)` and tail `[size-tail_bytes, size)`,
+each clamped to the blob (0 disables a side), merged into `[0, size)`
+when the clamped windows would cover the whole blob (no byte populated
+twice), empty for an empty blob.
+
+`src/image/structural_warmup.hpp::warmup_structural` — populates the
+windows of every target (one stored-blob-level source per data lower, a
+nullptr entry is skipped): head before tail per layer, each `populate()`
+sequentially awaited. **Never throws**: a failed (or throwing) populate
+is logged, counted in `windows_failed`, and warm-up moves on; processing
+stops early when the wall-time budget is spent (`budget_exhausted`
+set). The window semantics (why the tail is the tar *view's* tail) and
+the bring-up position are in Concepts → "Structural warm-up".
 
 ### `trace_replay.hpp` — TraceReplayOptions, TraceReplayStats, replay_trace
 
@@ -598,6 +709,30 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
 - `image: writable image with a trace layer assembles and replays` — a
   writable (`upper`) image with `accelerationLayer` still sets the trace
   layer aside, replays it, and serves copy-on-write reads/writes.
+- `image: structural warm-up windows clamp and merge on small blobs` —
+  the pure window computation: disjoint head/tail windows at the exact
+  edges, clamping per side, a single merged full window for any blob
+  smaller than head+tail (no double-population), 0 disabling a side, and
+  no windows for an empty blob.
+- `image: structural warm-up populates head and tail windows opportunistically` —
+  the driver issues head-before-tail per layer in layer order, merges a
+  small blob into one window, skips nullptr targets, counts failing and
+  throwing populates without propagating them, issues nothing when both
+  window sizes are 0, and stops early on the wall-time budget.
+- `image: prefetch config parses structural window knobs` — the
+  `prefetch` section's honored subset parses with the documented
+  defaults (enabled, 1024/1024), a 0 window size is kept, and partial
+  sections default field by field.
+- `image: prefetch enable false skips structural warm-up` — with
+  `prefetch.enable = false` no structural warm-up runs (stats zero)
+  while the device still assembles and reads byte-exactly; with it
+  enabled the local lower's merged window is populated (ADR-0012).
+- `integration: structural warm-up fetches head and tail extents at bring-up` —
+  against the multi-blob mock with 256 KiB windows: with warm-up
+  enabled, `open_image` alone (no device read) fetches a head extent and
+  a tail extent that only the warm-up can reach, while a middle extent
+  stays cold; with `prefetch.enable = false` the same extents stay cold
+  and the device still reads byte-exactly (ADR-0012 cold-start floor).
 - `integration: trace layer replays warm-up through the layer store` —
   end to end against the multi-blob mock: a tar-wrapped trace layer is
   recognized, set aside, and its records warm the data layer through
@@ -645,17 +780,18 @@ single Range-capable blob. No external golden files.
   compatibility path).
 - **Honored config surface is a subset** — `cacheConfig`, `ioEngine`,
   non-file `credentialConfig` modes, and `resultFile` handling
-  are parsed-as-ignored / informational in v0.1; of `prefetch`, only
-  `enable` is honored (see `docs/config.md` for
-  the full compatibility matrix). The trace layer IS recognized and
+  are parsed-as-ignored / informational in v0.1; of `prefetch`,
+  `enable`, `head_kb`, and `tail_kb` are honored (see `docs/config.md`
+  for the full compatibility matrix). The trace layer IS recognized and
   replayed (ADR-0013, proposed; see Concepts → "The trace layer"), with
   these gaps: trace **recording** is not implemented; the
   dynamic-prefetch file-list fallback is rejected by design; the tar
   member name (`trace`) is not checked — recognition is the config flag
   plus the blob magic; remote lowers without `dir` are not warmed
-  (populate is a no-op on the bare `RegistrySource`); and replay is
-  still awaited inline during bring-up — detaching it into background
-  scavenger warm-up is a follow-up the ADR-0012 funnel now makes safe.
+  (populate is a no-op on the bare `RegistrySource`); and both replay
+  and the structural warm-up are still awaited inline during bring-up —
+  detaching them into background scavenger warm-up is a follow-up the
+  ADR-0012 funnel now makes safe.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically** — the

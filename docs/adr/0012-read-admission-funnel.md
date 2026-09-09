@@ -5,7 +5,8 @@
 - Supersedes: none
 - Implemented-by: [#26](https://github.com/Coldwings/OverlayBD-Elio/pull/26)
 - Binds: docs/design-assumptions.md, docs/source.md, docs/ublk.md,
-  docs/config.md, src/source/registry.hpp, src/ublk/elio_bridge.hpp
+  docs/config.md, docs/image.md, src/source/registry.hpp,
+  src/ublk/elio_bridge.hpp, src/image/structural_warmup.hpp
 
 ## Context
 

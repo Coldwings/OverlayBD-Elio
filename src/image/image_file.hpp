@@ -30,9 +30,15 @@
 // its trace blob is replayed as populate() warm-up on the data lowers'
 // source chains (trace-format.md §6). Replay is opportunistic: a
 // missing/malformed trace never fails assembly.
+//
+// Structural warm-up (ADR-0012's cold-start floor): before replay, the
+// head/tail windows of every data lower's stored-blob view are
+// populated (structural_warmup.hpp) — bounded, scavenger-class, and
+// opportunistic like replay; `prefetch.enable` gates both.
 #pragma once
 
 #include "image/config.hpp"
+#include "image/structural_warmup.hpp"
 #include "image/trace_replay.hpp"
 #include "source/admission.hpp"
 #include "source/blob_source.hpp"
@@ -54,6 +60,8 @@ struct OpenedImage {
     std::string upper_path;      // the writable layer file, when writable
     TraceReplayStats trace;      // ADR-0013 replay outcome (all zero when
                                  // no acceleration layer was configured)
+    StructuralWarmupStats warmup;  // ADR-0012 structural warm-up outcome
+                                 // (all zero when prefetch.enable is off)
     /// The layer_stores vector holds non-owning handles to every
     /// LayerStore in the chain (owned by `root`), for lifecycle
     /// operations: background fills must be parked (call park_image_fills)

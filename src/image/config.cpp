@@ -81,9 +81,12 @@ GlobalConfig GlobalConfig::from_json_text(const std::string& text) {
     }
     if (const auto it = j.find("prefetch"); it != j.end() && it->is_object()) {
         // ADR-0012/0013: the honored subset of the upstream prefetch
-        // section is the master switch alone — the admission funnel's
-        // AIMD window is deliberately not operator-configured.
+        // section is the master switch plus the structural head/tail
+        // window sizes — the admission funnel's AIMD window is
+        // deliberately not operator-configured.
         cfg.prefetch_enable = it->value("enable", true);
+        cfg.prefetch_head_kb = it->value("head_kb", uint32_t{1024});
+        cfg.prefetch_tail_kb = it->value("tail_kb", uint32_t{1024});
     }
     // cacheConfig / ioEngine: intentionally not honored in v0.1
     // (docs/config.md).

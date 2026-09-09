@@ -654,7 +654,8 @@ elio::coro::task<ssize_t> LayerStore::populate(uint64_t offset, size_t len) {
         if (records_[eid].load(std::memory_order_acquire) & kFlagPresent) {
             continue;
         }
-        // Warm-up (trace replay): the ADR-0012 Prefetch scavenger class.
+        // Warm-up (structural prefetch, trace replay): the ADR-0012
+        // Prefetch scavenger class.
         const FetchResult fr =
             co_await join_or_fetch(eid, ReadClass::Prefetch);
         if (fr.error != 0) co_return -fr.error;

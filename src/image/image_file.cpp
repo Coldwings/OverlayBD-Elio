@@ -298,6 +298,28 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             co_await format::LsmtLayer::open(std::move(view)));
     }
 
+    // Structural warm-up (ADR-0012's cold-start floor): populate the
+    // head/tail windows of every data lower's stored-blob view before
+    // the merge takes ownership of the layer chain — the floor first;
+    // trace replay below refines it. Awaited inline during bring-up
+    // under a wall-time budget, exactly like replay (detaching both off
+    // the bring-up path is the same documented follow-up); every
+    // populate rides the funnel as the Prefetch scavenger class, and
+    // dedup against the open-time probes, replay, and fill is automatic
+    // via the LayerStore in-flight map. Opportunistic — failures are
+    // logged, never propagated, and a bypassed/degraded store turns
+    // populate into a no-op. `prefetch.enable` is the master gate for
+    // both warm-up kinds.
+    StructuralWarmupStats warmup_stats;
+    if (global.prefetch_enable) {
+        StructuralWarmupOptions wopts;
+        wopts.head_bytes =
+            static_cast<uint64_t>(global.prefetch_head_kb) << 10;
+        wopts.tail_bytes =
+            static_cast<uint64_t>(global.prefetch_tail_kb) << 10;
+        warmup_stats = co_await warmup_structural(warm_targets, wopts);
+    }
+
     // Trace replay (ADR-0013): warm the data lowers from the recorded
     // access pattern before the merge takes ownership of the layer chain.
     // Opportunistic — failures only disable prefetch.
@@ -313,6 +335,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         out.virtual_size = merged->size();
         out.layer_count = n;
         out.trace = trace_stats;
+        out.warmup = warmup_stats;
         out.root = std::move(merged);
         out.layer_stores = std::move(stores);
         out.funnel = std::move(funnel);
@@ -343,6 +366,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     out.writable = true;
     out.upper_path = upper_path;
     out.trace = trace_stats;
+    out.warmup = warmup_stats;
     out.root = std::move(merged);
     out.layer_stores = std::move(stores);
     out.funnel = std::move(funnel);

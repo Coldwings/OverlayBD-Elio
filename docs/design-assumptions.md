@@ -130,9 +130,10 @@ keep flowing through P2P). The rules:
 - **On-demand reads are unconditional** — a guest-blocking miss is
   admitted immediately, even past the concurrency window; it is never
   delayed to protect the window.
-- **Prefetch (trace replay) and fill are a scavenger class** — admitted
+- **Prefetch (structural warm-up and trace replay) and fill are a
+  scavenger class** — admitted
   only when no on-demand request is in flight and total in-flight
-  requests are below an AIMD window. Trace replay outranks fill within
+  requests are below an AIMD window. Prefetch outranks fill within
   the class. The window is not operator-configured: it grows additively
   while observed on-demand latency stays flat against an EMA baseline
   and shrinks multiplicatively on a latency rise (LEDBAT-style — consume
