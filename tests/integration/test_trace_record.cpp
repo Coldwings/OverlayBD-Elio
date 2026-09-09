@@ -223,11 +223,19 @@ std::string uds_rpc(const std::string& path, const std::string& line) {
         ::close(fd);
         throw std::system_error(e, std::generic_category());
     }
-    if (::write(fd, line.data(), line.size()) !=
-        static_cast<ssize_t>(line.size())) {
-        const int e = errno;
-        ::close(fd);
-        throw std::system_error(e, std::generic_category());
+    // ::write may legally short-write on SOCK_STREAM (and be EINTR'd);
+    // loop for the whole line like the production writer does.
+    size_t sent = 0;
+    while (sent < line.size()) {
+        const ssize_t w =
+            ::write(fd, line.data() + sent, line.size() - sent);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            const int e = w < 0 ? errno : EIO;
+            ::close(fd);
+            throw std::system_error(e, std::generic_category());
+        }
+        sent += static_cast<size_t>(w);
     }
     std::string reply;
     char buf[4096];
@@ -258,8 +266,18 @@ void uds_send_and_vanish(const std::string& path, const std::string& line) {
         ::close(fd);
         throw std::system_error(e, std::generic_category());
     }
-    const ssize_t w = ::write(fd, line.data(), line.size());
-    (void)w;
+    // Loop the write (short writes are legal on SOCK_STREAM, even on a
+    // fresh socket under load); then close WITHOUT reading (CLI-death).
+    size_t sent = 0;
+    while (sent < line.size()) {
+        const ssize_t w =
+            ::write(fd, line.data() + sent, line.size() - sent);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            break;  // best-effort: vanish regardless
+        }
+        sent += static_cast<size_t>(w);
+    }
     ::close(fd);  // gone: no reply read, no clean shutdown
 }
 
