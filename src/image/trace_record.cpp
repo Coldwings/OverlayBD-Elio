@@ -6,6 +6,7 @@
 #include <elio/io/io_awaitables.hpp>
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
 
 #include <fcntl.h>
@@ -297,10 +298,13 @@ TraceRecorder::finalize_locked_state(int fd, std::string path,
     // fsync can block for an unbounded time (dirty-data flush under IO
     // congestion); finalize can run on a LIVE device (duration expiry),
     // so offload it — never block an Elio worker on a sync syscall.
-    const int fs_rc = co_await elio::spawn_blocking([fd] { return ::fsync(fd); });
+    // errno is captured inside the blocking lambda (thread-local).
+    const int fs_rc = co_await elio::spawn_blocking([fd] {
+        return ::fsync(fd) != 0 ? -errno : 0;
+    });
     if (fs_rc != 0) {
         res.error = std::string("trace fsync failed: ") +
-                    std::strerror(fs_rc);
+                    std::strerror(-fs_rc);
         ::close(fd);
         co_return res;
     }
