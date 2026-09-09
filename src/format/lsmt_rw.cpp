@@ -678,10 +678,56 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
 elio::coro::task<int> LsmtRwLayer::seal_file(const std::string& path,
                                              const std::string& user_tag,
                                              std::string* sha256_hex,
-                                             uint64_t* size) {
+                                             uint64_t* size,
+                                             uint64_t virtual_size,
+                                             std::string* reject) {
     int err = 0;
     auto layer = co_await open_checkpointed(path, &err);
     if (!layer) co_return err;
+    if (virtual_size > 0) {
+        // D3 commit re-baseline: grow-only vs the layer's declared size
+        // AND its content extent (the highest covered sector end — the
+        // checkpoint index is loaded by open_checkpointed). An override
+        // smaller than either would re-baseline below existing content
+        // or below what the layer already declares (shrink), which is
+        // rejected here with a precise reason BEFORE any compaction, so
+        // the upper stays committable at the declared size.
+        if (virtual_size % kSector != 0) {
+            if (reject != nullptr) {
+                *reject = "commit virtual_size must be a positive multiple "
+                          "of 512 bytes";
+            }
+            co_return -EINVAL;
+        }
+        const uint64_t declared = layer->virtual_size();
+        if (virtual_size < declared) {
+            if (reject != nullptr) {
+                *reject = "commit virtual_size " +
+                          std::to_string(virtual_size) +
+                          " is smaller than the layer's declared size " +
+                          std::to_string(declared) +
+                          " (grow-only re-baseline)";
+            }
+            co_return -EINVAL;
+        }
+        uint64_t content_extent = 0;
+        for (const auto& s : layer->segments()) {
+            content_extent = std::max(content_extent, s.end() * kSector);
+        }
+        if (virtual_size < content_extent) {
+            if (reject != nullptr) {
+                *reject = "commit virtual_size " +
+                          std::to_string(virtual_size) +
+                          " is smaller than the layer's content extent " +
+                          std::to_string(content_extent) +
+                          " (grow-only re-baseline)";
+            }
+            co_return -EINVAL;
+        }
+        // The seal writes header/trailer and hashes virtual_size from
+        // the layer's vsize_ member; re-baseline by overriding it.
+        layer->vsize_ = virtual_size;
+    }
     const int rc = co_await layer->seal(user_tag);
     if (rc != 0) co_return rc;
     layer.reset();  // seal renamed over path; drop the stale inode's fd

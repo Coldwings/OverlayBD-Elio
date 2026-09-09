@@ -27,7 +27,7 @@ void usage(const char* argv0) {
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
-                 "  %s [--socket PATH] commit <id> [--tag TAG]\n"
+                 "  %s [--socket PATH] commit <id> [--tag TAG] [--virtual-size BYTES]\n"
                  "  %s [--socket PATH] trace_start <id> <output.trace> [--duration SEC]\n"
                  "  %s [--socket PATH] trace_stop <id>\n"
                  "  %s [--socket PATH] resize <id> <size-bytes>\n",
@@ -121,7 +121,30 @@ int main(int argc, char** argv) {
         while (i < argc) {
             const std::string a = argv[i++];
             if (a == "--tag" && i < argc) req["user_tag"] = argv[i++];
-            else {
+            else if (a == "--virtual-size" && i < argc) {
+                // D3 commit re-baseline override (bytes): full strtoull
+                // validation; grow-only/alignment semantics are decided
+                // where the upper is readable (supervisor + seal path).
+                const char* v = argv[i++];
+                if (v[0] == '-') {
+                    std::fprintf(stderr,
+                                 "invalid --virtual-size '%s' (want a "
+                                 "positive byte count)\n",
+                                 v);
+                    return 2;
+                }
+                char* end = nullptr;
+                errno = 0;
+                const unsigned long long b = std::strtoull(v, &end, 10);
+                if (errno != 0 || end == v || *end != '\0' || b == 0) {
+                    std::fprintf(stderr,
+                                 "invalid --virtual-size '%s' (want a "
+                                 "positive byte count)\n",
+                                 v);
+                    return 2;
+                }
+                req["virtual_size"] = b;
+            } else {
                 usage(argv[0]);
                 return 2;
             }

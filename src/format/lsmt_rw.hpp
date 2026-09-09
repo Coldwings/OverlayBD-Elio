@@ -74,10 +74,21 @@ public:
     /// -ENOENT when the file is missing, -EALREADY when it is already
     /// sealed, -EINVAL when it is not a valid checkpointed LSMT-RW file
     /// (e.g. the device crashed before checkpointing).
+    ///
+    /// D3 commit re-baseline: `virtual_size` (bytes, 0 = keep the
+    /// checkpointed size) overrides the virtual size written into the
+    /// sealed header/trailer (and hashed into the content digest), so a
+    /// commit can declare a larger device. Grow-only, validated here
+    /// before any compaction: the override must be 512-aligned and at
+    /// least both the layer's declared virtual size and its content
+    /// extent (the highest covered sector). A rejected override returns
+    /// -EINVAL with a human-readable reason in `reject` (when non-null).
     static elio::coro::task<int> seal_file(const std::string& path,
                                            const std::string& user_tag,
                                            std::string* sha256_hex,
-                                           uint64_t* size);
+                                           uint64_t* size,
+                                           uint64_t virtual_size = 0,
+                                           std::string* reject = nullptr);
 
 private:
     LsmtRwLayer() = default;

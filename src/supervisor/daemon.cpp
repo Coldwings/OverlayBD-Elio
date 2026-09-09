@@ -930,6 +930,24 @@ private:
     elio::coro::task<std::string> cmd_commit(const nlohmann::json& j) {
         const std::string id = j["id"].get<std::string>();
         const std::string user_tag = j.value("user_tag", "");
+        // D3 commit re-baseline: optional virtual_size override (bytes)
+        // written into the sealed header (0 = keep the layer's declared
+        // size). parse_command validated the type; alignment/positivity
+        // are checked here (before the device is stopped); grow-only vs
+        // the layer's declared size and content extent is validated in
+        // the seal path, where the checkpoint is readable.
+        uint64_t virtual_size = 0;
+        if (j.contains("virtual_size")) {
+            virtual_size = j["virtual_size"].is_number_unsigned()
+                               ? j["virtual_size"].get<uint64_t>()
+                               : static_cast<uint64_t>(
+                                     j["virtual_size"].get<int64_t>());
+        }
+        if (virtual_size > 0 && virtual_size % 512 != 0) {
+            co_return reply_error(
+                "commit virtual_size must be a positive multiple of 512 "
+                "bytes");
+        }
         std::shared_ptr<DeviceEntry> entry;
         {
             co_await mu_.lock();
@@ -951,7 +969,8 @@ private:
 
         std::string reply;
         try {
-            reply = co_await commit_stop_and_seal(entry, id, user_tag);
+            reply = co_await commit_stop_and_seal(entry, id, user_tag,
+                                                  virtual_size);
         } catch (const std::exception& e) {
             reply = reply_error(std::string("commit failed for ") + id +
                                 ": " + e.what());
@@ -965,10 +984,11 @@ private:
     }
 
     /// The commit critical section (see cmd_commit). Runs with the entry's
-    /// op_mu held across the stop and the seal.
+    /// op_mu held across the stop and the seal. `virtual_size` is the D3
+    /// re-baseline override (0 = keep the layer's declared size).
     elio::coro::task<std::string> commit_stop_and_seal(
         const std::shared_ptr<DeviceEntry>& entry, const std::string& id,
-        const std::string& user_tag) {
+        const std::string& user_tag, uint64_t virtual_size) {
         if (!entry->image_config_ok) {
             co_return reply_error(
                 "image config unreadable at create; upper unknown: " + id);
@@ -1025,13 +1045,19 @@ private:
 
         std::string sha256;
         uint64_t size = 0;
+        std::string seal_reject;
         const int rc = co_await format::LsmtRwLayer::seal_file(
-            upper, user_tag, &sha256, &size);
+            upper, user_tag, &sha256, &size, virtual_size, &seal_reject);
         if (rc == -ENOENT) {
             co_return reply_error("upper file not found: " + upper);
         }
         if (rc == -EALREADY) {
             co_return reply_error("upper already sealed: " + upper);
+        }
+        if (rc == -EINVAL && !seal_reject.empty()) {
+            // D3 re-baseline rejected (grow-only/alignment): precise
+            // reason; the upper is untouched and remains committable.
+            co_return reply_error(seal_reject);
         }
         if (rc == -EINVAL) {
             co_return reply_error("upper has no valid shutdown checkpoint "

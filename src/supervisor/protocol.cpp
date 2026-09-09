@@ -69,6 +69,17 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
             error = "commit 'user_tag' must be a string";
             return std::nullopt;
         }
+        // D3 commit re-baseline: optional 'virtual_size' override in
+        // bytes (0 = absent). Semantic rules (positive, 512-aligned,
+        // grow-only vs the layer's declared size and content extent)
+        // live in the handlers/seal path, where the upper is readable.
+        if (j.contains("virtual_size") &&
+            !j["virtual_size"].is_number_unsigned() &&
+            !(j["virtual_size"].is_number_integer() &&
+              j["virtual_size"].get<int64_t>() >= 0)) {
+            error = "commit 'virtual_size' must be a non-negative integer";
+            return std::nullopt;
+        }
     } else if (cmd == "trace_start") {
         if (!j.contains("id") || !j.contains("path") ||
             !j.contains("duration_sec")) {
