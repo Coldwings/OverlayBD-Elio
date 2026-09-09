@@ -130,7 +130,20 @@ bring-up, **after the layer chains are built and before the trace blob
 load and replay** (the floor first; the trace path refines it — and a
 slow trace layer's fetch time sits outside both warm-up budgets, so the
 floor must not wait on it), bounded by a 30 s wall-time budget
-(the same pattern and default as replay). Combined with replay's
+(the same pattern and default as replay). The budget means **30 s of
+actual warm-up work**: windows are populated in 64 KiB slices (one
+LayerStore extent — the granularity the LayerStore path already
+suspends at between remote fetches, so slicing adds no remote traffic),
+the budget is re-checked between slices, and a window that cannot
+finish within the budget is **abandoned mid-window** (`windows_skipped`)
+rather than awaited to its end. A slice whose funnel admission stays
+closed past the per-extent admit bound (2 s,
+`LayerStore::Config::populate_admit_timeout`, issue #35) skips its
+window outright the same way — blocked or slow windows are skipped,
+never awaited, overshoot bounded by one admit bound plus one extent
+fetch, and every skipped extent is simply served on demand later.
+(The same admit bound also covers trace replay's populates, which share
+the LayerStore populate path.) Combined with replay's
 identical budget, structural warm-up plus trace replay add at most
 **~60 s** to the worst-case device bring-up (plus the trace blob load,
 bounded only by the registry client's timeouts — see "The trace layer");
@@ -732,10 +745,20 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   smaller than head+tail (no double-population), 0 disabling a side, and
   no windows for an empty blob.
 - `image: structural warm-up populates head and tail windows opportunistically` —
-  the driver issues head-before-tail per layer in layer order, merges a
-  small blob into one window, skips nullptr targets, counts failing and
-  throwing populates without propagating them, issues nothing when both
-  window sizes are 0, and stops early on the wall-time budget.
+  the driver issues head-before-tail per layer in layer order (each
+  window in 64 KiB slices), merges a small blob into one window, skips
+  nullptr targets, counts failing and throwing populates without
+  propagating them, issues nothing when both window sizes are 0, and
+  stops early on the wall-time budget (abandoning the in-flight window).
+- `image: structural warm-up budget interrupts a slow window` — the
+  wall budget is real mid-window: a source sleeping 250 ms per extent
+  is interrupted after one or two 64 KiB slices under a 300 ms budget
+  (`windows_skipped`, `budget_exhausted`), never awaited to the
+  window's end.
+- `image: structural warm-up skips windows the funnel will not admit` —
+  issue #35: a `-EAGAIN` populate (funnel gate closed past the admit
+  timeout) skips the window (`windows_skipped`) and warm-up moves on
+  without waiting.
 - `image: prefetch config parses structural window knobs` — the
   `prefetch` section's honored subset parses with the documented
   defaults (enabled, 1024/1024), a 0 window size is kept, partial

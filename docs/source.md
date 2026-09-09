@@ -275,7 +275,12 @@ tail) — is populated before trace replay. It needs no trace and no
 format parsing (windows come from the blob's byte layout alone), rides
 this funnel as the Prefetch class like every populate, and is
 opportunistic: failures are logged and skipped, never a bring-up error,
-and on a bypassed/degraded LayerStore populate is a no-op.
+and on a bypassed/degraded LayerStore populate is a no-op. Its 30 s
+wall budget is checked between 64 KiB populate slices (one extent), and
+each slice's funnel admission is bounded (`populate_admit_timeout` —
+`acquire_scavenger_bounded`), so a slow source abandons a window
+mid-way and a storm-closed gate skips it outright — skipped, never
+awaited — instead of delaying bring-up (issue #35; see `docs/image.md`).
 
 The window is **not operator-configured**; it is AIMD-managed from
 observed on-demand latency, a LEDBAT-style scavenger that consumes only
@@ -629,6 +634,8 @@ public:
     explicit AdmissionFunnel(Config cfg);
     class Permit;  // move-only RAII admission slot
     elio::coro::task<Permit> acquire(ReadClass cls);
+    elio::coro::task<std::optional<Permit>> acquire_scavenger_bounded(
+        ReadClass cls, std::chrono::milliseconds timeout);
     size_t cap_request(ReadClass cls, size_t bytes) const;
     void note_on_demand_latency(std::chrono::nanoseconds sample);
     uint32_t window() const;
@@ -663,7 +670,17 @@ admission funnel (ADR-0012; see Concepts §"Read admission funnel").
   the caller's remote fetch must happen while holding it — the permit's
   lifetime is the fetch, and for OnDemand its wall-clock latency is the
   AIMD sample fed at release. Releasing may wake queued scavengers; it
-  never blocks.
+  never blocks. Plain `acquire()` waiters must not be cancelled: a
+  waiter cancelled after its slot was reserved would leak the slot.
+- `acquire_scavenger_bounded(cls, timeout)` — the scavenger-only bounded
+  variant (issue #35): if the gate has not opened within `timeout`, the
+  waiter dequeues itself and the result is `std::nullopt` — the caller
+  skips the request instead of waiting indefinitely (warm-up's "blocked
+  windows are skipped, never awaited" contract). Cancel-safe where
+  `acquire()` is not: a waiter whose slot was already reserved when the
+  timeout fires adopts the slot rather than leaking it; a still-queued
+  waiter is removed under the funnel mutex. OnDemand must not use it —
+  unconditional admission is the OnDemand contract.
 - `cap_request(cls, bytes)` — clamps scavenger requests to
   `scavenger_size_cap` (~1 MiB; the caller splits); OnDemand is uncapped.
 - `note_on_demand_latency(sample)` — feeds a synthetic AIMD sample
@@ -697,6 +714,7 @@ public:
             uint32_t block_size = 256 * 1024;
         } fill;
         AdmissionFunnelPtr funnel;  // null = no admission governance
+        std::chrono::milliseconds populate_admit_timeout{0};  // 0 = wait
     };
     enum class State : int { Filling = 0, Complete = 1, Bypass = 2 };
     enum class FillStatus : int { kDisabled, kWaiting, kFilling, kDone,
@@ -770,8 +788,14 @@ remote bytes into a sparse local staging file with a sidecar extent map
 - `src/source/layer_store.hpp::LayerStore::populate` — warms every missing
   extent in `[offset, offset+len)` through the same coalesced fetch and
   write-behind path without delivering data; with `Config::funnel` set the
-  fetches are admitted as the ADR-0012 Prefetch scavenger class. Returns 0
-  or a negative `-errno`. No-op (0) in `Complete` and `Bypass`.
+  fetches are admitted as the ADR-0012 Prefetch scavenger class. When
+  `Config::populate_admit_timeout` is non-zero (assembled devices set it,
+  issue #35), an extent whose fetch cannot be admitted within that bound
+  is SKIPPED: populate fails with `-EAGAIN` (warm-up and replay count the
+  window/record skipped and move on) instead of waiting at a storm-closed
+  gate indefinitely; in-flight joiners of the same extent see the same
+  `-EAGAIN`. Returns 0 or a negative `-errno`. No-op (0) in `Complete` and
+  `Bypass`.
 - Background fill (`Config::fill`) — one scavenger coroutine walking the
   extent map and fetching contiguous missing runs as coalesced range reads
   (cap `max(fill.block_size, extent_size)`, ≤ 1 MiB; with a funnel, the
@@ -1095,6 +1119,10 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: admission funnel blocks scavengers while on-demand is in flight` —
   queued Prefetch/Fill requests stay parked while an on-demand request is
   in flight (even with window room) and enter once it completes.
+- `source: admission funnel bounded scavenger acquire times out and dequeues` —
+  issue #35: a bounded scavenger acquire whose gate stays closed returns
+  `std::nullopt` at its timeout, dequeues without leaking a slot, and is
+  still admitted when the gate opens before the deadline.
 - `source: admission funnel grows additively on flat latency and halves on rise` —
   flat samples at the EMA baseline raise the window by one each; a sample
   above 150% of the baseline halves it (AIMD, ADR-0012).
@@ -1113,6 +1141,10 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: layer store populate waits at the admission funnel while reads pass` —
   with the window held full, a store `pread` (OnDemand) completes anyway
   while a `populate` (Prefetch) queues, proceeding when a slot frees.
+- `source: layer store populate skips the extent when the funnel gate stays closed` —
+  issue #35: with `populate_admit_timeout` set and the gate held closed,
+  `populate` fails the extent with `-EAGAIN` within the bound and
+  succeeds once the gate opens.
 - `source: admission funnel re-checks the gate when queueing a scavenger` —
   lost-wakeup regression: the scavenger slow path pushes its waiter and
   re-runs admission in one critical section, so a release landing in the

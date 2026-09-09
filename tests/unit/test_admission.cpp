@@ -149,6 +149,101 @@ TEST_CASE("source: admission funnel blocks scavengers while on-demand is in flig
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("source: admission funnel bounded scavenger acquire times out and dequeues",
+          "[source]") {
+    // Issue #35 primitive: a scavenger that cannot be admitted within
+    // its timeout skips (nullopt) instead of waiting indefinitely, the
+    // dequeued waiter leaves no ghost reservation behind (a leaked slot
+    // would wedge the window), and an admission before the timeout
+    // still succeeds.
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        AdmissionFunnel funnel;  // window starts at 2
+        {
+            // Gate open: immediate admission, like acquire().
+            auto p = co_await funnel.acquire_scavenger_bounded(
+                ReadClass::Prefetch, milliseconds(60));
+            REQUIRE(p.has_value());
+        }
+        // Hold the gate closed with an on-demand request.
+        auto od = co_await funnel.acquire(ReadClass::OnDemand);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto timed_out = co_await funnel.acquire_scavenger_bounded(
+            ReadClass::Prefetch, milliseconds(60));
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        REQUIRE(!timed_out.has_value());
+        REQUIRE(elapsed >= milliseconds(50));
+        REQUIRE(elapsed < std::chrono::seconds(2));
+        REQUIRE(funnel.scavenger_waits() == 1);
+        // The timeout dequeued the waiter and reserved nothing: only the
+        // held on-demand permit remains in flight.
+        REQUIRE(funnel.inflight_total() == 1);
+        // A bounded waiter queued while the gate is closed is still
+        // admitted when the gate opens before its timeout.
+        std::atomic<int> admitted{0};
+        elio::go([&]() -> elio::coro::task<void> {
+            auto p = co_await funnel.acquire_scavenger_bounded(
+                ReadClass::Fill, std::chrono::seconds(5));
+            if (p.has_value()) {
+                admitted.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        co_await elio::time::sleep_for(milliseconds(30));
+        REQUIRE(admitted.load() == 0);
+        od.reset();  // opens the gate
+        const bool got = co_await poll_until(
+            [&] { return admitted.load() == 1; });
+        REQUIRE(got);
+        // And no ghost reservation lingers after everything settles:
+        // the window is fully free again.
+        const bool drained = co_await poll_until(
+            [&] { return funnel.inflight_total() == 0; });
+        REQUIRE(drained);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store populate skips the extent when the funnel gate stays closed",
+          "[source]") {
+    // Issue #35 end of the plumbing: with populate_admit_timeout set,
+    // a populate whose extent fetch cannot be admitted within the
+    // bound fails that extent with -EAGAIN (warm-up skips the window)
+    // instead of waiting at the gate indefinitely; once the gate opens
+    // the same populate succeeds.
+    test::TempDir dir;
+    constexpr size_t kExtent = 64 * 1024;
+    auto blob = test::pattern_bytes(2 * kExtent, 23);
+    const std::string digest = common::Sha256::hex(blob.data(), blob.size());
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto funnel = std::make_shared<AdmissionFunnel>();
+        auto* vec = new test::VectorSource(blob);
+        source::LayerStore::Config lsc;
+        lsc.funnel = funnel;
+        lsc.populate_admit_timeout = milliseconds(60);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest, lsc);
+
+        // Hold the gate closed with an on-demand permit (the storm).
+        auto od = co_await funnel->acquire(ReadClass::OnDemand);
+        const auto t0 = std::chrono::steady_clock::now();
+        const ssize_t skipped = co_await store->populate(0, kExtent);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        REQUIRE(skipped == -EAGAIN);
+        REQUIRE(elapsed >= milliseconds(50));
+        REQUIRE(elapsed < std::chrono::seconds(2));
+        REQUIRE(vec->reads() == 0);  // nothing reached the remote
+
+        // Gate open: the same populate fetches and persists.
+        od.reset();
+        const ssize_t warmed = co_await store->populate(0, kExtent);
+        REQUIRE(warmed == 0);
+        REQUIRE(vec->reads() == 1);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("source: admission funnel grows additively on flat latency and halves on rise",
           "[source]") {
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {

@@ -35,8 +35,14 @@
 //
 // Warm-up is OPPORTUNISTIC: a failing populate (a source error, a
 // bypassed/degraded LayerStore — populate is a no-op there, never an
-// error) is logged and skipped, never a device bring-up error, and the
-// wall-time budget caps the worst-case bring-up delay.
+// error) is logged and skipped, never a device bring-up error. The
+// wall-time budget is real: windows are populated in 64 KiB slices (one
+// LayerStore extent — the granularity the LayerStore path already
+// suspends at, so slicing adds no remote traffic), the budget is
+// re-checked between slices, and a window that cannot finish within the
+// budget is abandoned mid-window (windows_skipped) rather than awaited
+// to its end — 30 s of actual warm-up work, with overshoot bounded by
+// one extent fetch, and every skipped extent simply served on demand.
 #pragma once
 
 #include "source/blob_source.hpp"
@@ -77,28 +83,38 @@ struct StructuralWarmupOptions {
     uint64_t tail_bytes = uint64_t{1} << 20;
     /// Wall-time budget: warm-up is sequentially awaited during device
     /// bring-up, so this caps the worst-case bring-up delay it adds
-    /// (same pattern and default as trace replay).
+    /// (same pattern and default as trace replay). Checked between
+    /// 64 KiB populate slices; a single in-flight slice may carry the
+    /// pass past the deadline by at most one extent fetch.
     std::chrono::milliseconds max_wall_time{30000};
 };
 
 /// Outcome of one warm-up pass, for logs and diagnostics (OpenedImage).
 struct StructuralWarmupStats {
     size_t layers_total = 0;      ///< data lowers warm-up ran for
-    size_t layers_warmed = 0;     ///< layers with >= 1 successful window
-    size_t windows_populated = 0; ///< populate() calls that succeeded
-    size_t windows_failed = 0;    ///< populate() calls that failed/threw
-    uint64_t bytes_warmed = 0;    ///< sum of populated window lengths
+    size_t layers_warmed = 0;     ///< layers with >= 1 successful slice
+    size_t windows_populated = 0; ///< windows fully populated
+    size_t windows_failed = 0;    ///< windows whose populate failed/threw
+    size_t windows_skipped = 0;   ///< windows skipped, never awaited:
+                                  ///< abandoned mid-way (budget spent) or
+                                  ///< not admitted at the funnel gate in
+                                  ///< time (EAGAIN, issue #35)
+    uint64_t bytes_warmed = 0;    ///< sum of populated slice lengths
     bool budget_exhausted = false; ///< stopped early on the wall budget
 };
 
 /// Function warmup_structural populates the head/tail windows of every
 /// target: warm_targets[i] is the stored-blob-level source of data lower
 /// i (the TarOffsetSource view; a nullptr entry is skipped). Per layer
-/// the head window is populated before the tail window, each populate()
-/// sequentially awaited. Never throws: a failed or throwing populate is
-/// logged and counted (windows_failed), and warm-up moves on — the
-/// device comes up regardless. Processing stops early when the
-/// wall-time budget is spent (budget_exhausted set).
+/// the head window is populated before the tail window, each window in
+/// sequentially awaited 64 KiB slices. Never throws: a failed or
+/// throwing populate is logged and counted (windows_failed), and warm-up
+/// moves on — the device comes up regardless. Processing stops early
+/// when the wall-time budget is spent (budget_exhausted set); a window
+/// interrupted mid-way by the budget, or whose populate reports EAGAIN
+/// because the funnel gate stayed closed past the store's admit timeout
+/// (issue #35), is counted windows_skipped, its remaining extents left
+/// to on-demand reads.
 elio::coro::task<StructuralWarmupStats> warmup_structural(
     const std::vector<source::BlobSource*>& warm_targets,
     const StructuralWarmupOptions& opts = {});
