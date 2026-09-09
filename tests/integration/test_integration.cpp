@@ -400,7 +400,8 @@ TEST_CASE("integration: layered stack stages over a mock registry",
         REQUIRE(got == 1000);
         auto untarred =
             co_await source::TarOffsetSource::open(std::move(store));
-        REQUIRE(co_await format::is_zfile(*untarred));
+        const bool is_zfile = co_await format::is_zfile(*untarred);
+        REQUIRE(is_zfile);
         auto view =
             co_await format::ZFileSource::open(std::move(untarred), true);
         auto layer = co_await format::LsmtLayer::open(std::move(view));
@@ -430,14 +431,16 @@ TEST_CASE("integration: cancelled connect probe does not break later io",
         // Unreachable probe (nothing on 19999): must time out fast.
         const auto addr = source::parse_dart_address("127.0.0.1:19999/dart");
         REQUIRE(addr.has_value());
-        REQUIRE(!co_await source::dart_proxy_reachable(*addr));
+        const bool reachable = co_await source::dart_proxy_reachable(*addr);
+        REQUIRE(!reachable);
         // Subsequent IO on this scheduler must still work.
         auto client = std::make_shared<source::RegistryClient>(
             nullptr, source::RegistryClientConfig{});
         auto src =
             co_await source::RegistrySource::open(client, server.url("b"));
         std::vector<uint8_t> buf(1024);
-        REQUIRE(co_await src->pread(buf.data(), buf.size(), 0) == 1024);
+        const ssize_t got = co_await src->pread(buf.data(), buf.size(), 0);
+        REQUIRE(got == 1024);
         co_return 0;
     });
     REQUIRE(rc == 0);
