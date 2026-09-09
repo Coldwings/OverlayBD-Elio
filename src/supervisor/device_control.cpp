@@ -38,6 +38,14 @@ public:
                 buf_.erase(0, nl + 1);
                 co_return line;
             }
+            // Oversize check: strictly > (not >=). A line of exactly
+            // kMaxMessageBytes bytes is LEGAL — its '\n' would arrive
+            // at position kMaxMessageBytes, making the buffered prefix
+            // exactly kMaxMessageBytes with no newline yet. Discarding
+            // at >= would kill that legal line. With >, the buffer may
+            // briefly hold kMaxMessageBytes + one read chunk (each
+            // chunk <= 4096) before the discard triggers — a BOUNDED
+            // overshoot, which is all the memory-cap contract needs.
             if (buf_.size() > kMaxMessageBytes) {
                 // Skip the oversized line WITHOUT growing buf_ any
                 // further (the 64 KiB cap exists to bound memory: an
