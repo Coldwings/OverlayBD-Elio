@@ -735,9 +735,9 @@ private:
             co_await fail_pending();
             co_return reply_error("device control channel timeout: " + id);
         }
-        if (!reply.value("ok", false)) {
-            co_return reply_error(reply.value(
-                "error", "device rejected the trace command"));
+        if (!bool_or(reply, "ok", false)) {
+            co_return reply_error(str_or(
+                reply, "error", "device rejected the trace command"));
         }
         // The device reply fields INCLUDING the "reply" discriminator;
         // cmd_trace_start/stop erase it before forwarding to the
