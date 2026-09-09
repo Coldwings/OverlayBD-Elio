@@ -192,6 +192,14 @@ Every test, grouped by area, with the property it guards.
   `index_size == 0` (uuid intact, cross-check would pass) is rejected by
   the index bounds guard instead of underflowing into an empty seal
   (ADR-0014).
+- `format: empty sealed lsmt layer is a zero base of its virtual size` —
+  the ADR-0014 blank-device zero base: a sealed LSMT layer with an empty
+  index opens with the requested `virtual_size` and reads the whole
+  range as zeroes through the normal merge path.
+- `format: empty lsmt layer bytes are deterministic per virtual size` —
+  identical sizes produce byte-identical sealed empty layers (content-
+  derived uuid pinned against an independent digest), different sizes
+  differ (ADR-0014 determinism).
 - `format: merged writable falls through and copy-on-writes` —
   `MergedWritable` reads fall through the upper to sealed lowers, and
   writes shadow lowers copy-on-write without mutating them (ADR-0008).
@@ -457,6 +465,10 @@ Every test, grouped by area, with the property it guards.
 - `image: writable upper assembles and serves writes` — a config with
   `upper.dir` opens a `MergedWritable` root that accepts and serves
   back writes (ADR-0008).
+- `image: blank device assembles a zeroed writable upper` — no config:
+  `open_blank_device` opens a writable root of the requested size over a
+  sealed empty LSMT zero base; fresh reads are zero, writes land in the
+  upper and read back, untouched ranges stay zero (ADR-0014 mode 2).
 - `image: trace replay populates traced extents in recorded order` —
   records interleaving two lowers issue `populate` on the right target in
   the trace's exact order (ADR-0013).
@@ -607,6 +619,13 @@ Every test, grouped by area, with the property it guards.
   field types are parse-time protocol errors, not handler exceptions),
   ignores unknown fields, and the `hello` reply pins the `protocol` field
   plus the `commit` feature advertisement (ADR-0014).
+- `supervisor: create blank spec parses and validates size and mkfs` —
+  the ADR-0014 blank create grammar end to end: `create` parses with a
+  `blank` object (mode 2, and mode 3 with `mkfs`); `config` and `blank`
+  are mutually exclusive with one mandatory; wrong-typed
+  `blank`/`size`/`mkfs` are parse-time errors; `parse_blank_spec`
+  rejects zero, unaligned, and oversized sizes and unsafe `mkfs` types
+  (`valid_mkfs_type`), accepting `ext4`/`xfs` (ADR-0014).
 - `supervisor: device trace control answers malformed-typed fields with clean errors` —
   the device-side trace command loop (`src/supervisor/device_control.hpp`)
   over a real socketpair: a `trace_start` with a wrong-typed `path` or
@@ -772,6 +791,24 @@ Every test, grouped by area, with the property it guards.
   succeeds, the loser gets a precise error ("commit already in progress"
   or "already sealed"), and the sealed file is intact (no interleaved
   tmp-file writes) (ADR-0014). Runs without privileges.
+- `supervisor: blank create serves a writable zero base and commit seals
+  its upper` — ADR-0014 mode 2 with the fake device: `create` with
+  `blank` (no config) assembles the workspace (`overlaybd.zero` +
+  `overlaybd.rw`) via `open_blank_device`; the fake round-trips a
+  payload through the merged stack (unwritten regions read zero); commit
+  stops it and seals the blank-born upper (path/sha256/size); a second
+  commit is "already sealed"; the sealed file re-opens as a valid LSMT
+  RO layer carrying the payload. A recording mock mkfs runner asserts
+  mode 2 never invokes host mkfs (ADR-0014). Runs without privileges.
+- `supervisor: mode-3 mkfs runs only when the blank spec requests it` —
+  ADR-0014 mode 3 with a mock mkfs runner (host mkfs is never executed
+  by the suite): a plain blank create never invokes the runner; a
+  `blank.mkfs` create invokes it exactly once with the requested type
+  and the reported device path and replies ok with the `mkfs` field;
+  commit of a mode-3 (supervisor-formatted) upper is refused with the
+  "host mkfs ... cannot be sealed" boundary error; a failing mkfs is a
+  clean create error and the half-created device entry is removed. Runs
+  without privileges.
 - `integration: trace recording captures remote reads end to end` — a
   real daemon with the extended fake obd-device (opens a REAL image
   against the mock registry, speaks the real device-side trace protocol,

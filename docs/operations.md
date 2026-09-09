@@ -113,6 +113,64 @@ obd-mkimage --input raw.img --out-dir /var/lib/overlaybd-elio/blobs \
             --name base --zfile --zstd
 ```
 
+## Creating devices: three modes (ADR-0014)
+
+`create` makes devices in one of three modes; blank (raw) devices are
+created with `obdctl create-blank` (or the equivalent `create` with a
+`blank` object — the wire form, useful for non-C++ clients):
+
+1. **From an image** — `obdctl create <id> <config.json>` (above): the
+   device virtual size is the image's declared size.
+
+2. **Blank raw disk with a mandatory size** (the caller formats it —
+   covers non-ext4 filesystems and custom layouts):
+
+   ```bash
+   obdctl create-blank myblank --size 8589934592     # 8 GiB, mode 2
+   # → {"ok":true,"id":"myblank","mode":"blank","size":8589934592,
+   #    "device":"/dev/ublkb1"}
+   ```
+
+   The device serves a **zeroed** block device of exactly `size` bytes
+   (positive, 512-aligned, ≤ 16 TiB sanity bound) with a writable upper
+   from birth. Reads of never-written ranges return zeroes; the zero base
+   is a sealed empty LSMT layer (byte-deterministic — see docs/format.md)
+   inside a per-device workspace under the supervisor's `--blank-dir`
+   (default `/var/lib/overlaybd-elio/devices/<id>/`). Commit the upper
+   exactly like any writable device:
+
+   ```bash
+   obdctl commit myblank --tag "vm-rootfs-v1"
+   # → the sealed layer's path/sha256/size (a standard LSMT layer)
+   ```
+
+3. **Blank + mkfs convenience** (host tooling; runtime only):
+
+   ```bash
+   obdctl create-blank myblank --size 8589934592 --mkfs ext4   # mode 3
+   # → {"ok":true,...,"mkfs":"ext4","device":"/dev/ublkb1"}
+   ```
+
+   After the device is up, the **supervisor** runs host `mkfs.<type>` on
+   the new block device (resolved on PATH; bounded by the supervisor's
+   `--mkfs-timeout`, default 300 s) and only replies `ok` once the format
+   succeeded. Requirements: the `mkfs.<type>` binary must exist and the
+   block device node must be visible in the supervisor's namespace.
+   A failing mkfs is a clean create error and the freshly created device
+   entry is removed (nothing half-formatted is left behind). mkfs runs
+   **only when explicitly requested** — mode-2 creates never invoke it.
+
+> **Warning — never feed mkfs output into an image build.** Host mkfs is
+> non-deterministic: every run randomizes UUIDs, hash seeds, timestamps
+> and layout heuristics, so two runs over the same input produce
+> different bytes and content-addressed layer reuse collapses. It exists
+> purely as a runtime convenience for scratch data disks (ADR-0014); the
+> deterministic image-build path is the pinned-library converter. The
+> supervisor enforces the boundary for its own convenience runs: a mode-3
+> device is marked at create time and `obdctl commit` refuses it with
+> "host mkfs ... cannot be sealed". A mode-2 blank that *you* format is
+> yours — commit it only when you intend to publish that exact content.
+
 ## Writable upper layers and sealing (ADR-0008)
 
 A per-image config may add a writable upper:
