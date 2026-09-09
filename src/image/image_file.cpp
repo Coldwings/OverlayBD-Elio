@@ -446,6 +446,54 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     co_return out;
 }
 
+elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
+    constexpr uint64_t kSector = format::lsmt::kAlignment;
+    if (spec.size == 0 || spec.size % kSector != 0) {
+        throw error(EINVAL,
+                    "blank device size must be a positive multiple of 512");
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(spec.dir, ec);
+    if (ec && !std::filesystem::exists(spec.dir)) {
+        throw error(ec.value() != 0 ? static_cast<int>(ec.value()) : EIO,
+                    "cannot create blank device workspace " + spec.dir);
+    }
+
+    // The zero base: a sealed EMPTY LSMT RO layer (ADR-0014). Byte
+    // deterministic (create_empty_lsmt_layer), virtual size = the requested
+    // device size; reads through the merge path zero-fill its whole range.
+    const std::string base_path = spec.dir + "/overlaybd.zero";
+    const int crc =
+        co_await format::create_empty_lsmt_layer(base_path, spec.size);
+    if (crc != 0) {
+        throw_errno(-crc, "cannot create the blank zero base " + base_path);
+    }
+    auto base_src = co_await source::LocalFileSource::open(base_path);
+    std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+    lowers.push_back(co_await format::LsmtLayer::open(std::move(base_src)));
+
+    // The writable upper, sized to the whole device: writes from birth land
+    // here and a later commit seals it like any other ADR-0008 upper.
+    const std::string upper_path = spec.dir + "/overlaybd.rw";
+    std::unique_ptr<format::WritableLayer> top =
+        co_await format::LsmtRwLayer::create(upper_path, spec.size);
+    auto merged = co_await format::MergedWritable::open(std::move(lowers),
+                                                        std::move(top));
+
+    OpenedImage out;
+    out.virtual_size = merged->size();
+    out.layer_count = 1;  // one data layer: the empty zero base
+    out.writable = true;
+    out.upper_path = upper_path;
+    out.root = std::move(merged);
+    // Idle recorder for shape parity with open_image (nothing remote to
+    // tap on a blank device; trace_start records an empty trace).
+    out.recorder = std::make_shared<TraceRecorder>();
+    ELIO_LOG_INFO("blank device assembled: {} bytes, writable upper {}",
+                  out.virtual_size, upper_path);
+    co_return out;
+}
+
 elio::coro::task<void> park_image_fills(const OpenedImage& opened) {
     for (auto* store : opened.layer_stores) store->stop_fill();
     for (auto* store : opened.layer_stores) {

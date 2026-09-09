@@ -296,6 +296,30 @@ mode:
 The rationale and scope live in ADR-0008; writable layers and TurboOCI
 beyond this scope remain out (ADR-0007).
 
+### The blank (raw) device mode (ADR-0014)
+
+A blank device has **no image at all** — no config, no lowers, no
+registry. `obd::image::open_blank_device` (below) assembles the same
+stack shape as the writable mode, but its "lower" is a **sealed empty
+LSMT layer** (docs/format.md, `create_empty_lsmt_layer`): virtual size =
+the requested size, no segments, no data. The writable LSMT-RW upper sits
+on top, also sized to the requested size, so:
+
+- the device reads as a **zeroed block device from birth** — never-written
+  ranges return zeroes through the ordinary merge path, not through any
+  new source type (the synthetic-zero-source alternative was rejected in
+  ADR-0014);
+- **writes land in the upper from day one**; `commit` (ADR-0014) seals the
+  upper exactly like an image-born writable device;
+- the empty zero base is byte-deterministic (content-derived uuid, a pure
+  function of the size), so identical blank devices start from identical
+  base bytes.
+
+The workspace layout (`overlaybd.zero` + `overlaybd.rw` under a per-device
+directory) is chosen by the caller of `open_blank_device`
+(`BlankDeviceSpec::dir`); the supervisor passes
+`<blank_dir>/<id>/` (docs/supervisor.md).
+
 ## Public API
 
 All types live in namespace `obd::image`. Parsing functions are synchronous
@@ -425,7 +449,7 @@ trace layer".
   `defaults` explicitly. Unknown fields are ignored; known fields keep their
   overlaybd-snapshotter meaning.
 
-### `image_file.hpp` — OpenedImage, open_image
+### `image_file.hpp` — OpenedImage, open_image, blank device
 
 ```cpp
 struct OpenedImage {
@@ -443,8 +467,24 @@ struct OpenedImage {
 
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                          const GlobalConfig& global);
+
+struct BlankDeviceSpec {   // ADR-0014 blank (raw) device
+    uint64_t size = 0;     // bytes; positive, sector aligned
+    std::string dir;       // per-device workspace (created if missing)
+};
+elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec);
+
 elio::coro::task<void> park_image_fills(const OpenedImage& opened);
 ```
+
+`open_blank_device` in `src/image/image_file.hpp` — assembles the blank (raw)
+device view: creates `<dir>/overlaybd.zero` (a sealed empty LSMT zero base
+via `create_empty_lsmt_layer` in `src/format/lsmt_rw.hpp`), opens it as an
+`LsmtLayer`, creates `<dir>/overlaybd.rw` (an `LsmtRwLayer` sized to
+`size`), and merges them into a `MergedWritable` — `writable = true`,
+`virtual_size = size`, `upper_path` set, idle recorder for shape parity.
+Throws `obd::error` on an invalid spec (size not a positive multiple of
+512) or IO failure.
 
 `src/image/image_file.hpp::OpenedImage` — the assembled device view.
 
@@ -694,6 +734,12 @@ Concepts → "The trace layer → Recording".
 - **Upper type validation is total** — every non-empty `upper` either
   selects a known layer type or is rejected with `EINVAL` at parse time; an
   unknown type can never reach assembly.
+- **Blank devices are zero- and writable-from-birth (ADR-0014)** —
+  `open_blank_device` returns a `MergedWritable` (never a read-only root):
+  its sealed empty LSMT zero base makes every never-written range read
+  zero through the ordinary merge path, and writes land in the LSMT-RW
+  upper from day one; the workspace layout is
+  `<dir>/overlaybd.zero` + `<dir>/overlaybd.rw`.
 
 ## Concurrency & Call Permissions
 
@@ -793,6 +839,13 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   layer). The underlying writable-layer mechanics are pinned separately by
   `format: merged writable falls through and copy-on-writes` (see
   `docs/format.md`).
+- `image: blank device assembles a zeroed writable upper` — ADR-0014
+  mode-2 assembly without any config: `open_blank_device` returns a
+  writable root of the requested size whose on-disk zero base
+  (`overlaybd.zero`) re-opens as a sealed empty LSMT layer; a fresh blank
+  reads zeroes across its whole range, and a patch write lands in the
+  upper (`overlaybd.rw`) and reads back while the untouched regions stay
+  zero.
 - `integration: registry pipeline serves a zfile-compressed image` — a
   remote image config (no local files, no layer dir) assembles through the
   mock registry and serves the full image byte-exactly, with the expected
