@@ -10,6 +10,7 @@
 
 #include <unistd.h>
 
+#include <cstring>
 #include <optional>
 #include <string>
 
@@ -47,18 +48,31 @@ private:
 
 }  // namespace
 
-void ControlChannelWriter::write_line(const nlohmann::json& j) {
-    write_line(j.dump() + "\n");
+bool ControlChannelWriter::write_line(const nlohmann::json& j) {
+    return write_line(j.dump() + "\n");
 }
 
-void ControlChannelWriter::write_line(const std::string& line) {
+bool ControlChannelWriter::write_line(const std::string& line) {
     // SOCK_STREAM has no PIPE_BUF rule: serialization across ALL of the
     // channel's writers (status reports, command replies, the expiry
     // event — different coroutines, different workers) is what keeps
-    // one line one write.
+    // one line one write. The lock is held across the WHOLE loop so a
+    // short write can never interleave another writer's bytes mid-line.
     std::lock_guard<std::mutex> lk(mu_);
-    const ssize_t w = ::write(fd_, line.data(), line.size());
-    (void)w;
+    size_t done = 0;
+    while (done < line.size()) {
+        const ssize_t w =
+            ::write(fd_, line.data() + done, line.size() - done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            ELIO_LOG_WARNING("control channel write failed after {} of "
+                             "{} bytes: {}",
+                             done, line.size(), std::strerror(errno));
+            return false;  // logged + dropped, never thrown
+        }
+        done += static_cast<size_t>(w);
+    }
+    return true;
 }
 
 namespace {

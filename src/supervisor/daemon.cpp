@@ -679,7 +679,10 @@ private:
             co_return reply_error(reply.value(
                 "error", "device rejected the trace command"));
         }
-        co_return reply.dump();  // device reply fields, minus "reply"
+        // The device reply fields INCLUDING the "reply" discriminator;
+        // cmd_trace_start/stop erase it before forwarding to the
+        // client.
+        co_return reply.dump();
     }
 
     /// ADR-0013 record path: start a server-side-duration-bounded trace

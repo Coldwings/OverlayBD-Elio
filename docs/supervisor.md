@@ -250,7 +250,8 @@ expiry event — different coroutines on different workers) go through
 one shared serialized writer (`ControlChannelWriter`,
 src/supervisor/device_control.hpp): AF_UNIX SOCK_STREAM has no PIPE_BUF
 atomicity, so without serialization two concurrent small writes could
-interleave into a corrupted line.
+interleave into a corrupted line — and every write loops until the
+whole line is out, since a short write would fuse lines just as well.
 
 Status lines (`DeviceStatus` / `make_device_status`):
 

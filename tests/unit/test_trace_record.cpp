@@ -711,3 +711,86 @@ TEST_CASE("image: trace recording rejected start never truncates existing files"
     REQUIRE(second.size() == 1);
     REQUIRE(second[0] == format::trace::TraceRecord{'R', 0, 4096, 65536});
 }
+
+TEST_CASE("image: trace recording start race truncates the output exactly once",
+          "[image]") {
+    // Regression (PR #34 review): two concurrent starts on the SAME
+    // path both passed the first gate and both opened O_TRUNC — the
+    // loser's open wiped the winner's file behind its clean "already
+    // in progress" rejection. Now the open carries no O_TRUNC and only
+    // the state winner ftruncates, under the lock. The test-only start
+    // hook holds start A between its open and the locked re-check so
+    // start B deterministically wins; A must be rejected WITHOUT
+    // touching the file, and B's finalize must produce a complete
+    // valid blob (truncated exactly once, before the taps armed).
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 97);
+    const std::string out = dir / "race.trace";
+    // A pre-existing file stand-in (e.g. a previous blob).
+    {
+        const int fd = ::open(out.c_str(), O_WRONLY | O_CREAT, 0644);
+        REQUIRE(fd >= 0);
+        REQUIRE(::write(fd, data.data(), 4096) == 4096);
+        ::close(fd);
+    }
+    std::atomic<bool> a_in_hook{false};
+    std::atomic<bool> release{false};
+    std::optional<bool> a_ok;
+    std::string a_err, b_err;
+    bool b_ok = false;
+    image::TraceRecorder::FinalizeResult res;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        // The hook is shared by every start on this recorder: fire it
+        // once (A parks; B must pass straight through or both deadlock).
+        std::atomic<bool> hook_used{false};
+        rec->set_start_hook_for_test([&]() -> elio::coro::task<void> {
+            if (hook_used.exchange(true, std::memory_order_acq_rel)) {
+                co_return;
+            }
+            a_in_hook.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) {
+                co_await elio::time::sleep_for(1ms);
+            }
+        });
+        auto cb = [](const image::TraceRecorder::FinalizeResult&) {};
+        elio::go([&]() -> elio::coro::task<void> {
+            a_ok = co_await rec->start(out, 300, cb, a_err);
+        });
+        for (int i = 0;
+             i < 5000 && !a_in_hook.load(std::memory_order_acquire); ++i) {
+            co_await elio::time::sleep_for(1ms);
+        }
+        if (!a_in_hook.load(std::memory_order_acquire)) co_return 2;
+        // B races A while A is parked between open and lock: B wins.
+        b_ok = co_await rec->start(out, 300, cb, b_err);
+        release.store(true, std::memory_order_release);
+        for (int i = 0; i < 5000 && !a_ok.has_value(); ++i) {
+            co_await elio::time::sleep_for(1ms);
+        }
+        rec->set_start_hook_for_test(nullptr);
+        if (!a_ok.has_value()) co_return 3;
+        co_await read_at(tap, 0, 4096);
+        co_await read_at(tap, 65536, 8192);
+        res = co_await rec->stop("stopped");
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(b_ok);                       // B won the race
+    REQUIRE(a_ok.has_value());
+    REQUIRE(!a_ok.value());              // A rejected cleanly
+    REQUIRE(a_err.find("already in progress") != std::string::npos);
+    // Exactly one truncation, before arming: the winner's blob is
+    // complete and the pre-existing bytes are gone.
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 2);
+    REQUIRE(res.sha256 == file_sha256(out));
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 2);
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
+    REQUIRE(records[1] == format::trace::TraceRecord{'R', 0, 8192, 65536});
+}

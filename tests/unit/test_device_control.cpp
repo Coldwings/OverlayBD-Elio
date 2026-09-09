@@ -17,7 +17,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <optional>
@@ -135,4 +137,45 @@ TEST_CASE("supervisor: device trace control answers malformed-typed fields with 
     REQUIRE(ok_stop.value("ok", false) == true);
     REQUIRE(ok_stop.value("seq", 0) == 4);
     REQUIRE(ok_stop.value("records", 1) == 0);  // empty window
+}
+
+TEST_CASE("supervisor: control channel writer loops short writes and never throws",
+          "[supervisor]") {
+    // A single ::write on SOCK_STREAM may write short (buffer
+    // pressure), which would truncate/fuse protocol lines. The writer
+    // loops until all bytes are out; a hard error is reported (logged
+    // + dropped), never thrown. Pin: a 128 KiB line over a NONBLOCKING
+    // pipe (64 KiB capacity) deterministically short-writes on the
+    // first pass, then EAGAINs — write_line must return false after
+    // looping; a normal line over a socketpair succeeds.
+    int pfd[2];
+    REQUIRE(::pipe(pfd) == 0);
+    const int flags = ::fcntl(pfd[1], F_GETFL);
+    REQUIRE(::fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK) == 0);
+    supervisor::ControlChannelWriter w(pfd[1]);
+    const std::string big(128 * 1024, 'x');
+    bool threw = false;
+    bool ok = true;
+    try {
+        ok = w.write_line(big);
+    } catch (...) {
+        threw = true;
+    }
+    REQUIRE(!threw);
+    REQUIRE(!ok);  // EAGAIN after the short first write: reported
+    ::close(pfd[0]);
+    ::close(pfd[1]);
+
+    int sfd[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sfd) ==
+            0);
+    supervisor::ControlChannelWriter w2(sfd[1]);
+    REQUIRE(w2.write_line(nlohmann::json{{"reply", "ping"}, {"ok", true}}));
+    char buf[64];
+    const ssize_t r = ::read(sfd[0], buf, sizeof(buf));
+    REQUIRE(r > 0);
+    REQUIRE(std::string(buf, static_cast<size_t>(r)).find("ping") !=
+            std::string::npos);
+    ::close(sfd[0]);
+    ::close(sfd[1]);
 }

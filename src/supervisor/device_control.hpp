@@ -43,12 +43,15 @@ class ControlChannelWriter {
 public:
     explicit ControlChannelWriter(int fd) : fd_(fd) {}
     int fd() const { return fd_; }
-    /// Best-effort single serialized write of one JSON line (the
-    /// supervisor tolerates loss as a command timeout / EOF).
-    void write_line(const nlohmann::json& j);
+    /// Best-effort serialized write of one JSON line, LOOPED until all
+    /// bytes are out (a single ::write on SOCK_STREAM may write short,
+    /// which would truncate/fuse protocol lines). Returns false on a
+    /// hard error (logged, dropped — never throws; the supervisor
+    /// tolerates loss as a command timeout / EOF).
+    bool write_line(const nlohmann::json& j);
     /// Same for a pre-serialized line (the lifecycle status codec
     /// produces a string, not a json object).
-    void write_line(const std::string& line);
+    bool write_line(const std::string& line);
 
 private:
     int fd_;

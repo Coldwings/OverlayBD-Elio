@@ -859,8 +859,11 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   — the state-machine guard against queue wipe/stat corruption, pinned
   with the test-only finalize hook;
   `image: trace recording rejected start never truncates existing files`
-  — the gate runs before the O_TRUNC open, so a rejected start cannot
-  destroy a previous valid blob or the active window.
+  — the gate runs before the output open, so a rejected start cannot
+  destroy a previous valid blob or the active window;
+  `image: trace recording start race truncates the output exactly once`
+  — only the state winner truncates (under the lock); the loser of a
+  same-path start race touches no filesystem.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` config with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merge (layer count, virtual

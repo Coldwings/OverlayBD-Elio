@@ -143,6 +143,16 @@ public:
         finalize_hook_ = std::move(hook);
     }
 
+    /// Test-only: when set, start() co_awaits this hook between the
+    /// output open and the locked state re-check, letting a test make
+    /// the start-vs-start race deterministic. Coroutine-side; never
+    /// set in production.
+    void set_start_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        start_hook_ = std::move(hook);
+    }
+
 private:
     enum class State : int { Idle = 0, Recording = 1, Finalizing = 2 };
 
@@ -174,6 +184,7 @@ private:
     std::optional<FinalizeResult> last_;
     std::shared_ptr<elio::coro::cancel_source> timer_cancel_;
     std::function<elio::coro::task<void>()> finalize_hook_;  // test-only
+    std::function<elio::coro::task<void>()> start_hook_;     // test-only
 };
 
 using TraceRecorderPtr = std::shared_ptr<TraceRecorder>;

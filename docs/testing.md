@@ -441,9 +441,14 @@ Every test, grouped by area, with the property it guards.
   rejected with "already in progress" and the finalize completes with
   its records and stats intact.
 - `image: trace recording rejected start never truncates existing files` —
-  the state gate runs BEFORE the O_TRUNC open: a rejected start leaves
+  the state gate runs BEFORE the output open: a rejected start leaves
   a previous recording's valid blob byte-identical and the active
   window's own finalize complete.
+- `image: trace recording start race truncates the output exactly once` —
+  two concurrent starts on the same path (made deterministic by the
+  test-only start hook): the loser is rejected without touching the
+  file, only the winner truncates (under the state lock), and the
+  winner's finalize produces a complete valid blob.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` image with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merged view and the trace fully
@@ -535,6 +540,12 @@ Every test, grouped by area, with the property it guards.
   gets a clean error reply (with the `seq` correlation echoed) instead
   of an escaping `type_error` killing the loop, and a valid start/stop
   cycle afterwards proves the loop stayed alive (ADR-0013).
+- `supervisor: control channel writer loops short writes and never throws` —
+  the serialized channel writer loops ::write until the whole line is
+  out (a short write would truncate/fuse protocol lines); a 128 KiB
+  line over a nonblocking pipe deterministically short-writes then
+  EAGAINs and is reported (false), never thrown, while a normal line
+  over a socketpair lands intact (ADR-0013).
 
 ### integration
 

@@ -85,13 +85,28 @@ elio::coro::task<bool> TraceRecorder::start(
             co_return false;
         }
     }
-    // Fail fast on the output path before arming any tap.
+    // Fail fast on the output path before arming any tap — but open
+    // WITHOUT O_TRUNC: two concurrent starts on the SAME path both get
+    // here, and a loser's truncation would wipe the winner's file
+    // under its feet (silent data loss behind a clean "already in
+    // progress"). Only the state winner truncates, below.
     const int fd =
-        ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
         error = "cannot open trace output " + path + ": " +
                 std::strerror(errno);
         co_return false;
+    }
+    // Test-only hook: lets a test hold a start between the open and
+    // the state re-check to make the start-vs-start race
+    // deterministic (same role as set_finalize_hook_for_test).
+    {
+        std::function<elio::coro::task<void>()> hook;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            hook = start_hook_;
+        }
+        if (hook) co_await hook();
     }
     uint64_t generation;
     std::shared_ptr<elio::coro::cancel_source> cancel;
@@ -103,9 +118,20 @@ elio::coro::task<bool> TraceRecorder::start(
             // finalize would wipe the draining queue (pending_.clear()),
             // corrupt the finalize's stats (dropped_.store(0)), and the
             // old stop's tail would stomp the NEW recording's state
-            // back to Idle with its fd/timer live.
+            // back to Idle with its fd/timer live. The loser only ever
+            // OPENED the path (no truncation, no writes), so its
+            // rejection leaves the filesystem untouched.
             ::close(fd);
             error = "trace recording already in progress";
+            co_return false;
+        }
+        // The winner alone truncates, under the same lock hold as the
+        // state transition: the file is emptied exactly once, before
+        // the taps arm, and no second start can slip between.
+        if (::ftruncate(fd, 0) != 0) {
+            ::close(fd);
+            error = "cannot truncate trace output " + path + ": " +
+                    std::strerror(errno);
             co_return false;
         }
         state_ = State::Recording;
