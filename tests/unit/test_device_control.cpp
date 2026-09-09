@@ -309,7 +309,7 @@ TEST_CASE("supervisor: device resize executor grows and rejects shrink or no-op"
     // also pins the loop's null-recorder tolerance for resize.
     int fds[2];
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
-    nlohmann::json grow, equal, shrink, misalign, trace_unavail;
+    nlohmann::json grow, equal, shrink, misalign, zero, trace_unavail;
     auto cur = std::make_shared<uint64_t>(512 * 64);   // 32 KiB
     auto calls = std::make_shared<int>(0);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
@@ -339,14 +339,18 @@ TEST_CASE("supervisor: device resize executor grows and rejects shrink or no-op"
         nlohmann::json cmd_misalign = {{"cmd", "resize"},
                                        {"size", 1000},
                                        {"seq", 4}};
+        nlohmann::json cmd_zero = {{"cmd", "resize"},
+                                   {"size", 0},
+                                   {"seq", 5}};
         nlohmann::json cmd_trace = {{"cmd", "trace_start"},
                                     {"path", "/tmp/x.trace"},
                                     {"duration_sec", 300},
-                                    {"seq", 5}};
+                                    {"seq", 6}};
         grow = co_await rpc_exchange(fds[0], cmd_grow);
         equal = co_await rpc_exchange(fds[0], cmd_equal);
         shrink = co_await rpc_exchange(fds[0], cmd_shrink);
         misalign = co_await rpc_exchange(fds[0], cmd_misalign);
+        zero = co_await rpc_exchange(fds[0], cmd_zero);
         trace_unavail = co_await rpc_exchange(fds[0], cmd_trace);
         ::shutdown(fds[1], SHUT_RDWR);
         // Let the detached loop observe the EOF before teardown.
@@ -380,6 +384,13 @@ TEST_CASE("supervisor: device resize executor grows and rejects shrink or no-op"
     REQUIRE(misalign.value("error", "").find("multiple of 512") !=
             std::string::npos);
     REQUIRE(misalign.value("seq", 0) == 4);
+    // A zero-byte request is pinned too: positive-multiple-of-512 rule
+    // rejects it BEFORE the grow-only comparison.
+    REQUIRE(zero.value("reply", "") == "resize");
+    REQUIRE(zero.value("ok", true) == false);
+    REQUIRE(zero.value("error", "").find("multiple of 512") !=
+            std::string::npos);
+    REQUIRE(zero.value("seq", 0) == 5);
     // The loop is recorder-less: trace commands are answered, never
     // dereferenced (never-throws contract).
     REQUIRE(trace_unavail.value("reply", "") == "trace_start");

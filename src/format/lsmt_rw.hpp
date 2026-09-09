@@ -51,7 +51,9 @@ public:
     /// or a negative -errno; -EROFS when already sealed or checkpointed.
     elio::coro::task<int> checkpoint() override;
 
-    uint64_t virtual_size() const override { return vsize_; }
+    uint64_t virtual_size() const override {
+        return vsize_.load(std::memory_order_acquire);
+    }
     const std::vector<bytes::segment_mapping>& segments() const override {
         return segments_;
     }
@@ -60,6 +62,13 @@ public:
     source::BlobSource& data_source() override;
 
     bool sealed() const noexcept { return sealed_; }
+
+    /// D3 grow-only vsize extension (see WritableLayer::grow): also
+    /// rewrites the on-disk declared-size header (uuid preserved) so a
+    /// later checkpoint/offline seal stays consistent with the grown
+    /// size. BLOCKING (header rewrite + fsync): run off an Elio worker
+    /// via elio::spawn_blocking. Returns 0 or a negative -errno.
+    int grow(uint64_t vsize) override;
 
     /// Compacts and seals the file in place (atomic rename); afterwards it
     /// is a standard sealed LSMT RO file. Subsequent pwrite returns -EROFS.
@@ -103,7 +112,10 @@ private:
     class View;                     // fd-backed BlobSource with dynamic size
     std::unique_ptr<View> view_;
     std::atomic<uint64_t> data_bytes_{0};  // upper bound for view reads
-    uint64_t vsize_ = 0;            // bytes
+    /// Declared size in bytes. Atomic: the device resize executor (a
+    /// spawn_blocking pool thread) grows the layer while bridge
+    /// coroutines on Elio workers read/write through it.
+    std::atomic<uint64_t> vsize_{0};
     uint64_t data_end_sector_ = 0;  // append position, sectors
     std::string uuid_;
     std::string path_;

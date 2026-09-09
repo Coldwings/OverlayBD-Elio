@@ -77,6 +77,14 @@ public:
 
     uint64_t discards() const { return discards_.load(); }
 
+    /// D3 data-plane grow (the test plays the merged-view grow the real
+    /// device performs before the kernel resize): extends the buffer to
+    /// `bytes`, zero-filling the added headroom.
+    void grow(uint64_t bytes) {
+        if (bytes <= data_.size()) return;
+        data_.resize(static_cast<size_t>(bytes), 0);
+    }
+
 private:
     std::vector<uint8_t> data_;
     std::atomic<uint64_t> discards_{0};
@@ -188,26 +196,32 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
 
 TEST_CASE("integration: ublk device grows online and serves the new capacity",
           "[ublk]") {
-    // D3 grow-only online resize: Device::resize_blocking issues
-    // UBLK_U_CMD_UPDATE_SIZE and the kernel gendisk grows. Self-skipping
-    // twice: no /dev/ublk-control at all, or a kernel whose driver lacks
-    // the UPDATE_SIZE command (it landed in the 6.16 development cycle) —
-    // both degrade to SKIP, never a failure.
+    // D3 grow-only online resize: the DATA PLANE is grown first (here the
+    // in-memory writable root plays the merged-view grow the real device
+    // performs), then Device::resize_blocking issues
+    // UBLK_U_CMD_UPDATE_SIZE and the kernel gendisk grows — after which a
+    // WRITE into the grown region lands and reads back (not just
+    // BLKGETSIZE64). Self-skipping twice: no /dev/ublk-control at all, or
+    // a kernel whose driver lacks the UPDATE_SIZE command (it landed in
+    // the 6.16 development cycle) — both degrade to SKIP, never a
+    // failure.
     if (!ublk_available()) {
         SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
     }
     int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto data = test::pattern_bytes(512 * 64, 85);
-        source::BlobSourcePtr src =
-            std::make_unique<test::VectorSource>(data);
+        auto src = std::make_unique<MemWritable>(data);
+        MemWritable* raw = src.get();
         ublk::DeviceParams params;
         params.dev_sectors = data.size() / 512;
+        params.read_only = false;  // writable: discard + headroom writes
         params.enable_recovery = false;
         stage("grow: create");
-        auto dev = co_await ublk::Device::create(params, std::move(src));
+        auto dev = co_await ublk::Device::create(
+            params, source::BlobSourcePtr(std::move(src)));
         REQUIRE(dev->size_bytes() == data.size());
         const int fd = co_await bdev_io([&] {
-            return ::open(dev->bdev_path().c_str(), O_RDONLY);
+            return ::open(dev->bdev_path().c_str(), O_RDWR);
         });
         REQUIRE(fd >= 0);
 
@@ -224,16 +238,19 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
         }
         if (!shrink_rejected) co_return 2;
 
-        // The real grow (kernel UPDATE_SIZE).
+        // Data-plane grow FIRST (the real device grows the writable
+        // merged view before touching the kernel), then the kernel grow.
+        const uint64_t grown = data.size() * 2;
+        raw->grow(grown);
         uint64_t new_size = 0;
         try {
             new_size = co_await elio::spawn_blocking([&] {
-                return dev->resize_blocking(data.size() * 2);
+                return dev->resize_blocking(grown);
             });
         } catch (const std::exception&) {
             co_return 3;  // kernel without UBLK_U_CMD_UPDATE_SIZE
         }
-        if (new_size != data.size() * 2) co_return 4;
+        if (new_size != grown) co_return 4;
         if (dev->size_bytes() != new_size) co_return 4;
 
         // The kernel gendisk reports the new capacity.
@@ -243,8 +260,23 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
         });
         if (ir != 0 || cap != new_size) co_return 5;
 
-        // The grown device still serves the original content.
+        // WRITE into the grown region (beyond the original size) and read
+        // it back through the block device: before the grow both the data
+        // plane and the kernel rejected these offsets.
+        const auto patch = test::pattern_bytes(4096, 86);
+        stage("grow: write into grown region");
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pwrite(fd, patch.data(), patch.size(),
+                                    data.size() + 1024);
+                }) == 4096);
         std::vector<uint8_t> buf(4096);
+        REQUIRE(co_await bdev_io([&] {
+                    return ::pread(fd, buf.data(), buf.size(),
+                                   data.size() + 1024);
+                }) == 4096);
+        REQUIRE(buf == patch);
+
+        // The grown device still serves the original content.
         REQUIRE(co_await bdev_io([&] {
                     return ::pread(fd, buf.data(), buf.size(),
                                    data.size() / 2);

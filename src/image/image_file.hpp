@@ -83,9 +83,15 @@ struct OpenedImage {
 
 /// Assembles the merged read-only view for an image. Throws obd::error /
 /// obd::format_error on any failure (a device that cannot assemble must not
-/// come up half-broken).
+/// come up half-broken). `writable_override_bytes` is the D3 create-time
+/// headroom override (0 = none): for a WRITABLE image it sizes the
+/// writable top — and hence the merged data plane — to the override
+/// (grow-only vs the image's declared size, validated here with the
+/// single-source rule device_capacity_bytes); a read-only image ignores
+/// it (headroom is dev-size-only at the ublk layer, set by the caller).
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
-                                         const GlobalConfig& global);
+                                         const GlobalConfig& global,
+                                         uint64_t writable_override_bytes = 0);
 
 /// Parks every background fill in the assembled chain: stop_fill() on
 /// each store, then a bounded wait for a terminal fill_status. Call before

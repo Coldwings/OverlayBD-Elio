@@ -188,10 +188,13 @@ is being sealed. Contract:
 
 `resize` grows a live device: the supervisor forwards the byte count to
 the device process, whose command-loop executor (the same control
-channel trace commands ride) enforces the **grow-only** rule and issues
-the ublk `UBLK_U_CMD_UPDATE_SIZE` (docs/ublk.md) through
-`elio::spawn_blocking` (a kernel control call may sleep on our own data
-plane — never run on an Elio worker). Wire shapes:
+channel trace commands ride) enforces the **grow-only** rule and — for a
+WRITABLE device — first grows the DATA PLANE (the merged view and its
+writable top; `MergedWritable::grow`, see docs/format.md) so writes into
+the headroom land in the upper, then issues the ublk
+`UBLK_U_CMD_UPDATE_SIZE` (docs/ublk.md) through `elio::spawn_blocking`
+(a kernel control call may sleep on our own data plane — never run on an
+Elio worker). Wire shapes:
 
 - obdctl → supervisor: `{"cmd":"resize","id":"<name>","size":<bytes>}`.
   `size` must be a positive multiple of 512 (validated supervisor-side
@@ -210,30 +213,50 @@ Contract:
   no-op or a shrink) is rejected by the DEVICE with
   `ok:false` + a "grow-only" message BEFORE any kernel IO — the current
   size is known only there. Shrink is rejected cleanly at every layer
-  that can compare sizes: the resize executor, `create --virtual-size`
-  against the assembled image size, and `commit --virtual-size` in the
-  seal path.
-- **Runtime dev-size only.** A resize changes the block device's
-  capacity (`dev_size`, the ADR-0014 quota boundary) at runtime. It
-  does NOT touch layer metadata — growth is not persisted, and a crash
-  recovery respawn (ADR-0010) re-attaches at the original create-time
-  size. Content writes beyond the data plane's extent are out of the
-  resize command's scope: to make headroom durable, follow the
-  three-step chain in docs/operations.md (resize → grow the
-  filesystem → commit with `--virtual-size` and re-create from the
-  sealed layer).
+  that can compare sizes: the resize executor, the writable layers'
+  `grow()` (-EINVAL below current; equal is an idempotent no-op, so a
+  retried grow after a partial kernel failure still succeeds),
+  `create --virtual-size` against the assembled image size, and
+  `commit --virtual-size` in the seal path.
+- **The data plane grows with the device (writable).** A resize of a
+  writable device grows the merged view AND its writable top to the new
+  size before the kernel command runs, so the guest can write into the
+  headroom and the data lands in the upper. For LsmtRwLayer the grow
+  rewrites the file's on-disk declared-size header (uuid preserved), so
+  a later graceful-shutdown checkpoint and a plain `commit` are
+  consistent at the grown size — the growth is DURABLE at commit time
+  (no `--virtual-size` needed; `commit --virtual-size` remains the
+  explicit re-baseline for layers whose header was not grown). A
+  read-only image has no data plane to grow: its headroom is
+  dev-size-only (reads past the image's end are zero-filled by the
+  bridge).
+- **Recovery (ADR-0010).** A grown device that crashes keeps its kernel
+  capacity across USER_RECOVERY (the driver never resets it, and the
+  replacement re-attaches without SET_PARAMS/UPDATE_SIZE). The
+  replacement obd-device therefore seeds its grow-only baseline from the
+  KERNEL's real capacity (`Ctrl::get_params`, not the create-time
+  params) so a post-recovery resize can never silently shrink the
+  gendisk; an unsealed LSMT-RW upper is truncated on recovery
+  (ADR-0008), so the fresh upper and data plane start at the image's
+  declared size — resize (grow) is how the operator restores the larger
+  window.
 - **Headroom at create.** `create --virtual-size <bytes>` sizes the
-  device to the override (sanctioned headroom); the default remains the
-  image's declared size. Grow-only vs the assembled image size is
-  validated device-side (single rule:
-  `image::device_capacity_bytes`), so a create that would shrink the
-  device below its content fails cleanly.
+  device to the override (sanctioned headroom); for a WRITABLE image
+  the writable upper — and hence the merged data plane — is assembled
+  at the override too (`open_image`'s override parameter); for a
+  read-only image it is dev-size-only. The default remains the image's
+  declared size. Grow-only vs the assembled image size is validated
+  with the single rule `image::device_capacity_bytes` (inside
+  `open_image` for writable images, in obd-device otherwise), so a
+  create that would shrink the device below its content fails cleanly.
 - **Errors**: unknown id, no live device control channel (a stopped/
   dead device: "device control channel unavailable"), a device whose
   executor has no resize seam ("resize unsupported on this device"),
-  misaligned/zero size, a grow-only rejection, and a kernel rejection
-  of `UBLK_U_CMD_UPDATE_SIZE` (drivers before the 6.16 cycle return
-  -EINVAL — surfaced as the command's error).
+  misaligned/zero size, a grow-only rejection, a failed data-plane
+  grow, and a kernel rejection of `UBLK_U_CMD_UPDATE_SIZE` (drivers
+  before the 6.16 cycle answer EOPNOTSUPP — surfaced as the command's
+  error; the data plane is already grown and the retry succeeds once
+  the kernel accepts it).
 
 ### Trace recording (ADR-0013)
 

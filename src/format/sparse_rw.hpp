@@ -31,7 +31,15 @@ public:
     /// uppers never seal — ADR-0014 upstream parity).
     elio::coro::task<int> checkpoint() override;
 
-    uint64_t virtual_size() const override { return vsize_; }
+    /// D3 grow-only vsize extension (see WritableLayer::grow): extends
+    /// the sparse file to `vsize` bytes so pwrite/discard accept the new
+    /// range. BLOCKING (ftruncate): run off an Elio worker via
+    /// elio::spawn_blocking. Returns 0 or a negative -errno.
+    int grow(uint64_t vsize) override;
+
+    uint64_t virtual_size() const override {
+        return vsize_.load(std::memory_order_acquire);
+    }
     const std::vector<bytes::segment_mapping>& segments() const override {
         return segments_;
     }
@@ -45,7 +53,10 @@ private:
 
     int fd_ = -1;                    // RW fd (writes + flushes)
     source::BlobSourcePtr ro_;       // RO view for data_source()
-    uint64_t vsize_ = 0;             // bytes
+    /// Declared size in bytes. Atomic: the device resize executor (a
+    /// spawn_blocking pool thread) grows the layer while bridge
+    /// coroutines on Elio workers read/write through it.
+    std::atomic<uint64_t> vsize_{0}; // bytes
     std::vector<bytes::segment_mapping> segments_;
 };
 

@@ -52,6 +52,20 @@ public:
 
     virtual uint64_t virtual_size() const = 0;
 
+    /// D3 grow-only vsize extension: extends this layer's write window to
+    /// `vsize` bytes so pwrite/discard accept the new range (the merged
+    /// view's grow calls this before widening itself). Must be a positive
+    /// multiple of 512 and strictly larger than the current size (an
+    /// equal request is an idempotent no-op — retried grows after a
+    /// partial failure land here); smaller is a shrink and returns
+    /// -EINVAL. For LsmtRwLayer this rewrites the on-disk declared-size
+    /// header (preserving the uuid), so a graceful-shutdown checkpoint
+    /// and the offline seal stay consistent with the grown size. BLOCKING
+    /// (header rewrite + fsync for LSMT): callers must run it off an Elio
+    /// worker via elio::spawn_blocking — the device resize executor does.
+    /// Returns 0 or a negative -errno.
+    virtual int grow(uint64_t vsize) = 0;
+
     /// Current segment index: sorted, disjoint, 512B sector units, tag 0.
     virtual const std::vector<bytes::segment_mapping>& segments() const = 0;
 

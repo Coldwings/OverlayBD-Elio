@@ -63,9 +63,18 @@ public:
     /// D3 grow-only online resize: tells the driver the device's new
     /// capacity (UBLK_U_CMD_UPDATE_SIZE; `sectors` in 512B units). The
     /// kernel ABI passes the size in cmd.data[0]. Drivers without the
-    /// command (pre-6.16) reject it with -EINVAL, which surfaces as a
-    /// thrown obd::error. Throws obd::error on failure.
+    /// command (the 6.16 development cycle added it) reject it with
+    /// EOPNOTSUPP, which surfaces as a thrown obd::error. Throws
+    /// obd::error on failure.
     void update_size(uint32_t dev_id, uint64_t sectors);
+
+    /// Reads the device's current parameters (UBLK_U_CMD_GET_PARAMS);
+    /// `basic.dev_sectors` is the kernel's CURRENT capacity in sectors —
+    /// which on a recovery attach may exceed the create-time params (a
+    /// grown device keeps its capacity across USER_RECOVERY; the
+    /// replacement never re-runs SET_PARAMS). Throws obd::error on
+    /// failure.
+    ublk_params get_params(uint32_t dev_id);
 
     /// ADR-0010 recovery handshake for a replacement server process:
     /// START_USER_RECOVERY announces the new server, END_USER_RECOVERY

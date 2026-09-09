@@ -266,6 +266,13 @@ TEST_CASE("supervisor: resize grows a device and rejects shrink or no-op cleanly
                       mis["error"].get<std::string>().find(
                           "multiple of 512") != std::string::npos,
                   "resize misaligned size not rejected");
+            // A zero-byte request is pinned too (positive-multiple rule).
+            const auto zero =
+                rpc_json({{"cmd", "resize"}, {"id", "d1"}, {"size", 0}});
+            check(zero.value("ok", true) == false &&
+                      zero["error"].get<std::string>().find(
+                          "multiple of 512") != std::string::npos,
+                  "resize zero size not rejected");
 
             // A real grow: reply carries the new size and the id.
             const auto grow = rpc_json({{"cmd", "resize"},
@@ -460,5 +467,103 @@ TEST_CASE("supervisor: commit virtual_size re-baselines the sealed layer grow-on
 
     // The sealed layer re-opens with the re-baselined virtual size and
     // the fake's payload intact (asserted on the calling thread).
+    require_sealed_layer(upper, kFakeVsize * 3);
+}
+
+TEST_CASE("supervisor: resize of a writable device grows its data plane and persists it",
+          "[supervisor]") {
+    // D3 data-plane grow end to end (no kernel): the fake's resize
+    // executor grows its writable layer through the REAL format grow
+    // path, so the growth is durable — a later commit stops the device
+    // (checkpoint at the grown declared size), seals offline, and the
+    // sealed layer re-opens at the grown size with the payload intact.
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string upper_dir = dir / "upper";
+    const std::string upper = upper_dir + "/overlaybd.rw";
+    const std::string cfg_lsmt = write_config(
+        dir, "config-lsmt.json",
+        {{"upper", {{"dir", upper_dir}, {"type", "lsmt"}}}});
+
+    auto guard = block_daemon_signals();
+
+    const int failures = run_daemon_case(
+        resize_test_cfg(sock),
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "d1"},
+                            {"config", cfg_lsmt}})
+                      .value("ok", false),
+                  "create d1 failed");
+            const auto grow = rpc_json({{"cmd", "resize"},
+                                        {"id", "d1"},
+                                        {"size", kFakeVsize * 2}});
+            check(grow.value("ok", false) == true,
+                  "resize grow failed");
+            const auto commit = rpc_json({{"cmd", "commit"}, {"id", "d1"}});
+            check(commit.value("ok", false) == true,
+                  "commit after resize failed");
+        });
+    REQUIRE(failures == 0);
+
+    // The sealed layer carries the GROWN declared size (no --virtual-size
+    // needed: the grow rewrote the upper's declared-size header, and the
+    // checkpoint/seal kept it) and the original payload.
+    require_sealed_layer(upper, kFakeVsize * 2);
+}
+
+TEST_CASE("supervisor: create virtual_size headroom sizes the writable upper",
+          "[supervisor]") {
+    // D3 create-time headroom end to end: like the real device's writable
+    // assembly, the fake creates its writable layer AT the override, so a
+    // plain commit seals that declared size — the headroom reaches the
+    // data plane, not just the (kernel) device size.
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string upper_dir = dir / "upper";
+    const std::string upper = upper_dir + "/overlaybd.rw";
+    const std::string cfg_lsmt = write_config(
+        dir, "config-lsmt.json",
+        {{"upper", {{"dir", upper_dir}, {"type", "lsmt"}}}});
+
+    auto guard = block_daemon_signals();
+
+    const int failures = run_daemon_case(
+        resize_test_cfg(sock),
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "d1"},
+                            {"config", cfg_lsmt},
+                            {"virtual_size", kFakeVsize * 3}})
+                      .value("ok", false),
+                  "create with headroom failed");
+            const auto commit = rpc_json({{"cmd", "commit"}, {"id", "d1"}});
+            check(commit.value("ok", false) == true,
+                  "commit of a headroom-created device failed");
+        });
+    REQUIRE(failures == 0);
+
+    // The sealed layer declares the headroom size — no --virtual-size on
+    // the commit was needed.
     require_sealed_layer(upper, kFakeVsize * 3);
 }

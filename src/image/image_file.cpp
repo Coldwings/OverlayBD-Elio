@@ -130,7 +130,8 @@ constexpr std::chrono::milliseconds kWarmupAdmitTimeout{2000};
 }  // namespace
 
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
-                                         const GlobalConfig& global) {
+                                         const GlobalConfig& global,
+                                         uint64_t writable_override_bytes) {
     if (cfg.lowers.empty()) {
         throw error(EINVAL, "image config has no lowers");
     }
@@ -395,9 +396,27 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     }
 
     // Writable upper (ADR-0008): the device view is the lowers merged with
-    // a writable top layer sized to cover the whole image.
+    // a writable top layer sized to cover the whole image. D3 create-time
+    // headroom: `writable_override_bytes` (a CLI-level override, 0 = none)
+    // additionally sizes the top — and therefore the merged data plane —
+    // to the override, so a later guest fs grow can write into the
+    // headroom (docs/config.md). Grow-only: an override smaller than the
+    // image's declared size is rejected (device_capacity_bytes, the
+    // single source of the rule); read-only assembly ignores the override
+    // (a read-only device's headroom is dev-size-only at the ublk layer).
     uint64_t vsize = 0;
     for (const auto& l : layers) vsize = std::max(vsize, l->virtual_size());
+    if (writable_override_bytes > 0) {
+        if (writable_override_bytes % 512 != 0) {
+            throw error(EINVAL, "create virtual_size must be a positive "
+                                "multiple of 512 bytes");
+        }
+        std::string cap_error;
+        const uint64_t cap = device_capacity_bytes(
+            vsize, writable_override_bytes, &cap_error);
+        if (cap == 0) throw error(EINVAL, cap_error);
+        vsize = cap;
+    }
     std::filesystem::create_directories(cfg.upper.dir);
     std::unique_ptr<format::WritableLayer> top;
     std::string upper_path;

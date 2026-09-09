@@ -488,6 +488,14 @@ drained and is terminal (no `pwrite`/`discard` may follow). `segments()` is
 the current index: sorted, disjoint, 512B sector units, tag 0.
 `data_source()` is the file view segment data is read from.
 
+`grow(vsize)` (D3) extends the layer's write window to `vsize` bytes so
+`pwrite`/`discard` accept the new range. Grow-only: a request smaller
+than the current size returns `-EINVAL`; an equal request is an
+idempotent no-op (retried grows after a partial kernel failure land
+here). It is **BLOCKING** (header rewrite + fsync for LSMT, ftruncate
+for sparse) — run it off an Elio worker via `elio::spawn_blocking`, as
+the device resize executor does (docs/supervisor.md).
+
 ### `src/format/sparse_rw.hpp` — `SparseRwLayer`
 
 `src/format/sparse_rw.hpp::SparseRwLayer`
@@ -527,7 +535,7 @@ public:
     static elio::coro::task<std::unique_ptr<LsmtRwLayer>> create(
         const std::string& path, uint64_t vsize);
 
-    // + WritableLayer overrides
+    // + WritableLayer overrides (grow() rewrites the declared-size header)
 
     bool sealed() const noexcept;
     elio::coro::task<int> seal(const std::string& user_tag = "");
@@ -537,6 +545,13 @@ public:
                                            uint64_t* size);
 };
 ```
+
+D3 `grow()`: besides widening the in-memory window, an LSMT grow rewrites
+the file's 4096B declared-size header at offset 0 (uuid preserved) —
+which is what keeps the checkpoint-vs-header cross-check and the offline
+seal consistent after a live grow: the graceful-shutdown checkpoint then
+writes its trailer at the grown size and a plain `seal_file` seals that
+declared size (no `--virtual_size` override needed).
 
 An unsealed single-file LSMT with **in-place edit** (ADR-0008):
 

@@ -9,6 +9,8 @@
 #include "format/writable.hpp"
 #include "source/blob_source.hpp"
 
+#include <atomic>
+
 namespace obd::format {
 
 /// Writable block source: BlobSource + sector-aligned pwrite + flush.
@@ -30,8 +32,20 @@ public:
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
 
-    uint64_t size() const noexcept override { return vsize_; }
+    uint64_t size() const noexcept override {
+        return vsize_.load(std::memory_order_acquire);
+    }
     std::string_view label() const noexcept override { return label_; }
+
+    /// D3 grow-only vsize extension: grows the writable top first (so its
+    /// pwrite/discard accept the new range) and then widens the merged
+    /// view to `vsize` — the headroom region reads as zeroes until
+    /// written, and new writes land in the writable top. Equal is an
+    /// idempotent no-op; smaller is a shrink and returns -EINVAL.
+    /// BLOCKING (the top grow does blocking header IO): run off an Elio
+    /// worker via elio::spawn_blocking — the device resize executor does.
+    /// Returns 0 or a negative -errno.
+    int grow(uint64_t vsize);
 
     WritableLayer& writable_top() const noexcept { return *top_; }
 
@@ -46,7 +60,10 @@ private:
     std::vector<std::unique_ptr<LsmtLayer>> layers_;  // topmost first (RO)
     std::unique_ptr<WritableLayer> top_;
     std::vector<bytes::segment_mapping> index_;       // tag 0 = writable top
-    uint64_t vsize_ = 0;
+    /// Device virtual size in bytes. Atomic: the device resize executor
+    /// (a spawn_blocking pool thread) grows the merged view while bridge
+    /// coroutines on Elio workers read/write through it.
+    std::atomic<uint64_t> vsize_{0};
     std::string label_;
 };
 

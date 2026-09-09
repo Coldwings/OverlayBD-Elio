@@ -39,6 +39,11 @@ public:
     /// FETCH for every tag → END_USER_RECOVERY (retrying EBUSY). The
     /// params' queue geometry must match the original device's. Must be
     /// awaited on the Elio scheduler. Throws obd::error on failure.
+    /// D3: the grow-only resize baseline (`size_bytes`) is seeded from
+    /// the kernel's REAL current capacity (Ctrl::get_params), NOT from
+    /// `params` — a grown device keeps its capacity across USER_RECOVERY,
+    /// and a params-based baseline would let a post-recovery resize
+    /// silently shrink the gendisk.
     static elio::coro::task<std::unique_ptr<Device>> attach(
         uint32_t dev_id, const DeviceParams& params,
         source::BlobSourcePtr src);
@@ -53,8 +58,11 @@ public:
     /// True once the kernel gendisk is live (START_DEV succeeded).
     bool started() const noexcept { return started_; }
 
-    /// Current device capacity in bytes (the grow-only resize baseline;
-    /// the size this process created/attached, updated by resize_blocking).
+    /// Current device capacity in bytes (the grow-only resize baseline:
+    /// on create, the capacity this process set via SET_PARAMS; on a
+    /// recovery attach, the kernel's real capacity read back via
+    /// GET_PARAMS — which may exceed the create-time size after a grow;
+    /// updated by resize_blocking).
     uint64_t size_bytes() const noexcept {
         return cur_bytes_.load(std::memory_order_acquire);
     }
@@ -68,7 +76,8 @@ public:
     /// <= the current size is rejected with obd::error. Returns the new
     /// size in bytes; throws obd::error (EINVAL for a shrink/no-op or a
     /// misaligned/zero request, the kernel's errno for UPDATE_SIZE
-    /// failure — e.g. -EINVAL on a driver without the command).
+    /// failure — EOPNOTSUPP on a driver without the command, which
+    /// landed in the 6.16 development cycle).
     uint64_t resize_blocking(uint64_t bytes);
 
     /// Signals queue threads and bridges to stop, joins the threads, and

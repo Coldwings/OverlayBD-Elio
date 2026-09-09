@@ -88,10 +88,13 @@ using ControlChannelWriterPtr = std::shared_ptr<ControlChannelWriter>;
 /// executor without `apply_resize` answers resize with a clean
 /// "unsupported" error. `current_size` (bytes) is the grow-only
 /// baseline the loop compares the request against BEFORE any kernel IO;
-/// `apply_resize(requested_bytes)` issues the ublk UPDATE_SIZE (a
-/// blocking control call; the loop runs it via elio::spawn_blocking, per
-/// the ublk control-plane rule) and returns the resulting size in bytes,
-/// throwing obd::error on failure.
+/// `apply_resize(requested_bytes)` performs the grow and returns the
+/// resulting size in bytes, throwing on failure. The loop runs
+/// `apply_resize` via elio::spawn_blocking, per the ublk control-plane
+/// rule — on the real device the executor first grows the writable DATA
+/// PLANE (merged view + writable top; a blocking layer grow, which is
+/// why it must run on that same pool thread) and then issues the ublk
+/// UPDATE_SIZE.
 struct ResizeExecutor {
     std::function<uint64_t()> current_size;
     std::function<uint64_t(uint64_t)> apply_resize;

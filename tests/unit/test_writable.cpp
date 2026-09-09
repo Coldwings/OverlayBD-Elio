@@ -11,6 +11,8 @@
 
 #include "../support.hpp"
 
+#include <elio/runtime/spawn_blocking.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <nlohmann/json.hpp>
@@ -868,6 +870,281 @@ TEST_CASE("format: offline seal re-baselines the sealed virtual size grow-only",
             buf.data(), buf.size(), 8 * 512);
         REQUIRE(r == static_cast<ssize_t>(buf.size()));
         REQUIRE(std::memcmp(buf.data(), payload.data(), buf.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: lsmt rw grow extends the write window and persists the size",
+          "[format]") {
+    // D3 data-plane grow: after grow(), pwrite/discard accept offsets past
+    // the original declared size and new data lands in the layer; the
+    // on-disk declared-size header is rewritten, so a graceful-shutdown
+    // checkpoint and the offline seal stay consistent with the grown size
+    // (a plain commit seals the grown declared size). Grow-only: smaller
+    // is -EINVAL, equal is an idempotent no-op, misaligned is -EINVAL.
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto a = sectors_pattern(0, 16, 710);
+    const auto b = sectors_pattern(512 * 64 / 512, 8, 711);  // 8 sectors @ N
+    std::string sha;
+    uint64_t size = 0;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+            const ssize_t ra =
+                co_await layer->pwrite(a.data(), a.size(), 0);
+            REQUIRE(ra == static_cast<ssize_t>(a.size()));
+            // BLOCKING grow (header rewrite + fsync): must run off the
+            // scheduler, exactly like the device resize executor does.
+            int g = co_await elio::spawn_blocking(
+                [&] { return layer->grow(512 * 96); });
+            REQUIRE(g == 0);
+            REQUIRE(layer->virtual_size() == 512 * 96);
+            // Grow-only: a shrink and a misaligned request are rejected;
+            // an equal request is an idempotent no-op.
+            g = co_await elio::spawn_blocking(
+                [&] { return layer->grow(512 * 64); });
+            REQUIRE(g == -EINVAL);
+            g = co_await elio::spawn_blocking(
+                [&] { return layer->grow(1000); });
+            REQUIRE(g == -EINVAL);
+            g = co_await elio::spawn_blocking(
+                [&] { return layer->grow(512 * 96); });
+            REQUIRE(g == 0);
+            // Write INTO the grown region (beyond the original 512*64):
+            // before the grow this was -EINVAL.
+            const ssize_t rb =
+                co_await layer->pwrite(b.data(), b.size(), 512 * 64);
+            REQUIRE(rb == static_cast<ssize_t>(b.size()));
+            std::vector<uint8_t> buf(b.size());
+            ssize_t r = co_await layer->pread(buf.data(), buf.size(),
+                                              512 * 64);
+            REQUIRE(r == static_cast<ssize_t>(buf.size()));
+            REQUIRE(std::memcmp(buf.data(), b.data(), b.size()) == 0);
+            // The pre-grow content is intact.
+            std::vector<uint8_t> buf_a(a.size());
+            r = co_await layer->pread(buf_a.data(), buf_a.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(buf_a.size()));
+            REQUIRE(std::memcmp(buf_a.data(), a.data(), a.size()) == 0);
+            const int crc = co_await layer->checkpoint();
+            REQUIRE(crc == 0);
+        }
+        // Offline seal with NO override keeps the (grown) declared size —
+        // this is what makes a post-resize commit seal the larger device.
+        const int src = co_await format::LsmtRwLayer::seal_file(
+            path, "grown", &sha, &size);
+        REQUIRE(src == 0);
+        REQUIRE(sha.size() == 64);
+        auto ro = co_await source::LocalFileSource::open(path);
+        source::BlobSourcePtr base = std::move(ro);
+        auto layer = co_await format::LsmtLayer::open(std::move(base));
+        REQUIRE(layer->virtual_size() == 512 * 96);
+        REQUIRE(layer->header().user_tag == "grown");
+        // Re-merge the sealed layer and read BOTH regions back through
+        // virtual offsets (a plain single-layer merge).
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(std::move(layer));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        std::vector<uint8_t> va(a.size());
+        const ssize_t rv =
+            co_await merged->pread(va.data(), va.size(), 0);
+        REQUIRE(rv == static_cast<ssize_t>(va.size()));
+        REQUIRE(std::memcmp(va.data(), a.data(), a.size()) == 0);
+        std::vector<uint8_t> vb(b.size());
+        const ssize_t rw2 = co_await merged->pread(vb.data(), vb.size(),
+                                                    512 * 64);
+        REQUIRE(rw2 == static_cast<ssize_t>(vb.size()));
+        REQUIRE(std::memcmp(vb.data(), b.data(), b.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse layer grow extends the write window", "[format]") {
+    // D3 data-plane grow for the sparse upper: ftruncate extends the
+    // sparse file; pwrite/pread accept the new range (sparse uppers never
+    // seal, so the size lives in the file's extent).
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const auto a = sectors_pattern(0, 16, 712);
+    const auto b = sectors_pattern(64, 8, 713);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 512 * 64);
+        const ssize_t ra = co_await layer->pwrite(a.data(), a.size(), 0);
+        REQUIRE(ra == static_cast<ssize_t>(a.size()));
+        int g = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 96); });
+        REQUIRE(g == 0);
+        REQUIRE(layer->virtual_size() == 512 * 96);
+        g = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 64); });
+        REQUIRE(g == -EINVAL);  // shrink rejected
+        const ssize_t rb =
+            co_await layer->pwrite(b.data(), b.size(), 512 * 64);
+        REQUIRE(rb == static_cast<ssize_t>(b.size()));
+        std::vector<uint8_t> buf(b.size());
+        const ssize_t r = co_await layer->pread(buf.data(), buf.size(),
+                                                512 * 64);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), b.data(), b.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged writable grows with its writable top", "[format]") {
+    // D3 data-plane grow at the merged-view level: MergedWritable::grow
+    // extends the writable top first, then the merged view — pwrite/
+    // discard accept the new range and reads of the headroom gap return
+    // zeroes until written.
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto a = sectors_pattern(0, 16, 714);
+    const auto b = sectors_pattern(64, 8, 715);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        const ssize_t ra = co_await top->pwrite(a.data(), a.size(), 0);
+        REQUIRE(ra == static_cast<ssize_t>(a.size()));
+        std::vector<std::unique_ptr<format::LsmtLayer>> none;
+        auto merged =
+            co_await format::MergedWritable::open(std::move(none),
+                                                  std::move(top));
+        REQUIRE(merged->size() == 512 * 64);
+        const int g = co_await elio::spawn_blocking(
+            [&] { return merged->grow(512 * 96); });
+        REQUIRE(g == 0);
+        REQUIRE(merged->size() == 512 * 96);
+        // Grow-only: shrink rejected.
+        const int g2 = co_await elio::spawn_blocking(
+            [&] { return merged->grow(512 * 64); });
+        REQUIRE(g2 == -EINVAL);
+        // Discard into the grown region is accepted too.
+        const int drc = co_await merged->discard(512 * 96 - 4096, 4096);
+        REQUIRE(drc == 0);
+        // Write into the grown region and read it back through the merge.
+        const ssize_t rb =
+            co_await merged->pwrite(b.data(), b.size(), 512 * 64);
+        REQUIRE(rb == static_cast<ssize_t>(b.size()));
+        std::vector<uint8_t> buf(b.size());
+        const ssize_t r = co_await merged->pread(buf.data(), buf.size(),
+                                                 512 * 64);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), b.data(), b.size()) == 0);
+        // An unwritten headroom gap reads as zeroes.
+        std::vector<uint8_t> gap(4096, 0xEE);
+        const ssize_t rg = co_await merged->pread(gap.data(), gap.size(),
+                                                   512 * 80);
+        REQUIRE(rg == static_cast<ssize_t>(gap.size()));
+        REQUIRE(std::memcmp(gap.data(), std::vector<uint8_t>(4096, 0).data(),
+                            gap.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("image: writable assembly grows to the virtual_size headroom override",
+          "[image]") {
+    // D3 create-time headroom on the REAL writable assembly path:
+    // open_image(..., override) sizes the writable top — and the merged
+    // data plane — to the override, so writes into the headroom (past the
+    // lowers' content) land in the upper and read back through the merge.
+    TempDir dir;
+    const auto lower_raw = test::pattern_bytes(512 * 32, 716);
+    std::string lower_lsmt;
+    make_lsmt_lower(dir.str(), "lower", lower_raw, &lower_lsmt);
+    nlohmann::json cfgj;
+    cfgj["repoBlobUrl"] = "";
+    cfgj["lowers"] = nlohmann::json::array(
+        {nlohmann::json{{"digest", "sha256:b"}, {"file", lower_lsmt}}});
+    cfgj["upper"] =
+        nlohmann::json{{"dir", dir / "upper"}, {"type", "lsmt"}};
+    const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+    REQUIRE(cfg.writable());
+
+    const auto patch = sectors_pattern(40, 8, 717);  // into the headroom
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const image::GlobalConfig global;
+        auto opened = co_await image::open_image(cfg, global, 512 * 64);
+        REQUIRE(opened.writable);
+        // The data plane (and device) are sized at the override.
+        REQUIRE(opened.virtual_size == 512 * 64);
+        auto* w =
+            dynamic_cast<source::WritableBlobSource*>(opened.root.get());
+        REQUIRE(w != nullptr);
+        // Writing past the lowers' 512*32 content into the headroom:
+        // before the override this was -EINVAL.
+        const ssize_t r =
+            co_await w->pwrite(patch.data(), patch.size(), 40 * 512);
+        REQUIRE(r == static_cast<ssize_t>(patch.size()));
+        std::vector<uint8_t> buf(512 * 48);
+        const ssize_t rd = co_await w->pread(buf.data(), buf.size(), 0);
+        REQUIRE(rd == static_cast<ssize_t>(buf.size()));
+        // Patch present in the headroom; lower content intact below it.
+        REQUIRE(std::memcmp(buf.data() + 40 * 512, patch.data(),
+                            patch.size()) == 0);
+        REQUIRE(std::memcmp(buf.data() + 8 * 512,
+                            lower_raw.data() + 8 * 512, 24 * 512) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: offline seal rejects a virtual_size below the content extent",
+          "[format]") {
+    // D3 commit re-baseline: the content-extent guard is defense against
+    // a checkpoint whose declared virtual size lies BELOW what its index
+    // actually covers (real writers keep extent <= declared, so the guard
+    // needs a synthetic fixture). Build a checkpointed layer, patch BOTH
+    // the on-disk header and the trailer to a smaller virtual size
+    // (keeping uuid/flags, exactly what the cross-check authenticates),
+    // then seal with an override >= the patched declared size but < the
+    // real content extent: the guard must reject with the precise reason.
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto payload = sectors_pattern(0, 16, 718);  // extent = 16 sectors
+    std::string reject;
+    std::string sha;
+    uint64_t size = 0;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+            const ssize_t r =
+                co_await layer->pwrite(payload.data(), payload.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(payload.size()));
+            const int crc = co_await layer->checkpoint();
+            REQUIRE(crc == 0);
+        }
+        struct stat st {};
+        REQUIRE(::stat(path.c_str(), &st) == 0);
+        const uint64_t trailer_off =
+            static_cast<uint64_t>(st.st_size) - format::lsmt::kSpace;
+        const uint64_t patched_vsize = 512 * 8;  // below the 16-sector extent
+        auto patch_region = [&](uint64_t off) {
+            std::vector<uint8_t> region(format::lsmt::kSpace);
+            const int fd = ::open(path.c_str(), O_RDWR);
+            REQUIRE(fd >= 0);
+            REQUIRE(::pread(fd, region.data(), region.size(),
+                            static_cast<off_t>(off)) ==
+                    static_cast<ssize_t>(region.size()));
+            auto ht = format::lsmt::HeaderTrailer::parse(region.data());
+            ht.virtual_size = patched_vsize;
+            std::memset(region.data(), 0, region.size());
+            ht.serialize(region.data());
+            REQUIRE(::pwrite(fd, region.data(), region.size(),
+                             static_cast<off_t>(off)) ==
+                    static_cast<ssize_t>(region.size()));
+            ::close(fd);
+        };
+        patch_region(0);          // header
+        patch_region(trailer_off);  // checkpoint trailer
+        // Override between the patched declared size and the content
+        // extent: >= declared passes, < extent trips the guard.
+        const int src = co_await format::LsmtRwLayer::seal_file(
+            path, "", &sha, &size, 512 * 12, &reject);
+        REQUIRE(src == -EINVAL);
+        REQUIRE(reject.find("content extent") != std::string::npos);
+        REQUIRE(reject.find("grow-only") != std::string::npos);
         co_return 0;
     });
     REQUIRE(rc == 0);

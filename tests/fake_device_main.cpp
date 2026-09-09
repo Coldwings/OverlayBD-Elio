@@ -32,6 +32,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <system_error>
 #include <unistd.h>
 
 namespace {
@@ -91,34 +92,12 @@ elio::coro::task<int> fake_main(Args args) {
             opened.emplace(co_await obd::image::open_image(img, g));
         }
 
-        // With an lsmt upper: write the payload and leave the file
-        // unsealed (checkpoint only on SIGTERM, like the real device).
-        std::unique_ptr<obd::format::LsmtRwLayer> lsmt;
-        if (img.writable() && img.upper.type == "lsmt") {
-            std::filesystem::create_directories(img.upper.dir);
-            lsmt = co_await obd::format::LsmtRwLayer::create(
-                img.upper.dir + "/overlaybd.rw", kVsize);
-            const auto payload =
-                obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
-            const ssize_t w = co_await lsmt->pwrite(payload.data(),
-                                                  payload.size(), 0);
-            if (w != static_cast<ssize_t>(payload.size())) {
-                report(channel, DeviceStatus{"failed", "", "payload write failed"});
-                co_return 1;
-            }
-        } else if (img.writable()) {
-            // Sparse: open the file so the device is plausible; sparse
-            // state is durable via fiemap and never seals.
-            std::filesystem::create_directories(img.upper.dir);
-            auto sparse = co_await obd::format::SparseRwLayer::open(
-                img.upper.dir + "/overlaybd.sparse", kVsize);
-            (void)sparse;
-        }
         // D3 create-time headroom: mirror the real device's grow-only
         // validation against the fake's declared image size (the merged
         // lowers when present, else the writable upper's kVsize) using
         // the same single-source rule. A rejected override fails create
-        // with the rule's message, exactly like the real device.
+        // with the rule's message, exactly like the real device — and
+        // BEFORE the writable upper is created below.
         {
             const uint64_t declared = opened.has_value()
                                           ? opened->virtual_size
@@ -133,6 +112,39 @@ elio::coro::task<int> fake_main(Args args) {
                 }
             }
         }
+
+        // With an lsmt/sparse upper: like the real device's writable
+        // assembly, the writable layer is sized at the D3 headroom
+        // override when given (so a commit of a headroom-created device
+        // seals that declared size), else kVsize; the standard payload is
+        // written at offset 0 (what the commit integration reads back)
+        // and the file is left unsealed — checkpoint only on SIGTERM,
+        // exactly like the real device.
+        std::shared_ptr<obd::format::WritableLayer> upper;
+        const uint64_t layer_vsize =
+            args.virtual_size > 0 ? args.virtual_size : kVsize;
+        if (img.writable() && img.upper.type == "lsmt") {
+            std::filesystem::create_directories(img.upper.dir);
+            auto lsmt = co_await obd::format::LsmtRwLayer::create(
+                img.upper.dir + "/overlaybd.rw", layer_vsize);
+            const auto payload =
+                obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
+            const ssize_t w =
+                co_await lsmt->pwrite(payload.data(), payload.size(), 0);
+            if (w != static_cast<ssize_t>(payload.size())) {
+                report(channel, DeviceStatus{"failed", "",
+                                          "payload write failed"});
+                co_return 1;
+            }
+            upper = std::move(lsmt);
+        } else if (img.writable()) {
+            // Sparse: open the file so the device is plausible; sparse
+            // state is durable via fiemap and never seals.
+            std::filesystem::create_directories(img.upper.dir);
+            auto sparse = co_await obd::format::SparseRwLayer::open(
+                img.upper.dir + "/overlaybd.sparse", layer_vsize);
+            upper = std::move(sparse);
+        }
         report(channel, DeviceStatus{"ready", "/dev/ublkb70", ""});
 
         // Serve the supervisor's device commands on the control channel
@@ -143,13 +155,17 @@ elio::coro::task<int> fake_main(Args args) {
         // grow. A shared_ptr keeps `fake_size` alive for the detached
         // loop (which may outlive this coroutine's frame).
         if (args.control_fd >= 0) {
-            // The fake's declared device size: the --virtual-size
-            // override when given, else its declared image size.
-            const uint64_t declared = opened.has_value()
-                                          ? opened->virtual_size
-                                          : (img.writable() ? kVsize : 0);
+            // The fake's declared device size: the writable layer's
+            // (override-size or kVsize) when present, else the assembled
+            // image's size, else 0.
             const uint64_t base_size =
-                args.virtual_size > 0 ? args.virtual_size : declared;
+                upper != nullptr
+                    ? upper->virtual_size()
+                    : (opened.has_value() ? opened->virtual_size : 0);
+            // Shared state for the detached control loop (which may
+            // outlive this coroutine's frame): the tracked current size,
+            // and — for the layer-backed fakes — a shared_ptr to the
+            // writable layer so an in-flight grow can never outlive it.
             auto fake_size = std::make_shared<uint64_t>(base_size);
             obd::supervisor::DeviceControlHooks hooks;
             if (opened.has_value()) {
@@ -172,11 +188,23 @@ elio::coro::task<int> fake_main(Args args) {
                 };
             }
             // D3 resize executor seam (no kernel): current_size returns
-            // the fake's tracked size; apply records the growth.
+            // the fake's tracked size; apply grows the writable layer
+            // through the REAL format grow path (so a later checkpoint /
+            // commit seals the grown declared size, mirroring the real
+            // device's data-plane grow) and records the growth.
             hooks.resize.current_size = [fake_size]() -> uint64_t {
                 return *fake_size;
             };
-            hooks.resize.apply_resize = [fake_size](uint64_t bytes) {
+            hooks.resize.apply_resize = [upper,
+                                         fake_size](uint64_t bytes) {
+                if (upper != nullptr) {
+                    const int r = upper->grow(bytes);
+                    if (r != 0) {
+                        throw std::system_error(
+                            -r, std::generic_category(),
+                            "fake resize: data plane grow failed");
+                    }
+                }
                 *fake_size = bytes;
                 return bytes;
             };
@@ -213,8 +241,8 @@ elio::coro::task<int> fake_main(Args args) {
             }
             co_await obd::image::park_image_fills(*opened);
         }
-        if (lsmt) {
-            const int crc = co_await lsmt->checkpoint();
+        if (upper != nullptr) {
+            const int crc = co_await upper->checkpoint();
             if (crc != 0) {
                 report(channel, DeviceStatus{"failed", "",
                                           "checkpoint failed"});

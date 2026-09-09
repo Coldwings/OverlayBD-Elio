@@ -172,10 +172,23 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         }
         dev->ctrl_->adopt_dev(dev_id);
         dev->started_ = true;
-        dev->cur_bytes_.store(params.dev_sectors * 512,
-                              std::memory_order_release);
-        ELIO_LOG_INFO("ublk device {} recovered ({})", dev_id,
-                      dev->bdev_path());
+        // D3/FIX-2 grow-only baseline: a recovered device's kernel gendisk
+        // KEEPS the capacity it had when the previous server died
+        // (USER_RECOVERY never resets it, and attach issues no
+        // SET_PARAMS/UPDATE_SIZE), which may be LARGER than the
+        // create-time params. Seeding the baseline from the params would
+        // let a post-recovery "resize" pass the grow-only check and then
+        // actually SHRINK the gendisk via UPDATE_SIZE. Read the kernel's
+        // REAL current capacity (GET_PARAMS) instead; grow-only then
+        // rejects anything at or below it.
+        dev->cur_bytes_.store(
+            co_await elio::spawn_blocking([&]() -> uint64_t {
+                const ublk_params p = dev->ctrl_->get_params(dev_id);
+                return p.basic.dev_sectors * 512;
+            }),
+            std::memory_order_release);
+        ELIO_LOG_INFO("ublk device {} recovered ({}, {} bytes)",
+                      dev_id, dev->bdev_path(), dev->size_bytes());
     } catch (...) {
         dev->stop();
         throw;

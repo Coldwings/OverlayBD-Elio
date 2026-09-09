@@ -211,6 +211,32 @@ Every test, grouped by area, with the property it guards.
   declared size (and content extent) is written into the sealed
   header/trailer and content digest, and the sealed layer re-opens with
   the larger declared size and byte-exact content (ADR-0014).
+- `format: lsmt rw grow extends the write window and persists the size` —
+  the D3 data-plane grow for the LSMT upper: after `grow()`, pwrite
+  into the region past the original declared size succeeds and reads
+  back; shrink/misaligned grow requests are rejected (equal is an
+  idempotent no-op); the on-disk declared-size header is rewritten, so
+  a checkpoint and a plain offline seal stay consistent and the sealed
+  layer re-opens at the grown size with both content regions intact
+  (ADR-0014).
+- `format: sparse layer grow extends the write window` — the D3 grow for
+  the sparse upper (ftruncate): pwrite/pread accept the new range and
+  shrink is rejected (ADR-0014).
+- `format: merged writable grows with its writable top` — the D3 merged-
+  view grow: `MergedWritable::grow` extends the writable top first and
+  then the merged view; pwrite/discard accept the grown range, an
+  unwritten headroom gap reads as zeroes, and shrink is rejected
+  (ADR-0014).
+- `image: writable assembly grows to the virtual_size headroom override` —
+  `open_image(..., override)` on the real writable assembly path sizes
+  the writable top — and hence the merged data plane — at the override:
+  writes past the lowers' content into the headroom land in the upper
+  and read back through the merge (D3; ADR-0014).
+- `format: offline seal rejects a virtual_size below the content extent` —
+  the D3 re-baseline content-extent guard on a synthetic fixture whose
+  checkpointed declared size was patched below its real content extent:
+  the seal rejects with the precise "content extent" grow-only reason
+  (ADR-0014).
 ### source
 
 - `source: tar adapter detects ustar wrapper and skips the header` — a
@@ -769,3 +795,15 @@ Every test, grouped by area, with the property it guards.
   override at least the declared size seals with the override in the
   header (verified by re-opening the sealed layer) (D3; ADR-0014).
   Runs without privileges.
+- `supervisor: resize of a writable device grows its data plane and persists it` —
+  a real daemon with the fake obd-device: a resize grows the fake's
+  writable layer through the REAL format grow path, and a subsequent
+  plain commit seals the grown declared size — the data plane grew with
+  the device and the growth is durable at commit (D3; ADR-0014). Runs
+  without privileges.
+- `supervisor: create virtual_size headroom sizes the writable upper` —
+  the same daemon/fake pair: a create with `--virtual-size` assembles
+  the writable upper at the override (like the real device's writable
+  assembly), so a plain commit seals that declared size — the headroom
+  reaches the data plane, not just the device size (D3; ADR-0014). Runs
+  without privileges.

@@ -183,10 +183,21 @@ void Ctrl::start_user_recovery(uint32_t dev_id) {
 void Ctrl::update_size(uint32_t dev_id, uint64_t sectors) {
     // D3 grow-only online resize (UBLK_U_CMD_UPDATE_SIZE): the new size
     // rides cmd.data[0], in sectors (kernel ABI, ublk_cmd.h). No data
-    // buffer, no queue. A kernel without the command returns -EINVAL,
-    // reported as a clean error by the caller.
+    // buffer, no queue. A kernel without the command (it landed in the
+    // 6.16 development cycle) rejects it with EOPNOTSUPP, reported as a
+    // clean error by the caller.
     ctrl_cmd(UBLK_U_CMD_UPDATE_SIZE, dev_id, static_cast<uint16_t>(-1),
              nullptr, 0, sectors, "UPDATE_SIZE");
+}
+
+ublk_params Ctrl::get_params(uint32_t dev_id) {
+    ublk_params params {};
+    params.len = sizeof(params);
+    // The driver fills `types` and the param blocks (basic at minimum)
+    // into the data buffer.
+    ctrl_cmd(UBLK_U_CMD_GET_PARAMS, dev_id, static_cast<uint16_t>(-1),
+             &params, sizeof(params), 0, "GET_PARAMS");
+    return params;
 }
 
 void Ctrl::end_user_recovery(uint32_t dev_id) {

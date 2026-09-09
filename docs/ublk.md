@@ -141,14 +141,26 @@ A live device can grow through `Ctrl::update_size` (D3):
 rides `ublksrv_ctrl_cmd.data[0]`, in 512-byte sectors (kernel ABI,
 ublk_cmd.h) — and the driver updates the gendisk capacity. The command
 landed in the 6.16 development cycle: an older driver rejects it with
-`-EINVAL`, which the caller surfaces as a clean error. The command is
+`EOPNOTSUPP`, which the caller surfaces as a clean error. The command is
 **grow-only by contract**: `Device::resize_blocking` rejects a request
 at or below the current size before any kernel IO, and the supervisor's
 `resize` executor enforces the same rule against the device's tracked
-size (docs/supervisor.md). Like every control call it is a blocking
-cold-path call: `Device::resize_blocking` documents that it must be run
-through `elio::spawn_blocking` (the device command loop does so), never
-on an Elio worker.
+size (docs/supervisor.md). For a WRITABLE image the executor grows the
+data plane (merged view + writable top; docs/format.md) BEFORE the
+kernel call, so headroom writes land in the upper; this layer module
+itself only changes the kernel gendisk. Like every control call it is a
+blocking cold-path call: `Device::resize_blocking` must be run through
+`elio::spawn_blocking` (the device command loop does so), never on an
+Elio worker.
+
+**Recovery baseline (D3).** `Device::attach` seeds the grow-only
+baseline (`size_bytes()`) from the kernel's REAL current capacity via
+`Ctrl::get_params`, not from the create-time `DeviceParams`: a grown
+device keeps its capacity across USER_RECOVERY (the driver never resets
+it, and attach issues no SET_PARAMS/UPDATE_SIZE), so a params-derived
+baseline would let a post-recovery resize pass the grow-only check and
+actually shrink the gendisk. GET_PARAMS returns the same
+`basic.dev_sectors` the driver updated at UPDATE_SIZE time.
 
 ## Public API
 
@@ -199,7 +211,11 @@ and remembers the added device for best-effort cleanup. Non-copyable.
 - `void update_size(uint32_t dev_id, uint64_t sectors)` — D3 online
   resize: `UBLK_U_CMD_UPDATE_SIZE` with the new capacity (sectors) in
   `data[0]`. Throws `obd::error` (a kernel without the command returns
-  `-EINVAL`). Blocking; see the spawn_blocking rule below.
+  `EOPNOTSUPP`). Blocking; see the spawn_blocking rule below.
+- `ublk_params get_params(uint32_t dev_id)` — `UBLK_U_CMD_GET_PARAMS`;
+  `basic.dev_sectors` is the kernel's current capacity in sectors
+  (which, after an online grow, may exceed the create-time params).
+  Throws `obd::error`. Blocking; see the spawn_blocking rule below.
 - `void stop_dev(uint32_t) noexcept`, `void del_dev(uint32_t) noexcept` —
   best-effort teardown commands; errors are deliberately ignored.
 - `static std::string cdev_path(uint32_t)` → `/dev/ublkc<N>`;
@@ -286,8 +302,9 @@ Full lifecycle of one image as one ublk device. Non-copyable.
   `obd::error` on any setup failure (partial state is torn down via
   `stop()` first).
 - `uint64_t size_bytes() const` — the current device capacity in bytes
-  (the D3 grow-only resize baseline; the size this process
-  created/attached, updated by `resize_blocking`).
+  (the D3 grow-only resize baseline: params-derived on create, kernel-
+  derived via `Ctrl::get_params` on a recovery attach — which may exceed
+  the create-time size after a grow — and updated by `resize_blocking`).
 - `uint64_t resize_blocking(uint64_t bytes)` — D3 grow-only online
   resize: `Ctrl::update_size` after validating positivity, 512-byte
   alignment, and growth over `size_bytes()`. Returns the new capacity.
