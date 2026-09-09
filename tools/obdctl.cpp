@@ -23,7 +23,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage:\n"
                  "  %s [--socket PATH] hello\n"
-                 "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N]\n"
+                 "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N] [--virtual-size BYTES]\n"
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
@@ -77,7 +77,31 @@ int main(int argc, char** argv) {
             if (a == "--global" && i < argc) req["global"] = argv[i++];
             else if (a == "--dev-id" && i < argc)
                 req["dev_id"] = std::stoi(argv[i++]);
-            else {
+            else if (a == "--virtual-size" && i < argc) {
+                // D3 headroom override (bytes): full strtoull validation
+                // for a fast, clear error; the grow-only/alignment
+                // semantics are decided where sizes are comparable
+                // (supervisor + device).
+                const char* v = argv[i++];
+                if (v[0] == '-') {
+                    std::fprintf(stderr,
+                                 "invalid --virtual-size '%s' (want a "
+                                 "positive byte count)\n",
+                                 v);
+                    return 2;
+                }
+                char* end = nullptr;
+                errno = 0;
+                const unsigned long long b = std::strtoull(v, &end, 10);
+                if (errno != 0 || end == v || *end != '\0' || b == 0) {
+                    std::fprintf(stderr,
+                                 "invalid --virtual-size '%s' (want a "
+                                 "positive byte count)\n",
+                                 v);
+                    return 2;
+                }
+                req["virtual_size"] = b;
+            } else {
                 usage(argv[0]);
                 return 2;
             }

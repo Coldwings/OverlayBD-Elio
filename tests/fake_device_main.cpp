@@ -26,6 +26,7 @@
 
 #include <sys/socket.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +45,10 @@ constexpr size_t kPayloadBytes = 512 * 16;
 struct Args {
     std::string config;
     int control_fd = -1;
+    /// D3 create-time headroom override (bytes; 0 = none), validated
+    /// against the fake's declared image size with the same single-source
+    /// rule (image::device_capacity_bytes) the real device uses.
+    uint64_t virtual_size = 0;
 };
 
 void report(const obd::supervisor::ControlChannelWriterPtr& channel,
@@ -108,6 +113,25 @@ elio::coro::task<int> fake_main(Args args) {
             auto sparse = co_await obd::format::SparseRwLayer::open(
                 img.upper.dir + "/overlaybd.sparse", kVsize);
             (void)sparse;
+        }
+        // D3 create-time headroom: mirror the real device's grow-only
+        // validation against the fake's declared image size (the merged
+        // lowers when present, else the writable upper's kVsize) using
+        // the same single-source rule. A rejected override fails create
+        // with the rule's message, exactly like the real device.
+        {
+            const uint64_t declared = opened.has_value()
+                                          ? opened->virtual_size
+                                          : (img.writable() ? kVsize : 0);
+            if (args.virtual_size > 0 && declared > 0) {
+                std::string cap_error;
+                const uint64_t cap = obd::image::device_capacity_bytes(
+                    declared, args.virtual_size, &cap_error);
+                if (cap == 0) {
+                    report(channel, DeviceStatus{"failed", "", cap_error});
+                    co_return 1;
+                }
+            }
         }
         report(channel, DeviceStatus{"ready", "/dev/ublkb70", ""});
 
@@ -210,6 +234,22 @@ int main(int argc, char** argv) {
             args.control_fd = std::stoi(next("--control-fd"));
         else if (a == "--global") (void)next("--global");  // accepted, unused
         else if (a == "--dev-id") (void)next("--dev-id");  // accepted, unused
+        else if (a == "--virtual-size") {
+            const std::string vs = next("--virtual-size");
+            const char* v = vs.c_str();
+            if (v[0] == '-') {
+                std::fprintf(stderr, "invalid --virtual-size '%s'\n", v);
+                return 2;
+            }
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long b = std::strtoull(v, &end, 10);
+            if (errno != 0 || end == v || *end != '\0') {
+                std::fprintf(stderr, "invalid --virtual-size '%s'\n", v);
+                return 2;
+            }
+            args.virtual_size = b;
+        }
         else if (a == "--recover") { /* accepted, unused */ }
         else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());

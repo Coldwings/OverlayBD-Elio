@@ -69,6 +69,11 @@ struct CreateCommand {
     std::string global;      // overlaybd.json path ("" = supervisor default)
     std::string device_bin;  // obd-device path ("" = supervisor default)
     int dev_id = -1;         // requested ublk dev id (-1 = auto)
+    /// D3 create-time headroom: optional dev_size override in bytes
+    /// (0 = absent; the device is sized to the image's virtual size).
+    /// Positive + 512-aligned, and grow-only vs the image size (checked
+    /// device-side after assembly, where the image size is known).
+    uint64_t virtual_size = 0;
 };
 
 struct IdCommand {  // destroy / status
@@ -79,6 +84,11 @@ struct IdCommand {  // destroy / status
 struct CommitCommand {  // commit (ADR-0014: offline seal of the upper)
     std::string id;
     std::string user_tag;  // optional; recorded in the sealed header
+    /// D3 commit re-baseline: optional sealed virtual size in bytes
+    /// (0 = keep the checkpointed size). Grow-only: must be >= the
+    /// layer's declared size and its content extent (validated in the
+    /// seal path).
+    uint64_t virtual_size = 0;
 };
 
 // Trace recording (ADR-0013 record path): wire shapes.

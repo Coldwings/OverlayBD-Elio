@@ -452,4 +452,23 @@ elio::coro::task<void> park_image_fills(const OpenedImage& opened) {
     co_return;
 }
 
+uint64_t device_capacity_bytes(uint64_t image_bytes, uint64_t override_bytes,
+                               std::string* error) {
+    // Grow-only (ADR-0014 dev_size model): the override is sanctioned
+    // headroom — an override below the image's declared size would
+    // shrink the device below its content and is rejected cleanly.
+    // override == image size is a no-op override and allowed.
+    if (override_bytes > 0 && override_bytes < image_bytes) {
+        if (error != nullptr) {
+            *error = "create virtual_size " + std::to_string(override_bytes) +
+                     " is smaller than the image's virtual size " +
+                     std::to_string(image_bytes) +
+                     " (grow-only: a smaller device would shrink below the "
+                     "image content)";
+        }
+        return 0;
+    }
+    return override_bytes > 0 ? override_bytes : image_bytes;
+}
+
 }  // namespace obd::image

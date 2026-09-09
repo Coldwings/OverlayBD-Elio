@@ -36,6 +36,17 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
                     "'dev_id' an integer";
             return std::nullopt;
         }
+        // D3 create-time headroom: optional 'virtual_size' override in
+        // bytes. Semantic rules (positive, 512-aligned, grow-only vs the
+        // image size) live in the handlers, where the image's declared
+        // size is known (the device's opened.virtual_size).
+        if (j.contains("virtual_size") &&
+            !j["virtual_size"].is_number_unsigned() &&
+            !(j["virtual_size"].is_number_integer() &&
+              j["virtual_size"].get<int64_t>() >= 0)) {
+            error = "create 'virtual_size' must be a non-negative integer";
+            return std::nullopt;
+        }
     } else if (cmd == "destroy" || cmd == "status") {
         if (!j.contains("id")) {
             error = cmd + " requires 'id'";

@@ -33,7 +33,7 @@ namespace {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --config PATH [--global PATH] [--control-fd N] "
-                 "[--dev-id N] [--recover]\n",
+                 "[--dev-id N] [--recover] [--virtual-size BYTES]\n",
                  argv0);
 }
 
@@ -43,6 +43,9 @@ struct Args {
     int control_fd = -1;
     int dev_id = -1;
     bool recover = false;  // ADR-0010: attach to an existing device
+    /// D3 create-time headroom: dev_size override in bytes (0 = derive
+    /// from the image's declared virtual size).
+    uint64_t virtual_size = 0;
 };
 
 void report(const obd::supervisor::ControlChannelWriterPtr& channel,
@@ -79,9 +82,36 @@ elio::coro::task<int> device_main(Args args) {
                                       "virtual size not sector aligned"});
             co_return 1;
         }
+        // D3 create-time headroom: an optional --virtual-size override
+        // (bytes) sizes the device beyond the image's declared size —
+        // sanctioned headroom (ADR-0014 dev_size model). Grow-only: an
+        // override below the image size is rejected here (the single
+        // source of the rule is device_capacity_bytes). The override is
+        // validated against the image size only after assembly, where the
+        // image's declared size is actually known.
+        uint64_t dev_bytes = opened.virtual_size;
+        if (args.virtual_size > 0) {
+            if (args.virtual_size % 512 != 0) {
+                ELIO_LOG_ERROR(
+                    "virtual-size override {} is not sector aligned",
+                    args.virtual_size);
+                report(channel, DeviceStatus{"failed", "",
+                                          "virtual_size not sector aligned"});
+                co_return 1;
+            }
+            std::string cap_error;
+            dev_bytes = obd::image::device_capacity_bytes(
+                opened.virtual_size, args.virtual_size, &cap_error);
+            if (dev_bytes == 0) {
+                ELIO_LOG_ERROR("virtual-size override rejected: {}",
+                               cap_error);
+                report(channel, DeviceStatus{"failed", "", cap_error});
+                co_return 1;
+            }
+        }
 
         obd::ublk::DeviceParams params;
-        params.dev_sectors = opened.virtual_size / 512;
+        params.dev_sectors = dev_bytes / 512;
         params.read_only = !opened.writable;  // ADR-0008
         params.enable_recovery = global.ublk_recovery;  // ADR-0010
         if (args.dev_id >= 0) {
@@ -241,6 +271,26 @@ int main(int argc, char** argv) {
         else if (a == "--control-fd")
             args.control_fd = std::stoi(next("--control-fd"));
         else if (a == "--dev-id") args.dev_id = std::stoi(next("--dev-id"));
+        else if (a == "--virtual-size") {
+            // Byte count via strtoull (std::stoull would throw on bad
+            // input): negative wraps through unsigned — reject it
+            // explicitly; the positive/alignment/grow-only semantic
+            // checks live in device_main where sizes are comparable.
+            const std::string vs = next("--virtual-size");
+            const char* v = vs.c_str();
+            if (v[0] == '-') {
+                std::fprintf(stderr, "invalid --virtual-size '%s'\n", v);
+                return 2;
+            }
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long b = std::strtoull(v, &end, 10);
+            if (errno != 0 || end == v || *end != '\0') {
+                std::fprintf(stderr, "invalid --virtual-size '%s'\n", v);
+                return 2;
+            }
+            args.virtual_size = b;
+        }
         else if (a == "--recover") args.recover = true;
         else if (a == "--help" || a == "-h") {
             usage(argv[0]);

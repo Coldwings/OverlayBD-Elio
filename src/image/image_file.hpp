@@ -94,4 +94,16 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
 /// use-after-free (the fill coroutine touches members on resume).
 elio::coro::task<void> park_image_fills(const OpenedImage& opened);
 
+/// D3 create-time headroom rule (ADR-0014 dev_size model): the device
+/// capacity in bytes given the image's declared virtual size and an
+/// optional create-time override (0 = none — the device is sized to the
+/// image). The override is sanctioned headroom and must be at least the
+/// image size — a smaller override would shrink the device below its
+/// content (grow-only), which is rejected with a message in `error`.
+/// Sector alignment is validated by the caller (obd-device checks the
+/// override before use, mirroring its image-size check). Pure, so the
+/// rule is unit-testable without a device or kernel.
+uint64_t device_capacity_bytes(uint64_t image_bytes, uint64_t override_bytes,
+                               std::string* error);
+
 }  // namespace obd::image

@@ -492,9 +492,26 @@ private:
         const std::string global = j.value("global", cfg_.global_config);
         const std::string bin = j.value("device_bin", cfg_.device_bin);
         const int dev_id = j.value("dev_id", -1);
+        // D3 create-time headroom (bytes; 0 = size the device to the
+        // image). parse_command validated the type; positivity/alignment
+        // are checked here, and grow-only vs the image's declared size is
+        // enforced by the device after assembly (the supervisor cannot
+        // know the image size without opening every layer).
+        uint64_t virtual_size = 0;
+        if (j.contains("virtual_size")) {
+            virtual_size = j["virtual_size"].is_number_unsigned()
+                               ? j["virtual_size"].get<uint64_t>()
+                               : static_cast<uint64_t>(
+                                     j["virtual_size"].get<int64_t>());
+        }
 
         if (id.empty() || id.find('/') != std::string::npos) {
             co_return reply_error("invalid id");
+        }
+        if (virtual_size > 0 && virtual_size % 512 != 0) {
+            co_return reply_error(
+                "create virtual_size must be a positive multiple of 512 "
+                "bytes");
         }
         if (!file_exists(config)) {
             co_return reply_error("config file not found: " + config);
@@ -510,7 +527,8 @@ private:
         }
 
         auto entry = std::make_shared<DeviceEntry>();
-        entry->spec = ChildSpec{id, bin, config, global, dev_id, false};
+        entry->spec =
+            ChildSpec{id, bin, config, global, dev_id, false, virtual_size};
         // ADR-0014: record the upper's path/kind for a later commit.
         // Provenance is the config as of create time — a later edit of the
         // config file must not redirect commit. A parse failure leaves the
