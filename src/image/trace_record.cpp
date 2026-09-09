@@ -10,6 +10,7 @@
 #include <elio/time/timer.hpp>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -113,6 +114,17 @@ elio::coro::task<bool> TraceRecorder::start(
     if (fd < 0) {
         error = "cannot open trace output " + path + ": " +
                 std::strerror(errno);
+        co_return false;
+    }
+    // Only REGULAR files may be trace outputs: writing/fsyncing a
+    // device node, FIFO (already non-blocked), or other special file
+    // would break the "finalize produces a valid blob" contract.
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        const int e = errno ? errno : EINVAL;
+        ::close(fd);
+        error = "trace output is not a regular file: " + path +
+                std::string(" (") + std::strerror(e) + ")";
         co_return false;
     }
     // Test-only hook: lets a test hold a start between the open and
