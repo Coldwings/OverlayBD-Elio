@@ -142,6 +142,13 @@ class Daemon {
         bool cmd_pending = false;
         nlohmann::json pending_reply;
         std::shared_ptr<elio::sync::event> reply_waiter;
+        // L2 correlation: every forwarded command carries a fresh
+        // `seq`; the device echoes it in the reply. A late reply to a
+        // TIMED-OUT command would otherwise complete the NEXT pending
+        // command with the wrong fields — mismatches are dropped
+        // (logged), the pending command times out on its own.
+        uint64_t cmd_seq = 0;
+        uint64_t pending_seq = 0;
         nlohmann::json trace;
     };
 
@@ -356,6 +363,16 @@ private:
                              {"error", "device control channel closed"}};
                         if (entry->reply_waiter) entry->reply_waiter->set();
                     }
+                    // Crash/exit mid-record: queued records were
+                    // memory-only and died with the device — never
+                    // leave "recording" standing (it would survive a
+                    // recovery respawn of a device that records
+                    // nothing).
+                    if (entry->trace.is_object() &&
+                        entry->trace.value("state", "") == "recording") {
+                        entry->trace["state"] = "lost";
+                        entry->trace["reason"] = "device_exit";
+                    }
                     mu_.unlock();
                 }
                 // EOF: the process is gone (or closing); mark exited if not
@@ -547,17 +564,43 @@ private:
             t["dropped"] = j.value("dropped", 0);
             if (!j.value("ok", false)) t["error"] = j.value("error", "");
             co_await mu_.lock();
-            entry->trace = std::move(t);
+            // Only the recording the event belongs to: a stale expiry
+            // landing after a NEW recording started must not flip the
+            // fresh "recording" status back to "stopped". (trace is
+            // null json until the first trace_start — value() on null
+            // throws.)
+            if (entry->trace.is_object() &&
+                entry->trace.value("state", "") == "recording") {
+                entry->trace = std::move(t);
+            } else {
+                ELIO_LOG_WARNING(
+                    "device {}: stale trace event ignored (state {})",
+                    entry->spec.id,
+                    entry->trace.is_object()
+                        ? entry->trace.value("state", "none")
+                        : "none");
+            }
             mu_.unlock();
             co_return;
         }
         // trace_start/trace_stop reply (or garbage): hand to the pending
-        // command handler if there is one.
+        // command handler if there is one — but only when the reply's
+        // echoed `seq` matches the pending command's. A LATE reply to a
+        // timed-out command carries an old seq and is dropped, never
+        // completing the wrong command.
         co_await mu_.lock();
         if (entry->cmd_pending) {
-            entry->cmd_pending = false;
-            entry->pending_reply = std::move(j);
-            if (entry->reply_waiter) entry->reply_waiter->set();
+            const uint64_t echoed = j.value("seq", uint64_t{0});
+            if (echoed == entry->pending_seq) {
+                entry->cmd_pending = false;
+                entry->pending_reply = std::move(j);
+                if (entry->reply_waiter) entry->reply_waiter->set();
+            } else {
+                ELIO_LOG_WARNING(
+                    "device {}: dropping stale command reply (seq {}, "
+                    "pending seq {})",
+                    entry->spec.id, echoed, entry->pending_seq);
+            }
         }
         mu_.unlock();
         co_return;
@@ -581,6 +624,7 @@ private:
             if (entry && !entry->cmd_pending && entry->control_fd >= 0) {
                 entry->cmd_pending = true;
                 entry->reply_waiter = waiter;
+                entry->pending_seq = ++entry->cmd_seq;
                 fd = entry->control_fd;
             } else {
                 fd = -1;
@@ -600,6 +644,7 @@ private:
             entry->reply_waiter.reset();
             mu_.unlock();
         };
+        cmd["seq"] = entry->pending_seq;  // the device echoes it back
         const std::string line = cmd.dump() + "\n";
         const auto w = co_await elio::io::async_write(fd, line.data(),
                                                       line.size(), -1);

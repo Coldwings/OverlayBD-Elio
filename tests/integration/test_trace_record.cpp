@@ -350,6 +350,7 @@ TEST_CASE("integration: trace recording captures remote reads end to end",
         write_image_config(dir, server.repo_base(), img, layer_dir);
 
     auto guard = block_daemon_signals();
+    std::string stop_sha256;  // threaded out of the client (L5)
 
     const int failures = run_trace_daemon_case(
         trace_test_cfg(sock), server,
@@ -397,6 +398,7 @@ TEST_CASE("integration: trace recording captures remote reads end to end",
                   "trace_stop path mismatch");
             check(stopped.value("sha256", "").size() == 64,
                   "trace_stop sha256 not 64 hex chars");
+            stop_sha256 = stopped.value("sha256", "");
             check(stopped.value("size", 0) == 24 + 24,
                   "trace blob should hold exactly one record");
             check(stopped.value("records", 0) == 1,
@@ -426,8 +428,8 @@ TEST_CASE("integration: trace recording captures remote reads end to end",
     // [65024, 261632), merged by the coalescing window.
     REQUIRE(rec.offset == 65024);
     REQUIRE(rec.count == 3 * 65536);
-    REQUIRE(common::Sha256::hex(blob.data(), blob.size()) ==
-            common::Sha256::hex(blob.data(), blob.size()));  // self-check
+    // The digest the stop reply reported IS the produced file's digest.
+    REQUIRE(stop_sha256 == common::Sha256::hex(blob.data(), blob.size()));
 }
 
 TEST_CASE("integration: trace recording duration expiry finalizes without a client call",
@@ -674,4 +676,88 @@ TEST_CASE("integration: trace recording rejects bad requests cleanly",
     auto parsed = format::trace::parse(read_whole_file(trace_path));
     REQUIRE(parsed.has_value());
     REQUIRE(parsed->size() == 1);
+}
+
+TEST_CASE("integration: trace recording crash mid-record marks the trace lost",
+          "[integration]") {
+    // A device dying mid-recording takes its queued records with it
+    // (memory-only until finalize): the supervisor must not leave a
+    // "recording" status standing — status reports the trace "lost".
+    test::TempDir dir;
+    const auto img = make_test_image(dir, 89);
+    const std::string sock = dir / "supervisor.sock";
+    const std::string layer_dir = dir / "layer0";
+    const std::string trace_path = dir / "out.trace";
+    std::filesystem::create_directories(layer_dir);
+    TraceBlobServer server({{img.digest, img.blob}}, 19211);
+    const std::string cfg_path =
+        write_image_config(dir, server.repo_base(), img, layer_dir);
+
+    auto guard = block_daemon_signals();
+
+    const int failures = run_trace_daemon_case(
+        trace_test_cfg(sock), server,
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "d1"},
+                            {"config", cfg_path}})
+                      .value("ok", false),
+                  "create d1 failed");
+            check(rpc_json({{"cmd", "trace_start"},
+                            {"id", "d1"},
+                            {"path", trace_path},
+                            {"duration_sec", 300}})
+                      .value("ok", false),
+                  "trace_start failed");
+            const auto st1 = rpc_json({{"cmd", "status"}, {"id", "d1"}});
+            check(st1.value("ok", false) && st1.contains("trace") &&
+                      st1["trace"].value("state", "") == "recording",
+                  "status does not show recording");
+            const int pid = st1.value("pid", -1);
+            if (pid <= 0) {
+                check(false, "no device pid in status");
+                return;
+            }
+
+            // Crash the device mid-record (SIGKILL: no shutdown
+            // finalize can run).
+            if (::kill(pid, SIGKILL) != 0) {
+                check(false, "cannot SIGKILL the device");
+                return;
+            }
+            std::string state, reason;
+            for (int i = 0; i < 500; ++i) {
+                const auto st = rpc_json({{"cmd", "status"}, {"id", "d1"}});
+                if (st.value("ok", false) && st.contains("trace") &&
+                    st["trace"].value("state", "") == "lost") {
+                    state = "lost";
+                    reason = st["trace"].value("reason", "");
+                    break;
+                }
+                std::this_thread::sleep_for(20ms);
+            }
+            check(state == "lost", "trace not marked lost after crash");
+            check(reason == "device_exit",
+                  "lost trace reason not 'device_exit'");
+            check(rpc_json({{"cmd", "hello"}}).value("ok", false),
+                  "daemon unusable after device crash");
+        });
+    REQUIRE(failures == 0);
+
+    // The output file was O_TRUNC-created at start but never finalized:
+    // it is empty and not a valid trace blob — the "lost" status, not
+    // the file, is the source of truth for a crashed recording.
+    struct stat st {};
+    REQUIRE(::stat(trace_path.c_str(), &st) == 0);
+    REQUIRE(st.st_size == 0);
 }

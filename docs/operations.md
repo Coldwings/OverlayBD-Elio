@@ -234,8 +234,16 @@ Runbook notes:
   layer indices that no longer match.
 - `obdctl trace_start <id> <output.trace> [--duration SEC]` and
   `obdctl trace_stop <id>` require supervisor protocol ≥ 3 (`hello`'s
-  `features` lists `"trace"`); against an older supervisor the CLI
-  refuses before sending.
+  `features` lists `"trace"`). obdctl performs no handshake gate of its
+  own: against an older supervisor the command is sent and the daemon
+  answers a clean `unknown cmd 'trace_start'` protocol error.
+- **Crash mid-record loses the window.** Queued records live in device
+  memory until finalize, so a device crash or SIGKILL mid-recording
+  loses them: the supervisor marks the `trace` status `"state":"lost",
+  "reason":"device_exit"` (never a stale "recording" — the mark also
+  survives a recovery respawn, which records nothing), and the output
+  file — created O_TRUNC at start — remains a 0-byte non-blob. Treat a
+  lost window as "no trace" and record again.
 
 ## Logging
 

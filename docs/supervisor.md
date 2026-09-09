@@ -173,12 +173,18 @@ surface is `OpenedImage::recorder`). Unlike `commit`, these commands are
 device over channel 2 and relays the reply. Contract:
 
 - **Forwarding.** The supervisor sends
-  `{"cmd":"trace_start","path":...,"duration_sec":N}` /
-  `{"cmd":"trace_stop"}` to the device and waits (bounded, 30 s) for the
-  device's `{"reply":"trace_start"|"trace_stop", ...}` line. One device
-  command is outstanding per device at a time; a wedged or ancient
-  device answers as "device control channel timeout". A dead device
-  (channel EOF) fails a pending command immediately.
+  `{"cmd":"trace_start","path":...,"duration_sec":N,"seq":N}` /
+  `{"cmd":"trace_stop","seq":N}` to the device and waits (bounded, 30 s)
+  for the device's `{"reply":"trace_start"|"trace_stop", ...}` line.
+  `seq` is a per-command correlation token, fresh for every forwarded
+  command and echoed by the device in its reply (additive: older
+  supervisors omit it, older devices do not echo); a reply whose `seq`
+  does not match the pending command is dropped and logged, so a LATE
+  reply to a timed-out command can never complete the next command with
+  the wrong fields. One device command is outstanding per device at a
+  time; a wedged or ancient device answers as "device control channel
+  timeout". A dead device (channel EOF) fails a pending command
+  immediately.
 - **Server-side duration bound.** The duration timer lives in the
   DEVICE process: expiry finalizes the recording exactly like an
   explicit stop, so a dead, crashed, or disconnected CLI can never leak
@@ -194,8 +200,16 @@ device over channel 2 and relays the reply. Contract:
   unsolicited `{"reply":"trace_event","event":"expired", ...stats...}`
   line; the supervisor records it and both `status` and `list` replies
   carry the additive **`trace`** object from then on:
-  `{"state":"recording"|"stopped","path","duration_sec"?,"reason":
-  "stopped"|"expired","sha256"?,"size"?,"records"?,"dropped"?}`.
+  `{"state":"recording"|"stopped"|"lost","path","duration_sec"?,
+  "reason":"stopped"|"expired"|"device_exit","sha256"?,"size"?,
+  "records"?,"dropped"?}`. Expiry events apply ONLY while the entry's
+  trace state is "recording" — a stale expiry landing after a new
+  recording started is logged and ignored, never overwriting the fresh
+  recording's status. **Crash mid-record** (device exit with a
+  recording open) marks the trace `"state":"lost",
+  "reason":"device_exit"`: queued records are memory-only and die with
+  the device, and the mark — not a stale "recording" — is what a
+  recovery respawn starts from.
 - **Idempotent stop.** A `trace_stop` that races (or follows) an expiry
   returns the same finalized stats, never an error — a CLI can always
   learn the outcome of its recording. A stop with no recording ever
@@ -508,8 +522,11 @@ needing a real ublk device or root.
   the device-side timer finalizes on its own and a late stop returns
   the same stats; `integration: trace recording survives client
   disconnect mid-record` — a CLI that vanishes mid-command cannot leak
-  a recording device; `integration: trace recording rejects bad
-  requests cleanly` — protocol validation, unknown ids, idle stops,
+  a recording device; `integration: trace recording crash mid-record
+  marks the trace lost` — a SIGKILLed device's trace status flips to
+  "lost"/"device_exit" and the never-finalized output file stays a
+  0-byte non-blob; `integration: trace recording rejects bad requests
+  cleanly` — protocol validation, unknown ids, idle stops,
   out-of-bounds durations, and double starts are precise errors that
   leave the daemon and the active recording unaffected.
 

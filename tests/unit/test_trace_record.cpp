@@ -11,11 +11,13 @@
 // No Catch2 macros between start and stop: a REQUIRE throw would skip
 // the stop and leak the timer; read results are collected and asserted
 // after the stop.
+#include "common/sha256.hpp"
 #include "image/trace_record.hpp"
 #include "source/layer_store.hpp"
 
 #include "../support.hpp"
 
+#include <elio/runtime/spawn.hpp>
 #include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -23,6 +25,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -73,6 +76,27 @@ elio::coro::task<image::TraceRecorder::FinalizeResult> with_recording(
     co_return co_await rec.stop("stopped");
 }
 
+std::vector<uint8_t> read_file_bytes(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    struct stat st {};
+    REQUIRE(::fstat(fd, &st) == 0);
+    std::vector<uint8_t> blob(static_cast<size_t>(st.st_size));
+    size_t done = 0;
+    while (done < blob.size()) {
+        const ssize_t r = ::read(fd, blob.data() + done, blob.size() - done);
+        REQUIRE(r > 0);
+        done += static_cast<size_t>(r);
+    }
+    ::close(fd);
+    return blob;
+}
+
+std::string file_sha256(const std::string& path) {
+    const auto blob = read_file_bytes(path);
+    return common::Sha256::hex(blob.data(), blob.size());
+}
+
 std::vector<format::trace::TraceRecord> parse_file(const std::string& path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     REQUIRE(fd >= 0);
@@ -119,6 +143,8 @@ TEST_CASE("image: trace recording round-trips through the codec reader",
     REQUIRE(res.size == format::trace::kHeaderSize +
                             3 * format::trace::kRecordSize);
     REQUIRE(res.sha256.size() == 64);
+    // The reported digest is the real file's digest, not a length check.
+    REQUIRE(res.sha256 == file_sha256(out));
     const auto records = parse_file(out);
     REQUIRE(records.size() == 3);
     REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
@@ -480,4 +506,143 @@ TEST_CASE("image: trace recording translates offsets out of the tar wrapper",
             format::trace::TraceRecord{'R', 0, 65536 - 512, 0});
     REQUIRE(records[1] ==
             format::trace::TraceRecord{'R', 0, 65536, 262144 - 512});
+}
+
+TEST_CASE("image: trace recording finalizes an empty window to a valid header-only blob",
+          "[image]") {
+    // Stop before any record: the queue drains empty, the codec writer
+    // still performs the header checksum rewrite, and the C2 reader
+    // accepts the 24-byte header-only blob.
+    test::TempDir dir;
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        image::TraceRecorder rec;
+        res = co_await with_recording(
+            rec, out, []() -> elio::coro::task<void> { co_return; });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 0);
+    REQUIRE(res.dropped == 0);
+    REQUIRE(res.size == format::trace::kHeaderSize);
+    REQUIRE(res.sha256 == file_sha256(out));
+    REQUIRE(parse_file(out).empty());
+}
+
+TEST_CASE("image: trace recording restarts cleanly after a stop",
+          "[image]") {
+    // start -> stop -> start: the second window opens fresh (queue and
+    // drop counter reset), records only its own reads, and the first
+    // blob stays intact.
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 91);
+    const std::string out1 = dir / "one.trace";
+    const std::string out2 = dir / "two.trace";
+    image::TraceRecorder::FinalizeResult res1, res2;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        res1 = co_await with_recording(
+            *rec, out1, [&]() -> elio::coro::task<void> {
+                co_await read_at(tap, 0, 4096);
+            });
+        res2 = co_await with_recording(
+            *rec, out2, [&]() -> elio::coro::task<void> {
+                co_await read_at(tap, 65536, 4096);
+                co_await read_at(tap, 131072, 4096);
+            });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(res1.ok);
+    REQUIRE(res2.ok);
+    REQUIRE(res1.records == 1);
+    REQUIRE(res2.records == 2);
+    REQUIRE(res2.dropped == 0);  // counters reset per window
+    const auto first = parse_file(out1);
+    REQUIRE(first.size() == 1);
+    REQUIRE(first[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
+    const auto second = parse_file(out2);
+    REQUIRE(second.size() == 2);
+    REQUIRE(second[0] == format::trace::TraceRecord{'R', 0, 4096, 65536});
+    REQUIRE(second[1] == format::trace::TraceRecord{'R', 0, 4096, 131072});
+}
+
+TEST_CASE("image: trace recording rejects start while a finalize is in flight",
+          "[image]") {
+    // M1 regression: a start slipping into an in-flight finalize would
+    // wipe the draining queue and corrupt its stats. The test-only
+    // finalize hook holds the finalize open (state Finalizing) so the
+    // second start deterministically meets it and is rejected with the
+    // clean "already in progress" error; the in-flight finalize then
+    // completes with its records and stats intact.
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 93);
+    const std::string out1 = dir / "one.trace";
+    const std::string out2 = dir / "two.trace";
+    std::atomic<bool> finalize_entered{false};
+    std::atomic<bool> finalize_release{false};
+    bool second_start_ok = true;
+    std::string second_start_error;
+    std::optional<image::TraceRecorder::FinalizeResult> stop_res;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_finalize_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                finalize_entered.store(true, std::memory_order_release);
+                while (!finalize_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out1, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!started) co_return 1;
+        co_await read_at(tap, 0, 4096);
+        // Stop concurrently: the finalize reaches the hook and parks.
+        elio::go([&]() -> elio::coro::task<void> {
+            stop_res = co_await rec->stop("stopped");
+        });
+        for (int i = 0;
+             i < 5000 &&
+             !finalize_entered.load(std::memory_order_acquire); ++i) {
+            co_await elio::time::sleep_for(1ms);
+        }
+        if (!finalize_entered.load(std::memory_order_acquire)) co_return 2;
+        // The finalize is held open: a start now MUST be rejected.
+        second_start_ok = co_await rec->start(
+            out2, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {},
+            second_start_error);
+        finalize_release.store(true, std::memory_order_release);
+        for (int i = 0; i < 5000 && !stop_res.has_value(); ++i) {
+            co_await elio::time::sleep_for(1ms);
+        }
+        rec->set_finalize_hook_for_test(nullptr);
+        co_return stop_res.has_value() ? 0 : 3;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(!second_start_ok);
+    REQUIRE(second_start_error.find("already in progress") !=
+            std::string::npos);
+    // The held finalize completed untouched: its record and digest.
+    REQUIRE(stop_res->ok);
+    REQUIRE(stop_res->records == 1);
+    REQUIRE(stop_res->dropped == 0);
+    REQUIRE(stop_res->sha256 == file_sha256(out1));
+    const auto records = parse_file(out1);
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
 }

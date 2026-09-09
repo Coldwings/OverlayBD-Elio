@@ -181,7 +181,7 @@ Every test, grouped by area, with the property it guards.
   data (mask semantics, ADR-0009).
 - `format: trace crc32c golden vectors match the spec` — the trace blob's
   raw-chaining CRC-32C matches the trace-format.md §4 golden vectors,
-  including the chaining property (ADR-0013, proposed).
+  including the chaining property (ADR-0013).
 - `format: trace decodes the spec worked example byte-for-byte` — the
   golden 72-byte blob from the trace-format.md §13 appendix decodes to
   the documented header fields and records, and the conforming writer
@@ -398,7 +398,7 @@ Every test, grouped by area, with the property it guards.
   back writes (ADR-0008).
 - `image: trace replay populates traced extents in recorded order` —
   records interleaving two lowers issue `populate` on the right target in
-  the trace's exact order (ADR-0013, proposed).
+  the trace's exact order (ADR-0013).
 - `image: trace replay skips unknown ops, layers and bad records` —
   non-READ ops, unknown/null layer indexes, zero and > 1 MiB counts, and
   negative offsets skip silently; a failing populate and a malformed blob
@@ -430,6 +430,16 @@ Every test, grouped by area, with the property it guards.
 - `image: trace recording translates offsets out of the tar wrapper` —
   records address payload space; header-spanning fetches clamp to their
   payload overlap.
+- `image: trace recording finalizes an empty window to a valid header-only blob` —
+  a stop before any record still runs the header checksum rewrite; the
+  24-byte blob parses with the C2 reader.
+- `image: trace recording restarts cleanly after a stop` —
+  start→stop→start opens a fresh window (queue/drop counter reset) and
+  both blobs stay valid.
+- `image: trace recording rejects start while a finalize is in flight` —
+  a start meeting an in-flight finalize (held open by the test hook) is
+  rejected with "already in progress" and the finalize completes with
+  its records and stats intact.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` image with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merged view and the trace fully
@@ -635,6 +645,11 @@ Every test, grouped by area, with the property it guards.
   reply cannot leak a recording device: the duration bound still
   finalizes and the supervisor keeps serving (ADR-0013). Runs without
   privileges.
+- `integration: trace recording crash mid-record marks the trace lost` —
+  a SIGKILLed device's `trace` status flips to
+  `"state":"lost","reason":"device_exit"`, the never-finalized output
+  file stays a 0-byte non-blob, and the daemon keeps serving
+  (ADR-0013). Runs without privileges.
 - `integration: trace recording rejects bad requests cleanly` — missing
   or wrong-typed fields (protocol parse), unknown ids, idle stops,
   out-of-bounds durations, and double starts are precise errors that

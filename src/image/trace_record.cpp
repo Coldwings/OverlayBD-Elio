@@ -87,7 +87,12 @@ elio::coro::task<bool> TraceRecorder::start(
     std::shared_ptr<elio::coro::cancel_source> cancel;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (state_ == State::Recording) {
+        if (state_ != State::Idle) {
+            // Reject Finalizing too: a start slipping into an in-flight
+            // finalize would wipe the draining queue (pending_.clear()),
+            // corrupt the finalize's stats (dropped_.store(0)), and the
+            // old stop's tail would stomp the NEW recording's state
+            // back to Idle with its fd/timer live.
             ::close(fd);
             error = "trace recording already in progress";
             co_return false;
@@ -207,6 +212,14 @@ TraceRecorder::finalize_locked_state(int fd, std::string path,
         }
         pending_.clear();
     }
+    // Test-only hook: lets a test hold the finalize open here (state
+    // stays Finalizing) to exercise start/stop races.
+    std::function<elio::coro::task<void>()> hook;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        hook = finalize_hook_;
+    }
+    if (hook) co_await hook();
     const std::span<const uint8_t> blob = writer.finalize();
     res.records = writer.record_count();
     res.size = blob.size();

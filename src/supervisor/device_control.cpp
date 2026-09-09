@@ -55,6 +55,17 @@ void reply_line(int fd, const nlohmann::json& j) {
     (void)w;
 }
 
+/// L2 correlation: the supervisor stamps a per-command `seq` into every
+/// forwarded command; replies echo it so the supervisor can drop a LATE
+/// reply to a timed-out command instead of completing the wrong one.
+/// Additive: absent seq (an older supervisor) means no echo.
+void echo_seq(const nlohmann::json& cmd, nlohmann::json& reply) {
+    const auto it = cmd.find("seq");
+    if (it != cmd.end() && it->is_number_unsigned()) {
+        reply["seq"] = it->get<uint64_t>();
+    }
+}
+
 nlohmann::json finalize_fields(const image::TraceRecorder::FinalizeResult& r) {
     nlohmann::json j;
     j["path"] = r.path;
@@ -98,37 +109,40 @@ elio::coro::task<void> run_trace_control(
             };
             const bool started = co_await recorder->start(
                 path, duration, std::move(on_expire), error);
+            nlohmann::json rj;
             if (started) {
-                reply_line(control_fd,
-                           {{"reply", "trace_start"},
-                            {"ok", true},
-                            {"path", path},
-                            {"duration_sec", duration}});
-                if (hooks.on_start) hooks.on_start();
+                rj = {{"reply", "trace_start"},
+                      {"ok", true},
+                      {"path", path},
+                      {"duration_sec", duration}};
             } else {
-                reply_line(control_fd,
-                           {{"reply", "trace_start"},
-                            {"ok", false},
-                            {"error", error}});
+                rj = {{"reply", "trace_start"},
+                      {"ok", false},
+                      {"error", error}};
             }
+            echo_seq(j, rj);
+            reply_line(control_fd, rj);
+            if (started && hooks.on_start) hooks.on_start();
         } else if (cmd == "trace_stop") {
             auto res = co_await recorder->stop("stopped");
+            nlohmann::json rj;
             if (res.ok) {
-                nlohmann::json rj = finalize_fields(res);
+                rj = finalize_fields(res);
                 rj["reply"] = "trace_stop";
                 rj["ok"] = true;
-                reply_line(control_fd, rj);
             } else {
-                reply_line(control_fd,
-                           {{"reply", "trace_stop"},
-                            {"ok", false},
-                            {"error", res.error}});
+                rj = {{"reply", "trace_stop"},
+                      {"ok", false},
+                      {"error", res.error}};
             }
+            echo_seq(j, rj);
+            reply_line(control_fd, rj);
         } else {
-            reply_line(control_fd,
-                       {{"reply", cmd},
-                        {"ok", false},
-                        {"error", "unknown device command"}});
+            nlohmann::json rj = {{"reply", cmd},
+                                 {"ok", false},
+                                 {"error", "unknown device command"}};
+            echo_seq(j, rj);
+            reply_line(control_fd, rj);
         }
     }
 }

@@ -399,7 +399,7 @@ selects `overlaybd.rw` (`"lsmt"`, default) or `overlaybd.sparse`
 (`"sparse"`).
 
 `src/image/config.hpp::ImageConfig::acceleration_layer` — from the
-top-level `accelerationLayer` boolean (ADR-0013, proposed): marks the
+top-level `accelerationLayer` boolean (ADR-0013): marks the
 uppermost lower as the acceleration (trace) layer; see Concepts → "The
 trace layer".
 
@@ -846,7 +846,14 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   extents;
   `image: trace recording translates offsets out of the tar wrapper` —
   records address payload space, with header-spanning fetches clamped
-  to their payload overlap.
+  to their payload overlap;
+  `image: trace recording finalizes an empty window to a valid header-only blob`
+  — a stop before any record still runs the checksum rewrite;
+  `image: trace recording restarts cleanly after a stop` — a fresh
+  window resets the queue and counters;
+  `image: trace recording rejects start while a finalize is in flight`
+  — the state-machine guard against queue wipe/stat corruption, pinned
+  with the test-only finalize hook.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` config with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merge (layer count, virtual
@@ -953,7 +960,7 @@ single Range-capable blob. No external golden files.
   are parsed-as-ignored / informational in v0.1; of `prefetch`,
   `enable`, `head_kb`, and `tail_kb` are honored (see `docs/config.md`
   for the full compatibility matrix). The trace layer IS recognized and
-  replayed (ADR-0013, proposed; see Concepts → "The trace layer"), with
+  replayed (ADR-0013; see Concepts → "The trace layer"), with
   these gaps: trace **recording** is not implemented; the
   dynamic-prefetch file-list fallback is rejected by design; the tar
   member name (`trace`) is not checked — recognition is the config flag

@@ -320,7 +320,7 @@ contracts above:
   model (ADR-0004) bounds the blast radius meanwhile.
 - **Prefetch** is trace-replay only: the upstream trace blob IS replayed
   through `populate` when the image config marks an `accelerationLayer`
-  (ADR-0013, proposed — see `docs/image.md`), admitted at the device's
+  (ADR-0013 — see `docs/image.md`), admitted at the device's
   ADR-0012 funnel as the Prefetch scavenger class; the `prefetch` config
   section's `enable` switch is honored. The dynamic prefetcher, trace
   recording, and the structural head/tail warm-up stay out.

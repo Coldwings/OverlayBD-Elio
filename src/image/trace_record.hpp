@@ -104,8 +104,11 @@ public:
     /// is irrelevant — the timer lives in the device process) and
     /// `on_expire` receives the result. `on_expire` runs on the timer
     /// coroutine; keep it short (a best-effort control-channel write).
-    /// Returns false with `error` set when already recording, the
-    /// duration is out of bounds, or the path is not writable.
+    /// Returns false with `error` set when a recording is in progress
+    /// OR still finalizing (a start must never slip into an in-flight
+    /// finalize: it would wipe the draining queue, corrupt the
+    /// finalize's stats, and strand the new recording's state), when
+    /// the duration is out of bounds, or the path is not writable.
     /// Requires a running Elio scheduler. LIFETIME: the duration timer
     /// is a detached coroutine on the caller's scheduler — the recorder
     /// must be stopped (stop()) before that scheduler shuts down; a
@@ -127,6 +130,17 @@ public:
     std::optional<FinalizeResult> last_result() const {
         std::lock_guard<std::mutex> lk(mu_);
         return last_;
+    }
+
+    /// Test-only: when set, finalize co_awaits this hook after the
+    /// queue drain and before the file write, letting a test hold a
+    /// finalize open to exercise start/stop races deterministically
+    /// (same role as LayerStore's fetch_done_hook_). Coroutine-side;
+    /// never set in production.
+    void set_finalize_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        finalize_hook_ = std::move(hook);
     }
 
 private:
@@ -159,6 +173,7 @@ private:
     std::function<void(const FinalizeResult&)> on_expire_;
     std::optional<FinalizeResult> last_;
     std::shared_ptr<elio::coro::cancel_source> timer_cancel_;
+    std::function<elio::coro::task<void>()> finalize_hook_;  // test-only
 };
 
 using TraceRecorderPtr = std::shared_ptr<TraceRecorder>;

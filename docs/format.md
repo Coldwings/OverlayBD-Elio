@@ -29,7 +29,7 @@ images built by upstream `overlaybd-*` tools load identically here:
   `obd-mkimage` and the test fixtures. The data plane never writes through
   these.
 - **Trace codec** (`trace.hpp`) — the upstream OverlayBD prefetch trace
-  blob (ADR-0013, proposed): an in-memory parser and conforming writer for
+  blob (ADR-0013): an in-memory parser and conforming writer for
   the raw-struct wire format specified in
   [trace-format.md](./trace-format.md). The codec exists and is tested;
   record/replay against live devices is **not wired yet**.
@@ -124,7 +124,7 @@ implementations exist: a sparse file with identity mapping
 (`LsmtRwLayer`), which `seal()` compacts into a standard sealed LSMT RO
 file.
 
-### Trace blob (ADR-0013, proposed)
+### Trace blob (ADR-0013)
 
 The prefetch trace blob is a 24-byte header (magic, `data_size`,
 CRC-32C checksum) followed by fixed 24-byte records, an LP64
@@ -996,7 +996,7 @@ writers and readers agree on the same bytes.
   after every `pwrite`; write-heavy workloads should batch writes.
 - **Trace record/replay is not wired.** The trace codec (`trace.hpp`) is
   implemented and tested, but no device path records or replays traces yet,
-  and the blob is not packaged as an image layer (ADR-0013, proposed).
+  and the blob is not packaged as an image layer (ADR-0013).
 - **Writers are single-shot fixtures.** `write_lsmt_single_layer` covers the
   whole input contiguously (no sparse/zero segments); general-purpose image
   authoring belongs to upstream tools.

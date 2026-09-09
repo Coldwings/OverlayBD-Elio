@@ -84,20 +84,30 @@ struct CommitCommand {  // commit (ADR-0014: offline seal of the upper)
 //      "duration_sec":<1..3600>}
 //     {"cmd":"trace_stop","id":"<device>"}
 //   supervisor -> device (control socketpair):
-//     {"cmd":"trace_start","path":"...","duration_sec":N}
-//     {"cmd":"trace_stop"}
+//     {"cmd":"trace_start","path":"...","duration_sec":N,"seq":N}
+//     {"cmd":"trace_stop","seq":N}
+//     ("seq" is the supervisor's per-command correlation token, fresh
+//      per forwarded command; additive — older supervisors omit it)
 //   device -> supervisor (same socketpair, "reply" discriminator):
-//     {"reply":"trace_start","ok":true,"path":"...","duration_sec":N}
+//     {"reply":"trace_start","ok":true,"path":"...","duration_sec":N,
+//      "seq":N}
 //     {"reply":"trace_stop","ok":true,"path":"...","sha256":"<hex>",
-//      "size":N,"records":N,"dropped":N}
+//      "size":N,"records":N,"dropped":N,"seq":N}
+//     (replies echo the command's "seq" when present; the supervisor
+//      drops a reply whose seq does not match the pending command — a
+//      late reply to a timed-out command never completes the next one)
 //     {"reply":"trace_event","event":"expired","path":"...",
 //      "sha256":"<hex>","size":N,"records":N,"dropped":N}
+//     (unsolicited, no seq; applied only while the entry's trace state
+//      is "recording", so a stale expiry cannot overwrite a NEW
+//      recording's status)
 //     (error shape for the two replies: {"reply":"<cmd>","ok":false,
 //      "error":"..."})
 //   obdctl <- supervisor: the device reply fields plus "id"; an additive
 //     "trace" object in status/list replies carries the latest state:
-//     {"state":"recording"|"stopped","path":...,"duration_sec":...,
-//      "reason":"stopped"|"expired","sha256":...,"size":...,
+//     {"state":"recording"|"stopped"|"lost","path":...,
+//      "duration_sec":...,
+//      "reason":"stopped"|"expired"|"device_exit","sha256":...,"size":...,
 //      "records":...,"dropped":...}
 
 /// True when a device-to-supervisor line is a command reply/event (the
