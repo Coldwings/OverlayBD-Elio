@@ -996,9 +996,12 @@ writers and readers agree on the same bytes.
   read back as the on-disk zeros).
 - **Merged index rebuild is O(index) per write.** `MergedWritable` rebuilds
   after every `pwrite`; write-heavy workloads should batch writes.
-- **Trace record/replay is not wired.** The trace codec (`trace.hpp`) is
-  implemented and tested, but no device path records or replays traces yet,
-  and the blob is not packaged as an image layer (ADR-0013).
+- **Trace packaging is external.** The trace codec (`trace.hpp`) is
+  implemented and tested; replay is wired into device bring-up
+  (`trace_replay.hpp`, ADR-0013) and recording into the supervisor's
+  trace commands (`trace_record.hpp`, supervisor protocol v3) — but
+  packaging the recorded blob as an image layer stays with the external
+  CLI (ADR-0014 boundary).
 - **Writers are single-shot fixtures.** `write_lsmt_single_layer` covers the
   whole input contiguously (no sparse/zero segments); general-purpose image
   authoring belongs to upstream tools.
