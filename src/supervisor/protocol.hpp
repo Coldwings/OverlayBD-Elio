@@ -5,6 +5,9 @@
 //
 //   obdctl --UDS--> supervisor:    {"cmd":"hello"|"create"|"destroy"|"list"|"status"|"commit"|"trace_start"|"trace_stop"|"resize", ...}
 //   supervisor --> obdctl:         {"ok":true,...} | {"ok":false,"error":"..."}
+//   (create is one command with two modes: image via "config", or blank
+//    raw via the additive "blank" object — ADR-0014 modes 2/3:
+//    {"cmd":"create","id":"...","blank":{"size":<bytes>[,"mkfs":"<type>"]}})
 //
 //   obd-device --socketpair--> supervisor: {"state":"starting"|"ready"|"failed"|"stopped", ...}
 //                                        | {"reply":"trace_start"|"trace_stop"|"trace_event"|"resize", ...}
@@ -50,7 +53,8 @@ inline constexpr size_t kMaxMessageBytes = 64 * 1024;
 ///       channel, and the additive "trace" field in status/list replies.
 ///   4 — adds the resize command and the optional create/commit
 ///       `virtual_size` fields (D3 grow-only resize chain; feature
-///       "resize").
+///       "resize"), and the additive create "blank" object: blank (raw)
+///       device creation modes 2/3 of ADR-0014 (feature "blank").
 inline constexpr int kProtocolVersion = 4;
 
 /// Project version string, wired from CMake `project(... VERSION ...)` so
@@ -63,9 +67,48 @@ inline constexpr std::string_view kProjectVersion = "dev";
 
 // --- obdctl → supervisor commands ------------------------------------------
 
+/// ADR-0014 blank (raw) device spec — the additive "blank" object that
+/// turns `create` into blank-device creation (no image config):
+///
+///   {"cmd":"create","id":"<name>","blank":{"size":<bytes>}}
+///   {"cmd":"create","id":"<name>","blank":{"size":<bytes>,"mkfs":"<type>"}}
+///
+/// Mode 2 (`size` only): the device serves a zeroed block device of `size`
+/// bytes — a sealed EMPTY LSMT layer as the zero base with a writable
+/// LSMT-RW upper from birth (docs/format.md, image.md). Mode 3 adds `mkfs`:
+/// after the device is up, the supervisor runs host `mkfs.<type>` on the
+/// new block device before create replies — a RUNTIME-ONLY convenience
+/// whose output is never an image-build input (non-deterministic;
+/// ADR-0014, docs/operations.md).
+struct BlankSpec {
+    uint64_t size = 0;  // bytes; > 0, multiple of 512
+    std::string mkfs;   // "" = no mkfs (mode 2); else mkfs.<type> (mode 3)
+};
+
+/// Operator sanity bound for blank device sizes (bytes, 16 TiB). Blank
+/// devices allocate no data up front (the zero base is an empty layer), so
+/// this only guards against a typo'd size; value-level validation lives in
+/// parse_blank_spec (docs/supervisor.md).
+inline constexpr uint64_t kMaxBlankSizeBytes = uint64_t{1} << 44;
+
+/// True when `type` is a safe `mkfs.<type>` suffix (lowercase alphanumeric
+/// plus '_', 1..16 chars). The supervisor execs `mkfs.<type>` by name, so
+/// the charset is the injection boundary; a type that fails this check is
+/// rejected at parse time.
+bool valid_mkfs_type(const std::string& type);
+
+/// Parses the additive "blank" object (value level): validates size > 0,
+/// 512-aligned, within kMaxBlankSizeBytes, and an optional mkfs type via
+/// valid_mkfs_type. Returns nullopt with `error` set when `blank` is absent
+/// or invalid. Field TYPES are validated earlier, in parse_command.
+std::optional<BlankSpec> parse_blank_spec(const nlohmann::json& blank,
+                                          std::string& error);
+
 struct CreateCommand {
     std::string id;          // unique device name within the supervisor
-    std::string config;      // per-image config.json path (required)
+    std::string config;      // per-image config.json path (required in
+                             // image mode; blank mode carries BlankSpec
+                             // instead — see docs/supervisor.md)
     std::string global;      // overlaybd.json path ("" = supervisor default)
     std::string device_bin;  // obd-device path ("" = supervisor default)
     int dev_id = -1;         // requested ublk dev id (-1 = auto)

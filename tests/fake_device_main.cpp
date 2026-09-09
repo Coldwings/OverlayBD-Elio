@@ -13,6 +13,7 @@
 #include "image/config.hpp"
 #include "image/image_file.hpp"
 #include "format/lsmt_rw.hpp"
+#include "format/merged_writable.hpp"
 #include "format/sparse_rw.hpp"
 #include "supervisor/device_control.hpp"
 #include "supervisor/protocol.hpp"
@@ -27,6 +28,7 @@
 
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -54,6 +56,10 @@ struct Args {
     /// against the fake's declared image size with the same single-source
     /// rule (image::device_capacity_bytes) the real device uses.
     uint64_t virtual_size = 0;
+    // ADR-0014 modes 2/3: blank raw device (--blank-size/--blank-dir).
+    bool blank = false;
+    uint64_t blank_size = 0;
+    std::string blank_dir;
 };
 
 void report(const obd::supervisor::ControlChannelWriterPtr& channel,
@@ -75,83 +81,153 @@ elio::coro::task<int> fake_main(Args args) {
             : nullptr;
     report(channel, DeviceStatus{"starting", "", ""});
     try {
-        const obd::image::ImageConfig img = obd::image::ImageConfig::from_file(
-            args.config, obd::image::DownloadConfig{});
-
-        // ADR-0013 record-path tests: a config WITH lowers makes the fake
-        // a real image server (full assembly: registry -> record tap ->
-        // LayerStore -> tar -> zfile -> lsmt -> merge) minus the ublk
-        // device. The trace control loop then drives the real recorder,
-        // and the scripted workload (run when a recording starts) reads
-        // through the merged root so the tap captures genuine remote
-        // reads from the test's mock registry.
+        // The stack served while the fake is "ready". Blank mode and the
+        // record-path image mode assemble through the REAL image module so
+        // the tests exercise genuine assembly minus the ublk device.
         std::optional<obd::image::OpenedImage> opened;
-        if (!img.lowers.empty()) {
-            // Prefetch off: the structural head/tail warm-up (default
-            // on) would pre-warm the whole small test layer at bring-up
-            // and the scripted workload would hit local extents,
-            // recording nothing.
-            obd::image::GlobalConfig g;
-            g.prefetch_enable = false;
-            opened.emplace(co_await obd::image::open_image(img, g));
-        }
-
-        // D3 create-time headroom: mirror the real device's grow-only
-        // validation against the fake's declared image size (the merged
-        // lowers when present, else the writable upper's kVsize) using
-        // the same single-source rule. A rejected override fails create
-        // with the rule's message, exactly like the real device — and
-        // BEFORE the writable upper is created below.
-        {
-            const uint64_t declared = opened.has_value()
-                                          ? opened->virtual_size
-                                          : (img.writable() ? kVsize : 0);
-            if (args.virtual_size > 0 && declared > 0) {
-                std::string cap_error;
-                const uint64_t cap = obd::image::device_capacity_bytes(
-                    declared, args.virtual_size, &cap_error);
-                if (cap == 0) {
-                    report(channel, DeviceStatus{"failed", "", cap_error});
-                    co_return 1;
-                }
-            }
-        }
-
-        // With an lsmt/sparse upper: like the real device's writable
-        // assembly, the writable layer is sized at the D3 headroom
-        // override when given (so a commit of a headroom-created device
-        // seals that declared size), else kVsize; the standard payload is
-        // written at offset 0 (what the commit integration reads back)
-        // and the file is left unsealed — checkpoint only on SIGTERM,
-        // exactly like the real device.
-        std::shared_ptr<obd::format::WritableLayer> upper;
         // D3 shutdown guard + drain gate (created here so the SIGTERM
         // path below can set/drain them; see make_resize_apply).
         auto stopping = std::make_shared<std::atomic<bool>>(false);
         auto resize_gate = std::make_shared<std::mutex>();
-        const uint64_t layer_vsize =
-            args.virtual_size > 0 ? args.virtual_size : kVsize;
-        if (img.writable() && img.upper.type == "lsmt") {
-            std::filesystem::create_directories(img.upper.dir);
-            auto lsmt = co_await obd::format::LsmtRwLayer::create(
-                img.upper.dir + "/overlaybd.rw", layer_vsize);
-            const auto payload =
-                obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
-            const ssize_t w =
-                co_await lsmt->pwrite(payload.data(), payload.size(), 0);
-            if (w != static_cast<ssize_t>(payload.size())) {
+        // D3 resize/checkpoint handles: `upper` is the image's writable
+        // top (lsmt/sparse, sized at the headroom override); `blank_top`
+        // is the blank device's merged writable top and `blank_merged`
+        // that merged root itself (the resize executor grows the merged
+        // DATA PLANE through it, exactly like the real device).
+        std::shared_ptr<obd::format::WritableLayer> upper;
+        obd::format::WritableLayer* blank_top = nullptr;
+        obd::format::MergedWritable* blank_merged = nullptr;
+
+        if (args.blank) {
+            // ADR-0014 modes 2/3: assemble the real blank stack (empty
+            // LSMT zero base + LSMT-RW upper) and drive a ublk-free
+            // round-trip through it: an unwritten region reads zeroes,
+            // then the payload write lands in the upper and reads back.
+            obd::image::BlankDeviceSpec spec;
+            spec.size = args.blank_size;
+            spec.dir = args.blank_dir;
+            opened.emplace(co_await obd::image::open_blank_device(spec));
+            auto* w = dynamic_cast<obd::source::WritableBlobSource*>(
+                opened->root.get());
+            if (w == nullptr) {
                 report(channel, DeviceStatus{"failed", "",
-                                          "payload write failed"});
+                                          "blank root is not writable"});
                 co_return 1;
             }
-            upper = std::move(lsmt);
-        } else if (img.writable()) {
-            // Sparse: open the file so the device is plausible; sparse
-            // state is durable via fiemap and never seals.
-            std::filesystem::create_directories(img.upper.dir);
-            auto sparse = co_await obd::format::SparseRwLayer::open(
-                img.upper.dir + "/overlaybd.sparse", layer_vsize);
-            upper = std::move(sparse);
+            std::vector<uint8_t> zero_buf(kPayloadBytes);
+            const ssize_t zr = co_await w->pread(zero_buf.data(),
+                                                 zero_buf.size(),
+                                                 512 * 32);  // unwritten
+            if (zr != static_cast<ssize_t>(zero_buf.size()) ||
+                !std::all_of(zero_buf.begin(), zero_buf.end(),
+                             [](uint8_t b) { return b == 0; })) {
+                report(channel, DeviceStatus{"failed", "",
+                                          "blank unwritten read not zero"});
+                co_return 1;
+            }
+            const auto payload =
+                obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
+            const ssize_t wrc =
+                co_await w->pwrite(payload.data(), payload.size(), 0);
+            if (wrc != static_cast<ssize_t>(payload.size())) {
+                report(channel, DeviceStatus{"failed", "",
+                                          "blank payload write failed"});
+                co_return 1;
+            }
+            std::vector<uint8_t> back(payload.size());
+            const ssize_t brc =
+                co_await w->pread(back.data(), back.size(), 0);
+            if (brc != static_cast<ssize_t>(back.size()) ||
+                std::memcmp(back.data(), payload.data(), back.size()) != 0) {
+                report(channel, DeviceStatus{"failed", "",
+                                          "blank payload readback mismatch"});
+                co_return 1;
+            }
+            auto* mw = dynamic_cast<obd::format::MergedWritable*>(
+                opened->root.get());
+            if (mw == nullptr) {
+                report(channel, DeviceStatus{"failed", "",
+                                          "blank root is not merged writable"});
+                co_return 1;
+            }
+            blank_top = &mw->writable_top();
+            blank_merged = mw;
+        } else {
+            const obd::image::ImageConfig img =
+                obd::image::ImageConfig::from_file(
+                    args.config, obd::image::DownloadConfig{});
+
+            // ADR-0013 record-path tests: a config WITH lowers makes the
+            // fake a real image server (full assembly: registry -> record
+            // tap -> LayerStore -> tar -> zfile -> lsmt -> merge) minus
+            // the ublk device. The trace control loop then drives the real
+            // recorder, and the scripted workload (run when a recording
+            // starts) reads through the merged root so the tap captures
+            // genuine remote reads from the test's mock registry.
+            if (!img.lowers.empty()) {
+                // Prefetch off: the structural head/tail warm-up (default
+                // on) would pre-warm the whole small test layer at
+                // bring-up and the scripted workload would hit local
+                // extents, recording nothing.
+                obd::image::GlobalConfig g;
+                g.prefetch_enable = false;
+                opened.emplace(co_await obd::image::open_image(img, g));
+            }
+
+            // D3 create-time headroom: mirror the real device's grow-only
+            // validation against the fake's declared image size (the
+            // merged lowers when present, else the writable upper's
+            // kVsize) using the same single-source rule. A rejected
+            // override fails create with the rule's message, exactly like
+            // the real device — and BEFORE the writable upper is created
+            // below.
+            {
+                const uint64_t declared =
+                    opened.has_value()
+                        ? opened->virtual_size
+                        : (img.writable() ? kVsize : 0);
+                if (args.virtual_size > 0 && declared > 0) {
+                    std::string cap_error;
+                    const uint64_t cap = obd::image::device_capacity_bytes(
+                        declared, args.virtual_size, &cap_error);
+                    if (cap == 0) {
+                        report(channel, DeviceStatus{"failed", "", cap_error});
+                        co_return 1;
+                    }
+                }
+            }
+
+            // With an lsmt/sparse upper: like the real device's writable
+            // assembly, the writable layer is sized at the D3 headroom
+            // override when given (so a commit of a headroom-created
+            // device seals that declared size), else kVsize; the standard
+            // payload is written at offset 0 (what the commit integration
+            // reads back) and the file is left unsealed — checkpoint only
+            // on SIGTERM, exactly like the real device.
+            const uint64_t layer_vsize =
+                args.virtual_size > 0 ? args.virtual_size : kVsize;
+            if (img.writable() && img.upper.type == "lsmt") {
+                std::filesystem::create_directories(img.upper.dir);
+                auto lsmt = co_await obd::format::LsmtRwLayer::create(
+                    img.upper.dir + "/overlaybd.rw", layer_vsize);
+                const auto payload =
+                    obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
+                const ssize_t w = co_await lsmt->pwrite(
+                    payload.data(), payload.size(), 0);
+                if (w != static_cast<ssize_t>(payload.size())) {
+                    report(channel, DeviceStatus{"failed", "",
+                                              "payload write failed"});
+                    co_return 1;
+                }
+                upper = std::move(lsmt);
+            } else if (img.writable()) {
+                // Sparse: open the file so the device is plausible; sparse
+                // state is durable via fiemap and never seals.
+                std::filesystem::create_directories(img.upper.dir);
+                auto sparse = co_await obd::format::SparseRwLayer::open(
+                    img.upper.dir + "/overlaybd.sparse", layer_vsize);
+                upper = std::move(sparse);
+            }
         }
         report(channel, DeviceStatus{"ready", "/dev/ublkb70", ""});
 
@@ -208,13 +284,22 @@ elio::coro::task<int> fake_main(Args args) {
             hooks.resize.current_size = [fake_size]() -> uint64_t {
                 return *fake_size;
             };
+            // Data-plane grow for whichever stack this fake serves: the
+            // image's writable upper (D3), or the blank device's merged
+            // root (ADR-0014 modes 2/3) — the same seam the real
+            // obd-device wires from merged_root.
+            std::function<int(uint64_t)> grow_data_plane;
+            if (upper != nullptr) {
+                grow_data_plane = [upper](uint64_t bytes) {
+                    return upper->grow(bytes);
+                };
+            } else if (blank_merged != nullptr) {
+                grow_data_plane = [blank_merged](uint64_t bytes) {
+                    return blank_merged->grow(bytes);
+                };
+            }
             hooks.resize.apply_resize = obd::supervisor::make_resize_apply(
-                stopping, resize_gate,
-                upper != nullptr
-                    ? std::function<int(uint64_t)>([upper](uint64_t bytes) {
-                          return upper->grow(bytes);
-                      })
-                    : std::function<int(uint64_t)>(),
+                stopping, resize_gate, std::move(grow_data_plane),
                 [fake_size](uint64_t bytes) {
                     *fake_size = bytes;
                     return bytes;
@@ -261,11 +346,23 @@ elio::coro::task<int> fake_main(Args args) {
                 std::lock_guard<std::mutex> drain(*resize_gate);
             });
         }
+        // ADR-0014: persist the writable upper's index on graceful
+        // shutdown (LSMT-RW image upper, or the blank device's merged
+        // writable top), exactly like the real obd-device, so the
+        // supervisor's offline commit can seal it afterwards.
         if (upper != nullptr) {
             const int crc = co_await upper->checkpoint();
             if (crc != 0) {
                 report(channel, DeviceStatus{"failed", "",
                                           "checkpoint failed"});
+                co_return 1;
+            }
+        }
+        if (blank_top != nullptr) {
+            const int crc = co_await blank_top->checkpoint();
+            if (crc != 0) {
+                report(channel, DeviceStatus{"failed", "",
+                                          "blank checkpoint failed"});
                 co_return 1;
             }
         }
@@ -301,6 +398,10 @@ int main(int argc, char** argv) {
             return argv[i];
         };
         if (a == "--config") args.config = next("--config");
+        else if (a == "--blank-size") {
+            args.blank = true;
+            args.blank_size = std::stoull(next("--blank-size"));
+        } else if (a == "--blank-dir") args.blank_dir = next("--blank-dir");
         else if (a == "--control-fd")
             args.control_fd = std::stoi(next("--control-fd"));
         else if (a == "--global") (void)next("--global");  // accepted, unused
@@ -327,7 +428,15 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (args.config.empty()) {
+    if (args.blank) {
+        if (args.blank_size == 0 || args.blank_dir.empty()) {
+            std::fprintf(stderr,
+                         "usage: %s --blank-size BYTES --blank-dir PATH "
+                         "[--control-fd N]\n",
+                         argv[0]);
+            return 2;
+        }
+    } else if (args.config.empty()) {
         std::fprintf(stderr, "usage: %s --config PATH [--control-fd N]\n",
                      argv[0]);
         return 2;

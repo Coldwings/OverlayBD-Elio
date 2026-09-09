@@ -36,8 +36,10 @@ namespace {
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "usage: %s --config PATH [--global PATH] [--control-fd N] "
-                 "[--dev-id N] [--recover] [--virtual-size BYTES]\n",
+                 "usage: %s (--config PATH | --blank-size BYTES --blank-dir "
+                 "PATH)\n"
+                 "          [--global PATH] [--control-fd N] [--dev-id N] "
+                 "[--recover] [--virtual-size BYTES]\n",
                  argv0);
 }
 
@@ -48,8 +50,15 @@ struct Args {
     int dev_id = -1;
     bool recover = false;  // ADR-0010: attach to an existing device
     /// D3 create-time headroom: dev_size override in bytes (0 = derive
-    /// from the image's declared virtual size).
+    /// from the image's declared virtual size). Only meaningful for an
+    /// image device; a blank device sizes itself to blank_size.
     uint64_t virtual_size = 0;
+    // ADR-0014 modes 2/3 (blank raw device): no image config; the device
+    // assembles the empty LSMT zero base + a writable LSMT-RW upper of
+    // blank_size bytes inside blank_dir.
+    bool blank = false;
+    uint64_t blank_size = 0;
+    std::string blank_dir;
 };
 
 void report(const obd::supervisor::ControlChannelWriterPtr& channel,
@@ -75,19 +84,36 @@ elio::coro::task<int> device_main(Args args) {
             args.global.empty()
                 ? obd::image::GlobalConfig{}
                 : obd::image::GlobalConfig::from_file(args.global);
-        const obd::image::ImageConfig img =
-            obd::image::ImageConfig::from_file(args.config, global.download);
+        obd::image::OpenedImage opened;
+        if (args.blank) {
+            if (args.blank_size == 0 || args.blank_size % 512 != 0) {
+                ELIO_LOG_ERROR("blank size {} is not sector aligned",
+                               args.blank_size);
+                report(channel, DeviceStatus{"failed", "",
+                                          "blank size not sector aligned"});
+                co_return 1;
+            }
+            obd::image::BlankDeviceSpec spec;
+            spec.size = args.blank_size;
+            spec.dir = args.blank_dir;
+            opened = co_await obd::image::open_blank_device(spec);
+        } else {
+            const obd::image::ImageConfig img =
+                obd::image::ImageConfig::from_file(args.config,
+                                                   global.download);
+            // D3 create-time headroom (--virtual-size, bytes): for a
+            // WRITABLE image the override is threaded into open_image,
+            // which sizes the writable top — and hence the merged DATA
+            // PLANE — to the override (grow-only vs the image's declared
+            // size, rejected inside open_image with the single-source
+            // rule). A read-only image ignores the override in assembly:
+            // its headroom is dev-size-only, validated below with
+            // device_capacity_bytes (reads past the image's end are
+            // zero-filled by the bridge).
+            opened = co_await obd::image::open_image(img, global,
+                                                     args.virtual_size);
+        }
 
-        // D3 create-time headroom (--virtual-size, bytes): for a WRITABLE
-        // image the override is threaded into open_image, which sizes the
-        // writable top — and hence the merged DATA PLANE — to the
-        // override (grow-only vs the image's declared size, rejected
-        // inside open_image with the single-source rule). A read-only
-        // image ignores the override in assembly: its headroom is
-        // dev-size-only, validated below with device_capacity_bytes (reads
-        // past the image's end are zero-filled by the bridge).
-        auto opened = co_await obd::image::open_image(
-            img, global, args.virtual_size);
         if (opened.virtual_size == 0 || opened.virtual_size % 512 != 0) {
             ELIO_LOG_ERROR("image virtual size {} is not sector aligned",
                            opened.virtual_size);
@@ -315,6 +341,10 @@ int main(int argc, char** argv) {
             return argv[i];
         };
         if (a == "--config") args.config = next("--config");
+        else if (a == "--blank-size") {
+            args.blank = true;
+            args.blank_size = std::stoull(next("--blank-size"));
+        } else if (a == "--blank-dir") args.blank_dir = next("--blank-dir");
         else if (a == "--global") args.global = next("--global");
         else if (a == "--control-fd")
             args.control_fd = std::stoi(next("--control-fd"));
@@ -349,8 +379,19 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (args.config.empty()) {
+    if (!args.blank && args.config.empty()) {
         usage(argv[0]);
+        return 2;
+    }
+    if (args.blank && (args.blank_size == 0 || args.blank_dir.empty())) {
+        std::fprintf(stderr,
+                     "--blank-size and --blank-dir are required for a blank "
+                     "device\n");
+        return 2;
+    }
+    if (args.blank && !args.config.empty()) {
+        std::fprintf(stderr, "--config and --blank-size are mutually "
+                             "exclusive\n");
         return 2;
     }
 

@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,7 @@ void usage(const char* argv0) {
                  "usage:\n"
                  "  %s [--socket PATH] hello\n"
                  "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N] [--virtual-size BYTES]\n"
+                 "  %s [--socket PATH] create-blank <id> --size BYTES [--mkfs TYPE] [--global PATH] [--dev-id N]\n"
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
@@ -32,7 +34,7 @@ void usage(const char* argv0) {
                  "  %s [--socket PATH] trace_stop <id>\n"
                  "  %s [--socket PATH] resize <id> <size-bytes>\n",
                  argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-                 argv0);
+                 argv0, argv0);
 }
 
 bool send_all(int fd, const std::string& data) {
@@ -106,6 +108,63 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+    } else if (cmd == "create-blank") {
+        // ADR-0014 modes 2/3: build the wire create with the additive
+        // "blank" object (size mandatory, mkfs optional).
+        if (i >= argc) {
+            usage(argv[0]);
+            return 2;
+        }
+        req["id"] = argv[i++];
+        nlohmann::json blank;
+        bool have_size = false;
+        while (i < argc) {
+            const std::string a = argv[i++];
+            if (a == "--size" && i < argc) {
+                const char* v = argv[i++];
+                char* end = nullptr;
+                errno = 0;
+                const long long n = std::strtoll(v, &end, 10);
+                if (errno != 0 || end == v || *end != '\0' || n <= 0 ||
+                    n % 512 != 0) {
+                    std::fprintf(stderr,
+                                 "invalid --size '%s' (want a positive "
+                                 "multiple of 512 bytes)\n",
+                                 v);
+                    return 2;
+                }
+                blank["size"] = static_cast<uint64_t>(n);
+                have_size = true;
+            } else if (a == "--mkfs" && i < argc) {
+                const char* v = argv[i++];
+                // Local charset mirror of valid_mkfs_type (supervisor-side
+                // validation is authoritative).
+                const std::string t(v);
+                if (t.empty() || t.size() > 16 ||
+                    !std::all_of(t.begin(), t.end(), [](char c) {
+                        return (c >= 'a' && c <= 'z') ||
+                               (c >= '0' && c <= '9') || c == '_';
+                    })) {
+                    std::fprintf(stderr,
+                                 "invalid --mkfs '%s' (want a 1..16 char "
+                                 "lowercase alphanumeric type)\n",
+                                 v);
+                    return 2;
+                }
+                blank["mkfs"] = t;
+            } else if (a == "--global" && i < argc) req["global"] = argv[i++];
+            else if (a == "--dev-id" && i < argc)
+                req["dev_id"] = std::stoi(argv[i++]);
+            else {
+                usage(argv[0]);
+                return 2;
+            }
+        }
+        if (!have_size) {
+            std::fprintf(stderr, "create-blank requires --size BYTES\n");
+            return 2;
+        }
+        req["blank"] = std::move(blank);
     } else if (cmd == "destroy" || cmd == "status") {
         if (i >= argc) {
             usage(argv[0]);

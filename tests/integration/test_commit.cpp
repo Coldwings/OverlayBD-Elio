@@ -36,6 +36,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -443,4 +444,272 @@ TEST_CASE("supervisor: concurrent commits are serialized and reject the loser",
     // Whichever commit won, the file is a valid sealed layer with the
     // payload — never a half-written interleaving.
     require_sealed_payload(upper, "");
+}
+
+namespace {
+
+/// ADR-0014 mode-3 mkfs mock: records invocations instead of running host
+/// mkfs (the suite never executes mkfs.<type>). `fail_rc` != 0 makes the
+/// runner fail, for the clean-error path. The daemon coroutine and the
+/// client thread touch the records, so they are mutex-guarded.
+struct MockMkfs final : public supervisor::MkfsRunner {
+    std::atomic<int> calls{0};
+    std::atomic<int> fail_rc{0};  // set before the create that should fail
+
+    elio::coro::task<int> run(const std::string& fs_type,
+                              const std::string& device,
+                              std::string* error) override {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            calls.fetch_add(1);
+            last_type_ = fs_type;
+            last_device_ = device;
+        }
+        if (fail_rc.load() != 0) {
+            if (error) *error = "injected mkfs failure";
+            co_return fail_rc.load();
+        }
+        co_return 0;
+    }
+
+    std::string last_type() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return last_type_;
+    }
+    std::string last_device() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return last_device_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::string last_type_;
+    std::string last_device_;
+};
+
+/// The sealed blank upper must re-open as a standard sealed LSMT RO layer
+/// carrying the fake's payload (written through the blank merged stack at
+/// virtual offset 0, so the data sits at sector 8) with the requested
+/// virtual size.
+void require_sealed_blank_upper(const std::string& upper,
+                                const std::string& user_tag) {
+    REQUIRE(test::run_coro([&]() -> elio::coro::task<int> {
+        auto ro = co_await source::LocalFileSource::open(upper);
+        source::BlobSourcePtr base = std::move(ro);
+        auto layer = co_await format::LsmtLayer::open(std::move(base));
+        REQUIRE(layer->virtual_size() == kFakeVsize);
+        REQUIRE(layer->segments().size() == 1);
+        REQUIRE(layer->header().user_tag == user_tag);
+        const auto payload =
+            test::pattern_bytes(kFakePayloadBytes, kFakePayloadSeed);
+        std::vector<uint8_t> buf(payload.size());
+        const ssize_t r = co_await layer->data_source().pread(
+            buf.data(), buf.size(), 8 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), payload.data(), buf.size()) == 0);
+        co_return 0;
+    }) == 0);
+}
+
+}  // namespace
+
+TEST_CASE("supervisor: blank create serves a writable zero base and commit "
+          "seals its upper",
+          "[supervisor]") {
+    // ADR-0014 mode 2 end to end (no ublk): create a blank raw device of a
+    // requested size through the real daemon → the fake device assembles
+    // the empty LSMT zero base + LSMT-RW upper via open_blank_device and
+    // round-trips a payload through the merged stack (unwritten regions
+    // read zero) → commit stops it and seals the blank-born upper offline.
+    // Host mkfs is NEVER involved: a recording mock runner asserts zero
+    // invocations.
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string blank_root = dir / "blank";
+    const std::string upper = blank_root + "/d1/overlaybd.rw";
+
+    auto mock = std::make_shared<MockMkfs>();
+    auto guard = block_daemon_signals();
+
+    const int failures = run_daemon_case(
+        [&] {
+            supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+            cfg.blank_dir = blank_root;
+            cfg.mkfs_runner = mock;
+            return cfg;
+        }(),
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+
+            // Config-less create without blank is a clean protocol error.
+            const auto no_mode = rpc_json({{"cmd", "create"}, {"id", "x"}});
+            check(no_mode.value("ok", true) == false,
+                  "create without config/blank not an error");
+            // Malformed blank specs are clean protocol errors.
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "x"},
+                            {"blank", {{"size", 100}}}})
+                      .value("ok", true) == false,
+                  "unaligned blank size not an error");
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "x"},
+                            {"blank", {{"size", 512 * 64},
+                                       {"mkfs", "EXT4"}}}}
+                          )
+                      .value("ok", true) == false,
+                  "uppercase mkfs type not an error");
+
+            // Mode 2: blank create without mkfs. The fake's internal
+            // zero-read + pwrite/pread round-trip through the blank stack
+            // must have succeeded for the device to report ready.
+            const auto created = rpc_json({{"cmd", "create"},
+                                           {"id", "d1"},
+                                           {"blank", {{"size", kFakeVsize}}}});
+            check(created.value("ok", false) == true, "blank create failed");
+            if (!created.value("ok", false)) {
+                std::fprintf(stderr, "[blank create reply] %s\n",
+                             created.dump().c_str());
+                return;
+            }
+            check(created.value("mode", "") == "blank",
+                  "blank create reply lacks mode");
+            check(created.value("size", uint64_t{0}) == kFakeVsize,
+                  "blank create reply size mismatch");
+            check(mock->calls.load() == 0,
+                  "mode-2 create must not invoke mkfs");
+
+            // The device workspace holds the sealed empty zero base and the
+            // unsealed upper file.
+            check(std::filesystem::exists(blank_root + "/d1/overlaybd.zero"),
+                  "blank zero base missing");
+            check(std::filesystem::exists(upper), "blank upper missing");
+
+            // Commit seals the blank-born upper (stop-then-seal), exactly
+            // like an image-born upper.
+            const auto commit =
+                rpc_json({{"cmd", "commit"}, {"id", "d1"},
+                          {"user_tag", "blank-v1"}});
+            check(commit.value("ok", false) == true, "blank commit failed");
+            if (!commit.value("ok", false)) {
+                std::fprintf(stderr, "[blank commit reply] %s\n",
+                             commit.dump().c_str());
+                return;
+            }
+            check(commit.contains("path") &&
+                      commit["path"].get<std::string>() == upper,
+                  "blank commit path mismatch");
+            check(commit.contains("sha256") &&
+                      commit["sha256"].get<std::string>().size() == 64,
+                  "blank commit sha256 not 64 hex chars");
+            check(mock->calls.load() == 0,
+                  "commit must not invoke mkfs");
+
+            // A second commit of the blank device is the usual
+            // already-sealed error.
+            const auto again = rpc_json({{"cmd", "commit"}, {"id", "d1"}});
+            check(again.value("ok", true) == false,
+                  "second blank commit not an error");
+        });
+    REQUIRE(failures == 0);
+    require_sealed_blank_upper(upper, "blank-v1");
+}
+
+TEST_CASE("supervisor: mode-3 mkfs runs only when the blank spec requests it",
+          "[supervisor]") {
+    // ADR-0014 mode 3: the daemon runs host mkfs.<type> on the new block
+    // device ONLY when the create's blank object explicitly requests a
+    // type. The mock runner records the invocation; a plain mode-2 create
+    // never calls it, and a failing mkfs answers with a clean error and
+    // removes the device entry.
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string blank_root = dir / "blank";
+
+    auto mock = std::make_shared<MockMkfs>();
+    auto guard = block_daemon_signals();
+
+    const int failures = run_daemon_case(
+        [&] {
+            supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+            cfg.blank_dir = blank_root;
+            cfg.mkfs_runner = mock;
+            return cfg;
+        }(),
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+
+            // Mode 2 first: no mkfs anywhere.
+            const auto plain = rpc_json({{"cmd", "create"},
+                                         {"id", "p1"},
+                                         {"blank", {{"size", kFakeVsize}}}});
+            check(plain.value("ok", false) == true, "plain blank create failed");
+            check(mock->calls.load() == 0,
+                  "plain blank create invoked mkfs");
+
+            // Mode 3: explicit mkfs → exactly one invocation, with the
+            // fake's reported block device path and the requested type.
+            const auto formatted = rpc_json({{"cmd", "create"},
+                                             {"id", "f1"},
+                                             {"blank", {{"size", kFakeVsize},
+                                                        {"mkfs", "ext4"}}}});
+            check(formatted.value("ok", false) == true,
+                  "mode-3 blank create failed");
+            if (formatted.value("ok", false)) {
+                check(formatted.value("mkfs", "") == "ext4",
+                      "mode-3 reply lacks mkfs field");
+            }
+            check(mock->calls.load() == 1, "mkfs invoked != once");
+            check(mock->last_type() == "ext4", "mkfs type mismatch");
+            check(mock->last_device() == "/dev/ublkb70",
+                  "mkfs device path mismatch");
+
+            // ADR-0014 boundary: an upper the supervisor formatted with
+            // host mkfs (mode 3) is never sealed — commit refuses it
+            // before any stop/stop seal.
+            const auto refused =
+                rpc_json({{"cmd", "commit"}, {"id", "f1"}});
+            check(refused.value("ok", true) == false,
+                  "mode-3 commit not refused");
+            check(refused.contains("error") &&
+                      refused["error"].get<std::string>().find(
+                          "host mkfs") != std::string::npos,
+                  "mode-3 commit refusal text mismatch");
+
+            // A failing mkfs is a clean create error and the entry is
+            // removed (no half-created device left behind).
+            mock->fail_rc = 1;
+            const auto bad = rpc_json({{"cmd", "create"},
+                                       {"id", "g1"},
+                                       {"blank", {{"size", kFakeVsize},
+                                                  {"mkfs", "xfs"}}}});
+            check(bad.value("ok", true) == false,
+                  "failing mkfs not an error");
+            check(bad.contains("error") &&
+                      bad["error"].get<std::string>().find("mkfs.xfs") !=
+                          std::string::npos,
+                  "failing mkfs error text mismatch");
+            check(mock->calls.load() == 2, "failing mkfs not invoked");
+            const auto ghost = rpc_json({{"cmd", "status"}, {"id", "g1"}});
+            check(ghost.value("ok", true) == false,
+                  "failed-mkfs device entry still present");
+        });
+    REQUIRE(failures == 0);
 }

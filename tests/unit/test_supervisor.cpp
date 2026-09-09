@@ -343,3 +343,86 @@ TEST_CASE("supervisor: exec failure surfaces as exit 127", "[supervisor]") {
             std::string::npos);
     ::close(child->release_control_fd());
 }
+
+TEST_CASE("supervisor: create blank spec parses and validates size and mkfs",
+          "[supervisor]") {
+    // ADR-0014 modes 2/3: create accepts the additive "blank" object in
+    // place of "config"; field TYPES are parse errors, value-level rules
+    // (positive, 512-aligned, size bound, mkfs charset) come from
+    // parse_blank_spec.
+    std::string err;
+    const auto blank_ok =
+        supervisor::parse_command(R"({"cmd":"create","id":"a",)"
+                                  R"("blank":{"size":4096}})",
+                                  err);
+    REQUIRE(blank_ok.has_value());
+    const auto blank_mkfs = supervisor::parse_command(
+        R"({"cmd":"create","id":"a","blank":{"size":4096,"mkfs":"ext4"}})",
+        err);
+    REQUIRE(blank_mkfs.has_value());
+    const auto mkfs_val =
+        supervisor::parse_blank_spec((*blank_mkfs)["blank"], err);
+    REQUIRE(mkfs_val.has_value());
+    REQUIRE(mkfs_val->size == 4096);
+    REQUIRE(mkfs_val->mkfs == "ext4");
+    // mode 2 (no mkfs) → empty mkfs type
+    const auto plain =
+        supervisor::parse_blank_spec((*blank_ok)["blank"], err);
+    REQUIRE(plain.has_value());
+    REQUIRE(plain->size == 4096);
+    REQUIRE(plain->mkfs.empty());
+
+    // config and blank are mutually exclusive; one is mandatory.
+    REQUIRE(!supervisor::parse_command(R"({"cmd":"create","id":"a",)"
+                                       R"("config":"/c.json",)"
+                                       R"("blank":{"size":4096}})",
+                                       err)
+                 .has_value());
+    REQUIRE(err.find("exactly one of 'config'") != std::string::npos);
+    REQUIRE(!supervisor::parse_command(R"({"cmd":"create","id":"a"})", err)
+                 .has_value());
+
+    // Field TYPE errors at parse time.
+    REQUIRE(!supervisor::parse_command(R"({"cmd":"create","id":"a",)"
+                                       R"("blank":5})",
+                                       err)
+                 .has_value());
+    REQUIRE(err.find("'blank' must be an object") != std::string::npos);
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"create","id":"a","blank":{"size":"big"}})", err)
+                 .has_value());
+    REQUIRE(!supervisor::parse_command(
+                R"({"cmd":"create","id":"a","blank":{"size":4096,)"
+                R"("mkfs":7}})",
+                err)
+                 .has_value());
+    REQUIRE(err.find("'mkfs' must be a string") != std::string::npos);
+
+    // Value-level validation (parse_blank_spec).
+    const auto bad_size = supervisor::parse_blank_spec(
+        nlohmann::json{{"size", 0}}, err);
+    REQUIRE(!bad_size.has_value());
+    REQUIRE(err.find("positive") != std::string::npos);
+    const auto unaligned =
+        supervisor::parse_blank_spec(nlohmann::json{{"size", 100}}, err);
+    REQUIRE(!unaligned.has_value());
+    REQUIRE(err.find("multiple of 512") != std::string::npos);
+    const auto oversized = supervisor::parse_blank_spec(
+        nlohmann::json{{"size", supervisor::kMaxBlankSizeBytes + 512}},
+        err);
+    REQUIRE(!oversized.has_value());
+    REQUIRE(err.find("exceeds") != std::string::npos);
+    const auto bad_type = supervisor::parse_blank_spec(
+        nlohmann::json{{"size", 4096}, {"mkfs", "EXT4"}}, err);
+    REQUIRE(!bad_type.has_value());
+    REQUIRE(err.find("invalid blank 'mkfs'") != std::string::npos);
+    const auto bad_type2 = supervisor::parse_blank_spec(
+        nlohmann::json{{"size", 4096}, {"mkfs", "ext4/../sh"}}, err);
+    REQUIRE(!bad_type2.has_value());
+    REQUIRE(supervisor::valid_mkfs_type("ext4"));
+    REQUIRE(supervisor::valid_mkfs_type("xfs"));
+    REQUIRE(!supervisor::valid_mkfs_type(""));
+    REQUIRE(!supervisor::valid_mkfs_type("Ext4"));
+    REQUIRE(!supervisor::valid_mkfs_type("e:t4"));
+    REQUIRE(!supervisor::valid_mkfs_type(std::string(17, 'a')));
+}

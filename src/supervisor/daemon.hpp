@@ -5,9 +5,31 @@
 
 #include <elio/coro/task.hpp>
 
+#include <memory>
 #include <string>
 
 namespace obd::supervisor {
+
+/// Host `mkfs.<type>` runner for ADR-0014 create mode 3 (blank raw device
+/// plus a convenience mkfs). The daemon invokes it against the new block
+/// device path ONLY when a create command's `blank` object explicitly
+/// requests a type — host mkfs output is non-deterministic (UUIDs, hash
+/// seeds, timestamps), so it is a runtime convenience and never an
+/// image-build input (ADR-0014; docs/operations.md). The default
+/// implementation (daemon.cpp) forks `mkfs.<type> <device>` and bounds it
+/// by DaemonConfig::mkfs_timeout_sec; tests inject a mock so the suite
+/// never runs host mkfs.
+class MkfsRunner {
+public:
+    virtual ~MkfsRunner() = default;
+    /// Runs `mkfs.<fs_type>` against `device`. Returns 0 on success; on
+    /// failure a positive exit code, negative -errno, or -ETIMEDOUT, with
+    /// `error` populated (human readable).
+    virtual elio::coro::task<int> run(const std::string& fs_type,
+                                      const std::string& device,
+                                      std::string* error) = 0;
+};
+using MkfsRunnerPtr = std::shared_ptr<MkfsRunner>;
 
 struct DaemonConfig {
     std::string socket_path = "/run/overlaybd-elio/supervisor.sock";
@@ -22,6 +44,15 @@ struct DaemonConfig {
     /// ublk USER_RECOVERY before the device is left failed. 0 disables
     /// respawn.
     int max_recovery_attempts = 3;
+    /// ADR-0014 blank-device workspace root (modes 2/3): each blank device
+    /// owns `<blank_dir>/<id>/` with `overlaybd.zero` (the sealed empty
+    /// LSMT zero base) and `overlaybd.rw` (the writable upper) inside.
+    std::string blank_dir = "/var/lib/overlaybd-elio/devices";
+    /// Mode-3 mkfs runner (see MkfsRunner); empty = the default fork/exec
+    /// runner with mkfs_timeout_sec. Injectable so tests never run host
+    /// mkfs.
+    MkfsRunnerPtr mkfs_runner;
+    int mkfs_timeout_sec = 300;  // default mode-3 mkfs bound
 };
 
 /// Runs the daemon until SIGTERM/SIGINT (graceful: children are terminated
