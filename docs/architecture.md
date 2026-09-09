@@ -71,7 +71,7 @@ A read travels through four ownership boundaries:
    persistence per layer; extents already persisted are served locally,
    and a completed layer is renamed to `overlaybd.commit` for the local
    probe to bind on the next open) — or, for a layer without a configured
-   `dir`, behind the legacy in-memory `ChunkCache`. When
+   `dir`, served remote-only (ADR-0016). When
    DART is enabled and reachable, the registry client's requests go
    through the DART prefix proxy instead (ADR-0005). This assembly is
    built once at open time in `open_image` (see `src/image/image_file.cpp`).
@@ -181,10 +181,8 @@ to parsing semantics is breaking for image compatibility.
 Pluggable blob sources behind the single async `BlobSource` interface:
 `LocalFileSource`, `RegistrySource` (OCI registry HTTP range reads,
 bearer-token auth, redirect handling), `LayerStore` (sparse-file
-read-through layer persistence with sidecar bitmap and per-extent CRC —
-the remote-layer backing in image assembly, ADR-0011), `SwitchSource`
-plus `Downloader` and `ChunkCache` (the retired pre-ADR-0011 mechanism,
-kept as composable components until the part-3 follow-up),
+read-through layer persistence with sidecar bitmap, per-extent CRC, and
+background fill — the remote-layer backing in image assembly, ADR-0011),
 `TarOffsetSource`
 (ustar wrapper detection), the DART prefix proxy helpers (ADR-0005), and
 the `CredentialStore` (longest-prefix registry credential matching).

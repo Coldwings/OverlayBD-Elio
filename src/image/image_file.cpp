@@ -7,7 +7,6 @@
 #include "format/merged_writable.hpp"
 #include "format/sparse_rw.hpp"
 #include "format/zfile.hpp"
-#include "source/chunk_cache.hpp"
 #include "source/dart.hpp"
 #include "source/layer_store.hpp"
 #include "source/local_file.hpp"
@@ -15,10 +14,12 @@
 #include "source/tar_offset.hpp"
 
 #include <elio/log/macros.hpp>
+#include <elio/time/timer.hpp>
 
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 
 namespace obd::image {
@@ -149,7 +150,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     }
     auto client = std::make_shared<source::RegistryClient>(creds, rcc);
 
-    // Trace layer recognition (ADR-0013, proposed; trace-format.md §6):
+    // Trace layer recognition (ADR-0013; trace-format.md §6):
     // `accelerationLayer: true` marks the UPPERMOST lower as the
     // acceleration layer. It is NOT a data layer: set it aside from the
     // merge and load its trace blob best-effort (a missing/unreadable
@@ -174,6 +175,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     // the objects are owned by the layer chain built below.
     std::vector<source::BlobSource*> warm_targets;
     warm_targets.reserve(data_lowers.size());
+    std::vector<source::LayerStore*> stores;
     for (const auto& lower : data_lowers) {
         source::BlobSourcePtr raw;
         const std::string local_path = probe_local_blob(lower);
@@ -186,27 +188,74 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 throw error(EINVAL, "no local blob and no repoBlobUrl for " +
                                         lower.digest);
             }
+            // ADR-0016 boundary: the degrade path below is for environment
+            // failures (an unusable layer dir) only — structural config
+            // errors fail loud. A malformed layer digest is a config
+            // error, so it is validated here, before any registry I/O and
+            // outside the degrade handler. (A digest without the
+            // "sha256:" prefix normalizes to empty = no verification —
+            // that form is allowed.)
+            const std::string sha =
+                ImageConfig::digest_sha256_hex(lower.digest);
+            if (!sha.empty() &&
+                (sha.size() != 64 ||
+                 !std::all_of(sha.begin(), sha.end(), [](char c) {
+                     return std::isxdigit(static_cast<unsigned char>(c)) !=
+                            0;
+                 }))) {
+                throw error(EINVAL, "malformed sha256 digest: " +
+                                        lower.digest);
+            }
             const std::string url = cfg.repo_blob_url + "/" + lower.digest;
             auto reg = co_await source::RegistrySource::open(client, url);
             if (lower.dir.empty()) {
                 // No persistence directory configured: a LayerStore needs
-                // a writable per-layer dir to stage into, so the layer
-                // keeps the legacy in-memory ChunkCache in front of the
-                // registry (restart-cold; retired with part 3).
+                // a writable per-layer dir to stage into, so the layer is
+                // served remote-only (no local caching at all; the kernel
+                // page cache has nothing to work on). The snapshotter
+                // always sets dir, so this is the compatibility path.
                 ELIO_LOG_WARNING("layer {} has no dir; serving remotely "
-                                 "with in-memory caching only",
+                                 "without persistence",
                                  lower.digest);
-                raw = co_await source::ChunkCache::open(std::move(reg));
+                raw = std::move(reg);
             } else {
                 // ADR-0011: one remote source per layer; the LayerStore
                 // reads through it and persists every served extent into
                 // the per-layer dir (staging pair, renamed to
-                // overlaybd.commit on completion).
+                // overlaybd.commit on completion). The download section
+                // drives the background fill (enable/delay/throttle) and
+                // the completion-verify retry bound (tryCnt).
                 std::error_code ec;
                 std::filesystem::create_directories(lower.dir, ec);
-                raw = co_await source::LayerStore::open(
-                    std::move(reg), lower.dir,
-                    ImageConfig::digest_sha256_hex(lower.digest));
+                source::LayerStore::Config lsc;
+                lsc.try_count = cfg.download.try_count;
+                lsc.fill.enable = cfg.download.enable;
+                lsc.fill.delay_sec = cfg.download.delay_sec;
+                lsc.fill.delay_extra_sec = cfg.download.delay_extra_sec;
+                lsc.fill.max_mbps = cfg.download.max_mbps;
+                lsc.fill.block_size = cfg.download.block_size;
+                bool store_opened = false;
+                try {
+                    raw = co_await source::LayerStore::open(
+                        std::move(reg), lower.dir, sha, std::move(lsc));
+                    stores.push_back(
+                        static_cast<source::LayerStore*>(raw.get()));
+                    store_opened = true;
+                } catch (const error& e) {
+                    // ADR-0016: persistence is best-effort. An unwritable,
+                    // full, or otherwise unusable layer dir must not stop
+                    // the image from booting — degrade to remote-only.
+                    ELIO_LOG_WARNING(
+                        "layer {}: persistence unavailable ({}); serving "
+                        "remotely without caching",
+                        lower.digest, e.what());
+                }
+                if (!store_opened) {
+                    // The moved-from `reg` died with the failed open;
+                    // re-open the plain registry source (cold path).
+                    reg = co_await source::RegistrySource::open(client, url);
+                    raw = std::move(reg);
+                }
             }
         }
 
@@ -239,6 +288,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         out.layer_count = n;
         out.trace = trace_stats;
         out.root = std::move(merged);
+        out.layer_stores = std::move(stores);
         ELIO_LOG_INFO("image assembled: {} layers, virtual size {} bytes", n,
                       out.virtual_size);
         co_return out;
@@ -267,10 +317,36 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     out.upper_path = upper_path;
     out.trace = trace_stats;
     out.root = std::move(merged);
+    out.layer_stores = std::move(stores);
     ELIO_LOG_INFO("image assembled writable: {} lowers + {} upper, virtual "
                   "size {} bytes",
                   n, cfg.upper.type, out.virtual_size);
     co_return out;
+}
+
+elio::coro::task<void> park_image_fills(const OpenedImage& opened) {
+    for (auto* store : opened.layer_stores) store->stop_fill();
+    for (auto* store : opened.layer_stores) {
+        bool parked = false;
+        for (int i = 0; i < 5000 && !parked; ++i) {
+            using FillStatus = source::LayerStore::FillStatus;
+            const FillStatus s = store->fill_status();
+            parked = s == FillStatus::kDisabled || s == FillStatus::kDone ||
+                     s == FillStatus::kStopped;
+            if (!parked) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        if (!parked) {
+            // Still in its start delay or stuck on the remote: the caller
+            // is on a teardown path that ends in process exit, which
+            // reaps the coroutine before it can resume (see the
+            // LayerStore lifetime contract).
+            ELIO_LOG_WARNING("layer store fill did not park within the "
+                             "bounded wait; relying on process exit");
+        }
+    }
+    co_return;
 }
 
 }  // namespace obd::image

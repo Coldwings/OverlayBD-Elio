@@ -202,8 +202,6 @@ Every test, grouped by area, with the property it guards.
   tar-wrapped blob is exposed at its payload offset, header invisible.
 - `source: tar adapter passes plain files through unwrapped` — a
   non-tar blob is served byte-identically, offset zero.
-- `source: chunk cache serves repeats from memory` — a second read of a
-  cached chunk does not reach the backing source (read counter stays).
 - `source: credential store longest-prefix matching` — the
   `CredentialStore` picks the longest matching key, with and without
   URL scheme.
@@ -265,6 +263,30 @@ Every test, grouped by area, with the property it guards.
   an empty expected digest zero-fills the sidecar header (resume still
   matches) and completes to `overlaybd.commit` without sha256
   verification.
+- `source: layer store completes an empty layer` — a zero-length remote
+  creates an empty `overlaybd.commit` instead of remaining in `Filling`.
+- `source: layer store fill completes a partially warmed store` — one
+  read-through extent plus the background fill warm the whole layer to
+  `overlaybd.commit` (`kDone`); a reopen serves everything locally.
+- `source: layer store fill resumes from the sidecar across a restart` —
+  a fill stopped mid-walk leaves persisted extents in the sidecar; a
+  reopen resumes them without refetching and the restarted fill
+  completes the layer.
+- `source: layer store fill honors the throughput throttle` — a 1 MiB/s
+  budget makes a 3 MiB fill take measurable seconds instead of
+  milliseconds.
+- `source: layer store fill stays off in bypass` — an injected `ENOSPC`
+  mid-fill flips the store to `Bypass`: fill stops (`kStopped`), reads
+  continue remotely, nothing persists, no commit appears.
+- `source: layer store fill is disabled without download.enable` — with
+  fill not configured there is no background traffic: `kDisabled`, zero
+  extents present, zero remote reads.
+- `source: layer store sweeps stale pairs when the commit binds` — a dir
+  holding `overlaybd.commit` plus leftover `.download.*`/`.bitmap.*`
+  files binds the commit and removes the pair files.
+- `source: layer store fill does not starve readers` — with fill active
+  and back-pressured (tiny queue, slow disk), cold-reader preads each
+  complete within a bounded 1 s budget, byte-exactly.
 - `source: registry concurrent 401s share one token refresh` — N
   concurrent reads on a server-side-expired token trigger exactly one
   coalesced token exchange (mock counts token endpoint hits); all reads
@@ -372,8 +394,8 @@ Every test, grouped by area, with the property it guards.
 ### integration
 
 - `integration: layered stack stages over a mock registry` — the full
-  registry→cache→tar→zfile→lsmt→merge chain serves correct bytes for a
-  multi-layer image.
+  registry→layer store→tar→zfile→lsmt→merge chain serves correct bytes
+  for a multi-layer image.
 - `integration: cancelled connect probe does not break later io` — a
   cancelled reachability/connect probe leaves the HTTP stack usable for
   subsequent reads.
@@ -406,9 +428,17 @@ Every test, grouped by area, with the property it guards.
   a LayerStore driven to completion renames its staging file to
   `overlaybd.commit`; a reopen binds it via the local probe and serves
   byte-exact reads with zero remote data reads.
-- `integration: downloader writes, verifies and installs the blob` —
-  the background downloader stages, sha256-verifies, and atomically
-  installs `overlaybd.commit`.
+- `integration: background fill completes a layer through image assembly` —
+  with `download.enable` set, the first open reads a prefix while the
+  background fill warms every remaining extent to `overlaybd.commit`; the
+  second open binds the commit with zero additional remote reads.
+- `image: malformed remote lower digest fails assembly` — a malformed
+  `sha256:` lower digest fails assembly with `EINVAL` before any registry
+  I/O (ADR-0016 boundary: structural config errors fail loud).
+- `integration: unwritable layer dir degrades to remote-only reads` — a
+  `lower.dir` that can never be created does not fail `open_image`: the
+  image boots, serves byte-exact remote-only reads, and writes no
+  persistence state (ADR-0016).
 - `supervisor: crashed device child is recovered with bounded respawns` —
   a real daemon with a fake obd-device: crash → respawn with
   `--recover`, bounded at `max_recovery_attempts`, `recoveries` reported
@@ -437,8 +467,6 @@ Every test, grouped by area, with the property it guards.
   succeeds, the loser gets a precise error ("commit already in progress"
   or "already sealed"), and the sealed file is intact (no interleaved
   tmp-file writes) (ADR-0014). Runs without privileges.
-- `integration: switch source swaps reads to the local copy` — after
-  install, reads migrate from the remote source to the local file.
 - `integration: ublk device serves sector reads from a blob` — the
   privileged E2E: a real ublk device backed by an in-memory blob
   returns correct sectors through `/dev/ublkb<N>` (self-skips without

@@ -87,7 +87,7 @@ See [docs/operations.md](docs/operations.md) for deployment, configuration
 ```
 src/common/       shared utilities: errors, crc32c, digest, byte ranges
 src/format/       ZFile/LSMT readers, layer merge, writable uppers (+ fixture writers)
-src/source/       blob sources: local, registry, switch/download, chunk cache, DART proxy
+src/source/       blob sources: local, registry, layer store with background fill, DART proxy
 src/image/        image assembly from overlaybd-compatible config.json
 src/ublk/         ublk control + per-queue data plane + Elio bridge
 src/supervisor/   daemon, child lifecycle, control protocol
@@ -110,8 +110,8 @@ docs/adr/         Architecture Decision Records
 
 ## Status
 
-Implemented and tested: read path (local + registry + download + cache +
-DART), ZFile/LSMT formats, multi-layer merge, writable uppers (sparse and
+Implemented and tested: read path (local + registry + layer store with
+background fill + DART), ZFile/LSMT formats, multi-layer merge, writable uppers (sparse and
 in-place-edit LSMT-RW with seal), discard/punch-hole with mask-with-zeroes
 semantics (ADR-0009), ublk data plane, supervisor process model with ublk
 USER_RECOVERY crash recovery (ADR-0010). Deferred by design: TurboOCI,

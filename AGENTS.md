@@ -16,8 +16,8 @@ A read-first block-device stack for OverlayBD-format container images:
   layers), plus multi-layer merge into one read-only block view.
 - **source** — pluggable blob sources behind one async interface: local
   files, OCI registry HTTP range reads (with bearer-token auth), a
-  remote→local switch source with background download, an in-memory chunk
-  cache, and a **DART proxy source** (prefix passthrough:
+  sparse-file layer store with background fill (ADR-0011), and a
+  **DART proxy source** (prefix passthrough:
   `GET http://<dart>/<prefix>/<full upstream URL>`).
 - **image** — assembly: an OverlayBD-compatible `config.json` becomes a
   merged read-only block source.
@@ -37,7 +37,7 @@ generator).
 ```
 src/common/       shared utilities: errors, logging glue, digest, byte ranges
 src/format/       OverlayBD on-disk formats: zfile, lsmt, layer merge (+ fixture writers)
-src/source/       blob sources: local, registry, switch/download, chunk cache, dart proxy
+src/source/       blob sources: local, registry, layer store with background fill, dart proxy
 src/image/        image assembly from overlaybd-compatible config.json
 src/ublk/         ublk control + per-queue data plane + Elio bridge
 src/supervisor/   daemon, child-process lifecycle, control-socket protocol

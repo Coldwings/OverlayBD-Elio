@@ -134,6 +134,7 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0010](./0010-ublk-user-recovery.md) | ublk USER_RECOVERY crash recovery with bounded respawn | accepted |
 | [0011](./0011-sparse-layer-store.md) | Unify layer persistence into a sparse-file LayerStore with sidecar bitmap and per-extent CRC | accepted |
 | [0012](./0012-read-admission-funnel.md) | Admit all remote reads through one priority funnel with scavenger-class prefetch | proposed |
-| [0013](./0013-trace-prefetch.md) | Record and replay prefetch traces in upstream-compatible format without a photon dependency | proposed |
+| [0013](./0013-trace-prefetch.md) | Record and replay prefetch traces in upstream-compatible format without a photon dependency | accepted |
 | [0014](./0014-offline-commit-and-cli-boundary.md) | Commit offline with deterministic seal, grow-only resize, and an external CLI boundary | accepted |
-| [0015](./0015-registry-token-singleflight-and-expiry.md) | Single-flight registry token re-auth with expires_in-honoring cache lifetimes | proposed |
+| [0015](./0015-registry-token-singleflight-and-expiry.md) | Single-flight registry token re-auth with expires_in-honoring cache lifetimes | accepted |
+| [0016](./0016-persistence-never-gates-boot.md) | Layer persistence is best-effort — an unusable layer dir degrades to remote-only, never fails assembly | accepted |

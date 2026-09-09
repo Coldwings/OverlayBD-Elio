@@ -1,6 +1,5 @@
-// Unit tests: source module — tar adapter, chunk cache, credentials,
-// DART address handling.
-#include "source/chunk_cache.hpp"
+// Unit tests: source module — tar adapter, credentials, DART address
+// handling.
 #include "source/credentials.hpp"
 #include "source/dart.hpp"
 #include "source/tar_offset.hpp"
@@ -50,31 +49,6 @@ TEST_CASE("source: tar adapter passes plain files through unwrapped",
                 nullptr);
         REQUIRE(adapted.get() == vec);
         REQUIRE(adapted->size() == 4096);
-        co_return 0;
-    });
-    REQUIRE(rc == 0);
-}
-
-TEST_CASE("source: chunk cache serves repeats from memory", "[source]") {
-    const int rc = test::run_coro([]() -> elio::coro::task<int> {
-        auto payload = test::pattern_bytes(256 * 1024, 11);
-        auto* vec = new VectorSource(payload);
-        source::BlobSourcePtr base(vec);
-        source::ChunkCache::Config cfg;
-        cfg.chunk_size = 64 * 1024;
-        cfg.max_bytes = 1 << 20;
-        auto cache = co_await source::ChunkCache::open(std::move(base), cfg);
-        std::vector<uint8_t> buf(100 * 1024);
-        const ssize_t r1 = co_await cache->pread(buf.data(), buf.size(), 4096);
-        REQUIRE(r1 == static_cast<ssize_t>(buf.size()));
-        REQUIRE(buf == std::vector<uint8_t>(payload.begin() + 4096,
-                                            payload.begin() + 4096 +
-                                                buf.size()));
-        const uint64_t after_first = vec->reads();
-        const ssize_t r2 = co_await cache->pread(buf.data(), buf.size(), 4096);
-        REQUIRE(r2 == static_cast<ssize_t>(buf.size()));
-        REQUIRE(vec->reads() == after_first);  // all chunks hit
-        REQUIRE(cache->hits() > 0);
         co_return 0;
     });
     REQUIRE(rc == 0);

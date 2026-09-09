@@ -46,8 +46,8 @@ to every image in the process.
 
 `lowers[]` is ordered bottom-up: `lowers[0]` is the base layer and the last
 entry is the topmost read-only layer. Blob identity is the OCI `digest`
-(`"sha256:<hex>"`); the hex payload doubles as the integrity-check value for
-background downloads.
+(`"sha256:<hex>"`); the hex payload doubles as the integrity-check value
+for the `LayerStore` completion verification.
 
 ### The per-lower assembly chain
 
@@ -65,13 +65,16 @@ For each lower, in order:
    read through by the store, which persists every served extent into
    `lower.dir` (created if missing) as a sparse staging file plus sidecar
    bitmap, and renames it to `<dir>/overlaybd.commit` once the layer is
-   complete and sha256-verified. A remote layer with an **empty**
-   `lower.dir` cannot persist — it keeps the legacy in-memory
-   `ChunkCache` in front of the `RegistrySource` (with a warning;
-   restart-cold, retired with part 3). The `download` section is
-   still parsed (operator contract) but currently has no effect: locality
-   already grows read-through; background whole-blob fill returns as
-   LayerStore fill in the ADR-0011 follow-up (part 3).
+   complete and sha256-verified. The `download` section drives the
+   store's background fill (`enable`/`delay`/`delayExtra`/`maxMBps`/
+   `blockSize`) and the completion-verify retry bound (`tryCnt`). Two
+   degrade paths keep a remote layer bootable without persistence
+   (ADR-0016): an **empty** `lower.dir` is served remote-only (plain
+   `RegistrySource`, with a warning — the snapshotter always sets `dir`,
+   so this is the compatibility path), and a `lower.dir` the store
+   cannot open (unwritable, full, blocked by a non-directory) degrades
+   to the same remote-only chain with a warning instead of failing
+   assembly.
 3. **TarOffsetSource** — auto-detects and removes the tar wrapper.
 4. **ZFile detection** — when `format::is_zfile()` recognizes the ZFile
    magic, the view becomes a `ZFileSource` (with caller-side digest
@@ -170,7 +173,7 @@ struct GlobalConfig {
     std::string credential_file;
     bool p2p_enable = false;
     std::string p2p_address;
-    source::DownloadConfig download;
+    DownloadConfig download;
     int log_level = 1;
 
     static GlobalConfig from_file(const std::string& path);
@@ -188,9 +191,10 @@ struct GlobalConfig {
   from `p2pConfig` (`enable`, `address`); the DART proxy (ADR-0005).
 - `src/image/config.hpp::download` — the global download defaults
   (`enable`, `delay`, `delayExtra`, `maxMBps`, `tryCnt`, `blockSize` →
-  `src/source/downloader.hpp::DownloadConfig`); per-image `download`
-  sections override these field by field. Parsed for compatibility but
-  currently inert (ADR-0011 part 2 — see Limitations & TODO).
+  `src/image/config.hpp::DownloadConfig`); per-image `download`
+  sections override these field by field. The knobs drive the
+  `LayerStore` background fill and completion-verify bound (ADR-0011;
+  see `docs/config.md`).
 - `src/image/config.hpp::log_level` — `logConfig.logLevel`:
   0=debug, 1=info (default), 2=warn, 3=error.
 - `from_file(path)` — reads and parses the file. Throws `obd::error` on IO
@@ -219,16 +223,16 @@ struct ImageConfig {
     std::string repo_blob_url;
     std::vector<LowerConfig> lowers;   // bottom-up
     std::string result_file;
-    source::DownloadConfig download;   // merged over the global defaults
+    DownloadConfig download;   // merged over the global defaults
     bool acceleration_layer = false;   // uppermost lower is the trace layer
     UpperConfig upper;
     bool writable() const noexcept;
 
     static std::string digest_sha256_hex(const std::string& digest);
     static ImageConfig from_file(const std::string& path,
-                                 const source::DownloadConfig& defaults);
+                                 const DownloadConfig& defaults);
     static ImageConfig from_json_text(const std::string& text,
-                                      const source::DownloadConfig& defaults);
+                                      const DownloadConfig& defaults);
 };
 ```
 
@@ -238,7 +242,7 @@ is the OCI digest; `size` is the blob size as recorded by the snapshotter
 registry probe); `dir` is the per-layer directory used for the local probe
 and the `LayerStore` persistence state (staging pair and
 `overlaybd.commit`; created if missing; empty disables persistence for a
-remote layer, which then keeps the legacy in-memory `ChunkCache`); `file`
+remote layer, which is then served remote-only); `file`
 names a local blob file (empty = the layer is remote).
 
 `src/image/config.hpp::UpperConfig` — the writable upper (ADR-0008).
@@ -283,10 +287,12 @@ struct OpenedImage {
     bool writable = false;
     std::string upper_path;
     TraceReplayStats trace;       // ADR-0013 replay outcome
+    std::vector<source::LayerStore*> layer_stores;  // non-owning
 };
 
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                          const GlobalConfig& global);
+elio::coro::task<void> park_image_fills(const OpenedImage& opened);
 ```
 
 `src/image/image_file.hpp::OpenedImage` — the assembled device view.
@@ -308,6 +314,15 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
   trace replay (ADR-0013): whether a valid trace was present, records
   replayed/skipped, bytes warmed, and whether a replay bound stopped the
   pass early. All zero when no `accelerationLayer` was configured.
+- `src/image/image_file.hpp::layer_stores` — non-owning handles to every
+  `LayerStore` in the chain (owned by `root`), for lifecycle operations.
+- `src/image/image_file.hpp::park_image_fills` — stops every background
+  fill in the chain (`stop_fill` + a bounded wait for a terminal
+  `fill_status`). Must be called before `root` is destroyed on any path
+  other than process exit: destroying a store with a fill in flight is a
+  use-after-free (the fill coroutine touches members on resume). The
+  device server calls it during shutdown; fills still in their start
+  delay exit within one 100 ms sleep slice.
 
 `open_image(cfg, global)` — assembles the merged view. Cold path; runs on
 the calling Elio coroutine during device setup.
@@ -340,14 +355,17 @@ Behavior, in order:
    `sparse`) sized to the maximum lower virtual size, merges with
    `MergedWritable`, and returns with `writable = true`.
 
-Error behavior: **all-or-nothing** — any failure (config, credentials parse
-aside, network probe, corrupt layer, unsupported format, an unwritable
-layer dir) throws `obd::error` /
+Error behavior: **all-or-nothing** — any structural failure (config,
+credentials parse aside, network probe, corrupt layer, unsupported
+format) throws `obd::error` /
 `src/common/errors.hpp::format_error`; a device that cannot assemble must
 not come up half-broken. `open_image` never returns a partially assembled
-image. It requires a running Elio scheduler (the DART probe, the registry
-size probes, and `LayerStore::open`'s blocking setup via
-`elio::spawn_blocking`).
+image. The one sanctioned degrade: a remote layer whose `LayerStore`
+cannot open (unwritable/full/unusable `lower.dir`) falls back to
+remote-only reads with a warning — persistence is best-effort and never
+gates boot (ADR-0016). It requires a running Elio scheduler (the DART
+probe, the registry size probes, and `LayerStore::open`'s blocking setup
+via `elio::spawn_blocking`).
 
 ### `trace_replay.hpp` — TraceReplayOptions, TraceReplayStats, replay_trace
 
@@ -406,7 +424,12 @@ Concepts → "The trace layer".
 - **DART is strictly optional** — enabling `p2pConfig` can never make an
   image that would otherwise open fail to open (ADR-0005).
 - **Fail-loud assembly** — `open_image` either returns a fully assembled
-  image or throws; there is no degraded/half-open state.
+  image or throws; there is no half-open state. Loss of *persistence* is
+  not an assembly failure: an unusable layer dir degrades that layer to
+  remote-only reads with a warning (ADR-0016). The degrade covers
+  environment failures only — a malformed lower digest is a structural
+  config error, validated before any registry I/O, and throws
+  `obd::error(EINVAL)`.
 - **Config compatibility** — unknown fields are ignored; known fields keep
   their overlaybd-snapshotter meaning (operator contract). A config produced
   by the overlaybd-snapshotter parses identically here.
@@ -435,11 +458,13 @@ Concepts → "The trace layer".
   `std::thread`, and an atomic rename to `<dir>/overlaybd.commit` on
   completion). The caller must keep the returned `OpenedImage` (and thus
   the sources and stores) alive for the device's lifetime, and must not
-  destroy it while reads are in flight: a `LayerStore` touches members on
-  resume of a suspended `pread`/`populate` (its lifetime contract, see
-  `docs/source.md`).
-- **No global state** — all per-image state (registry client, caches,
-  downloaders) hangs off the returned `OpenedImage` ownership tree.
+  destroy it while reads are in flight or a background fill is unparked:
+  a `LayerStore` touches members on
+  resume of a suspended `pread`/`populate`/fill step (its lifetime
+  contract, see `docs/source.md`). `park_image_fills` is the sanctioned
+  pre-destroy step (the device server calls it during shutdown).
+- **No global state** — all per-image state (registry client, layer
+  stores) hangs off the returned `OpenedImage` ownership tree.
 
 ## Stability Contract
 
@@ -456,16 +481,19 @@ changes are T1):
 - **The local probe contract** — the probe order (`lower.file`, then
   `overlaybd.commit`, `.commit`, `overlaybd.sealed` in the layer directory)
   is shared with the snapshotter's on-disk layout and with the install
-  path every persistence mechanism uses (the retired Downloader, and the
-  `LayerStore` whose completion rename lands exactly there); changing it
+  path every persistence mechanism uses (the
+  `LayerStore`, whose completion rename lands exactly there); changing it
   strands previously downloaded blobs.
 - **The remote addressing rule** — `repoBlobUrl + "/" + digest`.
 - **The writable mode (ADR-0008)** — the `upper` object shape, the
   `lsmt`/`sparse` type set, the upper file names (`overlaybd.rw`,
   `overlaybd.sparse`), `EINVAL` on unknown types, and read-only behavior
   when `upper` is absent or empty.
-- **Assembly failure semantics** — `open_image` throwing (never degrading)
-  is relied on by the device process's startup protocol.
+- **Assembly failure semantics** — `open_image` throwing on structural
+  failure (never half-assembling) is relied on by the device process's
+  startup protocol. The bounded exception is ADR-0016: layer persistence
+  is best-effort, so an unusable `lower.dir` degrades the layer to
+  remote-only reads with a warning instead of throwing.
 
 Compatible changes: newly honored config fields (additive, previously
 ignored), new lower/upper layer types added alongside the existing ones,
@@ -511,7 +539,7 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   remote image config (no local files, no layer dir) assembles through the
   mock registry and serves the full image byte-exactly, with the expected
   layer count and virtual size; the missing `dir` exercises the no-dir
-  exception path (legacy in-memory `ChunkCache`).
+  remote-only path (ADR-0016).
 - `integration: image assembly serves remote reads through the layer store` —
   a remote lower with a configured `dir` is served through the
   `RegistrySource → LayerStore` chain byte-exactly, and the read-through
@@ -558,6 +586,19 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   two remote dir-configured data layers: a `layer_index` 1 record warms
   an otherwise-untouched extent of layer 1's blob only, pinning the
   warm-target ordering end to end.
+- `integration: background fill completes a layer through image assembly` —
+  with `download.enable` set in the image config, a first open reads a
+  prefix while the `LayerStore` background fill warms every remaining
+  extent to `overlaybd.commit`; a second open binds the commit with zero
+  additional remote reads.
+- `image: malformed remote lower digest fails assembly` — a remote lower
+  with a malformed `sha256:` digest fails `open_image` with
+  `obd::error(EINVAL)` before any registry I/O — structural config errors
+  fail loud; the ADR-0016 degrade never swallows them.
+- `integration: unwritable layer dir degrades to remote-only reads` — a
+  `lower.dir` that can never be created (a regular file blocks its parent
+  path) does not fail `open_image`: the image boots, serves byte-exact
+  remote-only reads, and writes no persistence state (ADR-0016).
 
 Fixture data is generated in-test (`obd-mkimage`-equivalent writers from
 `src/format`, deterministic patterned bytes); the mock registry serves a
@@ -565,17 +606,12 @@ single Range-capable blob. No external golden files.
 
 ## Limitations & TODO
 
-- **`download.enable` is parsed but currently inert** — the `download`
-  sections keep parsing (operator contract), but the SwitchSource/Downloader
-  background download was retired from assembly in ADR-0011 part 2:
-  locality already grows read-through via the `LayerStore`. Background
-  whole-blob fill returns in part 3 as LayerStore fill (see
-  `docs/config.md`).
-- **In-memory caching only on the no-dir exception path** — for
-  dir-configured remote layers the kernel page cache over the
+- **The no-dir path has no local caching at all** — for dir-configured
+  remote layers the kernel page cache over the
   `LayerStore` staging/commit file is the L1 (ADR-0011 rejected a
-  user-space LRU on top); a remote layer without `lower.dir` keeps the
-  legacy in-memory `ChunkCache` (restart-cold) until part 3.
+  user-space LRU on top); a remote layer without `lower.dir` is served
+  remote-only (the snapshotter always sets `dir`; the empty case is the
+  compatibility path).
 - **Honored config surface is a subset** — `cacheConfig`, `ioEngine`,
   `prefetch`, non-file `credentialConfig` modes, and `resultFile` handling
   are parsed-as-ignored / informational in v0.1 (see `docs/config.md` for
@@ -585,7 +621,7 @@ single Range-capable blob. No external golden files.
   dynamic-prefetch file-list fallback is rejected by design; the tar
   member name (`trace`) is not checked — recognition is the config flag
   plus the blob magic; remote lowers without `dir` are not warmed
-  (populate is a no-op on the legacy in-memory `ChunkCache`); and replay
+  (populate is a no-op on the bare `RegistrySource`); and replay
   runs at normal priority until the B-phase admission funnel exists.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.

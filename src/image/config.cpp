@@ -34,7 +34,7 @@ nlohmann::json parse_json(const std::string& text, const std::string& what) {
 /// override. overlaybd field names: enable, delay, delayExtra, maxMBps,
 /// tryCnt, blockSize.
 void apply_download_json(const nlohmann::json& j,
-                         source::DownloadConfig& base) {
+                         DownloadConfig& base) {
     if (!j.is_object()) return;
     if (j.contains("enable")) base.enable = j["enable"].get<bool>();
     if (j.contains("delay")) base.delay_sec = j["delay"].get<uint32_t>();
@@ -93,12 +93,12 @@ std::string ImageConfig::digest_sha256_hex(const std::string& digest) {
 }
 
 ImageConfig ImageConfig::from_file(const std::string& path,
-                                   const source::DownloadConfig& defaults) {
+                                   const DownloadConfig& defaults) {
     return from_json_text(read_text_file(path), defaults);
 }
 
 ImageConfig ImageConfig::from_json_text(const std::string& text,
-                                        const source::DownloadConfig& defaults) {
+                                        const DownloadConfig& defaults) {
     const auto j = parse_json(text, "image config");
     ImageConfig cfg;
     cfg.download = defaults;

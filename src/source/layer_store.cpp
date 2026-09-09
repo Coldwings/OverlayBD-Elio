@@ -7,7 +7,9 @@
 
 #include <elio/io/io_awaitables.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/time/timer.hpp>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -117,6 +119,24 @@ uint64_t parse_nonce_name(const std::string& name, std::string_view prefix) {
     return nonce == 0 ? 0 : nonce;  // 0 is the "no pair" sentinel
 }
 
+// Unlinks every stale staging/sidecar pair file in `dir` (the commit-bind
+// sweep: once overlaybd.commit exists the probe binds it first, so a
+// leftover pair can never be resumed — it is pure disk leak). Returns the
+// number of files removed. Blocking; cold paths only.
+size_t sweep_stale_pairs(const std::string& dir) {
+    size_t removed = 0;
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, 10, ".download.") == 0 ||
+            name.compare(0, 8, ".bitmap.") == 0) {
+            if (::unlink(entry.path().c_str()) == 0) ++removed;
+        }
+    }
+    return removed;
+}
+
 }  // namespace
 
 std::string LayerStore::hex_nonce(uint64_t nonce) {
@@ -177,7 +197,13 @@ elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
             self->commit_fd_.store(fd, std::memory_order_release);
             self->state_.store(static_cast<int>(State::Complete),
                                std::memory_order_release);
-            ELIO_LOG_INFO("layer store {}: bound to commit file", self->dir_);
+            // Cheap hygiene: a pair left beside the commit can never win
+            // the probe — sweep it.
+            const size_t swept = sweep_stale_pairs(self->dir_);
+            ELIO_LOG_INFO(
+                "layer store {}: bound to commit file ({} stale pair "
+                "files swept)",
+                self->dir_, swept);
             return;
         }
 
@@ -207,6 +233,11 @@ elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
     if (ls->state() == State::Complete) co_return ls;
     LayerStore* self = ls.get();
     ls->writer_ = std::thread([self] { self->writer_main(); });
+    if (ls->cfg_.fill.enable && ls->extent_count_ > 0) {
+        elio::go([self]() -> elio::coro::task<void> {
+            co_await self->run_fill();
+        });
+    }
     co_return ls;
 }
 
@@ -457,7 +488,7 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
     if (r < 0) {
         f->error = static_cast<int>(-r);
     } else if (static_cast<size_t>(r) != elen) {
-        f->error = EIO;  // short fill from the remote (see ChunkCache)
+        f->error = EIO;  // short fill from the remote
     } else {
         f->data = std::move(buf);
     }
@@ -471,16 +502,21 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
 }
 
 void LayerStore::enqueue_write(
-    uint64_t extent_id, std::shared_ptr<const std::vector<uint8_t>> data) {
-    const uint32_t crc = crc32_of(data->data(), data->size());
+    uint64_t extent_id, std::shared_ptr<const std::vector<uint8_t>> data,
+    size_t data_offset) {
+    const uint64_t ebase = extent_id * cfg_.extent_size;
+    const size_t elen = static_cast<size_t>(
+        std::min<uint64_t>(cfg_.extent_size, size_ - ebase));
+    const uint32_t crc = crc32_of(data->data() + data_offset, elen);
     std::lock_guard lk(qmu_);
     if (stopping_ || state() != State::Filling) return;
-    if (queued_bytes_ + data->size() > cfg_.queue_max_bytes) {
+    if (queued_bytes_ + elen > cfg_.queue_max_bytes) {
         dropped_writes_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    queued_bytes_ += data->size();
-    queue_.push_back(WriteJob{extent_id, std::move(data), crc, false});
+    queued_bytes_ += elen;
+    queue_.push_back(
+        WriteJob{extent_id, std::move(data), data_offset, elen, crc, false});
     qcv_.notify_one();
 }
 
@@ -488,7 +524,7 @@ void LayerStore::enqueue_clear(uint64_t extent_id) {
     std::lock_guard lk(qmu_);
     if (stopping_ || state() != State::Filling) return;
     // Bookkeeping, not payload: never dropped for queue fullness.
-    queue_.push_back(WriteJob{extent_id, nullptr, 0, true});
+    queue_.push_back(WriteJob{extent_id, nullptr, 0, 0, 0, true});
     qcv_.notify_one();
 }
 
@@ -598,6 +634,152 @@ elio::coro::task<ssize_t> LayerStore::populate(uint64_t offset, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
+// Background fill (one scavenger-class coroutine; ADR-0011 bulk path)
+// ---------------------------------------------------------------------------
+
+elio::coro::task<bool> LayerStore::wait_queue_room(size_t len) {
+    for (;;) {
+        {
+            std::lock_guard lk(qmu_);
+            if (stopping_ || state() != State::Filling ||
+                fill_stop_.load(std::memory_order_acquire)) {
+                co_return false;
+            }
+            if (queued_bytes_ + len <= cfg_.queue_max_bytes) co_return true;
+        }
+        // Scavenger back-pressure: fill may wait on the writer; readers
+        // never do. 1 ms polling is cheap at concurrency 1.
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+elio::coro::task<void> LayerStore::run_fill() {
+    // Fill is the ADR-0012 `Fill` scavenger class: conservative
+    // concurrency 1 (this single walk) until the admission funnel (#B1)
+    // merges and governs it.
+    fill_status_.store(static_cast<int>(FillStatus::kWaiting),
+                       std::memory_order_release);
+    uint32_t delay = cfg_.fill.delay_sec;
+    if (cfg_.fill.delay_extra_sec != 0) {
+        // std::random_device jitter (upstream download precedent); not part of the
+        // determinism surface.
+        std::random_device rd;
+        delay += rd() % (cfg_.fill.delay_extra_sec + 1);
+    }
+    // Slept in 100 ms slices so stop_fill() (park_image_fills, teardown)
+    // takes effect promptly even inside a long start delay.
+    for (uint64_t slept_ms = 0;
+         slept_ms < static_cast<uint64_t>(delay) * 1000 &&
+         !fill_stop_.load(std::memory_order_acquire);
+         slept_ms += 100) {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (fill_stop_.load(std::memory_order_acquire) ||
+        state() != State::Filling) {
+        fill_status_.store(static_cast<int>(FillStatus::kStopped),
+                           std::memory_order_release);
+        co_return;
+    }
+    fill_status_.store(static_cast<int>(FillStatus::kFilling),
+                       std::memory_order_release);
+    ELIO_LOG_INFO("layer store {}: background fill starting ({} extents)",
+                  dir_, extent_count_);
+
+    const uint64_t es = cfg_.extent_size;
+    // Coalescing cap: the bulk-path rule — contiguous misses are fetched
+    // with larger range reads, capped near 1 MiB.
+    const uint64_t cap = std::min<uint64_t>(
+        std::max<uint64_t>(cfg_.fill.block_size, es), 1024 * 1024);
+    const uint64_t budget =
+        static_cast<uint64_t>(std::max(cfg_.fill.max_mbps, 1u)) << 20;
+    uint64_t window_used = 0;
+    auto window_start = std::chrono::steady_clock::now();
+    unsigned consecutive_errors = 0;
+    bool done = false;
+
+    while (!fill_stop_.load(std::memory_order_acquire) &&
+           state() == State::Filling) {
+        // First missing extent, then the contiguous missing run after it.
+        uint64_t e = 0;
+        for (; e < extent_count_; ++e) {
+            if (!(records_[e].load(std::memory_order_acquire) &
+                  kFlagPresent)) {
+                break;
+            }
+        }
+        if (e == extent_count_) {
+            done = true;  // nothing missing: completion is the writer's job
+            break;
+        }
+        uint64_t run_end = e;
+        while (run_end < extent_count_ &&
+               (run_end - e) * es < cap &&
+               !(records_[run_end].load(std::memory_order_acquire) &
+                 kFlagPresent)) {
+            ++run_end;
+        }
+        const uint64_t run_len =
+            std::min((run_end - e) * es, size_ - e * es);
+        auto buf = std::make_shared<std::vector<uint8_t>>(
+            static_cast<size_t>(run_len));
+        const ssize_t r =
+            co_await remote_->pread(buf->data(), buf->size(), e * es);
+        if (r < 0 || static_cast<uint64_t>(r) != run_len) {
+            // Transient remote trouble: back off (1s doubling, capped at
+            // 60s) and resume the walk — persisted extents survive in the
+            // sidecar, so progress is never lost.
+            ++consecutive_errors;
+            const unsigned shift = std::min(consecutive_errors, 6u);
+            ELIO_LOG_WARNING(
+                "layer store {}: fill read failed at extent {} ({}); "
+                "retrying in {}s",
+                dir_, e,
+                r < 0 ? strerror(static_cast<int>(-r)) : "short read",
+                1u << shift);
+            co_await elio::time::sleep_for(std::chrono::seconds(1u << shift));
+            continue;
+        }
+        consecutive_errors = 0;
+        for (uint64_t x = e; x < run_end; ++x) {
+            if (records_[x].load(std::memory_order_acquire) &
+                kFlagPresent) {
+                continue;  // a reader beat us to it
+            }
+            const uint64_t xbase = x * es;
+            const size_t elen = static_cast<size_t>(
+                std::min<uint64_t>(es, size_ - xbase));
+            const bool room =
+                co_await wait_queue_room(elen);
+            if (!room) {
+                fill_status_.store(
+                    static_cast<int>(FillStatus::kStopped),
+                    std::memory_order_release);
+                co_return;
+            }
+            enqueue_write(x, buf, static_cast<size_t>(xbase - e * es));
+        }
+        // Throughput throttle (the download contract's per-second budget window).
+        window_used += run_len;
+        if (window_used >= budget) {
+            const auto elapsed =
+                std::chrono::steady_clock::now() - window_start;
+            if (elapsed < std::chrono::seconds(1)) {
+                co_await elio::time::sleep_for(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::seconds(1) - elapsed));
+            }
+            window_start = std::chrono::steady_clock::now();
+            window_used = 0;
+        }
+    }
+    fill_status_.store(static_cast<int>(done ? FillStatus::kDone
+                                             : FillStatus::kStopped),
+                       std::memory_order_release);
+    ELIO_LOG_INFO("layer store {}: background fill {}",
+                  dir_, done ? "finished" : "stopped");
+}
+
+// ---------------------------------------------------------------------------
 // Write-behind writer thread (blocking disk work lives here, never on an
 // Elio worker — same precedent as the ublk queue threads)
 // ---------------------------------------------------------------------------
@@ -620,7 +802,7 @@ void LayerStore::writer_main() {
         }
         WriteJob job = std::move(queue_.front());
         queue_.pop_front();
-        if (job.data) queued_bytes_ -= job.data->size();
+        if (job.data) queued_bytes_ -= job.len;
         std::function<int(uint64_t)> hook = write_hook_;
         lk.unlock();
         process_job(job, hook);
@@ -656,7 +838,7 @@ void LayerStore::process_job(
     }
     // Consistency rule (ADR-0011): the record lands only after the data.
     int rc = pwrite_all(staging_fd_.load(std::memory_order_relaxed),
-                        job.data->data(), job.data->size(),
+                        job.data->data() + job.data_offset, job.len,
                         job.extent_id * cfg_.extent_size);
     if (rc == 0) {
         uint8_t rec[8];

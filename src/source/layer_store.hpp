@@ -1,7 +1,7 @@
 // LayerStore — sparse-file layer persistence with a sidecar extent map
 // (ADR-0011). Wired into image assembly as the read chain for
-// dir-configured remote layers; background fill (populate driven without
-// readers) is the remaining follow-up.
+// dir-configured remote layers; an optional background fill (the download
+// config contract) warms the whole layer without readers.
 //
 // Every remote byte a layer serves is persisted into a sparse local staging
 // file, so the layer's dependence on the remote source shrinks monotonically
@@ -18,17 +18,22 @@
 //     cache misses, never silent corruption);
 //   * a bounded, droppable write-behind queue drained by a dedicated plain
 //     std::thread (blocking disk work never occupies an Elio worker);
-//   * a bypass state on ENOSPC/EIO: writes stop, reads continue purely
-//     remote — a normal degraded mode, not an error path;
+//   * an optional background fill coroutine: delayed, throttled bulk
+//     warming of every missing extent (the ADR-0011 bulk path — contiguous
+//     misses are coalesced into larger range reads and split back into
+//     extents for accounting);
+//   * a bypass state on ENOSPC/EIO: writes stop, fill switches off, reads
+//     continue purely remote — a normal degraded mode, not an error path;
 //   * completion: when every extent is present, the staging file is
 //     sha256-verified against the image-config digest and atomically
-//     renamed to "<dir>/overlaybd.commit" (the same committed-layer
-//     contract the Downloader installs).
+//     renamed to "<dir>/overlaybd.commit" (the committed-layer contract
+//     the local probe binds).
 //
 // Lifetime: a LayerStore must not be destroyed while pread/populate
-// coroutines are in flight on it — a suspended fetch or joiner touches
-// members on resume (unlike LocalFileSource, whose destructor orders the
-// fd close against the io_uring backend).
+// coroutines or a background fill are in flight on it — a suspended fetch,
+// joiner, or fill step touches members on resume (unlike LocalFileSource,
+// whose destructor orders the fd close against the io_uring backend). Park
+// an active fill first: stop_fill() + fill_status() reaching kDone/kStopped.
 #pragma once
 
 #include "source/blob_source.hpp"
@@ -58,12 +63,33 @@ public:
         uint32_t extent_size = 64 * 1024;            // uniform extent unit
         uint64_t queue_max_bytes = 4ULL * 1024 * 1024;  // write-behind bound
         uint32_t try_count = 5;  // completion-verify attempts before giving up
+
+        /// Background fill — the `download` config contract (docs/config.md):
+        /// a scavenger-class bulk walk that warms every missing extent
+        /// without readers. Fill traffic runs at concurrency 1 (one walk);
+        /// the ADR-0012 admission funnel governs it once merged.
+        struct Fill {
+            bool enable = false;
+            uint32_t delay_sec = 300;        // start delay after open
+            uint32_t delay_extra_sec = 30;   // plus uniform random 0..extra
+            uint32_t max_mbps = 100;         // throughput throttle, MiB/s
+            uint32_t block_size = 256 * 1024;  // range-read coalescing cap
+        } fill;
     };
 
     enum class State : int {
         Filling = 0,   // serving remote + persisting into the staging pair
         Complete = 1,  // bound to <dir>/overlaybd.commit, plain local reads
         Bypass = 2,    // persistence broken/exhausted; reads purely remote
+    };
+
+    /// Background-fill lifecycle (fill_status()).
+    enum class FillStatus : int {
+        kDisabled = 0,  // fill not enabled
+        kWaiting = 1,   // in the start delay
+        kFilling = 2,   // walking and persisting
+        kDone = 3,      // walk finished: no missing extent remained
+        kStopped = 4,   // left early: bypass, completion, or stop_fill()
     };
 
     /// Opens (or creates) the persistence state for one layer in `dir`.
@@ -112,6 +138,18 @@ public:
     uint64_t coalesced_joins() const noexcept {
         return coalesced_joins_.load(std::memory_order_relaxed);
     }
+    FillStatus fill_status() const noexcept {
+        return static_cast<FillStatus>(
+            fill_status_.load(std::memory_order_acquire));
+    }
+
+    /// Asks the background fill to stop; it exits at the next step (a sleep
+    /// or queue wait, within ~1s once past the start delay). Idempotent.
+    /// Tests and teardown should poll fill_status() for kDone/kStopped
+    /// before destroying the store (see the lifetime contract above).
+    void stop_fill() noexcept {
+        fill_stop_.store(true, std::memory_order_release);
+    }
 
     /// Test-only hook: invoked by the writer thread before persisting each
     /// queued entry; a non-zero return is treated as a pwrite failure with
@@ -138,6 +176,8 @@ private:
     struct WriteJob {
         uint64_t extent_id = 0;
         std::shared_ptr<const std::vector<uint8_t>> data;  // null for clear
+        size_t data_offset = 0;  // extent's bytes begin here inside *data
+        size_t len = 0;  // extent payload length (queue accounting unit)
         uint32_t crc = 0;
         bool clear = false;  // demote the sidecar record (CRC-mismatch path)
     };
@@ -161,8 +201,15 @@ private:
                                            uint64_t offset);
     elio::coro::task<FetchResult> join_or_fetch(uint64_t extent_id);
     void enqueue_write(uint64_t extent_id,
-                       std::shared_ptr<const std::vector<uint8_t>> data);
+                       std::shared_ptr<const std::vector<uint8_t>> data,
+                       size_t data_offset = 0);
     void enqueue_clear(uint64_t extent_id);
+
+    // Background fill (one coroutine, spawned by open when fill.enable).
+    elio::coro::task<void> run_fill();
+    // Waits until the write-behind queue has room for `len` more bytes;
+    // false when the fill must stop (bypass, teardown, stop_fill).
+    elio::coro::task<bool> wait_queue_room(size_t len);
 
     // Writer thread (the only place blocking disk syscalls run).
     void writer_main();
@@ -226,6 +273,10 @@ private:
     std::function<int(uint64_t)> write_hook_;  // test-only, under qmu_
     uint32_t attempts_ = 0;        // completion-verify attempts (writer only)
     bool kick_completion_check_ = false;  // set before the writer starts
+
+    // Background fill (one elio::go coroutine; see the lifetime contract).
+    std::atomic<int> fill_status_{static_cast<int>(FillStatus::kDisabled)};
+    std::atomic<bool> fill_stop_{false};
 };
 
 }  // namespace obd::source

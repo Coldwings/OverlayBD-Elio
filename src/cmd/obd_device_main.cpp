@@ -123,6 +123,9 @@ elio::coro::task<int> device_main(Args args) {
                                std::strerror(-crc));
             }
         }
+        // Park background fills before the source chain is destroyed
+        // (the LayerStore lifetime contract; no-op when fill is off).
+        co_await obd::image::park_image_fills(opened);
         dev.reset();
         report(args, DeviceStatus{"stopped", "", ""});
         co_return 0;

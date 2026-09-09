@@ -858,3 +858,297 @@ TEST_CASE("source: layer store completes an empty layer", "[source]") {
     REQUIRE(std::filesystem::exists(dir.str() + "/overlaybd.commit"));
     REQUIRE(std::filesystem::file_size(dir.str() + "/overlaybd.commit") == 0);
 }
+
+TEST_CASE("source: layer store fill completes a partially warmed store",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(4 * kExtent, 22);
+    const std::string digest = digest_of(blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest, cfg);
+        // Warm one extent read-through; fill must warm the rest and drive
+        // the store to the sha256-verified commit without further reads.
+        std::vector<uint8_t> buf(kExtent);
+        const ssize_t r0 = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r0 == static_cast<ssize_t>(kExtent));
+        const bool done = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        // Completion lands on the writer thread; the fill walk notices a
+        // beat later — poll for its terminal status.
+        const bool fill_done = co_await poll_until([&] {
+            return store->fill_status() ==
+                   source::LayerStore::FillStatus::kDone;
+        });
+        REQUIRE(fill_done);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(std::filesystem::exists(dir.str() + "/overlaybd.commit"));
+
+    // Reopen binds the commit: byte-exact, zero remote reads.
+    const int rc2 = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest);
+        REQUIRE(store->state() == source::LayerStore::State::Complete);
+        std::vector<uint8_t> buf(blob.size());
+        const ssize_t r = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(blob.size()));
+        REQUIRE(buf == blob);
+        REQUIRE(vec->reads() == 0);
+        co_return 0;
+    });
+    REQUIRE(rc2 == 0);
+}
+
+TEST_CASE("source: layer store fill resumes from the sidecar across a restart",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(6 * kExtent, 23);
+    const std::string digest = digest_of(blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        uint64_t persisted_phase1 = 0;
+        {
+            auto* vec = new VectorSource(blob);
+            source::LayerStore::Config cfg;
+            cfg.fill.enable = true;
+            cfg.fill.delay_sec = 0;
+            cfg.fill.delay_extra_sec = 0;
+            cfg.queue_max_bytes = kExtent;  // fill back-pressures quickly
+            auto store = co_await source::LayerStore::open(
+                source::BlobSourcePtr(vec), dir.str(), digest, cfg);
+            // Slow disk: fill stays busy while a few extents persist.
+            store->set_test_write_hook([](uint64_t) -> int {
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(15);
+                while (std::chrono::steady_clock::now() < deadline) {
+                }
+                return 0;
+            });
+            const bool warm = co_await poll_until(
+                [&] { return store->extents_present() >= 1; });
+            REQUIRE(warm);
+            store->stop_fill();
+            const bool parked = co_await poll_until([&] {
+                return store->fill_status() ==
+                       source::LayerStore::FillStatus::kStopped;
+            });
+            REQUIRE(parked);
+            store->set_test_write_hook(nullptr);
+            persisted_phase1 = store->extents_present();
+            REQUIRE(persisted_phase1 >= 1);
+            REQUIRE(persisted_phase1 < 6);  // genuinely mid-fill
+        }  // store destroyed with the fill parked (lifetime contract)
+
+        // Reopen with fill: the persisted extents resume from the sidecar
+        // (not refetched); fill finishes the rest and completes.
+        auto* vec2 = new VectorSource(blob);
+        source::LayerStore::Config cfg2;
+        cfg2.fill.enable = true;
+        cfg2.fill.delay_sec = 0;
+        cfg2.fill.delay_extra_sec = 0;
+        auto store2 = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec2), dir.str(), digest, cfg2);
+        // The sidecar resumes at least what phase 1 persisted (the writer
+        // may legitimately have landed one more extent before teardown).
+        REQUIRE(store2->extents_present() >= persisted_phase1);
+        const bool done = co_await poll_until([&] {
+            return store2->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        // Resumed extents were not refetched: fill's coalesced runs touch
+        // at most the extents phase 1 never persisted.
+        REQUIRE(vec2->reads() <= 6 - persisted_phase1);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store fill honors the throughput throttle",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(3 * 1024 * 1024, 24);
+    const std::string digest = digest_of(blob);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.fill.max_mbps = 1;  // 1 MiB/s: 3 MiB takes >= 2 window waits
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest, cfg);
+        const bool done = co_await poll_until(
+            [&] {
+                return store->state() == source::LayerStore::State::Complete;
+            },
+            60000);
+        REQUIRE(done);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    // Unthrottled this completes in milliseconds; the 1 MiB/s budget
+    // forces ~2s. 1.5s leaves generous margin on slow machines.
+    REQUIRE(elapsed >= std::chrono::milliseconds(1500));
+}
+
+TEST_CASE("source: layer store fill stays off in bypass", "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(4 * kExtent, 25);
+    const std::string digest = digest_of(blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        // Gated remote: the hook is installed before any fill traffic.
+        auto* gated = new GatedSource(blob);
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.queue_max_bytes = kExtent;
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(gated), dir.str(), digest, cfg);
+        store->set_test_write_hook([](uint64_t) -> int { return ENOSPC; });
+        gated->gate.set();
+
+        const bool bypassed = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Bypass;
+        });
+        REQUIRE(bypassed);
+        const bool parked = co_await poll_until([&] {
+            return store->fill_status() ==
+                   source::LayerStore::FillStatus::kStopped;
+        });
+        REQUIRE(parked);
+        // Reads keep working remotely; nothing persists, no commit.
+        std::vector<uint8_t> buf(kExtent);
+        const ssize_t r = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(kExtent));
+        REQUIRE(buf == slice(blob, 0, kExtent));
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        REQUIRE(store->extents_present() == 0);
+        REQUIRE(store->state() == source::LayerStore::State::Bypass);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(!std::filesystem::exists(dir.str() + "/overlaybd.commit"));
+}
+
+TEST_CASE("source: layer store fill is disabled without download.enable",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(2 * kExtent, 26);
+    const std::string digest = digest_of(blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        REQUIRE(store->fill_status() ==
+                source::LayerStore::FillStatus::kDisabled);
+        REQUIRE(store->extents_present() == 0);
+        REQUIRE(vec->reads() == 0);  // no background traffic at all
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store sweeps stale pairs when the commit binds",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(2 * kExtent, 27);
+    // The commit from a previous completed run, plus a leftover pair that
+    // can never win the probe (disk leak to sweep).
+    test::write_file(dir.str() + "/overlaybd.commit", blob);
+    test::write_file(dir.str() + "/.download.deadbeefdeadbeef",
+                     slice(blob, 0, kExtent));
+    test::write_file(dir.str() + "/.bitmap.deadbeefdeadbeef",
+                     std::vector<uint8_t>(80, 0));
+    test::write_file(dir.str() + "/.download.0123456789abcdef",
+                     std::vector<uint8_t>(1, 0));
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest_of(blob));
+        REQUIRE(store->state() == source::LayerStore::State::Complete);
+        std::vector<uint8_t> buf(1024);
+        const ssize_t r = co_await store->pread(buf.data(), buf.size(), 5);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == slice(blob, 5, buf.size()));
+        REQUIRE(vec->reads() == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(names_with_prefix(dir.str(), ".download.").empty());
+    REQUIRE(names_with_prefix(dir.str(), ".bitmap.").empty());
+}
+
+TEST_CASE("source: layer store fill does not starve readers", "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(16 * kExtent, 28);
+    const std::string digest = digest_of(blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.queue_max_bytes = 2 * kExtent;  // fill sits in back-pressure
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest, cfg);
+        // Slow disk: fill stays active (queue-full waits) for the whole
+        // measurement, contending with the readers below.
+        store->set_test_write_hook([](uint64_t) -> int {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(20);
+            while (std::chrono::steady_clock::now() < deadline) {
+            }
+            return 0;
+        });
+        const bool active = co_await poll_until([&] {
+            return store->fill_status() ==
+                   source::LayerStore::FillStatus::kFilling;
+        });
+        REQUIRE(active);
+        // Scavenger claim, pinned: with fill mid-walk, cold-reader
+        // latency stays bounded (fill never holds the fetch-coalescing
+        // lock over a wait, and reader writes are droppable, never
+        // blocking). 1s is two orders above a local in-memory fetch.
+        std::vector<uint8_t> buf(kExtent);
+        for (uint64_t e = 0; e < 8; ++e) {
+            const auto a = std::chrono::steady_clock::now();
+            const ssize_t r = co_await store->pread(buf.data(), buf.size(),
+                                                    e * kExtent);
+            const auto b = std::chrono::steady_clock::now();
+            REQUIRE(r == static_cast<ssize_t>(kExtent));
+            REQUIRE(buf == slice(blob, e * kExtent, kExtent));
+            REQUIRE(b - a < std::chrono::seconds(1));
+        }
+        store->stop_fill();
+        const bool parked = co_await poll_until([&] {
+            return store->fill_status() ==
+                       source::LayerStore::FillStatus::kStopped ||
+                   store->fill_status() ==
+                       source::LayerStore::FillStatus::kDone;
+        });
+        REQUIRE(parked);
+        store->set_test_write_hook(nullptr);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}

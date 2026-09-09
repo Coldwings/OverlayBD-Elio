@@ -91,3 +91,29 @@ in the top-level `CMakeLists.txt`). New dependencies need clear
 justification in review. The kernel ABI surface is limited to ublk and
 io_uring; `<linux/ublk_cmd.h>` is never redefined — only `#ifndef`-guarded
 additions for what a given header version lacks.
+
+## A11. Layer persistence: one extent map, droppable writes, no eviction
+
+Every remote layer with a per-layer directory persists through one
+sparse-file `LayerStore` (ADR-0011). The cross-module rules:
+
+- **Single granularity** — one uniform 64 KiB extent is the remote-fetch,
+  persistence-accounting, and sidecar-record unit at once. Bulk paths
+  (background fill, prefetch) do not issue 64 KiB requests: they coalesce
+  contiguous missing extents into larger range reads (capped near 1 MiB)
+  and split the result back into extents for accounting.
+- **Bitmap-after-data** — a sidecar bit is set only after the extent's
+  data write completed, and local reads verify the extent's CRC32 first:
+  crashes and torn writes degrade to re-fetches, never to bad data.
+- **Write-behind is always droppable** — fetched bytes answer the reader
+  first; a full persistence queue drops writes (they are only cache).
+  `ENOSPC`/`EIO` bypasses the store: writes and background fill stop,
+  reads continue remotely — a normal degraded mode, not an error path.
+- **No eviction, ever** — layer directories are owned and reclaimed
+  wholesale by the container facility; the store never punches holes to
+  reclaim space.
+- **Persistence never gates reads** — an unusable layer directory
+  degrades the layer to remote-only reads at assembly (ADR-0016), and a
+  layer without a directory has no persistence at all. The
+  completed-layer file is `<dir>/overlaybd.commit`, installed by atomic
+  rename after sha256 verification.

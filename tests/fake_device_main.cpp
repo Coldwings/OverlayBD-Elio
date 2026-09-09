@@ -54,7 +54,7 @@ elio::coro::task<int> fake_main(Args args) {
     report(args, DeviceStatus{"starting", "", ""});
     try {
         const obd::image::ImageConfig img = obd::image::ImageConfig::from_file(
-            args.config, obd::source::DownloadConfig{});
+            args.config, obd::image::DownloadConfig{});
 
         // With an lsmt upper: write the payload and leave the file
         // unsealed (checkpoint only on SIGTERM, like the real device).

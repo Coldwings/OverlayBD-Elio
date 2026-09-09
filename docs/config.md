@@ -59,30 +59,29 @@ probe budget, it never blocks the image.
 
 ### `download`
 
-Global defaults for background blob download. The per-image `download`
-section overrides these **per field** (see below). Defaults come from
-`src/source/downloader.hpp::DownloadConfig`:
+Global defaults for the LayerStore background fill. The per-image
+`download` section overrides these **per field** (see below). Defaults
+come from `src/image/config.hpp::DownloadConfig`:
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `enable` | bool | `false` | Start a background download after device open. |
-| `delay` | uint32 | `300` | Start delay in seconds after device open. |
+| `enable` | bool | `false` | Start the background fill after device open. |
+| `delay` | uint32 | `300` | Fill start delay in seconds after device open. |
 | `delayExtra` | uint32 | `30` | Plus a uniform random extra of 0..`delayExtra` seconds. |
-| `maxMBps` | uint32 | `100` | Throughput throttle, MiB/s. |
-| `tryCnt` | uint32 | `5` | Attempts before giving up (a failed sha256 verification discards the file and restarts). |
-| `blockSize` | uint32 | `262144` (256 KiB) | Download chunk size in bytes. |
+| `maxMBps` | uint32 | `100` | Fill throughput throttle, MiB/s. |
+| `tryCnt` | uint32 | `5` | Completion-verify attempts before giving up (a failed sha256 verification discards the staging pair and restarts). |
+| `blockSize` | uint32 | `262144` (256 KiB) | Fill range-read coalescing cap in bytes (contiguous missing extents are fetched in reads of up to this size, never more than 1 MiB, and split back into 64 KiB extents for accounting). |
 
-**Currently parsed but inert (ADR-0011 part 2).** The whole section keeps
-parsing with its upstream meaning (operator contract — configs must not
-break), but no background download is started: image assembly now routes
-every remote layer through the `LayerStore`, which persists every
-remotely-served byte read-through into the layer's `dir` (sparse staging
-file `<dir>/.download.<nonce>` + sidecar `<dir>/.bitmap.<nonce>`,
-sha256-verified and atomically renamed to `<dir>/overlaybd.commit` once
-complete). Locality therefore grows with reads regardless of
-`download.enable`. Background whole-blob fill — the remaining effect of
-these knobs — returns in the ADR-0011 follow-up (part 3) as LayerStore
-fill.
+With `enable` set, every remote layer's `LayerStore` starts a background
+fill coroutine at open: a scavenger-class walk that warms every extent
+nobody has read yet into the layer's staging pair (sparse staging file
+`<dir>/.download.<nonce>` + sidecar `<dir>/.bitmap.<nonce>`), completing
+through the same sha256-verify + atomic rename to
+`<dir>/overlaybd.commit` as read-through warming. Fill traffic is
+throttled by `maxMBps`, delayed by `delay`+`delayExtra`, runs at
+concurrency 1 per layer, and back-pressures itself — readers are never
+queued behind it. Locality grows with reads regardless of
+`download.enable`; the knob only controls the proactive whole-layer warm.
 
 ### `logConfig`
 
@@ -124,7 +123,7 @@ An image with no lowers is rejected.
 |---|---|---|---|
 | `digest` | string | `""` | Content digest, `"sha256:<hex>"`. Used in the fetch URL and as the `LayerStore` completion integrity-check value (the `"sha256:"` prefix is stripped; other algorithms disable verification). |
 | `size` | uint64 | `0` | Blob size in bytes (informational for the reader). |
-| `dir` | string | `""` | Per-layer directory — the local probe location and the `LayerStore` persistence directory (staging pair + `overlaybd.commit`; created if missing). **Empty for a remote layer disables persistence**: the layer keeps only the legacy in-memory chunk cache in front of the registry (a warning is logged). |
+| `dir` | string | `""` | Per-layer directory — the local probe location and the `LayerStore` persistence directory (staging pair + `overlaybd.commit`; created if missing). **Empty for a remote layer disables persistence**: the layer is served remote-only, straight from the registry (a warning is logged; the snapshotter always sets `dir`, so this is the compatibility path). |
 | `file` | string | `""` | Explicit local blob file; empty means the layer may be remote. |
 
 **Local probe order** — a lower is served locally when one of these
@@ -174,8 +173,7 @@ shutdown writes the checkpoint that the offline `commit` seal consumes
 Same fields as the global `download` section. Merged **over the global
 defaults per field**: only fields present in the image's section
 override; absent fields inherit the global value
-(`src/image/config.cpp::apply_download_json`). Like the global section,
-currently parsed but inert — see the ADR-0011 note above.
+(`src/image/config.cpp::apply_download_json`).
 
 ### `resultFile`
 
