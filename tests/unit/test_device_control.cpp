@@ -160,16 +160,32 @@ TEST_CASE("supervisor: control channel writer loops short writes and never throw
     // A single ::write on SOCK_STREAM may write short (buffer
     // pressure), which would truncate/fuse protocol lines. The writer
     // loops until all bytes are out; a hard error is reported (logged
-    // + dropped), never thrown. Pin: a 128 KiB line over a NONBLOCKING
-    // pipe (64 KiB capacity) deterministically short-writes on the
-    // first pass, then EAGAINs — write_line must return false after
-    // looping; a normal line over a socketpair succeeds.
+    // + dropped), never thrown. Pin WITHOUT assuming a fixed pipe
+    // capacity (it varies across kernels/config): fill the NONBLOCKING
+    // pipe to capacity, drain half back, then write a line larger than
+    // half the capacity — the first ::write short-writes and the next
+    // EAGAINs, so write_line must return false after looping. A normal
+    // line over a socketpair succeeds afterwards.
     int pfd[2];
     REQUIRE(::pipe(pfd) == 0);
     const int flags = ::fcntl(pfd[1], F_GETFL);
     REQUIRE(::fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK) == 0);
+    size_t cap = 0;
+    std::string junk(8192, 'y');
+    for (;;) {
+        const ssize_t w = ::write(pfd[1], junk.data(), junk.size());
+        if (w <= 0) break;  // EAGAIN (or error): pipe full
+        cap += static_cast<size_t>(w);
+    }
+    // Drain half the capacity back so roughly half is free.
+    size_t freed = 0;
+    while (freed < cap / 2) {
+        const ssize_t r = ::read(pfd[0], junk.data(), junk.size());
+        if (r <= 0) break;
+        freed += static_cast<size_t>(r);
+    }
     supervisor::ControlChannelWriter w(pfd[1]);
-    const std::string big(128 * 1024, 'x');
+    const std::string big(cap, 'x');  // > free space by construction
     bool threw = false;
     bool ok = true;
     try {
@@ -178,7 +194,7 @@ TEST_CASE("supervisor: control channel writer loops short writes and never throw
         threw = true;
     }
     REQUIRE(!threw);
-    REQUIRE(!ok);  // EAGAIN after the short first write: reported
+    REQUIRE(!ok);  // short first write then EAGAIN: reported
     ::close(pfd[0]);
     ::close(pfd[1]);
 

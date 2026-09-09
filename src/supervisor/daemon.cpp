@@ -725,14 +725,21 @@ private:
             });
         nlohmann::json reply;
         {
+            // ONE lock scope for timeout and success cleanup alike: the
+            // timeout path previously reset reply_waiter here and only
+            // cleared cmd_pending later (fail_pending), leaving a window
+            // where a late matching reply was accepted into pending_reply
+            // with nobody signaled and cmd_pending still true. Clearing
+            // everything atomically makes a late reply fall into the
+            // ordinary "cmd_pending == false → stale, drop" path.
             co_await mu_.lock();
             reply = entry->pending_reply;
             entry->pending_reply = nlohmann::json();
             entry->reply_waiter.reset();
+            if (!got) entry->cmd_pending = false;
             mu_.unlock();
         }
         if (!got) {
-            co_await fail_pending();
             co_return reply_error("device control channel timeout: " + id);
         }
         if (!bool_or(reply, "ok", false)) {
