@@ -87,7 +87,17 @@ private:
 }  // namespace
 
 bool ControlChannelWriter::write_line(const nlohmann::json& j) {
-    return write_line(j.dump() + "\n");
+    // dump() throws on non-finite numbers and other pathological
+    // values; the writer's contract is never-throw (it runs on the
+    // detached control path). A pathological payload is dropped.
+    std::string line;
+    try {
+        line = j.dump() + "\n";
+    } catch (const std::exception& e) {
+        ELIO_LOG_ERROR("cannot serialize control line: {}", e.what());
+        return false;
+    }
+    return write_line(line);
 }
 
 bool ControlChannelWriter::write_line(const std::string& line) {
