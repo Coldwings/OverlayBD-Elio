@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
 
 namespace obd::image {

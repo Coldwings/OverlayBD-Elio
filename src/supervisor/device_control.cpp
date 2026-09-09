@@ -10,6 +10,7 @@
 
 #include <unistd.h>
 
+#include <cerrno>
 #include <algorithm>
 #include <cstring>
 #include <optional>
