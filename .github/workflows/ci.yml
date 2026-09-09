@@ -31,6 +31,11 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          # The GitHub runner image ships a google-chrome apt source whose index
+          # intermittently Hash-mismatches on dl.google.com (issue #37); the
+          # build never needs Chrome, so drop the source before updating.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+            /etc/apt/sources.list.d/google-chrome*.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             liburing-dev zlib1g-dev libssl-dev cmake ninja-build g++
@@ -57,6 +62,11 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          # The GitHub runner image ships a google-chrome apt source whose index
+          # intermittently Hash-mismatches on dl.google.com (issue #37); the
+          # build never needs Chrome, so drop the source before updating.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+            /etc/apt/sources.list.d/google-chrome*.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             liburing-dev zlib1g-dev libssl-dev linux-libc-dev \
@@ -70,6 +80,11 @@ jobs:
         # runners are full VMs: module loading works (no Secure Boot).
         run: |
           set -e
+          # The GitHub runner image ships a google-chrome apt source whose index
+          # intermittently Hash-mismatches on dl.google.com (issue #37); the
+          # build never needs Chrome, so drop the source before updating.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+            /etc/apt/sources.list.d/google-chrome*.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             "linux-headers-$(uname -r)" build-essential libelf-dev dwarves
