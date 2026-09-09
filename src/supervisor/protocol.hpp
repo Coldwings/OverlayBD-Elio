@@ -20,8 +20,7 @@
 //                                  pairings degrade to "device control
 //                                  channel timeout")
 //
-// Additive-only evolution rule (current law; governing decision ADR-0014,
-// currently proposed):
+// Additive-only evolution rule (current law; governing decision ADR-0014):
 //   - New commands and new reply fields may be added; existing field names
 //     and meanings never change.
 //   - Servers ignore unknown request fields; clients must ignore unknown
