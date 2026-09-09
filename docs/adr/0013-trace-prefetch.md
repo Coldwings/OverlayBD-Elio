@@ -1,7 +1,7 @@
 # ADR-0013: Record and replay prefetch traces in upstream-compatible format without a photon dependency
 
-- Status: proposed
-- Date: 2026-09-08
+- Status: accepted
+- Date: 2026-09-09
 - Supersedes: none
 - Binds: docs/image.md, docs/source.md, docs/config.md, docs/format.md
 

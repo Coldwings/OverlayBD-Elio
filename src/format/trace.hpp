@@ -1,5 +1,5 @@
 // Trace blob codec: reader and writer for the upstream OverlayBD prefetch
-// trace blob (docs/trace-format.md, ADR-0013 proposed).
+// trace blob (docs/trace-format.md, ADR-0013).
 //
 // The blob is a raw LP64 little-endian struct image: a 24-byte header
 // (magic, data_size, checksum) followed by a stream of fixed 24-byte

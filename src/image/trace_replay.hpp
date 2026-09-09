@@ -1,4 +1,4 @@
-// Trace replay (ADR-0013, proposed): translate a parsed prefetch trace
+// Trace replay (ADR-0013): translate a parsed prefetch trace
 // blob into populate() warm-up calls on the per-lower source chains.
 //
 // Wire authority: docs/trace-format.md. Each READ record

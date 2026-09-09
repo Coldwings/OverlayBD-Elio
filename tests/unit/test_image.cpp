@@ -1,4 +1,5 @@
 // Unit tests: image module — config parsing and local-file assembly.
+#include "common/errors.hpp"
 #include "image/image_file.hpp"
 #include "format/writer.hpp"
 
@@ -35,7 +36,7 @@ TEST_CASE("image: global config parses overlaybd.json fields", "[image]") {
 
 TEST_CASE("image: per-image download overrides merge over global defaults",
           "[image]") {
-    source::DownloadConfig defaults;
+    image::DownloadConfig defaults;
     defaults.enable = true;
     defaults.delay_sec = 300;
     defaults.max_mbps = 100;
@@ -117,6 +118,34 @@ TEST_CASE("image: assembly from local layer files reads merged content",
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("image: malformed remote lower digest fails assembly", "[image]") {
+    // ADR-0016: the remote-only degrade covers environment failures (an
+    // unusable layer dir); a malformed lower digest is a structural
+    // config error and must fail loud — before any registry I/O (the
+    // repo URL below is intentionally dead), not by degrading.
+    TempDir dir;
+    nlohmann::json cfgj;
+    cfgj["repoBlobUrl"] = "http://127.0.0.1:1/v2";
+    cfgj["lowers"] = nlohmann::json::array({nlohmann::json{
+        {"digest", "sha256:abcd"},
+        {"size", 65536},
+        {"dir", dir / "layer"}}});
+    const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+
+    int thrown_errno = 0;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const image::GlobalConfig global;
+        try {
+            (void)co_await image::open_image(cfg, global);
+        } catch (const error& e) {
+            thrown_errno = e.errno_value();
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(thrown_errno == EINVAL);
 }
 
 TEST_CASE("image: assembly picks the ZFile view for compressed layers",

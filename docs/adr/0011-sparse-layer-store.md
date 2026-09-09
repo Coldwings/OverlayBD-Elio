@@ -4,8 +4,7 @@
 - Date: 2026-09-08
 - Supersedes: none
 - Binds: docs/design-assumptions.md, docs/source.md, docs/config.md,
-  src/source/chunk_cache.hpp, src/source/downloader.hpp,
-  src/source/switch_source.hpp
+  src/source/layer_store.hpp, src/source/layer_store.cpp
 
 ## Context
 

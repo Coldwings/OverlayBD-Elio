@@ -1,20 +1,18 @@
-// Integration tests: the full read pipeline (registry mock -> chunk cache
+// Integration tests: the full read pipeline (registry mock -> layer store
 // -> tar adapter -> zfile -> lsmt merge), image assembly via open_image
 // (remote layers served through the LayerStore, ADR-0011), DART
-// optional-accelerator fallback, background download and the
-// remote->local switch. No kernel dependencies (ublk E2E lives in
-// test_ublk_e2e.cpp and self-skips). See docs/testing.md.
+// optional-accelerator fallback, and background fill through image
+// assembly. No kernel dependencies (ublk E2E lives in test_ublk_e2e.cpp
+// and self-skips). See docs/testing.md.
 #include "common/sha256.hpp"
 #include "format/lsmt.hpp"
 #include "format/trace.hpp"
 #include "format/writer.hpp"
 #include "format/zfile.hpp"
 #include "image/image_file.hpp"
-#include "source/chunk_cache.hpp"
 #include "source/dart.hpp"
-#include "source/downloader.hpp"
+#include "source/layer_store.hpp"
 #include "source/registry.hpp"
-#include "source/switch_source.hpp"
 #include "source/tar_offset.hpp"
 
 #include "../support.hpp"
@@ -98,7 +96,12 @@ private:
         if (last > first) {  // more than the 1-byte size probe
             data_gets_.fetch_add(1, std::memory_order_relaxed);
             std::lock_guard lk(extents_mu_);
-            served_extents_.insert(first / (64 * 1024));
+            // Record every covered extent: bulk paths (background fill)
+            // read several extents in one coalesced range read.
+            for (uint64_t e = first / (64 * 1024);
+                 e <= last / (64 * 1024); ++e) {
+                served_extents_.insert(e);
+            }
         }
         http::response resp(
             partial ? http::status::partial_content : http::status::ok,
@@ -331,6 +334,8 @@ TEST_CASE("integration: layered stack stages over a mock registry",
     TempDir dir;
     const auto raw = test::pattern_bytes(512 * 32, 41);
     const auto blob = make_zfile_blob(dir, raw);
+    const std::string layer_dir = dir / "layer_staging";
+    std::filesystem::create_directories(layer_dir);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         BlobServer server(blob, 19190);
         elio::go([&server]() -> elio::coro::task<void> {
@@ -343,11 +348,13 @@ TEST_CASE("integration: layered stack stages over a mock registry",
         auto reg =
             co_await source::RegistrySource::open(client, server.url("b"));
         REQUIRE(reg->size() == blob.size());
-        auto cache = co_await source::ChunkCache::open(std::move(reg));
+        auto store = co_await source::LayerStore::open(
+            std::move(reg), layer_dir, sha256_hex_of(blob));
         std::vector<uint8_t> buf(1000);
-        REQUIRE(co_await cache->pread(buf.data(), buf.size(), 100) == 1000);
+        const ssize_t got = co_await store->pread(buf.data(), buf.size(), 100);
+        REQUIRE(got == 1000);
         auto untarred =
-            co_await source::TarOffsetSource::open(std::move(cache));
+            co_await source::TarOffsetSource::open(std::move(store));
         REQUIRE(co_await format::is_zfile(*untarred));
         auto view =
             co_await format::ZFileSource::open(std::move(untarred), true);
@@ -357,8 +364,8 @@ TEST_CASE("integration: layered stack stages over a mock registry",
         layers.push_back(std::move(layer));
         auto merged = co_await format::MergedLsmt::open(std::move(layers));
         std::vector<uint8_t> all(raw.size());
-        REQUIRE(co_await merged->pread(all.data(), all.size(), 0) ==
-                static_cast<ssize_t>(raw.size()));
+        const ssize_t rd = co_await merged->pread(all.data(), all.size(), 0);
+        REQUIRE(rd == static_cast<ssize_t>(raw.size()));
         REQUIRE(all == raw);
         co_return 0;
     });
@@ -452,97 +459,122 @@ TEST_CASE("integration: registry pipeline serves a zfile-compressed image",
     REQUIRE(rc == 0);
 }
 
-TEST_CASE("integration: downloader writes, verifies and installs the blob",
+TEST_CASE("integration: background fill completes a layer through image assembly",
           "[integration]") {
     TempDir dir;
-    auto blob = test::pattern_bytes(96 * 1024, 61);
+    const auto raw = test::pattern_bytes(512 * 256, 73);
+    const auto blob = make_zfile_blob(dir, raw);
+    // Several 64 KiB extents, so fill has meaningful work after the reads.
+    REQUIRE(blob.size() > 2 * 64 * 1024);
     const std::string digest_hex = sha256_hex_of(blob);
+    const std::string layer_dir = dir / "layer_fill";
+    constexpr size_t kPrefix = 8192;
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19196);
+        BlobServer server(blob, 19194);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
         co_await elio::time::sleep_for(std::chrono::milliseconds(50));
 
-        auto client = std::make_shared<source::RegistryClient>(
-            nullptr, source::RegistryClientConfig{});
-        auto remote =
-            co_await source::RegistrySource::open(client, server.url("blob"));
-        const std::string layer_dir = dir / "layer1";
-        std::filesystem::create_directories(layer_dir);
+        auto cfgj = remote_image_config_with_dir(server.repo_base(),
+                                                 digest_hex, blob.size(),
+                                                 layer_dir);
+        cfgj["download"] =
+            nlohmann::json{{"enable", true}, {"delay", 0}, {"delayExtra", 0}};
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        const image::GlobalConfig global;
 
-        source::DownloadConfig dcfg;
-        dcfg.enable = true;
-        dcfg.delay_sec = 0;
-        dcfg.delay_extra_sec = 0;
-        dcfg.block_size = 16 * 1024;
-        source::Downloader dl(std::move(remote), layer_dir, digest_hex, dcfg);
-        dl.start();
-        for (int i = 0; i < 400 &&
-                        dl.status() != source::Downloader::Status::kDone &&
-                        dl.status() != source::Downloader::Status::kFailed;
-             ++i) {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(25));
+        // Run 1: reads work immediately; the background fill warms every
+        // remaining extent and drives the store to overlaybd.commit.
+        {
+            auto opened = co_await image::open_image(cfg, global);
+            std::vector<uint8_t> buf(kPrefix);
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(kPrefix));
+            REQUIRE(buf == std::vector<uint8_t>(raw.begin(),
+                                                raw.begin() + kPrefix));
+            bool committed = false;
+            for (int i = 0; i < 400 && !committed; ++i) {
+                committed = std::filesystem::exists(layer_dir +
+                                                    "/overlaybd.commit");
+                if (!committed) {
+                    co_await elio::time::sleep_for(
+                        std::chrono::milliseconds(25));
+                }
+            }
+            REQUIRE(committed);
+            // Fill fetched the extents the prefix read never touched.
+            REQUIRE(server.served_extent_count() ==
+                    (blob.size() + 64 * 1024 - 1) / (64 * 1024));
+            // Park the fill before the chain is destroyed (LayerStore
+            // lifetime contract).
+            co_await image::park_image_fills(opened);
         }
-        REQUIRE(dl.status() == source::Downloader::Status::kDone);
-        REQUIRE(dl.bytes_done() == blob.size());
-        const int fd =
-            ::open(source::Downloader::target_path(layer_dir).c_str(),
-                   O_RDONLY);
-        REQUIRE(fd >= 0);
-        std::vector<uint8_t> got(blob.size());
-        REQUIRE(::read(fd, got.data(), got.size()) ==
-                static_cast<ssize_t>(got.size()));
-        ::close(fd);
-        REQUIRE(got == blob);
+        const uint64_t served_gets = server.data_gets();
+
+        // Run 2: the commit binds via the local probe — zero remote data
+        // reads, byte-exact content.
+        {
+            auto opened = co_await image::open_image(cfg, global);
+            REQUIRE(opened.virtual_size == raw.size());
+            std::vector<uint8_t> buf(raw.size());
+            const ssize_t r = co_await opened.root->pread(buf.data(),
+                                                          buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(raw.size()));
+            REQUIRE(buf == raw);
+        }
+        REQUIRE(server.data_gets() == served_gets);
         co_return 0;
     });
     REQUIRE(rc == 0);
 }
 
-TEST_CASE("integration: switch source swaps reads to the local copy",
+TEST_CASE("integration: unwritable layer dir degrades to remote-only reads",
           "[integration]") {
     TempDir dir;
-    auto blob = test::pattern_bytes(64 * 1024, 71);
+    const auto raw = test::pattern_bytes(512 * 32, 83);
+    const auto blob = make_zfile_blob(dir, raw);
     const std::string digest_hex = sha256_hex_of(blob);
+    // A regular file where the layer dir's parent should be: the dir can
+    // never be created or opened (ENOTDIR) — the image must still boot
+    // (ADR-0016), served remote-only.
+    test::write_file(dir / "blocker", {1, 2, 3});
+    const std::string layer_dir =
+        std::string(dir / "blocker") + "/layer";
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19197);
+        BlobServer server(blob, 19189);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
         co_await elio::time::sleep_for(std::chrono::milliseconds(50));
 
-        auto client = std::make_shared<source::RegistryClient>(
-            nullptr, source::RegistryClientConfig{});
-        const std::string url = server.url("blob");
-        auto cached = co_await source::ChunkCache::open(
-            co_await source::RegistrySource::open(client, url));
-        auto raw_remote = co_await source::RegistrySource::open(client, url);
-        const std::string layer_dir = dir / "layer2";
-        std::filesystem::create_directories(layer_dir);
-        source::DownloadConfig dcfg;
-        dcfg.enable = true;
-        dcfg.delay_sec = 0;
-        dcfg.delay_extra_sec = 0;
-        auto sw = co_await source::SwitchSource::open(
-            std::move(cached), std::move(raw_remote), layer_dir, digest_hex,
-            dcfg);
-        REQUIRE(!sw->switched());
-        std::vector<uint8_t> buf(4096);
-        REQUIRE(co_await sw->pread(buf.data(), buf.size(), 0) == 4096);
-        for (int i = 0; i < 400 && !sw->switched(); ++i) {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(25));
-        }
-        REQUIRE(sw->switched());
-        std::vector<uint8_t> buf2(4096);
-        REQUIRE(co_await sw->pread(buf2.data(), buf2.size(), 8192) == 4096);
-        REQUIRE(buf2 == std::vector<uint8_t>(blob.begin() + 8192,
-                                             blob.begin() + 8192 + 4096));
+        const auto cfgj = remote_image_config_with_dir(
+            server.repo_base(), digest_hex, blob.size(), layer_dir);
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        const image::GlobalConfig global;
+        auto opened = co_await image::open_image(cfg, global);
+        REQUIRE(opened.virtual_size == raw.size());
+        std::vector<uint8_t> buf(raw.size());
+        const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(),
+                                                      0);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        REQUIRE(buf == raw);
+        REQUIRE(server.data_gets() > 0);
         co_return 0;
     });
     REQUIRE(rc == 0);
+    // No persistence state leaked anywhere under the temp dir.
+    bool staged = false;
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(dir.str())) {
+        if (entry.path().filename().string().starts_with(".download.")) {
+            staged = true;
+        }
+    }
+    REQUIRE(!staged);
 }
 
 TEST_CASE("integration: image assembly serves remote reads through the layer store",

@@ -1,7 +1,7 @@
 # ADR-0015: Single-flight registry token re-auth with expires_in-honoring cache lifetimes
 
-- Status: proposed
-- Date: 2026-09-08
+- Status: accepted
+- Date: 2026-09-09
 - Supersedes: none
 - Binds: docs/source.md, src/source/registry.hpp, src/source/registry.cpp
 

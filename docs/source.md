@@ -1,9 +1,8 @@
 # Source Module (`src/source`)
 
 Pluggable blob sources behind one async byte-source interface: local files,
-OCI registry HTTP range reads, a DART P2P proxy front-end, an in-memory chunk
-cache, a background downloader, a remote→local switch source, and a
-sparse-file layer store.
+OCI registry HTTP range reads, a DART P2P proxy front-end, and a sparse-file
+layer store with background fill.
 
 ## Overview
 
@@ -24,18 +23,15 @@ blob gets its own source stack, assembled bottom-up from these pieces:
 - **DART proxy support** (`dart.hpp`) — address parsing and a bounded
   reachability probe for the external DART P2P proxy; the actual request-URL
   rewriting lives in `RegistryClient` (ADR-0005).
-- **ChunkCache** — an in-memory LRU cache of ~64 KiB chunks in front of a
-  slow remote source.
 - **TarOffsetSource** — auto-detection and removal of the tar wrapper that
   overlaybd puts around layer blobs.
-- **Downloader / SwitchSource** — an optional background full-blob download
-  into the per-layer directory, with an atomic switch of the read path once
-  the local copy is verified and installed.
 - **LayerStore** — sparse-file layer persistence with a sidecar extent map
   and per-extent CRC32 (ADR-0011): every remote byte served is persisted
   into a local staging file, so remote dependence shrinks monotonically and
   survives restarts. This is the component image assembly wires behind
-  `RegistrySource` for every remote layer with a per-layer directory.
+  `RegistrySource` for every remote layer with a per-layer directory; its
+  optional background fill (the `download` config contract) warms the whole
+  layer without readers.
 - **CredentialStore** — registry credentials from the overlaybd-compatible
   credential file, with longest-prefix matching.
 - **base64** (`base64.hpp`) — a minimal RFC 4648 codec used for Basic-auth
@@ -52,7 +48,7 @@ mode (ADR-0008; the concrete writable layers live in `src/format`).
 Every source is a positional, immutable byte range:
 
 - **Immutability** — a blob's content and size never change for the lifetime
-  of the source. This is what makes caching (ChunkCache) and wrapping
+  of the source. This is what makes persistence (LayerStore) and wrapping
   (TarOffsetSource) sound without invalidation logic.
 - **Positional reads** — `pread(buf, count, offset)` never carries a cursor;
   concurrent reads on one source are independent.
@@ -70,9 +66,9 @@ Every source is a positional, immutable byte range:
   RegistrySource → LayerStore → TarOffsetSource
   ```
 
-  (A remote layer without a per-layer `dir` is the one exception: it keeps
-  the legacy `RegistrySource → ChunkCache` chain until part 3 — see
-  `docs/image.md`. The format module then wraps this with ZFile/LSMT
+  (A remote layer without a per-layer `dir` is the one exception: it is a
+  plain `RegistrySource` — remote-only, no local persistence; see
+  `docs/image.md`. The format module then wraps the chain with ZFile/LSMT
   readers; see `docs/image.md` for the full per-lower chain.)
 
 ### Hot path vs cold path error reporting
@@ -90,7 +86,7 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
 ### The registry request contract (registryfs v2 semantics)
 
 `RegistryClient` mirrors overlaybd's `registryfs_v2.cpp` behavior
-(`docs/design-assumptions.md` §S-3):
+(the registry contract, mirrored from overlaybd):
 
 - **GET with Range only** — never HEAD. Blob size comes from a `Range:
   bytes=0-0` probe's `Content-Range` total.
@@ -153,39 +149,40 @@ two shapes (overlaybd `tar/tar_file.cpp`):
 `TarOffsetSource::open` probes the first block(s) and either returns a
 wrapping source or hands the original source back unchanged.
 
-### Background download and the remote→local switch
+### Background fill (the download contract)
 
-**Retired from image assembly (ADR-0011 part 2).** Assembly no longer
-composes `Downloader`/`SwitchSource` — the `LayerStore` replaced them and
-the `ChunkCache` in the remote-layer chain. The components remain in the
-module (their tests compose them manually) until the ADR-0011 follow-up
-(part 3), which ports background fill into the LayerStore and decides
-their removal. The historical mechanism, kept for reference:
+When the image config's `download.enable` is set, the `LayerStore` starts a
+background fill coroutine at open: a scavenger-class bulk walk that warms
+every extent nobody has read yet, so a long-lived device's locality does not
+depend on access patterns (overlaybd's background-download contract, ported
+onto the ADR-0011 machinery):
 
-When `download.enable` was set, a background `Downloader` pulled the whole
-blob into the per-layer directory while reads kept being served remotely
-(overlaybd's download contract):
-
-- staging file `<dir>/.download`, `ftruncate`'d sparse to the blob size;
-- resume via `SEEK_HOLE` (a previous partial download continues where it
-  stopped; filesystems without `SEEK_HOLE` restart from 0);
-- chunked reads (`block_size`) with a per-second throughput window
-  (`maxMBps`);
-- on completion the file is sha256-verified against the image-config digest
-  (mismatch → discard and restart, up to `tryCnt` attempts), then atomically
-  `rename()`d to `<dir>/overlaybd.commit`;
-- the `SwitchSource` in the read path flips to the local file via a shared
-  control block — whole-file, not per-extent
-  (`docs/design-assumptions.md` §S-4).
+- start delay `delay_sec` plus a uniform random `0..delay_extra_sec` jitter
+  (`std::random_device`; not part of the determinism surface);
+- the ADR-0011 bulk path: contiguous missing extents are coalesced into
+  larger range reads (capped near 1 MiB; `blockSize` tunes the cap) and the
+  result is split back into extents for persistence accounting;
+- a per-second throughput budget (`maxMBps` MiB/s) throttles fill traffic;
+- fill is the ADR-0012 `Fill` scavenger class: it runs at concurrency 1 and
+  back-pressures itself when the write-behind queue is full — readers are
+  never queued behind fill traffic. (The ADR-0012 admission funnel governs
+  fill admission once it lands; until then the single-walk concurrency is
+  the conservative default.)
+- transient remote errors back off (2 s doubling, capped at 64 s) and the
+  walk resumes — persisted extents survive in the sidecar, so progress is
+  never lost;
+- completion rides the same sha256-verify + atomic rename as read-through
+  warming; a verification mismatch restarts fresh, bounded by `try_count`
+  (the `tryCnt` knob);
+- `Bypass` disables fill (the same rule as on-demand persistence), and a
+  `populate`/prefetch path shares the extent map with both.
 
 ### Sparse layer persistence (ADR-0011)
 
 `LayerStore` persists every remotely-served byte into a sparse local staging
 file, so a layer's dependence on the remote shrinks monotonically and
 survives restarts. Image assembly wires it behind `RegistrySource` for
-every remote layer with a non-empty `dir` (part 1 landed the component;
-part 2 wired it in place of ChunkCache/SwitchSource; part 3 ports
-background fill into it):
+every remote layer with a non-empty `dir`:
 
 - one staging file `<dir>/.download.<nonce>` (sparse-truncated to the blob
   size) plus one sidecar `<dir>/.bitmap.<nonce>`; the shared nonce in the
@@ -205,11 +202,15 @@ background fill into it):
 - persistence is write-behind on a bounded, droppable queue drained by a
   dedicated plain `std::thread` (readers are never back-pressured, and no
   Elio worker ever runs a blocking syscall); `ENOSPC`/`EIO` moves the store
-  into a bypass state — writes stop, reads continue purely remote;
+  into a bypass state — writes stop, fill switches off, reads continue
+  purely remote;
 - when every extent is present, the staging file is sha256-verified against
   the image-config digest and atomically renamed to
-  `<dir>/overlaybd.commit` — the same committed-layer contract the
-  Downloader installs; a mismatch restarts fresh (bounded by `try_count`).
+  `<dir>/overlaybd.commit` — the committed-layer contract the local probe
+  binds; a mismatch restarts fresh (bounded by `try_count`);
+- when the commit file binds at open, any stale `.download.*`/`.bitmap.*`
+  pair left beside it (a previous run that died between record writes and
+  the rename) is swept — it could never win the probe.
 
 ### Credentials
 
@@ -437,57 +438,6 @@ around an overlaybd layer blob.
 
 Cost: `open` costs one (usually) or two (pax) 512-byte reads.
 
-### `chunk_cache.hpp` — ChunkCache
-
-```cpp
-class ChunkCache final : public BlobSource {
-public:
-    struct Config {
-        size_t chunk_size = 64 * 1024;
-        size_t max_bytes = 256ULL * 1024 * 1024;
-    };
-    static elio::coro::task<std::unique_ptr<ChunkCache>> open(
-        BlobSourcePtr inner);
-    static elio::coro::task<std::unique_ptr<ChunkCache>> open(
-        BlobSourcePtr inner, Config cfg);
-    elio::coro::task<ssize_t> pread(void* buf, size_t count,
-                                    uint64_t offset) override;
-    uint64_t size() const noexcept override;
-    std::string_view label() const noexcept override;
-    uint64_t hits() const noexcept;
-    uint64_t misses() const noexcept;
-};
-```
-
-`src/source/chunk_cache.hpp::ChunkCache` — an in-memory LRU cache of
-fixed-size chunks in front of a slow source (registry or DART). It stands in
-for overlaybd's file-based cache: the per-device process model makes a
-private in-memory cache simpler and safer than shared on-disk cache files,
-and when DART is in the path DART itself provides the shared on-node disk
-cache (`docs/design-assumptions.md` §S-4). Since ADR-0011 part 2, image
-assembly composes it **only on the no-dir exception path** (a remote layer
-without `lower.dir`, where no persistence is possible): dir-configured
-remote layers use the `LayerStore` instead, with the kernel page cache
-over the staging/commit file as the L1; the component remains until the
-part-3 follow-up decides its removal.
-
-- `open(inner, cfg)` — takes ownership of `inner`, which must report a
-  stable size. Throws `obd::error(EINVAL)` on a null source or an invalid
-  config (`chunk_size == 0` or `max_bytes < chunk_size`). The one-argument
-  overload uses the defaults (64 KiB chunks, 256 MiB budget).
-- `pread` — serves the request chunk by chunk. On a miss the whole
-  containing chunk is filled from the inner source *outside* the lock, then
-  inserted; eviction runs from the LRU back until within `max_bytes` (the
-  just-filled chunk is never its own victim). Returns the full clamped count
-  on success. On an inner error: bytes already served are returned, or the
-  inner error / `-EIO` (short fill) when nothing was served yet.
-- `hits()` / `misses()` — monotonic chunk-request counters (relaxed
-  atomics); observability only.
-
-Complexity: O(1) map/list operations per chunk touched, plus one memcpy per
-chunk; a miss costs one inner `pread` of one chunk. Memory is bounded by
-`max_bytes` plus one in-flight fill per concurrent miss.
-
 ### `credentials.hpp` — Credential, CredentialStore
 
 ```cpp
@@ -568,122 +518,6 @@ prefix is `/dart`).
   `check_accelerate_url()`: on `false` the caller falls back to direct
   registry reads instead of failing the device.
 
-### `downloader.hpp` — DownloadConfig, Downloader
-
-```cpp
-struct DownloadConfig {
-    bool enable = false;
-    uint32_t delay_sec = 300;        // start delay after device open
-    uint32_t delay_extra_sec = 30;   // + random(0, extra)
-    uint32_t max_mbps = 100;         // throttle, MiB/s
-    uint32_t try_count = 5;
-    uint32_t block_size = 256 * 1024;
-};
-```
-
-`src/source/downloader.hpp::DownloadConfig` — the overlaybd download knobs
-(config field names: `enable`, `delay`, `delayExtra`, `maxMBps`, `tryCnt`,
-`blockSize`; see `docs/image.md` and `docs/config.md`).
-
-```cpp
-class Downloader {
-public:
-    enum class Status : int { kIdle, kWaiting, kDownloading, kVerifying,
-                              kDone, kFailed };
-    Downloader(BlobSourcePtr remote, std::string dir,
-               std::string expected_sha256, DownloadConfig cfg);
-    void start();
-    Status status() const noexcept;
-    int last_error() const noexcept;
-    uint64_t bytes_done() const noexcept;
-    uint64_t bytes_total() const noexcept;
-    static std::string staging_path(const std::string& dir);  // dir/.download
-    static std::string target_path(const std::string& dir);   // dir/overlaybd.commit
-    std::function<elio::coro::task<void>(const std::string&)> on_complete;
-};
-```
-
-`src/source/downloader.hpp::Downloader` — pulls one remote blob into the
-per-layer directory in the background. (Not wired by image assembly since
-ADR-0011 part 2; see Concepts §"Background download and the remote→local
-switch".)
-
-- The constructor takes ownership of `remote` (the raw, un-cached source —
-  the download must not pollute the read-path chunk cache) and snapshots
-  `bytes_total` from `remote->size()`. `expected_sha256` is the hex digest
-  payload from the image config; empty disables verification (logged as a
-  warning).
-- `src/source/downloader.hpp::Downloader::start` — spawns the download
-  coroutine (`elio::go`) and returns immediately. **Requires a running Elio
-  scheduler on the calling thread.**
-- Lifecycle: `kWaiting` (start delay `delay_sec + random(0,
-  delay_extra_sec)`) → `kDownloading` → `kVerifying` → `kDone`, or `kFailed`
-  after `try_count` attempts. Each attempt opens
-  `src/source/downloader.hpp::Downloader::staging_path`
-  (`O_RDWR | O_CREAT`, mode 0644), truncates it sparse to the blob size,
-  resumes from the first `SEEK_HOLE` hole, then copies `block_size` chunks
-  under a per-second `max_mbps` MiB token window. A sha256 mismatch (or any
-  verification failure) discards the staging file and restarts from scratch
-  after a 1 s pause; `last_error` records the most recent errno.
-- On success the staging file is atomically `rename()`d to
-  `src/source/downloader.hpp::Downloader::target_path`, status becomes
-  `kDone`, and `on_complete(target_path)` is `co_await`ed on the scheduler.
-  The callback runs before `run()` finishes; it must not outlive the
-  scheduler.
-- `status()`, `last_error()`, `bytes_done()`, `bytes_total()` are relaxed
-  atomic snapshots — safe to poll from any thread (the supervisor/obdctl
-  status path does so).
-- The download is best-effort: `kFailed` never fails reads (the read path
-  keeps using the remote source). There is no cancellation API; the
-  downloader object must be kept alive until `kDone`/`kFailed` (the owning
-  `SwitchSource` holds it in a `shared_ptr`).
-
-### `switch_source.hpp` — SwitchSource
-
-```cpp
-class SwitchSource final : public BlobSource {
-public:
-    static elio::coro::task<std::unique_ptr<SwitchSource>> open(
-        BlobSourcePtr remote, BlobSourcePtr raw_remote, std::string dir,
-        std::string expected_sha256, const DownloadConfig& dl_cfg);
-    elio::coro::task<ssize_t> pread(void* buf, size_t count,
-                                    uint64_t offset) override;
-    uint64_t size() const noexcept override;
-    std::string_view label() const noexcept override;
-    bool switched() const noexcept;
-    Downloader* downloader() const noexcept;
-    struct Control { std::atomic<std::shared_ptr<BlobSource>> local; };
-};
-```
-
-`src/source/switch_source.hpp::SwitchSource` — the atomic remote→local
-switch of a blob's read path (overlaybd `SwitchFile`, simplified to a
-whole-file switch per `docs/design-assumptions.md` §S-4). (Not wired by
-image assembly since ADR-0011 part 2; see Concepts §"Background download
-and the remote→local switch".)
-
-- `open(remote, raw_remote, dir, expected_sha256, dl_cfg)` — `remote` is the
-  read path used until the switch (typically the chunk-cached
-  registry/DART source); `raw_remote` is the un-cached source the downloader
-  reads from. Throws `obd::error(EINVAL)` on a null `remote`, or on
-  `dl_cfg.enable` with a null `raw_remote`.
-  - If `<dir>/overlaybd.commit` already exists (downloaded by a previous
-    run), it is opened immediately, reads bind to it, and **no download is
-    started**.
-  - Else, when `dl_cfg.enable` is set, the background download starts
-    immediately (requires a running scheduler; see `Downloader::start`).
-- `pread` — one atomic load per request: serves from the local file once
-  switched, else from `remote`. Never throws; errors propagate from
-  whichever source served the read.
-- `src/source/switch_source.hpp::SwitchSource::switched` — true once reads
-  are served locally. `src/source/switch_source.hpp::SwitchSource::downloader`
-  — the owned downloader (or null), for status reporting.
-- The `Control` block is shared with the downloader's completion coroutine
-  via `shared_ptr`, so the switch can land even if the `SwitchSource` itself
-  has been released by then; a failed local open is logged and non-fatal
-  (reads keep working over the remote). Public only for the completion
-  helper — not part of the module API.
-
 ### `layer_store.hpp` — LayerStore
 
 ```cpp
@@ -693,8 +527,17 @@ public:
         uint32_t extent_size = 64 * 1024;
         uint64_t queue_max_bytes = 4ULL * 1024 * 1024;
         uint32_t try_count = 5;
+        struct Fill {
+            bool enable = false;
+            uint32_t delay_sec = 300;
+            uint32_t delay_extra_sec = 30;
+            uint32_t max_mbps = 100;
+            uint32_t block_size = 256 * 1024;
+        } fill;
     };
     enum class State : int { Filling = 0, Complete = 1, Bypass = 2 };
+    enum class FillStatus : int { kDisabled, kWaiting, kFilling, kDone,
+                                  kStopped };
     static elio::coro::task<std::unique_ptr<LayerStore>> open(
         BlobSourcePtr remote, std::string dir, std::string expected_sha256_hex);
     static elio::coro::task<std::unique_ptr<LayerStore>> open(
@@ -712,6 +555,8 @@ public:
     uint64_t crc_failures() const noexcept;
     uint64_t remote_fetches() const noexcept;
     uint64_t coalesced_joins() const noexcept;
+    FillStatus fill_status() const noexcept;
+    void stop_fill() noexcept;
     void set_test_write_hook(std::function<int(uint64_t)> hook);  // test-only
 };
 ```
@@ -726,7 +571,8 @@ remote bytes into a sparse local staging file with a sidecar extent map
   the image config (an optional `sha256:` prefix is stripped; empty means no
   completion verification, logged). If `<dir>/overlaybd.commit` exists, the
   store binds to it read-only (state `Complete`, no staging, no writer
-  thread). Otherwise it scans `dir` for a `.download.X`/`.bitmap.X` pair
+  thread) and sweeps any stale `.download.*`/`.bitmap.*` pair files left
+  beside it. Otherwise it scans `dir` for a `.download.X`/`.bitmap.X` pair
   whose sidecar header (magic, version, extent size, blob size, extent
   count, layer sha256, nonce, header CRC32) matches this layer; a valid
   pair's records are loaded and filling resumes, anything unpaired or
@@ -734,10 +580,13 @@ remote bytes into a sparse local staging file with a sidecar extent map
   Filesystem probing and staging-pair creation run through
   `elio::spawn_blocking`, so setup disk I/O does not occupy an Elio worker.
   A zero-length layer starts its writer in the completion check and is
-  committed immediately.
+  committed immediately. When `Config::fill.enable` is set (and the store
+  is `Filling`), the background fill coroutine starts here (see Concepts
+  §"Background fill").
   Throws `obd::error` on unrecoverable setup problems (null remote, bad
   config, missing/unwritable `dir`, unloadable commit file, staging-pair
-  creation failure).
+  creation failure); image assembly degrades such failures to remote-only
+  reads rather than failing the image (ADR-0016).
 - `pread` — splits the request into extents. In `Complete` state: plain
   positional reads from the commit file. In `Filling` state, a present
   extent is read locally and CRC32-verified (the tail extent over its actual
@@ -747,11 +596,23 @@ remote bytes into a sparse local staging file with a sidecar extent map
   concurrent readers of the same missing extent join one fetch
   (`coalesced_joins`) — and the fetched bytes are enqueued for write-behind
   (not in `Bypass`). Returns the clamped count, or a negative `-errno` /
-  `-EIO` on remote error/short fill (matching ChunkCache). Never throws.
+  `-EIO` on remote error/short fill. Never throws.
 - `src/source/layer_store.hpp::LayerStore::populate` — warms every missing
   extent in `[offset, offset+len)` through the same coalesced fetch and
   write-behind path without delivering data; returns 0 or a negative
   `-errno`. No-op (0) in `Complete` and `Bypass`.
+- Background fill (`Config::fill`) — one scavenger coroutine walking the
+  extent map and fetching contiguous missing runs as coalesced range reads
+  (cap `max(fill.block_size, extent_size)`, ≤ 1 MiB), split back into
+  extents for the write-behind queue. Fill waits for queue room instead of
+  dropping its own work (a reader's write stays droppable — the walk would
+  just re-fetch it). Start delay `delay_sec + random(0, delay_extra_sec)`,
+  a per-second `max_mbps` MiB/s budget, transient-error backoff, and
+  completion through the same sha256 + rename path as read-through
+  warming. `stop_fill()` asks the walk to exit (prompt once past the start
+  delay); `fill_status()` reports `kDisabled`/`kWaiting`/`kFilling`/
+  `kDone`/`kStopped`. Fill shares the lifetime contract below: park it
+  (`stop_fill` + a terminal `fill_status`) before destroying the store.
 - Write-behind: fetched extents queue (bounded by `queue_max_bytes`) for a
   dedicated writer thread that `pwrite`s data, then the 8-byte sidecar
   record, then sets the in-memory bit. A full queue drops the entry and
@@ -769,8 +630,9 @@ remote bytes into a sparse local staging file with a sidecar extent map
   `Bypass` (logged as an error).
 - Observability — `state()` (`src/source/layer_store.hpp::LayerStore::State`),
   `extents_present()`/`extents_total()`, `dropped_writes()`,
-  `crc_failures()`, `remote_fetches()`, `coalesced_joins()` are relaxed
-  atomic snapshots, safe to poll from any thread.
+  `crc_failures()`, `remote_fetches()`, `coalesced_joins()`,
+  `fill_status()` are relaxed atomic snapshots, safe to poll from any
+  thread.
 - `src/source/layer_store.hpp::LayerStore::set_test_write_hook` — test-only
   hook invoked by the writer thread before persisting each entry; a non-zero
   return is treated as a pwrite failure with that errno. Not part of the
@@ -813,17 +675,10 @@ Callers may rely on:
   content: reading the same range through any composition of the sources
   above yields byte-identical results to reading the underlying blob at the
   translated offset.
-- **ChunkCache correctness under races** — concurrent fills of the same
-  chunk are harmless (the data is immutable; last insert wins) and every
-  reader serves correct bytes; the cache never serves partial chunks.
-- **Switch atomicity** — each `SwitchSource::pread` is served entirely by
-  the remote or entirely by the local copy; the flip is a single atomic
-  pointer load, so no read can observe a torn mix of the two.
-- **Download integrity** — `overlaybd.commit` only ever appears via an
-  atomic `rename()` after a successful sha256 verification (when a digest is
-  configured); a `.download` staging file is never served to readers. This
-  holds for both the Downloader and LayerStore (whose staging file is
-  per-extent CRC-verified before any byte of it is served).
+- **Commit integrity** — `overlaybd.commit` only ever appears via an atomic
+  `rename()` after a successful sha256 verification (when a digest is
+  configured); a `.download.<nonce>` staging file is never served to
+  readers (every byte of it is per-extent CRC-verified before it is).
 - **LayerStore crash rule** — a sidecar bit is set only after the extent's
   data write completed, and every local read verifies the extent's CRC32:
   a crash or torn write degrades to a re-fetch, never to bad data.
@@ -834,37 +689,37 @@ Callers may rely on:
 
 - **Scheduler context** — every `open`, `pread`, `pwrite`, `flush`,
   `populate`, `get_data`, `get_length`, `dart_proxy_reachable`, and the
-  downloader coroutine must run on a thread with a running Elio scheduler.
-  `start()` additionally requires it at call time (`elio::go`).
+  LayerStore fill coroutine must run on a thread with a running Elio
+  scheduler.
   `CredentialStore` and the base64 helpers are synchronous and
   scheduler-free. LayerStore's blocking disk writes (and its completion
   read-back) run on its own dedicated plain `std::thread`, never on an Elio
   worker — the same precedent as the ublk queue threads.
 - **Concurrent reads** — concurrent `pread`s on one source are safe for
   every type in this module. `LocalFileSource` and `RegistrySource` are
-  stateless per read; `ChunkCache` serializes its index under an
-  `elio::sync::mutex` and fills outside the lock; `SwitchSource` reads an
-  atomic pointer; `RegistryClient`'s caches are mutex-guarded and its token
-  exchanges are single-flight per key (concurrent re-auths share one
+  stateless per read; `RegistryClient`'s caches are mutex-guarded and its
+  token exchanges are single-flight per key (concurrent re-auths share one
   exchange, ADR-0015); `LayerStore`
   shares its extent map with the writer thread through per-extent atomics
-  and coalesces concurrent fetches of one extent to a single remote read.
-- **Instance state** — mutable state per instance: `ChunkCache` (chunk map,
-  LRU, counters), `RegistryClient` (token and URL-info caches), `Downloader`
-  (status atomics), `SwitchSource::Control` (the atomic local pointer),
-  `LayerStore` (extent map, write-behind queue, state/counter atomics). No
+  and coalesces concurrent fetches of one extent to a single remote read;
+  the fill coroutine never holds the fetch-coalescing lock over a wait, so
+  readers stay latency-bounded while fill is active.
+- **Instance state** — mutable state per instance: `RegistryClient` (token
+  and URL-info caches), `LayerStore` (extent map, write-behind queue,
+  state/counter/fill atomics). No
   hidden global mutable state anywhere in the module.
 - **Buffer ownership** — `buf` arguments are borrowed for the duration of
-  the `co_await`; sources never retain pointers into caller buffers. Cached
-  chunk data is held by the cache as `shared_ptr<const …>`.
+  the `co_await`; sources never retain pointers into caller buffers.
+  Fetched extent data is held as `shared_ptr<const …>` while it awaits
+  write-behind.
 - **Object lifetimes** — sources are owned via `BlobSourcePtr`
   (`unique_ptr`); wrapping takes ownership. A `LocalFileSource` may be
   destroyed with reads in flight (the destructor orders the fd close against
-  the io_uring backend). A `Downloader` must outlive its coroutine — keep
-  the owning `SwitchSource` (or an explicit `shared_ptr<Downloader>`) alive
-  until `kDone`/`kFailed`. A `LayerStore` must not be destroyed while
-  `pread`/`populate` coroutines are in flight on it (a suspended fetch or
-  joiner touches members on resume).
+  the io_uring backend). A `LayerStore` must not be destroyed while
+  `pread`/`populate` coroutines or a background fill are in flight on it
+  (a suspended fetch, joiner, or fill step touches members on resume) —
+  park an active fill first: `stop_fill()` + `fill_status()` reaching
+  `kDone`/`kStopped`.
 - **Writable sources** — `WritableBlobSource::pwrite`/`flush` are called only
   from the ublk data plane on the image root, after the bridge has confirmed
   the root implements the interface; writers and readers may race on
@@ -883,16 +738,17 @@ Breaking changes (require an ADR per the trigger list in
   of the server's `expires_in` (30 s fallback) with single-flight,
   generation-counted re-auth; the redirect/URL-info cache keeps its fixed
   300 s. Registries and CDNs that work with overlaybd must keep working
-  here (`docs/design-assumptions.md` §S-3).
+  here.
 - **The DART integration shape** (ADR-0005): DART stays an external process
   reached by prefix passthrough (`base + "/" + full upstream URL`, embedded
   scheme preserved); in-process P2P is rejected. Enabled-but-unreachable
   DART must keep falling back to direct registry reads — a device must never
   fail to open because the accelerator is down.
-- **On-disk download artifacts**: staging name `.download`, target name
-  `overlaybd.commit`, sparse-truncate + `SEEK_HOLE` resume, sha256-verify +
-  atomic rename. Other tools (and earlier runs of this project) rely on
-  these names and states.
+- **On-disk persistence artifacts**: the staging-pair names
+  `.download.<nonce>` / `.bitmap.<nonce>`, the sidecar layout, and the
+  target name `overlaybd.commit` with its sha256-verify + atomic rename
+  rule. Other tools (and earlier runs of this project) rely on these names
+  and states.
 - **The credential file format** (`auths` map, `auth` or
   `username`/`password` entries) and longest-prefix matching semantics
   mirror overlaybd; operator credential files must keep working unchanged.
@@ -926,9 +782,6 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: tar adapter passes plain files through unwrapped` — a blob
   without ustar magic is handed back as the identical source object
   (passthrough identity), with size preserved.
-- `source: chunk cache serves repeats from memory` — a repeated range read
-  issues no additional inner reads (chunk hits), byte content is exact, and
-  the hit counter advances.
 - `source: credential store longest-prefix matching` — the longest matching
   `auths` key wins over a shorter host key, `auth`-form entries decode to
   `username`/`password`, and unknown hosts match nothing.
@@ -999,6 +852,29 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   matches) and completes to `overlaybd.commit` without verification.
 - `source: layer store completes an empty layer` — a zero-length remote
   creates an empty `overlaybd.commit` instead of remaining in `Filling`.
+- `source: layer store fill completes a partially warmed store` — with
+  fill enabled, one read-through extent plus the background walk warm the
+  whole layer: the store completes to `overlaybd.commit` (`kDone`) and a
+  reopen serves everything locally.
+- `source: layer store fill resumes from the sidecar across a restart` — a
+  fill stopped mid-walk leaves persisted extents in the sidecar; a reopen
+  resumes them (not refetched) and the restarted fill completes the layer.
+- `source: layer store fill honors the throughput throttle` — a 1 MiB/s
+  budget makes a 3 MiB fill take measurable seconds instead of
+  milliseconds.
+- `source: layer store fill stays off in bypass` — an injected `ENOSPC`
+  flips the store to `Bypass` mid-fill: fill stops (`kStopped`), reads
+  continue remotely, nothing persists, no commit appears.
+- `source: layer store fill is disabled without download.enable` — with
+  fill not configured there is no background traffic at all: `kDisabled`,
+  zero extents present, zero remote reads.
+- `source: layer store sweeps stale pairs when the commit binds` — a dir
+  holding `overlaybd.commit` plus leftover `.download.*`/`.bitmap.*` files
+  binds the commit and removes the pair files.
+- `source: layer store fill does not starve readers` — with fill active
+  and back-pressured (tiny queue, slow disk), eight concurrent-reader
+  preads of cold extents each complete within a bounded 1 s budget
+  byte-exactly.
 - `source: registry concurrent 401s share one token refresh` — eight
   concurrent reads that all take a 401 on the server-side-expired token
   trigger exactly one coalesced token exchange (the mock counts token
@@ -1029,10 +905,9 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   `expires_in=0`, the 30 s fallback for absent/negative values, and the
   7-day cap for absurd ones.
 - `integration: layered stack stages over a mock registry` — the manual
-  composition RegistrySource → ChunkCache → TarOffsetSource → ZFile → LSMT
-  merge reads the original content byte-exactly (a component-composition
-  test; image assembly itself now wires RegistrySource → LayerStore,
-  ADR-0011).
+  composition RegistrySource → LayerStore → TarOffsetSource → ZFile → LSMT
+  merge reads the original content byte-exactly (the same chain image
+  assembly wires, ADR-0011).
 - `integration: cancelled connect probe does not break later io` — a DART
   probe against a dead port returns `false` quickly and subsequent registry
   IO on the same scheduler is unaffected (no leaked cancellation state).
@@ -1040,18 +915,18 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   with `p2pConfig` enabled but nothing listening, image assembly still opens
   and serves the full image directly from the registry (ADR-0005 optional
   accelerator).
-- `integration: downloader writes, verifies and installs the blob` — the
-  downloader reaches `kDone`, `bytes_done == size`, and
-  `<dir>/overlaybd.commit` contains the blob byte-exactly after sha256
-  verification and rename.
-- `integration: switch source swaps reads to the local copy` — reads start
-  on the remote (`!switched()`), the switch flips after the download
-  completes, and post-switch reads serve byte-exact content from the local
-  copy.
+- `integration: background fill completes a layer through image assembly` —
+  with `download.enable` set, a first open reads a prefix while the
+  background fill warms every remaining extent to `overlaybd.commit`; a
+  second open binds the commit with zero additional remote reads.
+- `integration: unwritable layer dir degrades to remote-only reads` — a
+  layer dir that can never be created (a file blocks its parent path) does
+  not fail `open_image`: the image boots and serves byte-exact reads
+  remote-only, with no persistence state written (ADR-0016).
 - `integration: image assembly serves remote reads through the layer store` —
   image assembly wires `RegistrySource → LayerStore` for a remote lower
   and serves reads byte-exactly while persisting read-through state into
-  the layer dir (ADR-0011 part 2).
+  the layer dir (ADR-0011).
 - `integration: layer store restart serves warmed extents without remote reads` —
   a partially-warmed staging pair survives an assembly restart: the second
   open serves the warmed reads locally (mock remote-read counter flat).
@@ -1065,22 +940,14 @@ directly.
 
 ## Limitations & TODO
 
-- **No background fill yet (ADR-0011 part 3).** The `LayerStore` warms
-  read-through only: extents nobody reads stay remote until they are read.
-  Background whole-blob fill (the retired Downloader's role) returns in
-  the part-3 follow-up as LayerStore fill driven through `populate`.
-- **ChunkCache is memory-only and per-device.** It loses its content on
-  restart. Since ADR-0011 part 2, image assembly uses it only on the
-  no-dir exception path (a remote layer without `lower.dir`);
-  dir-configured layers are persisted by the sparse-file LayerStore, with
-  the kernel page cache as the L1. It remains as a composable component
-  until part 3 decides its removal. DART, when enabled, is the shared
-  on-node cache.
-- **Downloader/SwitchSource are unused by assembly.** The whole-file
-  switch never migrated extents incrementally
-  (`docs/design-assumptions.md` §S-4); ADR-0011 made locality gradual per
-  extent and retired the pair from image assembly in part 2. They remain
-  as composable components until part 3.
+- **The no-dir path has no local caching at all.** A remote layer without
+  `lower.dir` is served remote-only (the snapshotter always sets `dir`;
+  the empty case is the compatibility path). DART, when enabled, is the
+  shared on-node cache in front of such reads.
+- **Fill runs without admission governance (ADR-0012 pending).** The
+  background fill is the `Fill` scavenger class but the admission funnel
+  that should meter it against on-demand reads is not merged yet; until
+  then fill runs at conservative concurrency 1 per store.
 - **Single-request size bound** — one registry Range read is bounded by
   `RegistryClientConfig::max_response_size` (64 MiB default); larger single
   requests must be split by the caller (the format readers already read in
@@ -1098,10 +965,14 @@ directly.
   admission funnel (ADR-0012) remain open.
 - **credentialConfig mode=file only** — inline/secret credential modes are
   ignored (see `docs/image.md` / `docs/config.md`).
-- **Downloader has no cancellation** — a running download finishes or fails
-  on its own; device teardown relies on process exit (per-device isolation,
-  ADR-0004). `delay_extra_sec` uses `std::random_device` per download, so
-  delays are not reproducible run-to-run.
+- **Fill teardown goes through `park_image_fills`** — destroying a store
+  with a fill in flight is a use-after-free (the fill coroutine touches
+  members on resume), so assembled chains are parked before destruction
+  (the device server calls `park_image_fills` during shutdown; stores
+  composed by hand use `stop_fill()` + a terminal `fill_status()`; the
+  start delay is slept in 100 ms slices so parking is prompt).
+  `delay_extra_sec` uses `std::random_device` per store, so delays are
+  not reproducible run-to-run.
 - **Redirect caching trusts `Location` for 300 s** — a CDN URL that expires
   sooner surfaces as a re-resolution after a 401/403; other 4xx/5xx
   responses on a stale redirect map to their errno without extending the

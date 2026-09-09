@@ -10,8 +10,10 @@
 //     RegistrySource (shared RegistryClient; DART accelerate prefix when
 //     p2pConfig is enabled and reachable)
 //     → LayerStore (ADR-0011: read-through persistence into lower.dir,
-//       staging pair renamed to overlaybd.commit on completion; a lower
-//       without a dir keeps the legacy in-memory ChunkCache instead)
+//       staging pair renamed to overlaybd.commit on completion, optional
+//       background fill from the download section; a lower without a dir —
+//       or with a dir the store cannot open — is served remote-only,
+//       ADR-0016)
 //
 //   → TarOffsetSource (auto-detected tar wrapper)
 //   → ZFileSource when is_zfile(), else the raw view
@@ -22,7 +24,7 @@
 // MergedWritable whose topmost layer is the writable upper — reads fall
 // through to the lowers, writes land in the upper.
 //
-// Trace layer (ADR-0013, proposed): when the config carries
+// Trace layer (ADR-0013): when the config carries
 // `accelerationLayer: true`, the UPPERMOST lower is the acceleration
 // (trace) layer — it is set aside from the merge (not a data layer) and
 // its trace blob is replayed as populate() warm-up on the data lowers'
@@ -33,6 +35,7 @@
 #include "image/config.hpp"
 #include "image/trace_replay.hpp"
 #include "source/blob_source.hpp"
+#include "source/layer_store.hpp"
 
 #include <elio/coro/task.hpp>
 
@@ -50,6 +53,12 @@ struct OpenedImage {
     std::string upper_path;      // the writable layer file, when writable
     TraceReplayStats trace;      // ADR-0013 replay outcome (all zero when
                                  // no acceleration layer was configured)
+    /// The layer_stores vector holds non-owning handles to every
+    /// LayerStore in the chain (owned by `root`), for lifecycle
+    /// operations: background fills must be parked (call park_image_fills)
+    /// before the chain is destroyed on any path other than process
+    /// exit — see the LayerStore lifetime contract.
+    std::vector<source::LayerStore*> layer_stores;
 };
 
 /// Assembles the merged read-only view for an image. Throws obd::error /
@@ -57,5 +66,12 @@ struct OpenedImage {
 /// come up half-broken).
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                          const GlobalConfig& global);
+
+/// Parks every background fill in the assembled chain: stop_fill() on
+/// each store, then a bounded wait for a terminal fill_status. Call before
+/// destroying `opened.root` on any path other than process exit (device
+/// shutdown, tests) — destroying a store with a fill in flight is a
+/// use-after-free (the fill coroutine touches members on resume).
+elio::coro::task<void> park_image_fills(const OpenedImage& opened);
 
 }  // namespace obd::image

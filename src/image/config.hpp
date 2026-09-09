@@ -11,13 +11,26 @@
 //     resultFile, and optionally `upper` — a writable layer (ADR-0008).
 #pragma once
 
-#include "source/downloader.hpp"
-
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace obd::image {
+
+/// The overlaybd `download` section (schema contract, docs/config.md):
+/// global defaults in overlaybd.json, per-field overrides per image.
+/// Under ADR-0011 these knobs drive the LayerStore background fill:
+/// enable starts the fill; delay/delayExtra the start delay (+ jitter);
+/// maxMBps the throughput throttle; blockSize the range-read coalescing
+/// cap; tryCnt bounds completion-verify restarts.
+struct DownloadConfig {
+    bool enable = false;
+    uint32_t delay_sec = 300;        // start delay after device open
+    uint32_t delay_extra_sec = 30;   // + random(0, extra)
+    uint32_t max_mbps = 100;         // throttle, MiB/s
+    uint32_t try_count = 5;
+    uint32_t block_size = 256 * 1024;
+};
 
 struct GlobalConfig {
     /// credentialConfig: only mode=file is honored; inline/secret modes are
@@ -29,7 +42,7 @@ struct GlobalConfig {
     std::string p2p_address;  // e.g. "localhost:19145/dart"
 
     /// Global download defaults (per-image download sections override).
-    source::DownloadConfig download;
+    DownloadConfig download;
 
     /// logConfig.logLevel: 0=debug, 1=info, 2=warn, 3=error.
     int log_level = 1;
@@ -64,9 +77,9 @@ struct ImageConfig {
     std::string repo_blob_url;
     std::vector<LowerConfig> lowers;  // bottom-up: lowers[0] = base layer
     std::string result_file;          // informational in v0.1 (docs/config.md)
-    source::DownloadConfig download;  // merged over the global defaults
+    DownloadConfig download;  // merged over the global defaults
 
-    /// accelerationLayer (ADR-0013, proposed): the snapshotter's signal
+    /// accelerationLayer (ADR-0013): the snapshotter's signal
     /// that the UPPERMOST lower is the acceleration (trace) layer, not a
     /// data layer (trace-format.md §6 — upstream backstore config.v1.json
     /// carries the same field). Assembly sets that lower aside from the
@@ -86,9 +99,9 @@ struct ImageConfig {
     /// Throws obd::error on IO failure, obd::format_error on malformed
     /// JSON, obd::error(EINVAL) on an unknown `upper.type` (ADR-0008).
     static ImageConfig from_file(const std::string& path,
-                                 const source::DownloadConfig& defaults);
+                                 const DownloadConfig& defaults);
     static ImageConfig from_json_text(const std::string& text,
-                                      const source::DownloadConfig& defaults);
+                                      const DownloadConfig& defaults);
 };
 
 }  // namespace obd::image

@@ -430,7 +430,7 @@ private:
         try {
             const std::string text = co_await read_text_file(config);
             const image::ImageConfig img = image::ImageConfig::from_json_text(
-                text, source::DownloadConfig{});
+                text, image::DownloadConfig{});
             entry->image_config_ok = true;
             if (img.writable()) {
                 entry->upper_type = img.upper.type;
