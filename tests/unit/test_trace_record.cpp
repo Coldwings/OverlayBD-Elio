@@ -103,8 +103,17 @@ std::vector<format::trace::TraceRecord> parse_file(const std::string& path) {
     struct stat st {};
     REQUIRE(::fstat(fd, &st) == 0);
     std::vector<uint8_t> blob(static_cast<size_t>(st.st_size));
-    REQUIRE(::read(fd, blob.data(), blob.size()) ==
-            static_cast<ssize_t>(blob.size()));
+    // ::read may return short even for regular files; loop for the full
+    // contents (a single-read assumption is a real flake source).
+    size_t got = 0;
+    while (got < blob.size()) {
+        const ssize_t n = ::read(fd, blob.data() + got, blob.size() - got);
+        if (n <= 0) {
+            ::close(fd);
+            FAIL("short read of trace file");
+        }
+        got += static_cast<size_t>(n);
+    }
     ::close(fd);
     auto parsed = format::trace::parse(blob);
     REQUIRE(parsed.has_value());

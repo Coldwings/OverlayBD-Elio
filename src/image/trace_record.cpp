@@ -103,10 +103,13 @@ elio::coro::task<bool> TraceRecorder::start(
     // under its feet (silent data loss behind a clean "already in
     // progress"). Only the state winner truncates, below. O_NOFOLLOW:
     // the path is operator-provided over the control channel; never
-    // follow a symlink and clobber an unrelated file.
+    // follow a symlink and clobber an unrelated file. O_NONBLOCK: an
+    // operator-supplied path that names a FIFO must not block this
+    // coroutine forever on the open (a regular file is unaffected).
     const int fd =
         ::open(path.c_str(),
-               O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+               O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+               0644);
     if (fd < 0) {
         error = "cannot open trace output " + path + ": " +
                 std::strerror(errno);

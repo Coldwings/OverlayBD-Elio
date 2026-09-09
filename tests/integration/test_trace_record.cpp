@@ -188,9 +188,17 @@ TestImage make_test_image(const test::TempDir& dir, uint32_t seed) {
         throw std::system_error(errno, std::generic_category());
     }
     std::vector<uint8_t> payload(static_cast<size_t>(st.st_size));
-    if (::read(lfd, payload.data(), payload.size()) !=
-        static_cast<ssize_t>(payload.size())) {
-        throw std::system_error(errno, std::generic_category());
+    // ::read may return short even for regular files; loop for the full
+    // contents (a single-read assumption is a real flake source).
+    size_t got = 0;
+    while (got < payload.size()) {
+        const ssize_t n =
+            ::read(lfd, payload.data() + got, payload.size() - got);
+        if (n <= 0) {
+            ::close(lfd);
+            throw std::system_error(EIO, std::generic_category());
+        }
+        got += static_cast<size_t>(n);
     }
     ::close(lfd);
     TestImage img;
