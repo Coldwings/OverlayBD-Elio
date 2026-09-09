@@ -142,6 +142,13 @@ elio::coro::task<void> run_trace_control(
     ControlChannelWriterPtr channel,
     std::shared_ptr<image::TraceRecorder> recorder,
     TraceControlHooks hooks) {
+    // Both are required by every path below; dereferencing a null here
+    // would crash the detached coroutine. Refuse loudly instead.
+    if (!channel || !recorder) {
+        ELIO_LOG_ERROR("run_trace_control requires a channel and a "
+                       "recorder; refusing to run");
+        co_return;
+    }
     LineReader reader(channel->fd());
     for (;;) {
         auto line = co_await reader.next();

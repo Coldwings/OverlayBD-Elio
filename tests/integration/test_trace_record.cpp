@@ -86,15 +86,45 @@ private:
             co_return resp;
         }
         const auto& blob = it->second;
+        // Empty blobs must not underflow the default `last` or be
+        // served: range-not-satisfiable is the honest answer.
+        if (blob.empty()) {
+            http::response resp(http::status::range_not_satisfiable);
+            resp.set_header("Content-Length", "0");
+            co_return resp;
+        }
         const std::string_view range = ctx.req().header("Range");
         uint64_t first = 0, last = blob.size() - 1;
         bool partial = false;
         if (range.starts_with("bytes=")) {
+            // Malformed/partial Range headers must not throw out of the
+            // mock (stoull on an unvalidated substring would).
             const auto dash = range.find('-', 6);
-            first = std::stoull(std::string(range.substr(6, dash - 6)));
-            last = std::min<uint64_t>(
-                std::stoull(std::string(range.substr(dash + 1))),
-                blob.size() - 1);
+            if (dash == std::string_view::npos || dash == 6 ||
+                dash + 1 >= range.size()) {
+                http::response resp(http::status::bad_request);
+                resp.set_header("Content-Length", "0");
+                co_return resp;
+            }
+            char* endp = nullptr;
+            errno = 0;
+            const uint64_t a =
+                std::strtoull(std::string(range.substr(6, dash - 6)).c_str(),
+                              &endp, 10);
+            if (errno != 0 || endp == nullptr || *endp != '\0') {
+                http::response resp(http::status::bad_request);
+                resp.set_header("Content-Length", "0");
+                co_return resp;
+            }
+            const uint64_t b = std::strtoull(
+                std::string(range.substr(dash + 1)).c_str(), &endp, 10);
+            if (errno != 0 || endp == nullptr || *endp != '\0') {
+                http::response resp(http::status::bad_request);
+                resp.set_header("Content-Length", "0");
+                co_return resp;
+            }
+            first = a;
+            last = std::min<uint64_t>(b, blob.size() - 1);
             partial = true;
         }
         if (first >= blob.size() || first > last) {

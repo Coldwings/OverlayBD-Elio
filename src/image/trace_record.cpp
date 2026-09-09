@@ -326,12 +326,17 @@ elio::coro::task<ssize_t> TraceRecordSource::pread(void* buf, size_t count,
         // The read range is raw-blob space; the tar header occupies
         // [0, base_). Extent-granular fetches can span the header, so
         // clamp to the payload overlap and record in payload space.
-        const uint64_t end = offset + static_cast<uint64_t>(r);
-        if (end > base_) {
-            const uint64_t payload_off =
-                offset > base_ ? offset - base_ : 0;
-            recorder_->record(layer_index_, payload_off,
-                              end - std::max(offset, base_));
+        // Guard the addition against uint64 overflow (r is ssize_t and
+        // a hostile/corrupt source could report a huge length).
+        const uint64_t off = static_cast<uint64_t>(offset);
+        const uint64_t rr = static_cast<uint64_t>(r);
+        if (rr <= UINT64_MAX - off) {
+            const uint64_t end = off + rr;
+            if (end > base_) {
+                const uint64_t payload_off = off > base_ ? off - base_ : 0;
+                recorder_->record(layer_index_, payload_off,
+                                  end - std::max(off, base_));
+            }
         }
     }
     co_return r;
