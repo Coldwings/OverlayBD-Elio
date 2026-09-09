@@ -15,6 +15,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace obd::supervisor {
 

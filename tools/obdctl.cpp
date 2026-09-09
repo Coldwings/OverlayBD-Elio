@@ -139,6 +139,12 @@ int main(int argc, char** argv) {
             return 2;
         }
         req["id"] = argv[i++];
+        if (i != argc) {
+            // Silent extra-arg acceptance would mask typos (trace_start
+            // validates its full remainder too).
+            usage(argv[0]);
+            return 2;
+        }
     } else if (cmd == "list" || cmd == "hello") {
         // no fields
     } else {
