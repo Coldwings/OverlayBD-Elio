@@ -274,3 +274,26 @@ TEST_CASE("supervisor: device trace control skips an oversized line and stays al
     REQUIRE(reply2.value("ok", false) == true);
     REQUIRE(reply2.value("seq", 0) == 2);
 }
+
+TEST_CASE("supervisor: control channel writer survives a closed peer without SIGPIPE",
+          "[supervisor]") {
+    // An EPIPE (the supervisor vanishing mid-write) must surface as a
+    // dropped line (write_line returns false), NOT SIGPIPE-terminate the
+    // device process — a real finalize/event write could race the
+    // supervisor's death. Sockets write via send(MSG_NOSIGNAL); this
+    // test would die by SIGPIPE under the pre-fix ::write.
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
+    ::close(fds[0]);  // peer gone: writes now hit EPIPE
+    supervisor::ControlChannelWriter w(fds[1]);
+    bool threw = false;
+    bool ok = true;
+    try {
+        ok = w.write_line(nlohmann::json{{"reply", "ping"}, {"ok", true}});
+    } catch (...) {
+        threw = true;
+    }
+    REQUIRE(!threw);
+    REQUIRE(!ok);  // EPIPE reported as a dropped line, process alive
+    ::close(fds[1]);
+}

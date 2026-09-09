@@ -109,8 +109,13 @@ bool ControlChannelWriter::write_line(const std::string& line) {
     std::lock_guard<std::mutex> lk(mu_);
     size_t done = 0;
     while (done < line.size()) {
+        // Sockets use send(MSG_NOSIGNAL): EPIPE (supervisor gone) must
+        // be an error, never SIGPIPE-kill the device process.
         const ssize_t w =
-            ::write(fd_, line.data() + done, line.size() - done);
+            is_socket_
+                ? ::send(fd_, line.data() + done, line.size() - done,
+                         MSG_NOSIGNAL)
+                : ::write(fd_, line.data() + done, line.size() - done);
         if (w == 0) {
             // A zero-byte write with bytes pending is not supposed to
             // happen on a stream socket; looping would spin forever.

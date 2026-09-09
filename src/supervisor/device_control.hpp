@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #include <functional>
 #include <memory>
@@ -49,6 +50,11 @@ public:
         // A full buffer surfaces as EAGAIN, handled as a dropped line.
         const int fl = ::fcntl(fd, F_GETFL, 0);
         if (fl >= 0) ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        // Sockets write via ::send(MSG_NOSIGNAL): an EPIPE (supervisor
+        // gone mid-write) must surface as an error, NOT SIGPIPE-kill the
+        // device process mid-finalize. Pipes (test harness) use ::write.
+        struct stat st {};
+        is_socket_ = ::fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode);
     }
     int fd() const { return fd_; }
     /// Best-effort serialized write of one JSON line, LOOPED until all
@@ -63,6 +69,7 @@ public:
 
 private:
     int fd_;
+    bool is_socket_ = false;
     std::mutex mu_;
 };
 

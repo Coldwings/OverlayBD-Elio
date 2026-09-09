@@ -550,10 +550,15 @@ Every test, grouped by area, with the property it guards.
   stayed alive (ADR-0013).
 - `supervisor: control channel writer loops short writes and never throws` —
   the serialized channel writer loops ::write until the whole line is
-  out (a short write would truncate/fuse protocol lines); a 128 KiB
-  line over a nonblocking pipe deterministically short-writes then
-  EAGAINs and is reported (false), never thrown, while a normal line
-  over a socketpair lands intact (ADR-0013).
+  out (a short write would truncate/fuse protocol lines); a line larger
+  than half the capacity of a nonblocking pipe (filled to capacity,
+  drained halfway — no fixed pipe size assumed) deterministically
+  short-writes then EAGAINs and is reported (false), never thrown,
+  while a normal line over a socketpair lands intact (ADR-0013).
+- `supervisor: control channel writer survives a closed peer without SIGPIPE` —
+  an EPIPE (the supervisor vanishing mid-write) is reported as a dropped
+  line (false) instead of SIGPIPE-terminating the process: sockets are
+  written via `send(MSG_NOSIGNAL)` (ADR-0013).
 
 ### integration
 
