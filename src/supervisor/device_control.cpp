@@ -203,12 +203,18 @@ elio::coro::task<void> run_trace_control(
                 }
             }
             if (pit == j.end() || !pit->is_string() || duration == 0) {
+                // Bounds come from the recorder (single source of truth);
+                // do not hard-code a second copy that could drift.
+                const std::string bound_msg =
+                    "trace_start requires a string path and an integer "
+                    "duration_sec in [" +
+                    std::to_string(image::TraceRecorder::kMinDurationSec) +
+                    ", " +
+                    std::to_string(image::TraceRecorder::kMaxDurationSec) +
+                    "]";
                 nlohmann::json rj = {{"reply", "trace_start"},
                                      {"ok", false},
-                                     {"error", "trace_start requires a "
-                                               "string path and an "
-                                               "integer duration_sec in "
-                                               "[1, 3600]"}};
+                                     {"error", bound_msg}};
                 echo_seq(j, rj);
                 channel->write_line(rj);
                 continue;

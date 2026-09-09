@@ -294,9 +294,13 @@ TraceRecorder::finalize_locked_state(int fd, std::string path,
         }
         done += static_cast<size_t>(r.result);
     }
-    if (::fsync(fd) != 0) {
+    // fsync can block for an unbounded time (dirty-data flush under IO
+    // congestion); finalize can run on a LIVE device (duration expiry),
+    // so offload it — never block an Elio worker on a sync syscall.
+    const int fs_rc = co_await elio::spawn_blocking([fd] { return ::fsync(fd); });
+    if (fs_rc != 0) {
         res.error = std::string("trace fsync failed: ") +
-                    std::strerror(errno);
+                    std::strerror(fs_rc);
         ::close(fd);
         co_return res;
     }
