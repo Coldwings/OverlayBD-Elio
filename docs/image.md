@@ -755,8 +755,9 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   and the device still reads byte-exactly (ADR-0012 cold-start floor).
 - `integration: structural warm-up runs before the trace blob load` —
   the mock's ordered cross-blob request log pins ADR-0012's "floor
-  first": a warm-up-only head extent of the data blob is served before
-  the trace blob's first data GET, and replay of a traced middle extent
+  first": both warm-up windows of the data blob (a warm-up-only head
+  extent and the tail window's first extent) are served before the
+  trace blob's first data GET, and replay of a traced middle extent
   still completes (a slow trace layer must not delay the floor).
 - `integration: trace layer replays warm-up through the layer store` —
   end to end against the multi-blob mock: a tar-wrapped trace layer is

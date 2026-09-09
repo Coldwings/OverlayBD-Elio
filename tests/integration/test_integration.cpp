@@ -1119,16 +1119,29 @@ TEST_CASE("integration: structural warm-up runs before the trace blob load",
     // load/replay must not delay the structural warm-up — a slow or
     // unhealthy trace layer's fetch time sits outside both warm-up
     // budgets, so the floor runs BEFORE the first trace-blob byte is
-    // fetched. Pinned via the mock's ordered request log: a warm-up-only
-    // head extent (extent 2, beyond the open-time probes' extent 0) of
-    // the data blob is served before the FIRST data GET of the trace
-    // blob. Under the pre-fix order (trace load ahead of layer
-    // construction) the trace blob's GETs would lead the log instead.
+    // fetched. Pinned via the mock's ordered request log: BOTH warm-up
+    // windows of the data blob — the warm-up-only head extent 2 (beyond
+    // the open-time probes' extent 0) AND the tail window's first
+    // extent (beyond the probes' last ~2 payload extents) — are served
+    // before the FIRST data GET of the trace blob. Requiring both
+    // windows closes the loophole a head→trace→tail regression order
+    // would otherwise slip through. Under the pre-fix order (trace
+    // load ahead of layer construction) the trace blob's GETs would
+    // lead the log instead.
     TempDir dir;
     const auto raw = test::pattern_bytes(512 * 384 * 6, 95);
     const auto data_payload = make_zfile_blob(dir, raw);
     REQUIRE(data_payload.size() > 3 * 256 * 1024);
     const auto data_blob = tar_wrap(data_payload);
+    // ustar base offset 512 (same arithmetic as the extent-4 pin): the
+    // tail window [size-256 KiB, size) of the view maps to underlying
+    // [size-256 KiB+512, size+512); its first extent sits ~4 extents
+    // back from the payload end, past the probes' reach.
+    const uint64_t tail_extent =
+        (data_payload.size() + 512 - 256 * 1024) / (64 * 1024);
+    // Distinct from the head pin (extent 2) and from the traced middle
+    // extent (640 KiB) below, so each pin attributes to its own cause.
+    REQUIRE(tail_extent > 640 * 1024 / (64 * 1024));
     // One replay record into a MIDDLE extent (outside both 256 KiB
     // windows), so replay traffic is distinguishable from warm-up
     // traffic — and proves replay still works after the reorder.
@@ -1172,8 +1185,10 @@ TEST_CASE("integration: structural warm-up runs before the trace blob load",
         REQUIRE(opened.trace.trace_present);
         REQUIRE(opened.trace.records_replayed == 1);
 
-        // The order pin: the data blob's warm-up-only head extent was
-        // served BEFORE the trace blob's first data GET.
+        // The order pin: BOTH of the data blob's warm-up-only extents
+        // (head window, tail window) were served BEFORE the trace
+        // blob's first data GET — a head→trace→tail order fails red on
+        // the tail check.
         const auto log = server.data_get_log();
         size_t first_accel = log.size();
         for (size_t i = 0; i < log.size(); ++i) {
@@ -1184,13 +1199,16 @@ TEST_CASE("integration: structural warm-up runs before the trace blob load",
         }
         REQUIRE(first_accel < log.size());
         bool head_extent_before = false;
+        bool tail_extent_before = false;
         for (size_t i = 0; i < first_accel; ++i) {
-            if (log[i].first == data_digest &&
-                log[i].second / (64 * 1024) == 2) {
-                head_extent_before = true;
+            if (log[i].first != data_digest) continue;
+            if (log[i].second / (64 * 1024) == 2) head_extent_before = true;
+            if (log[i].second / (64 * 1024) == tail_extent) {
+                tail_extent_before = true;
             }
         }
         REQUIRE(head_extent_before);
+        REQUIRE(tail_extent_before);
 
         // The replay warmed the traced middle extent, and the device
         // reads byte-exactly.

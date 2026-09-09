@@ -528,9 +528,11 @@ Every test, grouped by area, with the property it guards.
   device still reads byte-exactly.
 - `integration: structural warm-up runs before the trace blob load` —
   ADR-0012 "floor first": via the mock's ordered cross-blob request log,
-  a warm-up-only head extent of the data blob is served BEFORE the
-  trace blob's first data GET, while replay of a traced middle extent
-  still completes and the device reads byte-exactly.
+  BOTH warm-up windows of the data blob (a warm-up-only head extent and
+  the tail window's first extent) are served BEFORE the trace blob's
+  first data GET — a head→trace→tail regression order fails red on the
+  tail check — while replay of a traced middle extent still completes
+  and the device reads byte-exactly.
 - `image: malformed remote lower digest fails assembly` — a malformed
   `sha256:` lower digest fails assembly with `EINVAL` before any registry
   I/O (ADR-0016 boundary: structural config errors fail loud).
