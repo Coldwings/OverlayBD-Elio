@@ -36,9 +36,10 @@
 // Warm-up is OPPORTUNISTIC: a failing populate (a source error, a
 // bypassed/degraded LayerStore — populate is a no-op there, never an
 // error) is logged and skipped, never a device bring-up error. The
-// wall-time budget is real: windows are populated in 64 KiB slices (one
-// LayerStore extent — the granularity the LayerStore path already
-// suspends at, so slicing adds no remote traffic), the budget is
+// wall-time budget is real: windows are populated in 64 KiB slices (the
+// LayerStore extent size — chosen as the path's native per-extent
+// suspension granularity, not an alignment guarantee; slicing adds no
+// remote traffic, already-fetched extents being skipped), the budget is
 // re-checked between slices, and a window that cannot finish within the
 // budget is abandoned mid-window (windows_skipped) rather than awaited
 // to its end — 30 s of actual warm-up work, with overshoot bounded by

@@ -126,8 +126,8 @@ AdmissionFunnel::acquire_scavenger_bounded(
         // break the unconditional-admission contract. A bounded
         // on-demand call is always a caller bug; refuse it as "not
         // admitted" rather than silently bounding a guest-blocking read.
-        ELIO_LOG_ERROR("acquire_scavenger_bounded called with OnDemand; "
-                       "refused (on-demand admission is unconditional)");
+        ELIO_LOG_WARNING("acquire_scavenger_bounded called with OnDemand; "
+                         "refused (on-demand admission is unconditional)");
         co_return std::nullopt;
     }
     const auto start = std::chrono::steady_clock::now();

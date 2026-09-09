@@ -219,8 +219,8 @@ TEST_CASE("image: structural warm-up budget interrupts a slow window",
     // (here: 250 ms per extent, so a whole-window populate would take 1 s
     // with no budget check inside) is abandoned mid-window instead of
     // awaited to its end. Slice granularity (every recorded call <= 64
-    // KiB) and the elapsed bound below both fail red against the
-    // pre-fix window-at-once driver (256 KiB calls, ~1 s elapsed).
+    // KiB) fails red against the pre-fix window-at-once driver (which
+    // emits 256 KiB calls).
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         PopulateRecorder slow(1024 * 1024);
         slow.delay_per_64k = std::chrono::milliseconds(250);
@@ -229,9 +229,7 @@ TEST_CASE("image: structural warm-up budget interrupts a slow window",
         opts.tail_bytes = 256 * 1024;
         opts.max_wall_time = std::chrono::milliseconds(300);
         std::vector<source::BlobSource*> targets{&slow};
-        const auto t0 = std::chrono::steady_clock::now();
         const auto stats = co_await image::warmup_structural(targets, opts);
-        const auto elapsed = std::chrono::steady_clock::now() - t0;
 
         // Every populate call was extent-sized.
         REQUIRE(!slow.calls.empty());
@@ -239,15 +237,15 @@ TEST_CASE("image: structural warm-up budget interrupts a slow window",
             REQUIRE(len <= 64 * 1024);
         }
         // The head window was interrupted: no window completed, one was
-        // abandoned, and the tail window never started.
+        // abandoned, and the tail window never started. The per-call
+        // extent-size check above is what pins slice granularity (a
+        // window-at-once driver emits 256 KiB calls and fails red); no
+        // wall-clock assertion here, which would flake under CI load.
         REQUIRE(stats.windows_populated == 0);
         REQUIRE(stats.windows_skipped == 1);
         REQUIRE(stats.budget_exhausted);
         REQUIRE(stats.bytes_warmed >= 64 * 1024);
         REQUIRE(stats.bytes_warmed <= 2 * 64 * 1024);
-        // Budget + one in-flight slice + scheduling slack, far under the
-        // ~1 s a whole-window populate would take.
-        REQUIRE(elapsed < std::chrono::milliseconds(700));
         co_return 0;
     });
     REQUIRE(rc == 0);

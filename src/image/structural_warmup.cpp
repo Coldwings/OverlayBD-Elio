@@ -9,11 +9,13 @@ namespace obd::image {
 
 namespace {
 
-/// Populate slice size: one LayerStore extent (ADR-0011). The LayerStore
-/// populate path already suspends per extent between remote fetches, so
-/// slicing at this granularity adds no remote traffic (already-fetched
-/// extents are skipped via the present flags). Slices are computed in
-/// the TarOffsetSource VIEW byte space: at an unaligned tar base one
+/// Populate slice size: 64 KiB — the LayerStore extent size (ADR-0011),
+/// chosen as the path's native per-extent suspension granularity, not an
+/// alignment guarantee. The LayerStore populate path already suspends per
+/// extent between remote fetches, so slicing at this granularity adds no
+/// remote traffic (already-fetched extents are skipped via the present
+/// flags). Slices are computed in the TarOffsetSource VIEW byte space: at
+/// an unaligned tar base one
 /// view-space slice can span TWO underlying extents (two fetches and
 /// funnel acquires), so the wall-budget check below bounds how far past
 /// the budget one slow source can carry warm-up to at most two extent
