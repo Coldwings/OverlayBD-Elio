@@ -102,10 +102,11 @@ private:
         bool partial = false;
         if (range.starts_with("bytes=")) {
             // Malformed/partial Range headers must not throw out of the
-            // mock (stoull on an unvalidated substring would).
+            // mock (stoull on an unvalidated substring would). The
+            // OPEN-ENDED form `bytes=N-` is legal per RFC 9110 and is
+            // served to the blob end (real registries accept it).
             const auto dash = range.find('-', 6);
-            if (dash == std::string_view::npos || dash == 6 ||
-                dash + 1 >= range.size()) {
+            if (dash == std::string_view::npos || dash == 6) {
                 http::response resp(http::status::bad_request);
                 resp.set_header("Content-Length", "0");
                 co_return resp;
@@ -120,16 +121,19 @@ private:
                 resp.set_header("Content-Length", "0");
                 co_return resp;
             }
-            const uint64_t b = std::strtoull(
-                std::string(range.substr(dash + 1)).c_str(), &endp, 10);
-            if (errno != 0 || endp == nullptr || *endp != '\0') {
-                http::response resp(http::status::bad_request);
-                resp.set_header("Content-Length", "0");
-                co_return resp;
-            }
             first = a;
-            last = std::min<uint64_t>(b, blob.size() - 1);
             partial = true;
+            if (dash + 1 < range.size()) {
+                const uint64_t b = std::strtoull(
+                    std::string(range.substr(dash + 1)).c_str(), &endp, 10);
+                if (errno != 0 || endp == nullptr || *endp != '\0') {
+                    http::response resp(http::status::bad_request);
+                    resp.set_header("Content-Length", "0");
+                    co_return resp;
+                }
+                last = std::min<uint64_t>(b, blob.size() - 1);
+            }
+            // else: open-ended; last stays blob.size() - 1.
         }
         if (first >= blob.size() || first > last) {
             http::response resp(http::status::range_not_satisfiable);
