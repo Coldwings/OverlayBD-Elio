@@ -252,6 +252,14 @@ src/supervisor/device_control.hpp): AF_UNIX SOCK_STREAM has no PIPE_BUF
 atomicity, so without serialization two concurrent small writes could
 interleave into a corrupted line — and every write loops until the
 whole line is out, since a short write would fuse lines just as well.
+The device's control fd is `O_NONBLOCK` and the writer DROPS a line
+(never blocks a scheduler worker) if the supervisor stalls long enough
+to fill the socket buffer. Framing consequence is bounded and
+self-healing: a partial prefix fuses with the next complete line and is
+dropped by the reader as one malformed (non-JSON) line, after which
+framing is clean again — the channel tolerates the loss of at most one
+line per stall episode (command replies carry a 30 s timeout; status is
+re-queryable).
 
 Status lines (`DeviceStatus` / `make_device_status`):
 

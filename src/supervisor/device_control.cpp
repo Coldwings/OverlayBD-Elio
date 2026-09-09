@@ -95,9 +95,16 @@ bool ControlChannelWriter::write_line(const std::string& line) {
         if (w < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Non-blocking fd, full buffer: the supervisor is not
-                // draining. Drop the line (best-effort channel — status
-                // is re-queryable) rather than block a scheduler worker.
+                // Non-blocking fd, buffer full: the supervisor is not
+                // draining. Drop the remainder of this line rather than
+                // block a scheduler worker. Framing consequence (bounded,
+                // self-healing): if done > 0, the reader holds a partial
+                // prefix that FUSES with the next complete line and is
+                // dropped by it as one malformed (non-JSON) line — the
+                // line after that parses cleanly again. Loss is bounded
+                // to this line plus the one fused line, both tolerable
+                // on this best-effort channel (command replies have a
+                // 30 s timeout; status is re-queryable).
                 ELIO_LOG_WARNING("control channel write would block ({} "
                                  "of {} bytes pending); dropping line",
                                  line.size() - done, line.size());
