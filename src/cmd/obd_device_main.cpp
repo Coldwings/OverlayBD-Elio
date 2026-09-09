@@ -4,6 +4,7 @@
 #include "image/config.hpp"
 #include "image/image_file.hpp"
 #include "format/merged_writable.hpp"
+#include "supervisor/device_control.hpp"
 #include "supervisor/protocol.hpp"
 
 #if defined(OBD_HAVE_UBLK) && OBD_HAVE_UBLK
@@ -14,7 +15,10 @@
 
 #include <elio/log/macros.hpp>
 #include <elio/runtime/async_main.hpp>
+#include <elio/runtime/spawn.hpp>
 #include <elio/signal/signalfd.hpp>
+
+#include <sys/socket.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -100,6 +104,16 @@ elio::coro::task<int> device_main(Args args) {
         }
         report(args, DeviceStatus{"ready", dev->bdev_path(), ""});
 
+        // ADR-0013 record path: serve the supervisor's trace commands on
+        // the control channel (EOF = supervisor gone; the loop exits and
+        // the device keeps serving).
+        if (args.control_fd >= 0 && opened.recorder) {
+            elio::go([fd = args.control_fd,
+                      rec = opened.recorder]() -> elio::coro::task<void> {
+                co_await obd::supervisor::run_trace_control(fd, rec);
+            });
+        }
+
         // Serve until SIGTERM/SIGINT.
         elio::signal::signal_set term_set;
         term_set.add(SIGTERM).add(SIGINT);
@@ -112,6 +126,16 @@ elio::coro::task<int> device_main(Args args) {
         }
         ELIO_LOG_INFO("device {} shutting down", dev->bdev_path());
         dev->stop();
+        // ADR-0013: finalize any active trace recording BEFORE the source
+        // chain can go away (the taps feed the recorder; a shutdown
+        // finalize keeps the produced blob valid).
+        if (opened.recorder && opened.recorder->recording()) {
+            const auto tres = co_await opened.recorder->stop("shutdown");
+            if (!tres.ok) {
+                ELIO_LOG_ERROR("trace finalize on shutdown failed: {}",
+                               tres.error);
+            }
+        }
         // ADR-0014: with the queues drained, persist the writable top's
         // index so the supervisor can seal the upper offline (commit). A
         // checkpoint failure is logged, not fatal: shutdown continues and
@@ -128,6 +152,16 @@ elio::coro::task<int> device_main(Args args) {
         co_await obd::image::park_image_fills(opened);
         dev.reset();
         report(args, DeviceStatus{"stopped", "", ""});
+        // Unblock the trace control loop only AFTER the checkpoint and
+        // the stopped report are out: it is parked in a control-channel
+        // read that only EOF/error can end, and a parked coroutine
+        // stalls the scheduler's teardown drain — but shutdown(2) gives
+        // the supervisor an immediate EOF, and EOF marks the device
+        // gone, so an earlier call would race the checkpoint (a commit
+        // seal could observe "no valid shutdown checkpoint").
+        if (args.control_fd >= 0) {
+            ::shutdown(args.control_fd, SHUT_RDWR);
+        }
         co_return 0;
     } catch (const std::system_error& e) {
         ELIO_LOG_ERROR("device failed: {}", e.what());

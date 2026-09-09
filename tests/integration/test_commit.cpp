@@ -133,6 +133,10 @@ int run_daemon_case(supervisor::DaemonConfig cfg, F&& client_body) {
         if (!cond) {
             failures.fetch_add(1);
             fail_msg = what;
+            // stderr, not INFO: Catch2 assertion/INFO state is not
+            // thread-safe, and a scoped INFO would expire before the
+            // REQUIRE that reports this failure runs.
+            std::fprintf(stderr, "[client check failed] %s\n", what);
         }
     };
     std::thread client([&] {
@@ -326,6 +330,10 @@ TEST_CASE("supervisor: commit stops the device and seals its upper offline",
                                           {"id", "d1"},
                                           {"user_tag", "v1"}});
             check(commit.value("ok", false) == true, "commit d1 failed");
+            if (!commit.value("ok", false)) {
+                std::fprintf(stderr, "[commit d1 reply] %s\n",
+                             commit.dump().c_str());
+            }
             check(commit.contains("path") &&
                       commit["path"].get<std::string>() == upper,
                   "commit path mismatch");

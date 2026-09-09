@@ -39,6 +39,7 @@
 
 #include "image/config.hpp"
 #include "image/structural_warmup.hpp"
+#include "image/trace_record.hpp"
 #include "image/trace_replay.hpp"
 #include "source/admission.hpp"
 #include "source/blob_source.hpp"
@@ -72,6 +73,12 @@ struct OpenedImage {
     /// LayerStore and remote-only source of this image (kept alive by
     /// the chains; this handle is for observability and tests).
     source::AdmissionFunnelPtr funnel;
+    /// The trace recorder (ADR-0013, record path): always present, idle
+    /// until the supervisor's trace_start arms it. Every remote lower's
+    /// registry source is tapped through it (trace_record.hpp). Owned
+    /// here so the device process can drive start/stop from the control
+    /// channel; outlives the chain (taps hold a shared_ptr too).
+    TraceRecorderPtr recorder;
 };
 
 /// Assembles the merged read-only view for an image. Throws obd::error /

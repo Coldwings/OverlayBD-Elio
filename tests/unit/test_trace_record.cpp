@@ -1,0 +1,483 @@
+// Unit tests for trace recording (ADR-0013, record path): the
+// TraceRecordSource tap + TraceRecorder sink from src/image/trace_record.hpp.
+// Every produced blob is validated with the SAME codec reader the replay
+// side and upstream consumers use (src/format/trace.hpp), and against the
+// conforming-writer MUSTs of docs/trace-format.md §10.
+//
+// STYLE NOTE: each test runs its whole recording lifecycle (start, reads,
+// stop) inside ONE run_coro: the recorder's duration timer is a detached
+// coroutine on the starting scheduler, and a stop cancels it — a parked
+// timer across schedulers would stall teardown (see trace_record.hpp).
+// No Catch2 macros between start and stop: a REQUIRE throw would skip
+// the stop and leak the timer; read results are collected and asserted
+// after the stop.
+#include "image/trace_record.hpp"
+#include "source/layer_store.hpp"
+
+#include "../support.hpp"
+
+#include <elio/time/timer.hpp>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <optional>
+#include <stdexcept>
+#include <vector>
+
+using namespace obd;
+using namespace std::chrono_literals;
+
+namespace {
+
+/// One read through a source (coroutine context). No assertions here.
+elio::coro::task<ssize_t> read_at(source::BlobSource& src, uint64_t offset,
+                                  size_t count) {
+    std::vector<uint8_t> buf(count);
+    const ssize_t r = co_await src.pread(buf.data(), buf.size(), offset);
+    co_return r;
+}
+
+/// Starts the recorder, runs `body` (a coroutine lambda), and ALWAYS
+/// stops — even when the body throws — so the duration timer never
+/// leaks into scheduler teardown. Returns the stop result.
+template <typename F>
+elio::coro::task<image::TraceRecorder::FinalizeResult> with_recording(
+    image::TraceRecorder& rec, const std::string& out, F&& body) {
+    std::string error;
+    const bool started =
+        co_await rec.start(out, 300,
+                           [](const image::TraceRecorder::FinalizeResult&) {},
+                           error);
+    if (!started) {
+        throw std::runtime_error("recorder start failed: " + error);
+    }
+    // co_await is not permitted inside a catch handler: capture, clean
+    // up after the block, then rethrow.
+    std::exception_ptr err;
+    try {
+        co_await body();
+    } catch (...) {
+        err = std::current_exception();
+    }
+    if (err) {
+        const auto ignored = co_await rec.stop("shutdown");
+        (void)ignored;
+        std::rethrow_exception(err);
+    }
+    co_return co_await rec.stop("stopped");
+}
+
+std::vector<format::trace::TraceRecord> parse_file(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    struct stat st {};
+    REQUIRE(::fstat(fd, &st) == 0);
+    std::vector<uint8_t> blob(static_cast<size_t>(st.st_size));
+    REQUIRE(::read(fd, blob.data(), blob.size()) ==
+            static_cast<ssize_t>(blob.size()));
+    ::close(fd);
+    auto parsed = format::trace::parse(blob);
+    REQUIRE(parsed.has_value());
+    return parsed.value();
+}
+
+}  // namespace
+
+TEST_CASE("image: trace recording round-trips through the codec reader",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 61);
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+    std::vector<ssize_t> reads;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        res = co_await with_recording(
+            *rec, out, [&]() -> elio::coro::task<void> {
+                reads.push_back(co_await read_at(tap, 0, 4096));
+                reads.push_back(co_await read_at(tap, 65536, 8192));
+                reads.push_back(co_await read_at(tap, 4096, 2048));
+            });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(reads == std::vector<ssize_t>{4096, 8192, 2048});
+
+    REQUIRE(res.ok);
+    REQUIRE(res.reason == "stopped");
+    REQUIRE(res.records == 3);
+    REQUIRE(res.dropped == 0);
+    REQUIRE(res.size == format::trace::kHeaderSize +
+                            3 * format::trace::kRecordSize);
+    REQUIRE(res.sha256.size() == 64);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 3);
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
+    REQUIRE(records[1] == format::trace::TraceRecord{'R', 0, 8192, 65536});
+    REQUIRE(records[2] == format::trace::TraceRecord{'R', 0, 2048, 4096});
+}
+
+TEST_CASE("image: trace recording coalesces adjacent records and preserves order",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 63);
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap0(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        image::TraceRecordSource tap1(
+            std::make_unique<test::VectorSource>(data), rec, 1);
+        res = co_await with_recording(
+            *rec, out, [&]() -> elio::coro::task<void> {
+                // Adjacent same-layer reads merge (window: contiguity +
+                // 1 MiB cap).
+                co_await read_at(tap0, 0, 4096);
+                co_await read_at(tap0, 4096, 4096);
+                co_await read_at(tap0, 8192, 4096);
+                // An interleaved other-layer record must NOT merge but
+                // keeps order.
+                co_await read_at(tap1, 1024, 512);
+                // Non-adjacent same-layer: no merge.
+                co_await read_at(tap0, 65536, 4096);
+            });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 3);  // 3 merged into 1, +1 +1
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 3);
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 12288, 0});
+    REQUIRE(records[1] == format::trace::TraceRecord{'R', 1, 512, 1024});
+    REQUIRE(records[2] == format::trace::TraceRecord{'R', 0, 4096, 65536});
+}
+
+TEST_CASE("image: trace recording splits reads beyond the conforming count cap",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(3 * 1024 * 1024, 65);
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+    ssize_t big_read = -1;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        res = co_await with_recording(
+            *rec, out, [&]() -> elio::coro::task<void> {
+                // 2.5 MiB in one pread: the writer contract caps a
+                // record at 1 MiB, so the tap splits; the adjacent
+                // pieces cannot merge (the merged count would exceed
+                // the cap).
+                big_read =
+                    co_await read_at(tap, 0, 2 * 1024 * 1024 + 512 * 1024);
+            });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(big_read == 2 * 1024 * 1024 + 512 * 1024);
+
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 3);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 3);
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 1024 * 1024, 0});
+    REQUIRE(records[1] ==
+            format::trace::TraceRecord{'R', 0, 1024 * 1024, 1024 * 1024});
+    REQUIRE(records[2] ==
+            format::trace::TraceRecord{'R', 0, 512 * 1024, 2 * 1024 * 1024});
+}
+
+TEST_CASE("image: trace recording drops and counts records when the buffer fills",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(1024 * 1024, 67);
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>(
+            /*max_pending=*/4);
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        res = co_await with_recording(
+            *rec, out, [&]() -> elio::coro::task<void> {
+                // 10 non-adjacent reads against a 4-slot buffer: 4
+                // kept, 6 dropped.
+                for (int i = 0; i < 10; ++i) {
+                    co_await read_at(tap, static_cast<uint64_t>(i) * 65536,
+                                     4096);
+                }
+            });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 4);
+    REQUIRE(res.dropped == 6);
+    // A dropped-record trace is still a valid, parseable blob.
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 4);
+    REQUIRE(records.front() == format::trace::TraceRecord{'R', 0, 4096, 0});
+}
+
+TEST_CASE("image: trace recording skips partial and failed reads",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 69);
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+    ssize_t short_read = -1;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        res = co_await with_recording(
+            *rec, out, [&]() -> elio::coro::task<void> {
+                // A read crossing EOF is only partially satisfied: no
+                // record.
+                std::vector<uint8_t> buf(8192);
+                short_read = co_await tap.pread(buf.data(), buf.size(),
+                                                64 * 1024 - 4096);
+                co_await read_at(tap, 0, 4096);  // good read, contrast
+            });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(short_read == 4096);  // the short read happened, unsatisfied
+
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 1);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
+}
+
+TEST_CASE("image: trace recording is pass-through and error-clean when idle",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 71);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+
+        // Reads work with the recorder idle; nothing is queued.
+        const ssize_t idle_read = co_await read_at(tap, 0, 4096);
+        if (idle_read != 4096) co_return 1;
+        // Stop with no recording ever started is a clean error.
+        const auto res = co_await rec->stop("stopped");
+        if (res.ok) co_return 2;
+        if (res.error.find("no trace recording in progress") ==
+            std::string::npos) {
+            co_return 3;
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // Start validates the duration bound and the output path (a FAILED
+    // start spawns no timer, so these are safe outside the guard).
+    const int rc2 = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        std::string error;
+        const bool bad_dur =
+            co_await rec->start(dir / "x.trace", 0,
+                                [](const image::TraceRecorder::
+                                       FinalizeResult&) {},
+                                error);
+        if (bad_dur || error.find("duration_sec") == std::string::npos) {
+            co_return 1;
+        }
+        const bool bad_path =
+            co_await rec->start("relative.trace", 60,
+                                [](const image::TraceRecorder::
+                                       FinalizeResult&) {},
+                                error);
+        if (bad_path || error.find("absolute") == std::string::npos) {
+            co_return 2;
+        }
+        co_return 0;
+    });
+    REQUIRE(rc2 == 0);
+}
+
+TEST_CASE("image: trace recording stop is idempotent and reports expiry stats",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 73);
+    const std::string out = dir / "out.trace";
+    std::optional<image::TraceRecorder::FinalizeResult> expired;
+    image::TraceRecorder::FinalizeResult again;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        // Duration-1s recording, stopped by the timer with NO client
+        // action — then an explicit stop must return the SAME finalized
+        // stats (idempotent), which is what a CLI racing the expiry
+        // needs.
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult& r) {
+                expired = r;
+            },
+            error);
+        if (!started) co_return 1;
+        const ssize_t r1 = co_await read_at(tap, 0, 4096);
+        if (r1 != 4096) {
+            const auto ignored = co_await rec->stop("shutdown");
+            (void)ignored;
+            co_return 2;
+        }
+        for (int i = 0; i < 100 && rec->recording(); ++i) {
+            co_await elio::time::sleep_for(50ms);
+        }
+        again = co_await rec->stop("stopped");
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(expired.has_value());  // the timer fired with no client call
+
+    REQUIRE(expired->ok);
+    REQUIRE(expired->reason == "expired");
+    REQUIRE(expired->records == 1);
+    REQUIRE(again.ok);
+    REQUIRE(again.reason == "expired");
+    REQUIRE(again.records == expired->records);
+    REQUIRE(again.sha256 == expired->sha256);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+}
+
+TEST_CASE("image: trace recording captures only remote fetches through the layer store",
+          "[image]") {
+    // The tap sits at the remote source below the LayerStore: a second
+    // read of a persisted extent is a LOCAL hit and must produce NO new
+    // record (ADR-0013: one record per fully-satisfied REMOTE pread).
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 75);
+    const std::string layer_dir = dir / "layer";
+    REQUIRE(std::filesystem::create_directories(layer_dir));
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        auto tap = std::make_unique<image::TraceRecordSource>(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        auto store = co_await source::LayerStore::open(std::move(tap),
+                                                       layer_dir, "");
+
+        // Park/destroy inside this scheduler (LayerStore lifetime).
+        auto park = [&]() -> elio::coro::task<void> {
+            store->stop_fill();
+            using FillStatus = source::LayerStore::FillStatus;
+            for (int i = 0; i < 5000; ++i) {
+                const FillStatus s = store->fill_status();
+                if (s == FillStatus::kDisabled || s == FillStatus::kDone ||
+                    s == FillStatus::kStopped) {
+                    break;
+                }
+                co_await elio::time::sleep_for(1ms);
+            }
+            store.reset();
+        };
+        std::exception_ptr err;
+        try {
+            res = co_await with_recording(
+                *rec, out, [&]() -> elio::coro::task<void> {
+                    // First read: extent-0 miss -> one 64 KiB remote
+                    // fetch recorded. Wait for the write-behind to
+                    // PERSIST the extent (an earlier re-read would miss
+                    // the still-in-flight staging write and re-fetch
+                    // remotely — a legitimate second record); after
+                    // that, reads of the extent are local hits with NO
+                    // new record.
+                    co_await read_at(*store, 0, 4096);
+                    for (int i = 0; i < 5000 &&
+                                    store->extents_present() < 1; ++i) {
+                        co_await elio::time::sleep_for(1ms);
+                    }
+                    co_await read_at(*store, 0, 4096);
+                    co_await read_at(*store, 1024, 4096);
+                    // Extent 3 (non-adjacent, so the documented
+                    // coalescing window does not merge it into the
+                    // extent-0 record): one more fetch.
+                    co_await read_at(*store, 3 * 65536, 4096);
+                });
+        } catch (...) {
+            err = std::current_exception();
+        }
+        co_await park();
+        if (err) std::rethrow_exception(err);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 2);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 2);
+    // No tar wrapper here (base 0): records are extent reads verbatim.
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 65536, 0});
+    REQUIRE(records[1] ==
+            format::trace::TraceRecord{'R', 0, 65536, 3 * 65536});
+}
+
+TEST_CASE("image: trace recording translates offsets out of the tar wrapper",
+          "[image]") {
+    // The tar base is subtracted so recorded offsets address the payload
+    // space replay consumes; a read spanning the header clamps to the
+    // payload overlap (extent fetches include the 512-byte header).
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(512 * 1024, 77);
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        tap.set_base(512);  // what assembly does after the tar probe
+
+        res = co_await with_recording(
+            *rec, out, [&]() -> elio::coro::task<void> {
+                // Raw [0, 65536) = header + payload [0, 65024): the
+                // header overlap is clamped away, the record covers
+                // [0, 65024).
+                co_await read_at(tap, 0, 65536);
+                // Raw [262144, +65536) = payload [261632, 327168).
+                co_await read_at(tap, 262144, 65536);
+            });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(res.ok);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 2);
+    REQUIRE(records[0] ==
+            format::trace::TraceRecord{'R', 0, 65536 - 512, 0});
+    REQUIRE(records[1] ==
+            format::trace::TraceRecord{'R', 0, 65536, 262144 - 512});
+}

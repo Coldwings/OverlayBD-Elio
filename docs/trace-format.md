@@ -455,6 +455,13 @@ upstream replayers:
 A blob satisfying the writer contract always satisfies parser
 acceptance; the converse is false.
 
+This project's record path (`src/image/trace_record.hpp`, ADR-0013)
+produces blobs through that conforming writer: the recorder pre-splits
+reads above the 1 MiB count cap at append time, coalesces adjacent
+same-layer records without ever exceeding the cap, emits zero padding,
+and rewrites the header checksum at finalize — so a recorded blob is
+replayable by upstream and by this project's own replay path.
+
 ## 11. Codec guidance (dependency-free C++17/20)
 
 ADR-0013 mandates a hand-rolled codec. Mapping this format to one:

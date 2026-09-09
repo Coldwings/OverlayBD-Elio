@@ -25,8 +25,10 @@ void usage(const char* argv0) {
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
-                 "  %s [--socket PATH] commit <id> [--tag TAG]\n",
-                 argv0, argv0, argv0, argv0, argv0, argv0);
+                 "  %s [--socket PATH] commit <id> [--tag TAG]\n"
+                 "  %s [--socket PATH] trace_start <id> <output.trace> [--duration SEC]\n"
+                 "  %s [--socket PATH] trace_stop <id>\n",
+                 argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 bool send_all(int fd, const std::string& data) {
@@ -96,6 +98,29 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+    } else if (cmd == "trace_start") {
+        if (i + 2 > argc) {
+            usage(argv[0]);
+            return 2;
+        }
+        req["id"] = argv[i++];
+        req["path"] = argv[i++];
+        req["duration_sec"] = 300;  // runbook default (docs/operations.md)
+        while (i < argc) {
+            const std::string a = argv[i++];
+            if (a == "--duration" && i < argc)
+                req["duration_sec"] = std::stoi(argv[i++]);
+            else {
+                usage(argv[0]);
+                return 2;
+            }
+        }
+    } else if (cmd == "trace_stop") {
+        if (i >= argc) {
+            usage(argv[0]);
+            return 2;
+        }
+        req["id"] = argv[i++];
     } else if (cmd == "list" || cmd == "hello") {
         // no fields
     } else {

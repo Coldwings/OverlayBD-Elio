@@ -11,15 +11,20 @@
 // so a commit that sealed without stopping the device finds no checkpoint
 // and fails.
 #include "image/config.hpp"
+#include "image/image_file.hpp"
 #include "format/lsmt_rw.hpp"
 #include "format/sparse_rw.hpp"
+#include "supervisor/device_control.hpp"
 #include "supervisor/protocol.hpp"
 
 #include "support.hpp"
 
 #include <elio/log/macros.hpp>
 #include <elio/runtime/async_main.hpp>
+#include <elio/runtime/spawn.hpp>
 #include <elio/signal/signalfd.hpp>
+
+#include <sys/socket.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +61,24 @@ elio::coro::task<int> fake_main(Args args) {
         const obd::image::ImageConfig img = obd::image::ImageConfig::from_file(
             args.config, obd::image::DownloadConfig{});
 
+        // ADR-0013 record-path tests: a config WITH lowers makes the fake
+        // a real image server (full assembly: registry -> record tap ->
+        // LayerStore -> tar -> zfile -> lsmt -> merge) minus the ublk
+        // device. The trace control loop then drives the real recorder,
+        // and the scripted workload (run when a recording starts) reads
+        // through the merged root so the tap captures genuine remote
+        // reads from the test's mock registry.
+        std::optional<obd::image::OpenedImage> opened;
+        if (!img.lowers.empty()) {
+            // Prefetch off: the structural head/tail warm-up (default
+            // on) would pre-warm the whole small test layer at bring-up
+            // and the scripted workload would hit local extents,
+            // recording nothing.
+            obd::image::GlobalConfig g;
+            g.prefetch_enable = false;
+            opened.emplace(co_await obd::image::open_image(img, g));
+        }
+
         // With an lsmt upper: write the payload and leave the file
         // unsealed (checkpoint only on SIGTERM, like the real device).
         std::unique_ptr<obd::format::LsmtRwLayer> lsmt;
@@ -81,6 +104,38 @@ elio::coro::task<int> fake_main(Args args) {
         }
         report(args, DeviceStatus{"ready", "/dev/ublkb70", ""});
 
+        // Trace command channel (protocol v3), like the real obd-device.
+        // The workload hook runs inside the recording window: a
+        // deterministic read pattern through the merged root. The offsets
+        // target MIDDLE extents (assembly probes pre-warm the header
+        // extent and the trailer/index extents; reads there would be
+        // local hits and record nothing).
+        if (opened.has_value() && args.control_fd >= 0) {
+            auto* root = opened->root.get();
+            obd::supervisor::TraceControlHooks hooks;
+            hooks.on_start = [root]() {
+                elio::go([root]() -> elio::coro::task<void> {
+                    char buf[4096];
+                    for (const uint64_t off : {uint64_t{65536},
+                                               uint64_t{131072},
+                                               uint64_t{196608}}) {
+                        const ssize_t r =
+                            co_await root->pread(buf, sizeof(buf), off);
+                        if (r < 0) {
+                            ELIO_LOG_WARNING("fake workload read at {} "
+                                             "failed: {}", off, (int)-r);
+                        }
+                    }
+                });
+            };
+            elio::go([fd = args.control_fd, rec = opened->recorder,
+                      hooks = std::move(hooks)]() mutable
+                     -> elio::coro::task<void> {
+                co_await obd::supervisor::run_trace_control(fd, rec,
+                                                            std::move(hooks));
+            });
+        }
+
         // Serve until SIGTERM/SIGINT (pending under the inherited blocked
         // mask; signalfd consumes it).
         elio::signal::signal_set term_set;
@@ -92,6 +147,18 @@ elio::coro::task<int> fake_main(Args args) {
                 break;
             }
         }
+        // Finalize any active recording, then park fills, before the
+        // chain dies (same ordering contract as the real device).
+        if (opened.has_value()) {
+            if (opened->recorder && opened->recorder->recording()) {
+                const auto tres = co_await opened->recorder->stop("shutdown");
+                if (!tres.ok) {
+                    ELIO_LOG_ERROR("fake: trace finalize failed: {}",
+                                   tres.error);
+                }
+            }
+            co_await obd::image::park_image_fills(*opened);
+        }
         if (lsmt) {
             const int crc = co_await lsmt->checkpoint();
             if (crc != 0) {
@@ -101,6 +168,16 @@ elio::coro::task<int> fake_main(Args args) {
             }
         }
         report(args, DeviceStatus{"stopped", "", ""});
+        // Unblock the trace control loop (parked in a control-channel
+        // read) only AFTER the checkpoint and the stopped report are
+        // out: shutdown(2) gives the supervisor an immediate EOF, and
+        // the supervisor treats EOF as device-gone — an earlier call
+        // would race the checkpoint (a commit seal could observe "no
+        // valid shutdown checkpoint"). A parked coroutine would
+        // otherwise stall the scheduler's teardown drain.
+        if (args.control_fd >= 0) {
+            ::shutdown(args.control_fd, SHUT_RDWR);
+        }
         co_return 0;
     } catch (const std::exception& e) {
         report(args, DeviceStatus{"failed", "", e.what()});

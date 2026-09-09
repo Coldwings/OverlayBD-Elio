@@ -406,6 +406,30 @@ Every test, grouped by area, with the property it guards.
 - `image: trace replay enforces record, byte and time budgets` — the
   `max_records` / `max_bytes` / `max_wall_time` bounds each stop replay
   early with `budget_exhausted` set.
+- `image: trace recording round-trips through the codec reader` — a
+  recorded blob parses with the C2 reader (header checksum rewritten on
+  finalize) and the finalize stats match the file (ADR-0013).
+- `image: trace recording coalesces adjacent records and preserves order`
+  — same-layer continuations merge within the 1 MiB cap; disjoint reads
+  keep their exact order.
+- `image: trace recording splits reads beyond the conforming count cap` —
+  an oversized read lands as consecutive ≤ 1 MiB records.
+- `image: trace recording drops and counts records when the buffer fills`
+  — overflow sheds whole chunks, `dropped` is surfaced, and the blob
+  stays valid and replayable.
+- `image: trace recording skips partial and failed reads` — short reads
+  and read errors record nothing.
+- `image: trace recording is pass-through and error-clean when idle` — an
+  idle tap reads and reports errors exactly like the wrapped source.
+- `image: trace recording stop is idempotent and reports expiry stats` —
+  the device-side timer finalizes with no client call; a late stop
+  returns the same stats.
+- `image: trace recording captures only remote fetches through the layer store`
+  — local hits record nothing; misses record exactly the fetched
+  extents.
+- `image: trace recording translates offsets out of the tar wrapper` —
+  records address payload space; header-spanning fetches clamp to their
+  payload overlap.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` image with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merged view and the trace fully
@@ -594,6 +618,28 @@ Every test, grouped by area, with the property it guards.
   succeeds, the loser gets a precise error ("commit already in progress"
   or "already sealed"), and the sealed file is intact (no interleaved
   tmp-file writes) (ADR-0014). Runs without privileges.
+- `integration: trace recording captures remote reads end to end` — a
+  real daemon with the extended fake obd-device (opens a REAL image
+  against the mock registry, speaks the real device-side trace protocol,
+  and runs a scripted read workload when recording starts): start →
+  workload → stop returns `{path,sha256,size,records,dropped}`, the
+  additive `trace` status field reports recording then stopped, and the
+  blob parses with the codec reader to exactly the workload's coalesced
+  record (ADR-0013). Runs without privileges.
+- `integration: trace recording duration expiry finalizes without a client call` —
+  the device-side timer finalizes on its own; `status` reports
+  `"state":"stopped","reason":"expired"` and a late stop returns the
+  same stats (ADR-0013). Runs without privileges.
+- `integration: trace recording survives client disconnect mid-record` —
+  a client that sends `trace_start` and vanishes without reading the
+  reply cannot leak a recording device: the duration bound still
+  finalizes and the supervisor keeps serving (ADR-0013). Runs without
+  privileges.
+- `integration: trace recording rejects bad requests cleanly` — missing
+  or wrong-typed fields (protocol parse), unknown ids, idle stops,
+  out-of-bounds durations, and double starts are precise errors that
+  leave the daemon and the active recording unaffected (ADR-0013). Runs
+  without privileges.
 - `integration: ublk device serves sector reads from a blob` — the
   privileged E2E: a real ublk device backed by an in-memory blob
   returns correct sectors through `/dev/ublkb<N>` (self-skips without

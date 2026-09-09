@@ -26,6 +26,8 @@ add_library(obd_core STATIC
     image/image_file.cpp
     image/structural_warmup.cpp
     image/trace_replay.cpp
+    image/trace_record.cpp
+    supervisor/device_control.cpp
     supervisor/protocol.cpp
     supervisor/child.cpp
     supervisor/daemon.cpp)

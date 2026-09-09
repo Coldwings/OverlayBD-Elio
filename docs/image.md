@@ -162,7 +162,7 @@ and skipped, never a bring-up error, and a bypassed/degraded LayerStore
 turns populate into a no-op. `prefetch.enable` is the master gate for
 both warm-up kinds.
 
-### The trace layer (ADR-0013, proposed)
+### The trace layer (ADR-0013)
 
 When the image config carries `accelerationLayer: true`, the **uppermost
 lower is the acceleration (trace) layer**, not a data layer
@@ -224,6 +224,55 @@ bring-up without limit:
 
 The trace blob itself is read with a 64 MiB cap (a conforming trace is
 ~1.5 MiB at the record bound).
+
+**Recording.** The record path of ADR-0013 lives in
+`src/image/trace_record.hpp` and is driven by the supervisor's
+`trace_start`/`trace_stop` commands (docs/supervisor.md); the runbook is
+docs/operations.md. Design:
+
+- **Tap placement.** Assembly wraps each remote lower's `RegistrySource`
+  in a `TraceRecordSource` — BEFORE the `LayerStore` (and before the
+  no-dir `AdmissionSource` wrapper). Every pread on a lower's
+  `RegistrySource` IS a remote read by construction (the store touches
+  its remote only on a local miss), so local cache hits can never be
+  recorded and the tap needs no miss-detection of its own. The tap is
+  the narrowest common point of both remote chain shapes (dir-cached and
+  no-dir); the `layer_index` it stamps is the open_image loop index
+  threaded in at construction (data lowers only — local lowers occupy
+  index slots but carry no remote source, hence no tap).
+- **Payload offsets.** Records carry PAYLOAD offsets (the tar wrapper is
+  translated out: the tap subtracts the `TarOffsetSource` base once
+  assembly probes it, and an extent fetch spanning the 512-byte tar
+  header clamps to its payload overlap) — the same byte space replay
+  consumes, so a recorded blob feeds the replay path verbatim.
+- **Only fully-satisfied reads record** (a short or failed pread appends
+  nothing): a partial read would record bytes the device never received.
+- **Hot path.** Recording disabled costs one atomic load per remote
+  read; enabled, an append is a mutex + bounded-deque push (no IO, no
+  allocation growth, no syscall) — nanoseconds against the millisecond
+  scale of the remote fetch it follows. The buffer is bounded
+  (65536 records ≈ 1.5 MiB serialized, matching the replay
+  `max_records` bound): overflow DROPS the incoming record chunk and
+  counts it (`dropped`, surfaced in the stop reply and status field).
+  A trace with drops is still valid and replayable — it simply covers
+  fewer extents.
+- **Adjacent coalescing.** An append that continues the tail record
+  (same layer, `offset == tail.offset + tail.count`) merges into it —
+  sequential extent fetches, the common case, collapse to one record —
+  while respecting the 1 MiB conforming count cap (an oversized read is
+  pre-split into ≤ 1 MiB records at append time, so the queued stream
+  always satisfies the writer contract). Coalescing never reorders:
+  the serialized stream preserves record order exactly.
+- **Finalize.** `stop()` (explicit stop, duration expiry, or device
+  shutdown) drains the queue through the codec's
+  `format::trace::TraceWriter` — 24×N framing, raw-chaining CRC-32C,
+  header checksum rewritten on `finalize()` — then writes + fsyncs the
+  blob and reports `{path, sha256, size, records, dropped}`. The
+  duration timer is a cancellable sleep owned by the recorder; a stop
+  cancels it for an immediate exit, and a recorder must be stopped
+  before its scheduler shuts down (a parked timer coroutine would stall
+  the teardown drain). `stop()` is idempotent: a stop racing the expiry
+  waits for the in-flight finalize and returns its stats.
 
 ### The writable mode (ADR-0008)
 
@@ -389,6 +438,7 @@ struct OpenedImage {
     StructuralWarmupStats warmup; // ADR-0012 structural warm-up outcome
     std::vector<source::LayerStore*> layer_stores;  // non-owning
     source::AdmissionFunnelPtr funnel;  // the device's ADR-0012 funnel
+    TraceRecorderPtr recorder;    // ADR-0013 record path (one per image)
 };
 
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
@@ -427,6 +477,11 @@ elio::coro::task<void> park_image_fills(const OpenedImage& opened);
   source wrappers (no-dir lowers, ADR-0016 degrade, the trace blob
   fetch): all remote reads of the device compete at this single gate.
   The handle is for observability and tests; the chains keep it alive.
+- `src/image/image_file.hpp::recorder` — the image's `TraceRecorder`
+  (ADR-0013 record path): the supervisor-driven trace commands start and
+  stop it (docs/supervisor.md); obd-device finalizes it during shutdown.
+  The taps in the chain share it; idle, it costs one atomic load per
+  remote read.
 - `src/image/image_file.hpp::park_image_fills` — stops every background
   fill in the chain (`stop_fill` + a bounded wait for a terminal
   `fill_status`). Must be called before `root` is destroyed on any path
@@ -565,6 +620,43 @@ silently (upstream parity); a failed populate is logged and skipped.
 Processing stops early on any `TraceReplayOptions` bound
 (`budget_exhausted` set). The bounds and their rationale are tabulated in
 Concepts → "The trace layer".
+
+### `trace_record.hpp` — TraceRecorder, TraceRecordSource
+
+```cpp
+class TraceRecorder {  // one per opened image (OpenedImage::recorder)
+    static constexpr size_t kMaxPendingRecords = 65536;
+    static constexpr int kMinDurationSec = 1, kMaxDurationSec = 3600;
+    struct FinalizeResult {
+        bool ok; std::string error, path, sha256, reason;
+        uint64_t size = 0, records = 0, dropped = 0;
+    };
+    bool recording() const;   // hot-path gate (one atomic load)
+    void record(char op, uint32_t layer_index, uint64_t count,
+                uint64_t offset) noexcept;   // bounded append, drop-counted
+    elio::coro::task<bool> start(std::string path, int duration_sec,
+        std::function<void(const FinalizeResult&)> on_expire,
+        std::string* error);
+    elio::coro::task<FinalizeResult> stop(std::string reason);
+    FinalizeResult last_result() const;
+};
+
+class TraceRecordSource : public source::BlobSource {
+    // pread: passes through, records only fully-satisfied reads with
+    // the base subtracted; set_base() threads the tar payload offset.
+};
+```
+
+`src/image/trace_record.hpp::TraceRecorder` — the ADR-0013 record path's
+writer side: a bounded in-memory queue (drop-counted overflow, adjacent
+coalescing within the 1 MiB count cap, > 1 MiB reads pre-split) drained
+at `stop()` through the codec's conforming writer; the duration timer is
+cancellable and device-side (expiry finalizes without any client call).
+`start()` validates the duration bound and the absolute output path and
+opens the output file fail-fast. **Never throws from the read path** —
+`record()` is `noexcept`; an append failure drops and counts. The design
+(tap placement, payload offsets, hot-path cost, lifetime rule) is in
+Concepts → "The trace layer → Recording".
 
 ## Invariants & Guarantees
 
@@ -728,6 +820,33 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
 - `image: trace replay enforces record, byte and time budgets` — the
   `max_records` / `max_bytes` / `max_wall_time` bounds each stop replay
   early with `budget_exhausted` set.
+- Trace recording (ADR-0013; `tests/unit/test_trace_record.cpp`,
+  daemon-level coverage in `tests/integration/test_trace_record.cpp`,
+  listed in docs/supervisor.md):
+  `image: trace recording round-trips through the codec reader` — a
+  recorded blob parses with the C2 reader (checksum rewrite included)
+  and its stats match the file;
+  `image: trace recording coalesces adjacent records and preserves order`
+  — same-layer continuations merge within the 1 MiB cap, disjoint reads
+  stay ordered;
+  `image: trace recording splits reads beyond the conforming count cap`
+  — an oversized read lands as consecutive ≤ 1 MiB records;
+  `image: trace recording drops and counts records when the buffer fills`
+  — overflow sheds whole chunks, `dropped` is reported, and the blob
+  stays valid;
+  `image: trace recording skips partial and failed reads` — short reads
+  and read errors record nothing;
+  `image: trace recording is pass-through and error-clean when idle` —
+  an idle tap reads and reports errors exactly like the wrapped source;
+  `image: trace recording stop is idempotent and reports expiry stats` —
+  the device-side timer finalizes with no client call and a late stop
+  returns the same stats;
+  `image: trace recording captures only remote fetches through the layer store`
+  — local hits record nothing, misses record exactly the fetched
+  extents;
+  `image: trace recording translates offsets out of the tar wrapper` —
+  records address payload space, with header-spanning fetches clamped
+  to their payload overlap.
 - `image: local trace layer is set aside and replayed at open` — an
   `accelerationLayer: true` config with a local `<dir>/trace` blob opens
   with the trace layer excluded from the merge (layer count, virtual

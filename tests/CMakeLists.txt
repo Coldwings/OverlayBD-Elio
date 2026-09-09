@@ -10,6 +10,7 @@ add_executable(obd_unit_tests
     unit/test_format.cpp
     unit/test_trace.cpp
     unit/test_trace_replay.cpp
+    unit/test_trace_record.cpp
     unit/test_structural_warmup.cpp
     unit/test_source.cpp
     unit/test_admission.cpp
@@ -38,6 +39,7 @@ add_executable(obd_integration_tests
     integration/test_integration.cpp
     integration/test_recovery.cpp
     integration/test_commit.cpp
+    integration/test_trace_record.cpp
     integration/test_hello.cpp)
 target_include_directories(obd_integration_tests
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
