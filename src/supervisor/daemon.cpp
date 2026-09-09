@@ -766,6 +766,7 @@ private:
             }
             mu_.unlock();
             rj.erase("reply");
+            rj.erase("seq");  // internal routing token, not client API
             rj["id"] = id;
             rj["ok"] = true;
             co_return rj.dump() + "\n";
@@ -804,6 +805,7 @@ private:
             }
             mu_.unlock();
             rj.erase("reply");
+            rj.erase("seq");  // internal routing token, not client API
             rj["id"] = id;
             rj["ok"] = true;
             co_return rj.dump() + "\n";
