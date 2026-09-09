@@ -2,6 +2,9 @@
 // taxonomy, and the exact AIMD signals (ADR-0012).
 #include "source/admission.hpp"
 
+#include <elio/coro/with_timeout.hpp>
+#include <elio/log/macros.hpp>
+
 #include <algorithm>
 
 namespace obd::source {
@@ -59,7 +62,10 @@ void AdmissionFunnel::admit_locked(
             break;
         }
         // Reserve the slot now; the waiter adopts it on wake and must
-        // not re-check the gate.
+        // not re-check the gate. `reserved` (under mu_) is the
+        // reconciliation flag a timed-out bounded waiter checks before
+        // dequeuing itself.
+        w->reserved = true;
         inflight_total_.fetch_add(1, std::memory_order_relaxed);
         scavenger_admissions_.fetch_add(1, std::memory_order_relaxed);
         wake.push_back(std::move(w));
@@ -109,6 +115,74 @@ elio::coro::task<AdmissionFunnel::Permit> AdmissionFunnel::acquire(
     for (auto& wk : wake) wk->admitted.set();
     co_await w->admitted.wait();
     co_return Permit(this, cls, start);
+}
+
+elio::coro::task<std::optional<AdmissionFunnel::Permit>>
+AdmissionFunnel::acquire_scavenger_bounded(
+    ReadClass cls, std::chrono::milliseconds timeout) {
+    if (cls == ReadClass::OnDemand) {
+        // Precondition violation (a real check, not an assert — release
+        // builds compile asserts out): bounded OnDemand admission would
+        // break the unconditional-admission contract. A bounded
+        // on-demand call is always a caller bug; refuse it as "not
+        // admitted" rather than silently bounding a guest-blocking read.
+        ELIO_LOG_WARNING("acquire_scavenger_bounded called with OnDemand; "
+                         "refused (on-demand admission is unconditional)");
+        co_return std::nullopt;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lk(mu_);
+        if (inflight_on_demand_.load(std::memory_order_relaxed) == 0 &&
+            inflight_total_.load(std::memory_order_relaxed) <
+                window_.load(std::memory_order_relaxed)) {
+            inflight_total_.fetch_add(1, std::memory_order_relaxed);
+            scavenger_admissions_.fetch_add(1, std::memory_order_relaxed);
+            co_return Permit(this, cls, start);
+        }
+    }
+    // Same push-and-re-admit critical section as acquire() (no lost
+    // wakeup); then wait on the event with a timeout. Unlike acquire(),
+    // a waiter here may outrun its wake: the timeout path reconciles.
+    scavenger_waits_.fetch_add(1, std::memory_order_relaxed);
+    auto w = std::make_shared<Waiter>();
+    std::vector<std::shared_ptr<Waiter>> wake;
+    {
+        std::lock_guard lk(mu_);
+        (cls == ReadClass::Prefetch ? prefetch_q_ : fill_q_).push_back(w);
+        admit_locked(wake);
+    }
+    for (auto& wk : wake) wk->admitted.set();
+    if (w->reserved) {
+        // Self-admitted synchronously by our own admit_locked above.
+        co_return Permit(this, cls, start);
+    }
+    auto admitted = co_await elio::with_timeout(
+        timeout, [w](elio::coro::cancel_token tok) -> elio::coro::task<bool> {
+            const auto r = co_await w->admitted.wait(std::move(tok));
+            co_return r == elio::coro::cancel_result::completed;
+        });
+    if (admitted && *admitted) {
+        // Woken by a releaser: admit_locked reserved our slot before
+        // setting the event, so the Permit adoption is exactly
+        // acquire()'s.
+        co_return Permit(this, cls, start);
+    }
+    // Timed out. Reconcile under mu_: if a releaser's admit_locked
+    // already reserved a slot for us (popped the waiter, bumped
+    // inflight_total) we MUST adopt it — returning nullopt here would
+    // leak the slot and wedge the window (the reason plain acquire()
+    // waiters are uncancellable). A still-queued waiter instead dequeues
+    // itself; the pending set() on its event is then a harmless no-op
+    // (nobody waits on it).
+    {
+        std::lock_guard lk(mu_);
+        if (w->reserved) co_return Permit(this, cls, start);
+        auto& q = (cls == ReadClass::Prefetch ? prefetch_q_ : fill_q_);
+        const auto it = std::find(q.begin(), q.end(), w);
+        if (it != q.end()) q.erase(it);
+    }
+    co_return std::nullopt;
 }
 
 void AdmissionFunnel::release(ReadClass cls,

@@ -54,7 +54,12 @@
 // Lifetime/concurrency: the funnel is shared_ptr-held by every source
 // that admits through it and is safe to call from any Elio worker
 // thread. acquire() waiters must not be cancelled (no cancel tokens on
-// these paths — the same precedent as LayerStore's in-flight joins).
+// these paths — the same precedent as LayerStore's in-flight joins): a
+// waiter cancelled after admit_locked reserved its slot would leak the
+// slot. The BOUNDED variant (acquire_scavenger_bounded) is the sole
+// exception — it reconciles the reservation before returning (see its
+// contract), making it safe for callers that must not wait indefinitely
+// (warm-up's skip semantics, issue #35).
 #pragma once
 
 #include "source/blob_source.hpp"
@@ -70,6 +75,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace obd::source {
@@ -151,6 +157,22 @@ public:
     /// lifetime is the latency sample.
     elio::coro::task<Permit> acquire(ReadClass cls);
 
+    /// Scavenger-only bounded acquire (Prefetch or Fill): like
+    /// acquire(), but if the gate has not opened within `timeout` the
+    /// waiter dequeues itself and the result is std::nullopt — the
+    /// caller SKIPS the request (warm-up's opportunism contract: a
+    /// window that cannot start promptly is skipped, never awaited,
+    /// issue #35). Cancel-safe where acquire() is not: a waiter whose
+    /// slot was already reserved by admit_locked when the timeout fires
+    /// ADOPTS the slot (returns a Permit) instead of leaking it; a
+    /// waiter still queued is removed under mu_ before returning. The
+    /// AIMD/latency accounting is untouched (no Permit, no sample).
+    /// OnDemand is refused outright (`std::nullopt`, logged) —
+    /// unconditional admission is its contract, so a bounded on-demand
+    /// call is always a caller bug.
+    elio::coro::task<std::optional<Permit>> acquire_scavenger_bounded(
+        ReadClass cls, std::chrono::milliseconds timeout);
+
     /// Clamps a request size to the class's cap: scavenger requests are
     /// capped near 1 MiB (the caller splits larger warm requests);
     /// OnDemand is uncapped (its sizes are bounded upstream by the
@@ -199,6 +221,14 @@ public:
 private:
     struct Waiter {
         elio::sync::event admitted;
+        /// Set under mu_ when admit_locked pops the waiter and reserves
+        /// its slot; once true the slot is the waiter's to adopt even if
+        /// its bounded wait has already timed out (the reconciliation
+        /// that makes acquire_scavenger_bounded cancel-safe). Atomic:
+        /// the bounded acquire reads it again under mu_ after the timed
+        /// wait, but also once lock-free between its own admit_locked
+        /// and that wait.
+        std::atomic<bool> reserved{false};
     };
 
     void release(ReadClass cls, std::chrono::nanoseconds latency);

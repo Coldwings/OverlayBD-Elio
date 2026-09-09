@@ -35,6 +35,10 @@ public:
     ssize_t populate_result = 0;              // <0 injects a failure
     bool populate_throws = false;             // throws instead of -errno
     std::chrono::milliseconds populate_delay{0};
+    /// Delay proportional to len, per 64 KiB — models a source whose
+    /// per-extent remote fetch takes this long (so a 256 KiB populate
+    /// costs 4x as much as a 64 KiB one).
+    std::chrono::milliseconds delay_per_64k{0};
 
     elio::coro::task<ssize_t> pread(void*, size_t, uint64_t) override {
         co_return 0;
@@ -43,6 +47,10 @@ public:
                                        size_t len) override {
         if (populate_delay.count() > 0) {
             co_await elio::time::sleep_for(populate_delay);
+        }
+        if (delay_per_64k.count() > 0) {
+            co_await elio::time::sleep_for(
+                delay_per_64k * ((len + 64 * 1024 - 1) / (64 * 1024)));
         }
         calls.emplace_back(offset, len);
         if (populate_throws) throw obd::error(EIO, "injected populate throw");
@@ -116,6 +124,8 @@ TEST_CASE("image: structural warm-up populates head and tail windows opportunist
         constexpr uint64_t MiB = uint64_t{1} << 20;
         // Two layers: head window before tail window per layer, layers in
         // order; a nullptr target is skipped without failing the pass.
+        // Windows are populated in 64 KiB slices (one LayerStore
+        // extent), head slices before tail slices.
         {
             PopulateRecorder a(4 * MiB), b(2 * MiB);
             std::vector<source::BlobSource*> targets{&a, nullptr, &b};
@@ -124,20 +134,30 @@ TEST_CASE("image: structural warm-up populates head and tail windows opportunist
             REQUIRE(stats.layers_warmed == 2);
             REQUIRE(stats.windows_populated == 3);
             REQUIRE(stats.windows_failed == 0);
+            REQUIRE(stats.windows_skipped == 0);
             REQUIRE(stats.bytes_warmed == 4 * MiB);
             REQUIRE(!stats.budget_exhausted);
-            REQUIRE(a.calls.size() == 2);
-            REQUIRE((a.calls[0] == std::pair<uint64_t, size_t>{0, MiB}));
-            REQUIRE((a.calls[1] ==
-                     std::pair<uint64_t, size_t>{3 * MiB, MiB}));
+            constexpr size_t kSlicesPerMiB = 16;
+            REQUIRE(a.calls.size() == 2 * kSlicesPerMiB);
+            REQUIRE((a.calls[0] ==
+                     std::pair<uint64_t, size_t>{0, 64 * 1024}));
+            REQUIRE((a.calls[kSlicesPerMiB - 1] ==
+                     std::pair<uint64_t, size_t>{MiB - 64 * 1024,
+                                                 64 * 1024}));
+            REQUIRE((a.calls[kSlicesPerMiB] ==
+                     std::pair<uint64_t, size_t>{3 * MiB, 64 * 1024}));
             // The small blob merges into one full window.
-            REQUIRE(b.calls.size() == 1);
+            REQUIRE(b.calls.size() == 2 * kSlicesPerMiB);
             REQUIRE((b.calls[0] ==
-                     std::pair<uint64_t, size_t>{0, 2 * MiB}));
+                     std::pair<uint64_t, size_t>{0, 64 * 1024}));
+            REQUIRE((b.calls[2 * kSlicesPerMiB - 1] ==
+                     std::pair<uint64_t, size_t>{2 * MiB - 64 * 1024,
+                                                 64 * 1024}));
         }
         // A failing populate (-errno) and a throwing one are logged and
         // skipped; the remaining windows and layers still warm, and the
-        // pass never propagates the error.
+        // pass never propagates the error. A window fails on its first
+        // slice, so a bad layer still records one call per window.
         {
             PopulateRecorder failing(4 * MiB), throwing(4 * MiB), ok(4 * MiB);
             failing.populate_result = -EIO;
@@ -148,7 +168,9 @@ TEST_CASE("image: structural warm-up populates head and tail windows opportunist
             REQUIRE(stats.windows_failed == 4);
             REQUIRE(stats.windows_populated == 2);
             REQUIRE(stats.layers_warmed == 1);
-            REQUIRE(ok.calls.size() == 2);
+            REQUIRE(failing.calls.size() == 2);
+            REQUIRE(throwing.calls.size() == 2);
+            REQUIRE(ok.calls.size() == 32);
         }
         // Both window sizes 0: no populate traffic at all.
         {
@@ -162,9 +184,9 @@ TEST_CASE("image: structural warm-up populates head and tail windows opportunist
             REQUIRE(stats.windows_populated == 0);
             REQUIRE(a.calls.empty());
         }
-        // Wall-time budget: with each populate sleeping ~250 ms and a
-        // 550 ms budget, warm-up stops before the 8-window queue drains
-        // (same proof shape as the trace replay budget test).
+        // Wall-time budget: with each 64 KiB slice sleeping ~250 ms and
+        // a 550 ms budget, warm-up abandons the first window mid-way
+        // (windows_skipped) instead of draining the window queue.
         {
             PopulateRecorder a(8 * MiB), b(8 * MiB), c(8 * MiB), d(8 * MiB);
             a.populate_delay = std::chrono::milliseconds(250);
@@ -176,10 +198,81 @@ TEST_CASE("image: structural warm-up populates head and tail windows opportunist
             std::vector<source::BlobSource*> targets{&a, &b, &c, &d};
             const auto stats = co_await image::warmup_structural(targets,
                                                                  opts);
-            REQUIRE(stats.windows_populated >= 1);
-            REQUIRE(stats.windows_populated < 8);
+            // 3 slices fit (250/500/750 ms — the check after the slice at
+            // 500 ms still passes 550); the window never completes.
+            REQUIRE(stats.windows_populated == 0);
+            REQUIRE(stats.windows_skipped == 1);
+            REQUIRE(stats.windows_failed == 0);
             REQUIRE(stats.budget_exhausted);
+            REQUIRE(a.calls.size() <= 4);
+            REQUIRE(b.calls.empty());
         }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("image: structural warm-up budget interrupts a slow window",
+          "[image]") {
+    // The 30 s budget means 30 s of ACTUAL warm-up work: it is checked
+    // between 64 KiB populate slices, so one window whose source is slow
+    // (here: 250 ms per extent, so a whole-window populate would take 1 s
+    // with no budget check inside) is abandoned mid-window instead of
+    // awaited to its end. Slice granularity (every recorded call <= 64
+    // KiB) fails red against the pre-fix window-at-once driver (which
+    // emits 256 KiB calls).
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        PopulateRecorder slow(1024 * 1024);
+        slow.delay_per_64k = std::chrono::milliseconds(250);
+        image::StructuralWarmupOptions opts;
+        opts.head_bytes = 256 * 1024;
+        opts.tail_bytes = 256 * 1024;
+        opts.max_wall_time = std::chrono::milliseconds(300);
+        std::vector<source::BlobSource*> targets{&slow};
+        const auto stats = co_await image::warmup_structural(targets, opts);
+
+        // Every populate call was extent-sized.
+        REQUIRE(!slow.calls.empty());
+        for (const auto& [off, len] : slow.calls) {
+            REQUIRE(len <= 64 * 1024);
+        }
+        // The head window was interrupted: no window completed, one was
+        // abandoned, and the tail window never started. The per-call
+        // extent-size check above is what pins slice granularity (a
+        // window-at-once driver emits 256 KiB calls and fails red); no
+        // wall-clock assertion here, which would flake under CI load.
+        REQUIRE(stats.windows_populated == 0);
+        REQUIRE(stats.windows_skipped == 1);
+        REQUIRE(stats.budget_exhausted);
+        REQUIRE(stats.bytes_warmed >= 64 * 1024);
+        REQUIRE(stats.bytes_warmed <= 2 * 64 * 1024);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("image: structural warm-up skips windows the funnel will not admit",
+          "[image]") {
+    // Issue #35: a populate reporting -EAGAIN (the funnel gate stayed
+    // closed past the store's admit timeout) skips that window —
+    // windows_skipped, not windows_failed — and warm-up moves on to the
+    // next window instead of stalling bring-up. Both windows of the
+    // layer are skipped, nothing is counted warmed, and the pass is not
+    // budget-exhausted (it never waited).
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        PopulateRecorder gated(4 * 1024 * 1024);
+        gated.populate_result = -EAGAIN;
+        std::vector<source::BlobSource*> targets{&gated};
+        const auto stats = co_await image::warmup_structural(targets);
+        REQUIRE(stats.layers_total == 1);
+        REQUIRE(stats.layers_warmed == 0);
+        REQUIRE(stats.windows_populated == 0);
+        REQUIRE(stats.windows_failed == 0);
+        REQUIRE(stats.windows_skipped == 2);  // head and tail
+        REQUIRE(stats.bytes_warmed == 0);
+        REQUIRE(!stats.budget_exhausted);
+        // Each window was abandoned at its first slice.
+        REQUIRE(gated.calls.size() == 2);
         co_return 0;
     });
     REQUIRE(rc == 0);

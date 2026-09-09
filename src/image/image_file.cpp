@@ -115,6 +115,17 @@ elio::coro::task<std::vector<uint8_t>> load_trace_blob(
     }
 }
 
+/// How long one warm-up or replay (Prefetch-class populate) extent fetch
+/// may wait at the admission funnel's gate before the extent — and with
+/// it the warm-up window / replay record — is skipped (issue #35). Long
+/// enough to ride out a transient on-demand burst or one fill fetch
+/// cycle; short enough that a storm-closed gate degrades warm-up to
+/// skips well inside the 30 s wall budget (the budget check between
+/// populate slices stops the pass regardless). Not operator-configured
+/// (ADR-0012's small prefetch surface); the background fill keeps its
+/// unbounded scavenger wait.
+constexpr std::chrono::milliseconds kWarmupAdmitTimeout{2000};
+
 }  // namespace
 
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
@@ -254,6 +265,11 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 lsc.fill.max_mbps = cfg.download.max_mbps;
                 lsc.fill.block_size = cfg.download.block_size;
                 lsc.funnel = funnel;  // ADR-0012: shared across all lowers
+                // Issue #35: warm-up's populate fetches may not wait at
+                // a storm-closed funnel gate longer than this — the
+                // window is skipped instead of awaited (bring-up can
+                // never stall behind scavenger admission).
+                lsc.populate_admit_timeout = kWarmupAdmitTimeout;
                 bool store_opened = false;
                 try {
                     raw = co_await source::LayerStore::open(

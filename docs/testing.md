@@ -327,6 +327,13 @@ Every test, grouped by area, with the property it guards.
 - `source: admission funnel blocks scavengers while on-demand is in flight` —
   queued Prefetch/Fill requests stay parked while an on-demand request
   is in flight, even with window room, and enter once it completes.
+- `source: admission funnel bounded scavenger acquire times out and dequeues` —
+  issue #35: with the gate held closed, the bounded acquire returns
+  `std::nullopt` after its timeout and leaves no ghost reservation
+  (counters and a subsequent acquire prove the dequeue); admitted
+  immediately when the gate is open, admitted mid-wait when the gate
+  opens before the timeout, and refused outright (`std::nullopt`, no
+  slot taken) when mis-called with OnDemand.
 - `source: admission funnel grows additively on flat latency and halves on rise` —
   flat samples at the EMA baseline raise the window by one each; a
   sample above 150% of the baseline halves it; the drifted baseline
@@ -347,6 +354,11 @@ Every test, grouped by area, with the property it guards.
   the LayerStore class wiring end to end: with the window held full, a
   miss `pread` (OnDemand) completes anyway while a `populate`
   (Prefetch) queues until a slot frees (ADR-0012).
+- `source: layer store populate skips the extent when the funnel gate stays closed` —
+  issue #35: with `populate_admit_timeout` set and the gate held closed
+  by an on-demand permit, `populate` fails the extent with `-EAGAIN`
+  within the bound (nothing reaches the remote) and succeeds once the
+  gate opens.
 - `source: admission funnel re-checks the gate when queueing a scavenger` —
   lost-wakeup regression: with the check-then-queue gap injected by the
   test hook (a slot freed against empty queues inside it), the
@@ -413,10 +425,24 @@ Every test, grouped by area, with the property it guards.
   smaller than head+tail (no double-population), 0 disabling a side,
   and no windows for an empty blob.
 - `image: structural warm-up populates head and tail windows opportunistically` —
-  the driver issues head-before-tail per layer in layer order, merges a
-  small blob into one window, skips nullptr targets, counts failing and
-  throwing populates without propagating them, issues nothing with both
-  window sizes 0, and stops early on the wall-time budget.
+  the driver issues head-before-tail per layer in layer order (each
+  window in 64 KiB slices), merges a small blob into one window, skips
+  nullptr targets, counts failing and throwing populates without
+  propagating them, issues nothing with both window sizes 0, and stops
+  early on the wall-time budget (abandoning the in-flight window).
+- `image: structural warm-up budget interrupts a slow window` — the
+  wall budget is real mid-window, not just between windows: with a
+  source sleeping 250 ms per extent, a 300 ms budget interrupts the
+  first window after one or two 64 KiB slices (slice granularity and
+  the elapsed bound both fail red against whole-window population),
+  counted `windows_skipped` with `budget_exhausted` set and the
+  remaining windows/layers never started.
+- `image: structural warm-up skips windows the funnel will not admit` —
+  issue #35: a populate reporting `-EAGAIN` (gate closed past the admit
+  timeout) skips that window — `windows_skipped`, not
+  `windows_failed` — and warm-up moves on without waiting; both windows
+  of the layer are skipped at their first slice, nothing counted
+  warmed, and the pass is not budget-exhausted.
 - `image: prefetch config parses structural window knobs` — the
   `prefetch` section's honored subset (`enable`, `head_kb`, `tail_kb`)
   parses with the documented defaults; 0 window sizes are kept; partial

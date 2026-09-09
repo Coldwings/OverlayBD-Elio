@@ -1261,7 +1261,14 @@ TEST_CASE("integration: admission funnel bounds on-demand latency under scavenge
 
         // Prefetch storm: six coroutines warming cold ranges of the same
         // store through populate() — scavenger pressure at the funnel on
-        // top of the background fill.
+        // top of the background fill. The 1 ms sleep every iteration is
+        // LOAD-BEARING, not a pacing nicety: once the store is Complete
+        // (the structural warm-up fetches most extents during bring-up,
+        // so the fill frequently finishes mid-test), populate() becomes
+        // a no-op that returns WITHOUT any suspension point — a storm
+        // coroutine would then spin on its scheduler worker forever,
+        // never observe storm_stop, and starve the other coroutines on
+        // few-worker machines (the CI hang, issue #35).
         std::atomic<bool> storm_stop{false};
         std::atomic<int> storm_done{0};
         for (int i = 0; i < 6; ++i) {
@@ -1273,6 +1280,8 @@ TEST_CASE("integration: admission funnel bounds on-demand latency under scavenge
                         co_await store->populate(off % total, 256 * 1024);
                     if (pr < 0) break;
                     off += 6 * 256 * 1024;
+                    co_await elio::time::sleep_for(
+                        std::chrono::milliseconds(1));
                 }
                 storm_done.fetch_add(1, std::memory_order_relaxed);
             });

@@ -488,16 +488,37 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
     const size_t elen = static_cast<size_t>(
         std::min<uint64_t>(cfg_.extent_size, size_ - ebase));
     auto buf = std::make_shared<std::vector<uint8_t>>(elen);
-    remote_fetches_.fetch_add(1, std::memory_order_relaxed);
     // ADR-0012: the starter's remote fetch enters the source only
     // through the device's admission funnel (the permit's lifetime is
     // the fetch — its wall-clock latency is the AIMD sample for
     // OnDemand). One extent is 64 KiB, under the scavenger size cap.
+    // A populate (Prefetch) fetch additionally honors
+    // populate_admit_timeout (issue #35): a gate closed for longer than
+    // that skips the extent with EAGAIN instead of waiting — a blocked
+    // warm-up window is skipped, never awaited, so device bring-up
+    // cannot stall behind sustained on-demand contention. The skip
+    // flows through the normal completion bookkeeping below so in-flight
+    // joiners are released with the same EAGAIN, never left hanging.
     AdmissionFunnel::Permit permit;
-    if (cfg_.funnel) {
-        permit = co_await cfg_.funnel->acquire(cls);
+    ssize_t r;
+    if (cfg_.funnel && cls == ReadClass::Prefetch &&
+        cfg_.populate_admit_timeout.count() > 0) {
+        auto bounded = co_await cfg_.funnel->acquire_scavenger_bounded(
+            cls, cfg_.populate_admit_timeout);
+        if (!bounded) {
+            r = -EAGAIN;
+        } else {
+            permit = std::move(*bounded);
+            remote_fetches_.fetch_add(1, std::memory_order_relaxed);
+            r = co_await remote_->pread(buf->data(), elen, ebase);
+        }
+    } else {
+        if (cfg_.funnel) {
+            permit = co_await cfg_.funnel->acquire(cls);
+        }
+        remote_fetches_.fetch_add(1, std::memory_order_relaxed);
+        r = co_await remote_->pread(buf->data(), elen, ebase);
     }
-    const ssize_t r = co_await remote_->pread(buf->data(), elen, ebase);
     // The permit covers the remote fetch alone — its lifetime is the
     // latency sample (the same contract as run_fill's): release the
     // window slot before the completion bookkeeping below, so a queued

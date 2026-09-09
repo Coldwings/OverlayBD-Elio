@@ -45,6 +45,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -85,6 +86,17 @@ public:
         /// admission (hand-composed chains and unit tests; assembled
         /// devices always thread one — see image assembly).
         AdmissionFunnelPtr funnel;
+
+        /// Bound on how long one populate (Prefetch) extent fetch waits
+        /// at the funnel gate before being SKIPPED with EAGAIN
+        /// (warm-up's "blocked windows are skipped, never awaited"
+        /// contract, issue #35): 0 (default) waits indefinitely — the
+        /// hand-composed-chain/test behavior. Applies to populate only;
+        /// OnDemand misses stay unconditional and the background fill
+        /// keeps its unbounded scavenger wait (it has the whole
+        /// runtime). Assembled devices set this so a storm-closed gate
+        /// cannot stall device bring-up.
+        std::chrono::milliseconds populate_admit_timeout{0};
     };
 
     enum class State : int {
