@@ -7,12 +7,22 @@
 
 #include <linux/ublk_cmd.h>
 
+#include <sys/ioctl.h>  // _IOWR for the guarded command fallback below
+
 #include <cstddef>
 #include <cstdint>
 
 // Older headers (< 6.0) lack the in-task completion flag we rely on.
 #ifndef UBLK_F_URING_CMD_COMP_IN_TASK
 #define UBLK_F_URING_CMD_COMP_IN_TASK (1ULL << 1)
+#endif
+
+// UBLK_U_CMD_UPDATE_SIZE (D3: grow-only online resize) was added to the
+// uapi in the 6.16 development cycle, after this project's >= 6.0 header
+// baseline; older headers lack it. Kernel ABI (ublk_cmd.h): the new size
+// is passed in `ublksrv_ctrl_cmd.data[0]`, in units of 512-byte sectors.
+#ifndef UBLK_U_CMD_UPDATE_SIZE
+#define UBLK_U_CMD_UPDATE_SIZE _IOWR('u', 0x15, struct ublksrv_ctrl_cmd)
 #endif
 
 namespace obd::ublk {

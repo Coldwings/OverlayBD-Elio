@@ -180,6 +180,15 @@ void Ctrl::start_user_recovery(uint32_t dev_id) {
              "START_USER_RECOVERY");
 }
 
+void Ctrl::update_size(uint32_t dev_id, uint64_t sectors) {
+    // D3 grow-only online resize (UBLK_U_CMD_UPDATE_SIZE): the new size
+    // rides cmd.data[0], in sectors (kernel ABI, ublk_cmd.h). No data
+    // buffer, no queue. A kernel without the command returns -EINVAL,
+    // reported as a clean error by the caller.
+    ctrl_cmd(UBLK_U_CMD_UPDATE_SIZE, dev_id, static_cast<uint16_t>(-1),
+             nullptr, 0, sectors, "UPDATE_SIZE");
+}
+
 void Ctrl::end_user_recovery(uint32_t dev_id) {
     // The driver requires data[0] == ub->ublksrv_tgid, which is the
     // tgid recorded when the new daemon opened /dev/ublkcN (i.e. our

@@ -119,7 +119,7 @@ elio::coro::task<int> fake_main(Args args) {
         // local hits and record nothing).
         if (opened.has_value() && args.control_fd >= 0) {
             auto* root = opened->root.get();
-            obd::supervisor::TraceControlHooks hooks;
+            obd::supervisor::DeviceControlHooks hooks;
             hooks.on_start = [root]() {
                 elio::go([root]() -> elio::coro::task<void> {
                     char buf[4096];
@@ -138,7 +138,7 @@ elio::coro::task<int> fake_main(Args args) {
             elio::go([channel, rec = opened->recorder,
                       hooks = std::move(hooks)]() mutable
                      -> elio::coro::task<void> {
-                co_await obd::supervisor::run_trace_control(
+                co_await obd::supervisor::run_device_control(
                     channel, rec, std::move(hooks));
             });
         }

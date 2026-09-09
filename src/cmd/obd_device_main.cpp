@@ -4,6 +4,7 @@
 #include "image/config.hpp"
 #include "image/image_file.hpp"
 #include "format/merged_writable.hpp"
+#include "common/errors.hpp"
 #include "supervisor/device_control.hpp"
 #include "supervisor/protocol.hpp"
 
@@ -20,6 +21,7 @@
 
 #include <sys/socket.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -111,13 +113,45 @@ elio::coro::task<int> device_main(Args args) {
         }
         report(channel, DeviceStatus{"ready", dev->bdev_path(), ""});
 
-        // ADR-0013 record path: serve the supervisor's trace commands on
-        // the control channel (EOF = supervisor gone; the loop exits and
-        // the device keeps serving).
-        if (channel && opened.recorder) {
-            elio::go([channel,
-                      rec = opened.recorder]() -> elio::coro::task<void> {
-                co_await obd::supervisor::run_trace_control(channel, rec);
+        // Serve the supervisor's device commands (ADR-0013 trace record
+        // path, D3 resize) on the control channel (EOF = supervisor
+        // gone; the loop exits and the device keeps serving). The loop
+        // may outlive this coroutine's frame, so everything it touches
+        // is refcounted: channel, recorder, and the live-device pointer
+        // (nulled before dev teardown below so a resize arriving
+        // mid-shutdown gets a clean error, never a dangling deref).
+        // recorder may be null (recorder-less images) — trace commands
+        // are answered "unavailable" while resize still works.
+        std::shared_ptr<std::atomic<obd::ublk::Device*>> live_dev;
+        if (channel) {
+            live_dev =
+                std::make_shared<std::atomic<obd::ublk::Device*>>(nullptr);
+            live_dev->store(dev.get(), std::memory_order_release);
+            obd::supervisor::DeviceControlHooks hooks;
+            // D3 resize executor seam: grow-only is enforced by the
+            // command loop against current_size BEFORE any kernel IO;
+            // apply issues the blocking ublk UPDATE_SIZE (the loop runs
+            // it via spawn_blocking, per the ublk control-plane rule).
+            hooks.resize.current_size = [live_dev]() -> uint64_t {
+                obd::ublk::Device* d =
+                    live_dev->load(std::memory_order_acquire);
+                return d != nullptr ? d->size_bytes() : 0;
+            };
+            hooks.resize.apply_resize =
+                [live_dev](uint64_t bytes) -> uint64_t {
+                    obd::ublk::Device* d =
+                        live_dev->load(std::memory_order_acquire);
+                    if (d == nullptr) {
+                        throw obd::error(
+                            ECANCELED,
+                            "device is shutting down; resize ignored");
+                    }
+                    return d->resize_blocking(bytes);
+                };
+            elio::go([channel, rec = opened.recorder, hooks]() mutable
+                     -> elio::coro::task<void> {
+                co_await obd::supervisor::run_device_control(channel, rec,
+                                                             hooks);
             });
         }
 
@@ -157,6 +191,14 @@ elio::coro::task<int> device_main(Args args) {
         // Park background fills before the source chain is destroyed
         // (the LayerStore lifetime contract; no-op when fill is off).
         co_await obd::image::park_image_fills(opened);
+        // Retire the resize executor seam BEFORE the Device is destroyed:
+        // the command loop may still be parked on the channel (it only
+        // sees EOF once the shutdown(2) below lands), and a resize in
+        // that window must be answered "shutting down", never routed to
+        // a dead Device.
+        if (live_dev) {
+            live_dev->store(nullptr, std::memory_order_release);
+        }
         dev.reset();
         report(channel, DeviceStatus{"stopped", "", ""});
         // Unblock the trace control loop only AFTER the checkpoint and

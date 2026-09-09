@@ -313,6 +313,7 @@ private:
                     reply = co_await cmd_trace_start(*cmd);
                 else if (c == "trace_stop")
                     reply = co_await cmd_trace_stop(*cmd);
+                else if (c == "resize") reply = co_await cmd_resize(*cmd);
                 else if (c == "list") reply = co_await cmd_list();
                 else if (c == "hello") reply = reply_hello();
                 else reply = co_await cmd_status(*cmd);
@@ -654,12 +655,12 @@ private:
         co_return;
     }
 
-    /// Shared forward-and-await for device-executed trace commands
-    /// (ADR-0013): sends `cmd` to the device over the control channel
-    /// and waits (bounded) for its reply line. The duration bound is
-    /// enforced DEVICE-side, so a client disconnect is harmless — this
-    /// timeout only covers a wedged/dead device.
-    elio::coro::task<std::string> forward_trace_command(
+    /// Shared forward-and-await for device-executed commands (ADR-0013
+    /// trace path; D3 resize): sends `cmd` to the device over the control
+    /// channel and waits (bounded) for its reply line. The trace duration
+    /// bound is enforced DEVICE-side, so a client disconnect is harmless —
+    /// this timeout only covers a wedged/dead device.
+    elio::coro::task<std::string> forward_device_command(
         const std::string& id, nlohmann::json cmd) {
         std::shared_ptr<DeviceEntry> entry;
         std::shared_ptr<elio::sync::event> waiter =
@@ -744,7 +745,7 @@ private:
         }
         if (!bool_or(reply, "ok", false)) {
             co_return reply_error(str_or(
-                reply, "error", "device rejected the trace command"));
+                reply, "error", "device rejected the command"));
         }
         // The device reply fields INCLUDING the "reply" discriminator;
         // cmd_trace_start/stop erase it before forwarding to the
@@ -761,7 +762,7 @@ private:
         nlohmann::json cmd = {{"cmd", "trace_start"},
                               {"path", j["path"]},
                               {"duration_sec", j["duration_sec"]}};
-        std::string r = co_await forward_trace_command(id, std::move(cmd));
+        std::string r = co_await forward_device_command(id, std::move(cmd));
         auto rj = nlohmann::json::parse(r, nullptr, false);
         if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
             co_await mu_.lock();
@@ -786,7 +787,7 @@ private:
         // Named local: a brace-init json temporary as a coroutine
         // argument trips GCC 12's "array used as initializer" bug.
         nlohmann::json cmd = {{"cmd", "trace_stop"}};
-        std::string r = co_await forward_trace_command(id, std::move(cmd));
+        std::string r = co_await forward_device_command(id, std::move(cmd));
         auto rj = nlohmann::json::parse(r, nullptr, false);
         if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
             co_await mu_.lock();
@@ -811,6 +812,40 @@ private:
                 it->second->trace = std::move(t);
             }
             mu_.unlock();
+            rj.erase("reply");
+            rj.erase("seq");  // internal routing token, not client API
+            rj["id"] = id;
+            rj["ok"] = true;
+            co_return rj.dump() + "\n";
+        }
+        co_return r;
+    }
+
+    /// D3 grow-only online resize (ADR-0014 dev_size model): forwards the
+    /// byte-count `size` to the device, whose executor enforces the
+    /// grow-only rule (the current size is known only there) and issues
+    /// the ublk UPDATE_SIZE. The reply carries the new size in bytes.
+    /// Semantics validated here before forwarding: `size` is a positive
+    /// multiple of 512 (ublk sector granularity); anything else is a
+    /// clean error without a round-trip. Shrink attempts reach the device
+    /// and are rejected there with a clear message.
+    elio::coro::task<std::string> cmd_resize(const nlohmann::json& j) {
+        const std::string id = j["id"].get<std::string>();
+        // parse_command validated 'size' as a non-negative integer.
+        const uint64_t size = j["size"].is_number_unsigned()
+                                  ? j["size"].get<uint64_t>()
+                                  : static_cast<uint64_t>(
+                                        j["size"].get<int64_t>());
+        if (size == 0 || size % 512 != 0) {
+            co_return reply_error(
+                "resize size must be a positive multiple of 512 bytes");
+        }
+        // Named local: a brace-init json temporary as a coroutine
+        // argument trips GCC 12's "array used as initializer" bug.
+        nlohmann::json cmd = {{"cmd", "resize"}, {"size", size}};
+        std::string r = co_await forward_device_command(id, std::move(cmd));
+        auto rj = nlohmann::json::parse(r, nullptr, false);
+        if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
             rj.erase("reply");
             rj.erase("seq");  // internal routing token, not client API
             rj["id"] = id;

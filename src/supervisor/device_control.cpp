@@ -1,10 +1,12 @@
-// Device-side trace recording control. See device_control.hpp.
+// Device-side command control. See device_control.hpp.
 #include "supervisor/device_control.hpp"
 
+#include "common/errors.hpp"
 #include "supervisor/protocol.hpp"
 
 #include <elio/io/io_awaitables.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -177,15 +179,18 @@ nlohmann::json finalize_fields(const image::TraceRecorder::FinalizeResult& r) {
 
 }  // namespace
 
-elio::coro::task<void> run_trace_control(
+elio::coro::task<void> run_device_control(
     ControlChannelWriterPtr channel,
     std::shared_ptr<image::TraceRecorder> recorder,
-    TraceControlHooks hooks) {
-    // Both are required by every path below; dereferencing a null here
-    // would crash the detached coroutine. Refuse loudly instead.
-    if (!channel || !recorder) {
-        ELIO_LOG_ERROR("run_trace_control requires a channel and a "
-                       "recorder; refusing to run");
+    DeviceControlHooks hooks) {
+    // The channel is required by every path below; dereferencing a null
+    // here would crash the detached coroutine. Refuse loudly instead.
+    // `recorder` may be null on devices without one (read-only or
+    // recorder-less images): trace commands then get a clean error
+    // reply, while resize still works (it needs no recorder).
+    if (!channel) {
+        ELIO_LOG_ERROR("run_device_control requires a channel; refusing "
+                       "to run");
         co_return;
     }
     LineReader reader(channel->fd());
@@ -200,6 +205,18 @@ elio::coro::task<void> run_trace_control(
         }
         const std::string cmd = j["cmd"].get<std::string>();
         if (cmd == "trace_start") {
+            // A recorder-less device (or one mid-teardown) cannot record:
+            // answer cleanly instead of dereferencing a null recorder.
+            if (!recorder) {
+                nlohmann::json rj = {{"reply", "trace_start"},
+                                     {"ok", false},
+                                     {"error",
+                                      "trace recording unavailable on this "
+                                      "device"}};
+                echo_seq(j, rj);
+                channel->write_line(rj);
+                continue;
+            }
             // Field TYPES are validated, never assumed: value() on a
             // present-but-wrong-typed key throws type_error, and this
             // loop must answer malformed input, not die on it (the
@@ -290,6 +307,16 @@ elio::coro::task<void> run_trace_control(
                 }
             }
         } else if (cmd == "trace_stop") {
+            if (!recorder) {
+                nlohmann::json rj = {{"reply", "trace_stop"},
+                                     {"ok", false},
+                                     {"error",
+                                      "trace recording unavailable on this "
+                                      "device"}};
+                echo_seq(j, rj);
+                channel->write_line(rj);
+                continue;
+            }
             auto res = co_await recorder->stop("stopped");
             nlohmann::json rj;
             if (res.ok) {
@@ -301,6 +328,81 @@ elio::coro::task<void> run_trace_control(
                       {"ok", false},
                       {"error", res.error}};
             }
+            echo_seq(j, rj);
+            channel->write_line(rj);
+        } else if (cmd == "resize") {
+            // D3 grow-only online resize (ADR-0014 dev_size model). The
+            // GROW-ONLY rule is enforced HERE, against the executor's
+            // current-size seam, BEFORE any kernel IO: a request <= the
+            // current size is a shrink/no-op and is rejected with a
+            // clean error reply (never an exception — the never-throws
+            // contract, and the supervisor awaits a reply).
+            const ResizeExecutor& ex = hooks.resize;
+            const auto bad = [&](const std::string& msg) {
+                nlohmann::json rj = {{"reply", "resize"},
+                                     {"ok", false},
+                                     {"error", msg}};
+                echo_seq(j, rj);
+                channel->write_line(rj);
+            };
+            if (!ex.apply_resize || !ex.current_size) {
+                bad("resize unsupported on this device");
+                continue;
+            }
+            // `size` is a byte count. Field TYPES are validated, never
+            // assumed (value() would throw type_error): accept unsigned
+            // or non-negative signed integers only — floats, negatives
+            // and strings all get a clean error.
+            uint64_t requested = 0;
+            const auto zit = j.find("size");
+            bool size_ok = false;
+            if (zit != j.end() && zit->is_number_unsigned()) {
+                requested = zit->get<uint64_t>();
+                size_ok = true;
+            } else if (zit != j.end() && zit->is_number_integer() &&
+                       zit->get<int64_t>() >= 0) {
+                requested = static_cast<uint64_t>(zit->get<int64_t>());
+                size_ok = true;
+            }
+            if (!size_ok) {
+                bad("resize requires a non-negative integer 'size' (bytes)");
+                continue;
+            }
+            if (requested == 0 || requested % 512 != 0) {
+                bad("resize size must be a positive multiple of 512 bytes");
+                continue;
+            }
+            uint64_t current = 0;
+            try {
+                current = ex.current_size();
+            } catch (const std::exception& e) {
+                bad(std::string("cannot read current device size: ") +
+                    e.what());
+                continue;
+            }
+            if (requested <= current) {
+                bad("resize rejected: grow-only (requested " +
+                    std::to_string(requested) + " <= current " +
+                    std::to_string(current) + " bytes)");
+                continue;
+            }
+            // The executor's apply issues the ublk UPDATE_SIZE, a
+            // BLOCKING control-plane call that may sleep on our own data
+            // plane — never on an Elio worker (ublk control-plane rule;
+            // the executor may additionally re-check grow-only as
+            // defense in depth). Exceptions (kernel rejection, device
+            // shutting down) become clean error replies.
+            uint64_t applied = 0;
+            try {
+                applied = co_await elio::spawn_blocking(
+                    [&]() { return ex.apply_resize(requested); });
+            } catch (const std::exception& e) {
+                bad(std::string("resize failed: ") + e.what());
+                continue;
+            }
+            nlohmann::json rj = {{"reply", "resize"},
+                                 {"ok", true},
+                                 {"size", applied}};
             echo_seq(j, rj);
             channel->write_line(rj);
         } else {

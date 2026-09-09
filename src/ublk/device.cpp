@@ -98,6 +98,8 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
             throw error(EBUSY, "ublk START_DEV not ready after 5s");
         }
         dev->started_ = true;
+        dev->cur_bytes_.store(params.dev_sectors * 512,
+                              std::memory_order_release);
         ELIO_LOG_INFO("ublk device {} ready ({})", dev->dev_id_,
                       dev->bdev_path());
     } catch (...) {
@@ -170,6 +172,8 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         }
         dev->ctrl_->adopt_dev(dev_id);
         dev->started_ = true;
+        dev->cur_bytes_.store(params.dev_sectors * 512,
+                              std::memory_order_release);
         ELIO_LOG_INFO("ublk device {} recovered ({})", dev_id,
                       dev->bdev_path());
     } catch (...) {
@@ -177,6 +181,30 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         throw;
     }
     co_return dev;
+}
+
+uint64_t Device::resize_blocking(uint64_t bytes) {
+    // D3 grow-only online resize. BLOCKING (kernel control call): every
+    // caller must route this off an Elio worker via spawn_blocking —
+    // the device command loop does so (see run_device_control).
+    if (bytes == 0 || bytes % 512 != 0) {
+        throw error(EINVAL, "resize size must be a positive multiple of "
+                            "512 bytes");
+    }
+    const uint64_t cur = cur_bytes_.load(std::memory_order_acquire);
+    // Grow-only (ADR-0014 dev_size model): shrinking or no-op'ing a live
+    // device is rejected cleanly here — the executor's reply surfaces
+    // this message to the CLI.
+    if (bytes <= cur) {
+        throw error(EINVAL, "resize rejected: grow-only (requested " +
+                                std::to_string(bytes) +
+                                " <= current " + std::to_string(cur) +
+                                " bytes)");
+    }
+    ctrl_->update_size(dev_id_, bytes / 512);
+    cur_bytes_.store(bytes, std::memory_order_release);
+    ELIO_LOG_INFO("ublk device {} grew to {} bytes", dev_id_, bytes);
+    return bytes;
 }
 
 void Device::stop() noexcept {

@@ -81,6 +81,24 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
             error = "trace_stop 'id' must be a string";
             return std::nullopt;
         }
+    } else if (cmd == "resize") {
+        if (!j.contains("id") || !j.contains("size")) {
+            error = "resize requires 'id' and 'size'";
+            return std::nullopt;
+        }
+        if (!j["id"].is_string()) {
+            error = "resize 'id' must be a string";
+            return std::nullopt;
+        }
+        // 'size' is a byte count: accept unsigned or non-negative signed
+        // integers (semantic rules — positive, 512-aligned, grow-only —
+        // live in the handlers, which know the current size).
+        if (!j["size"].is_number_unsigned() &&
+            !(j["size"].is_number_integer() &&
+              j["size"].get<int64_t>() >= 0)) {
+            error = "resize 'size' must be a non-negative integer (bytes)";
+            return std::nullopt;
+        }
     } else if (cmd != "list" && cmd != "hello") {
         error = "unknown cmd '" + cmd + "'";
         return std::nullopt;
@@ -107,8 +125,10 @@ std::string reply_hello() {
     fields["version"] = kProjectVersion;
     // Capability gate (additive-only rule): "commit" = the ADR-0014
     // offline commit command is served; "trace" = the ADR-0013 record
-    // path (trace_start/trace_stop) is served.
-    fields["features"] = nlohmann::json::array({"commit", "trace"});
+    // path (trace_start/trace_stop) is served; "resize" = the D3
+    // grow-only online resize command is served.
+    fields["features"] =
+        nlohmann::json::array({"commit", "trace", "resize"});
     return reply_ok(fields);
 }
 

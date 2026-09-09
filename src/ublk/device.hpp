@@ -53,6 +53,24 @@ public:
     /// True once the kernel gendisk is live (START_DEV succeeded).
     bool started() const noexcept { return started_; }
 
+    /// Current device capacity in bytes (the grow-only resize baseline;
+    /// the size this process created/attached, updated by resize_blocking).
+    uint64_t size_bytes() const noexcept {
+        return cur_bytes_.load(std::memory_order_acquire);
+    }
+
+    /// D3 grow-only online resize. Issues UBLK_U_CMD_UPDATE_SIZE so the
+    /// kernel gendisk grows to `bytes`. BLOCKING — the kernel control
+    /// call may sleep on our own data plane, so this must run off an
+    /// Elio worker via elio::spawn_blocking (the device command loop
+    /// does that; see run_device_control). Grow-only is enforced HERE
+    /// too (defense in depth, so any caller can never shrink): a request
+    /// <= the current size is rejected with obd::error. Returns the new
+    /// size in bytes; throws obd::error (EINVAL for a shrink/no-op or a
+    /// misaligned/zero request, the kernel's errno for UPDATE_SIZE
+    /// failure — e.g. -EINVAL on a driver without the command).
+    uint64_t resize_blocking(uint64_t bytes);
+
     /// Signals queue threads and bridges to stop, joins the threads, and
     /// unregisters the device (STOP_DEV/DEL_DEV via ~Ctrl).
     void stop() noexcept;
@@ -65,6 +83,10 @@ private:
     std::unique_ptr<Ctrl> ctrl_;
     uint32_t dev_id_ = 0;
     bool started_ = false;
+    /// Live device capacity in bytes; the resize grow-only baseline.
+    /// Atomic: resize_blocking runs on a spawn_blocking pool thread
+    /// while the device command loop reads size_bytes() on a worker.
+    std::atomic<uint64_t> cur_bytes_{0};
 
     std::atomic<bool> stop_{false};
     // Coroutines that dereference queues_/src_ (bridges + per-IO

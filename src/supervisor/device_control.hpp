@@ -1,23 +1,31 @@
-// Device-side trace recording control (ADR-0013, record path): the
-// obd-device half of the supervisor's trace_start/trace_stop commands.
+// Device-side command control: the obd-device half of the supervisor's
+// forwarded device commands (ADR-0013 trace record path + D3 resize).
 //
-// The supervisor forwards trace commands as JSON-lines on the same
-// control socketpair the device reports lifecycle status on (protocol
-// v3). This loop reads them, drives the image's TraceRecorder, and
-// writes reply lines back with the "reply" discriminator:
+// The supervisor forwards commands as JSON-lines on the same control
+// socketpair the device reports lifecycle status on (protocol v3). This
+// loop is the device's single reader of that channel; it drives the
+// image's TraceRecorder, executes D3 resizes through the caller-supplied
+// executor seam, and writes reply lines back with the "reply"
+// discriminator:
 //
 //   {"reply":"trace_start","ok":true,"path":...,"duration_sec":N,"seq":N}
 //   {"reply":"trace_stop","ok":true,"path":...,"sha256":...,"size":N,
 //    "records":N,"dropped":N,"seq":N}
 //   {"reply":"trace_event","event":"expired", ...same stats...}
+//   {"reply":"resize","ok":true,"size":<new bytes>,"seq":N}
+//   {"reply":"resize","ok":false,"error":"...","seq":N}
 //
 // Replies echo the command's `seq` when present (the supervisor's
 // correlation token); the unsolicited expiry event carries none.
 //
-// The duration bound is enforced HERE, in the device process (a timer
-// armed by TraceRecorder::start) — a dead or disconnected CLI can never
-// leak a recording device. Shared by obd-device and the test fake
-// device so the wire behavior exists in exactly one place.
+// The trace duration bound is enforced HERE, in the device process (a
+// timer armed by TraceRecorder::start) — a dead or disconnected CLI can
+// never leak a recording device. The D3 resize is GROW-ONLY, enforced
+// HERE against the executor's current-size seam before any kernel IO
+// (shrink/no-op attempts get a clean error reply; see resize_blocking
+// in the ublk Device for the second, defense-in-depth check). Shared by
+// obd-device and the test fake device so the wire behavior exists in
+// exactly one place.
 #pragma once
 
 #include "image/trace_record.hpp"
@@ -75,25 +83,42 @@ private:
 
 using ControlChannelWriterPtr = std::shared_ptr<ControlChannelWriter>;
 
-struct TraceControlHooks {
+/// D3 resize executor seam: how THIS device (real obd-device or test
+/// fake) serves a `resize` command. All members are optional — an
+/// executor without `apply_resize` answers resize with a clean
+/// "unsupported" error. `current_size` (bytes) is the grow-only
+/// baseline the loop compares the request against BEFORE any kernel IO;
+/// `apply_resize(requested_bytes)` issues the ublk UPDATE_SIZE (a
+/// blocking control call; the loop runs it via elio::spawn_blocking, per
+/// the ublk control-plane rule) and returns the resulting size in bytes,
+/// throwing obd::error on failure.
+struct ResizeExecutor {
+    std::function<uint64_t()> current_size;
+    std::function<uint64_t(uint64_t)> apply_resize;
+};
+
+struct DeviceControlHooks {
     /// Invoked (coroutine context, best-effort) right after a recording
     /// successfully starts. The test fake uses it to run a scripted
     /// workload inside the recording window; the real device passes
     /// nothing (the workload is guest IO).
     std::function<void()> on_start;
+    /// D3 resize executor (null/empty members = resize unsupported).
+    ResizeExecutor resize;
 };
 
-/// Serves trace commands from `channel` until EOF (the supervisor
+/// Serves device commands from `channel` until EOF (the supervisor
 /// closed or died — the device keeps serving its block device; any
 /// active recording is still finalized by its duration timer or by the
-/// device shutdown path). Never throws: structurally malformed lines
-/// are logged and skipped, while parsed commands with missing or
-/// wrong-typed fields get a clean error REPLY (the supervisor awaits a
-/// reply — a skip would cost it a 30 s timeout). Spawn with elio::go
-/// after the image is open.
-elio::coro::task<void> run_trace_control(
+/// device shutdown path). `recorder` may be null on devices without a
+/// recorder; trace commands then get a clean "unavailable" error reply.
+/// Never throws: structurally malformed lines are logged and skipped,
+/// while parsed commands with missing or wrong-typed fields get a clean
+/// error REPLY (the supervisor awaits a reply — a skip would cost it a
+/// 30 s timeout). Spawn with elio::go after the image is open.
+elio::coro::task<void> run_device_control(
     ControlChannelWriterPtr channel,
     std::shared_ptr<image::TraceRecorder> recorder,
-    TraceControlHooks hooks = {});
+    DeviceControlHooks hooks = {});
 
 }  // namespace obd::supervisor

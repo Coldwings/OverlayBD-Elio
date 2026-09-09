@@ -84,7 +84,7 @@ TEST_CASE("supervisor: device trace control answers malformed-typed fields with 
         auto channel =
             std::make_shared<supervisor::ControlChannelWriter>(fds[1]);
         elio::go([channel, rec]() -> elio::coro::task<void> {
-            co_await supervisor::run_trace_control(channel, rec);
+            co_await supervisor::run_device_control(channel, rec);
         });
         // Wrong-typed path / duration_sec: clean error replies (the
         // pre-fix code threw type_error out of the loop here). Named
@@ -229,7 +229,7 @@ TEST_CASE("supervisor: device trace control skips an oversized line and stays al
         auto channel =
             std::make_shared<supervisor::ControlChannelWriter>(fds[1]);
         elio::go([channel, rec]() -> elio::coro::task<void> {
-            co_await supervisor::run_trace_control(channel, rec);
+            co_await supervisor::run_device_control(channel, rec);
         });
         // Junk line bigger than the 64 KiB cap (no '\n' inside), then a
         // valid command. The DEVICE reader must discard the oversized

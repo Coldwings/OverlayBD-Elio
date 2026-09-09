@@ -60,6 +60,13 @@ public:
     /// (EBUSY until every queue has parked its FETCH commands).
     void start_dev(uint32_t dev_id);
 
+    /// D3 grow-only online resize: tells the driver the device's new
+    /// capacity (UBLK_U_CMD_UPDATE_SIZE; `sectors` in 512B units). The
+    /// kernel ABI passes the size in cmd.data[0]. Drivers without the
+    /// command (pre-6.16) reject it with -EINVAL, which surfaces as a
+    /// thrown obd::error. Throws obd::error on failure.
+    void update_size(uint32_t dev_id, uint64_t sectors);
+
     /// ADR-0010 recovery handshake for a replacement server process:
     /// START_USER_RECOVERY announces the new server, END_USER_RECOVERY
     /// returns the device to live once every queue re-parked its FETCH
