@@ -36,11 +36,13 @@ jobs:
           # build never needs Chrome, so drop the source before updating.
           # rm the known file names AND delete any dl.google.com line from
           # every apt source (the exact path varies across runner images).
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-            /etc/apt/sources.list.d/google-chrome*.list \
-            /etc/apt/sources.list.d/*chrome*.list 2>/dev/null || true
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* \
+            /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          # .list AND deb822 .sources variants; the runner path varies.
           sudo sed -i '/dl\.google\.com/d' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/*.list \
+            /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             liburing-dev zlib1g-dev libssl-dev cmake ninja-build g++
@@ -72,11 +74,13 @@ jobs:
           # build never needs Chrome, so drop the source before updating.
           # rm the known file names AND delete any dl.google.com line from
           # every apt source (the exact path varies across runner images).
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-            /etc/apt/sources.list.d/google-chrome*.list \
-            /etc/apt/sources.list.d/*chrome*.list 2>/dev/null || true
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* \
+            /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          # .list AND deb822 .sources variants; the runner path varies.
           sudo sed -i '/dl\.google\.com/d' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/*.list \
+            /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             liburing-dev zlib1g-dev libssl-dev linux-libc-dev \
@@ -95,11 +99,13 @@ jobs:
           # build never needs Chrome, so drop the source before updating.
           # rm the known file names AND delete any dl.google.com line from
           # every apt source (the exact path varies across runner images).
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-            /etc/apt/sources.list.d/google-chrome*.list \
-            /etc/apt/sources.list.d/*chrome*.list 2>/dev/null || true
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* \
+            /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          # .list AND deb822 .sources variants; the runner path varies.
           sudo sed -i '/dl\.google\.com/d' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/*.list \
+            /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             "linux-headers-$(uname -r)" build-essential libelf-dev dwarves
