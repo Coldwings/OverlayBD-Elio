@@ -266,6 +266,11 @@ void LayerStore::set_test_write_hook(
     write_hook_ = std::move(hook);
 }
 
+void LayerStore::set_test_fetch_done_hook(std::function<void()> hook) {
+    // Armed before any coroutine runs (tests only), so no locking.
+    fetch_done_hook_ = std::move(hook);
+}
+
 // ---------------------------------------------------------------------------
 // Setup / recovery (cold paths)
 // ---------------------------------------------------------------------------
@@ -493,6 +498,12 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
         permit = co_await cfg_.funnel->acquire(cls);
     }
     const ssize_t r = co_await remote_->pread(buf->data(), elen, ebase);
+    // The permit covers the remote fetch alone — its lifetime is the
+    // latency sample (the same contract as run_fill's): release the
+    // window slot before the completion bookkeeping below, so a queued
+    // scavenger never waits behind the in-flight map update.
+    permit.reset();
+    if (fetch_done_hook_) fetch_done_hook_();  // test-only
     if (r < 0) {
         f->error = static_cast<int>(-r);
     } else if (static_cast<size_t>(r) != elen) {
@@ -501,11 +512,22 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
         f->data = std::move(buf);
     }
     co_await inflight_mu_.lock();
+    // Signal completion BEFORE retiring the entry, in the same critical
+    // section: a same-extent caller then either finds the entry (done
+    // already signaled — its wait returns immediately with the result)
+    // or finds nothing (the fetch is complete and its joiners were
+    // released). The previous erase-then-set order left a window —
+    // hittable once the scheduler runs several workers — in which a
+    // caller missed the retired entry and started a duplicate remote
+    // fetch for bytes just fetched, the waste extent dedup exists to
+    // prevent (ADR-0012). done.set() only collects and schedules
+    // waiters (never blocks, leaf mutex), so signaling under
+    // inflight_mu_ cannot deadlock. Joiners hold their own
+    // shared_ptr<InFlight>, so the event stays alive until every waiter
+    // has been scheduled away from it.
+    f->done.set();
     inflight_.erase(extent_id);
     inflight_mu_.unlock();
-    // Joiners hold their own shared_ptr<InFlight>, so the event stays alive
-    // until every waiter has been scheduled away from it.
-    f->done.set();
     co_return FetchResult{f->data, f->error};
 }
 

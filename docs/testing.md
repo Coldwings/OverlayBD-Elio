@@ -361,6 +361,10 @@ Every test, grouped by area, with the property it guards.
   dedup ordering (ADR-0012): a `populate` for an extent already being
   fetched joins the in-flight fetch (coalesced join) and consumes no
   scavenger admission and no queue event at the funnel.
+- `source: layer store fetch frees the funnel slot before retiring the fetch` —
+  the starter's funnel permit covers exactly the remote fetch: the
+  fetch-done hook observes the slot already released before the
+  completion bookkeeping (in-flight map retire) runs (ADR-0012).
 
 ### image
 

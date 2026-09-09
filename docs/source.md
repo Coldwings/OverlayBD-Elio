@@ -744,9 +744,15 @@ remote bytes into a sparse local staging file with a sidecar extent map
   `Bypass`) is fetched whole from the remote with in-flight coalescing —
   concurrent readers of the same missing extent join one fetch
   (`coalesced_joins`) — and the fetched bytes are enqueued for write-behind
-  (not in `Bypass`). With `Config::funnel` set, the fetch is admitted as
-  the ADR-0012 OnDemand class. Returns the clamped count, or a negative
-  `-errno` / `-EIO` on remote error/short fill. Never throws.
+  (not in `Bypass`). The starter signals fetch completion and retires the
+  in-flight entry in one critical section (signal first), so a same-extent
+  caller either joins or arrives after completion — it never starts a
+  duplicate fetch of bytes just fetched. The starter's funnel permit
+  covers exactly the remote fetch (released before the completion
+  bookkeeping, the run_fill contract). With `Config::funnel` set, the
+  fetch is admitted as the ADR-0012 OnDemand class. Returns the clamped
+  count, or a negative `-errno` / `-EIO` on remote error/short fill. Never
+  throws.
 - `src/source/layer_store.hpp::LayerStore::populate` — warms every missing
   extent in `[offset, offset+len)` through the same coalesced fetch and
   write-behind path without delivering data; with `Config::funnel` set the
@@ -1106,6 +1112,10 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   `populate` for an extent already being fetched joins the in-flight
   fetch and consumes no scavenger admission (dedup below the funnel,
   ADR-0012).
+- `source: layer store fetch frees the funnel slot before retiring the fetch` —
+  the starter's funnel permit covers exactly the remote fetch: the slot
+  is already released when the completion bookkeeping (in-flight map
+  retire) runs.
 - `integration: layered stack stages over a mock registry` — the manual
   composition RegistrySource → LayerStore → TarOffsetSource → ZFile → LSMT
   merge reads the original content byte-exactly (the same chain image

@@ -167,6 +167,12 @@ public:
     /// simulate a slow disk. Not part of the module API.
     void set_test_write_hook(std::function<int(uint64_t extent_id)> hook);
 
+    /// Test-only hook: invoked on the starter coroutine right after the
+    /// remote fetch completes (after the funnel permit is released,
+    /// before the in-flight entry is retired). Not part of the module
+    /// API.
+    void set_test_fetch_done_hook(std::function<void()> hook);
+
 private:
     LayerStore() = default;
 
@@ -286,6 +292,7 @@ private:
     uint64_t queued_bytes_ = 0;
     bool stopping_ = false;
     std::function<int(uint64_t)> write_hook_;  // test-only, under qmu_
+    std::function<void()> fetch_done_hook_;    // test-only, coroutine-side
     uint32_t attempts_ = 0;        // completion-verify attempts (writer only)
     bool kick_completion_check_ = false;  // set before the writer starts
 

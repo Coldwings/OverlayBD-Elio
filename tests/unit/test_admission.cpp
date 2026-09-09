@@ -519,3 +519,60 @@ TEST_CASE("source: populate joining an in-flight fetch bypasses the funnel",
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("source: layer store fetch frees the funnel slot before retiring the fetch",
+          "[source]") {
+    // Regression: the starter's funnel permit once stayed alive through
+    // the completion bookkeeping (result assignment, the suspending
+    // inflight_mu_ lock, the in-flight map retire) instead of covering
+    // exactly the remote fetch — inflating the OnDemand AIMD sample and
+    // holding a scavenger slot past the fetch. The fetch-done hook
+    // observes the slot count at the precise moment the fetch has
+    // completed but the in-flight entry is not yet retired.
+    test::TempDir dir;
+    constexpr size_t kExtent = 64 * 1024;
+    auto blob = test::pattern_bytes(4 * kExtent, 37);
+    const std::string digest = common::Sha256::hex(blob.data(), blob.size());
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto funnel = std::make_shared<AdmissionFunnel>();
+        auto* gated = new GatedSource(blob);  // gate closed
+        source::LayerStore::Config lsc;
+        lsc.funnel = funnel;
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(gated), dir.str(), digest, lsc);
+
+        std::atomic<int64_t> slot_at_completion{-1};
+        store->set_test_fetch_done_hook([&] {
+            slot_at_completion.store(
+                static_cast<int64_t>(funnel->inflight_total()),
+                std::memory_order_relaxed);
+        });
+
+        std::vector<uint8_t> buf(4096);
+        std::atomic<ssize_t> read_rc{-1};
+        elio::go([&]() -> elio::coro::task<void> {
+            const ssize_t r = co_await store->pread(
+                buf.data(), buf.size(), 2 * kExtent);
+            read_rc.store(r, std::memory_order_relaxed);
+        });
+        const bool fetching = co_await poll_until(
+            [&] { return store->remote_fetches() == 1; });
+        REQUIRE(fetching);
+        // The fetch is parked at the source gate, holding its slot.
+        REQUIRE(funnel->inflight_total() == 1);
+
+        gated->gate.set();
+        const bool done = co_await poll_until(
+            [&] { return read_rc.load() >= 0; });
+        REQUIRE(done);
+        REQUIRE(read_rc.load() == static_cast<ssize_t>(buf.size()));
+        // The hook ran after the fetch completed and BEFORE the
+        // completion protocol — the permit must already be released
+        // (0, not the 1 a fetch-scoped permit would still show).
+        REQUIRE(slot_at_completion.load() == 0);
+        REQUIRE(buf == slice(blob, 2 * kExtent, buf.size()));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
