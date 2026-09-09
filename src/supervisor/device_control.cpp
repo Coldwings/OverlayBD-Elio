@@ -265,7 +265,17 @@ elio::coro::task<void> run_trace_control(
             }
             echo_seq(j, rj);
             channel->write_line(rj);
-            if (started && hooks.on_start) hooks.on_start();
+            if (started && hooks.on_start) {
+                // A hook throwing would kill the detached control
+                // coroutine and strand every later command until the
+                // 30 s supervisor timeout. Guard it.
+                try {
+                    hooks.on_start();
+                } catch (const std::exception& e) {
+                    ELIO_LOG_WARNING("trace_start on_start hook threw: {}",
+                                     e.what());
+                }
+            }
         } else if (cmd == "trace_stop") {
             auto res = co_await recorder->stop("stopped");
             nlohmann::json rj;
