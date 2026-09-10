@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace {
@@ -50,7 +51,7 @@ bool parse_dev_id(const char* v, nlohmann::json* req) {
     errno = 0;
     const long id = std::strtol(v, &end, 10);
     if (errno != 0 || end == v || *end != '\0' || id < -1 ||
-        id > INT32_MAX) {
+        id > std::numeric_limits<int32_t>::max()) {
         std::fprintf(stderr,
                      "invalid --dev-id '%s' (want an integer >= -1; -1 = "
                      "auto)\n",
