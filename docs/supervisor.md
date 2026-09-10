@@ -32,7 +32,9 @@ A Unix domain stream socket (default
 UTF-8 JSON object per line, maximum line length **64 KiB**
 (`kMaxMessageBytes`) on both channels. Connections are **one-shot**: the
 client sends exactly one command line, the supervisor replies with exactly
-one line and closes.
+one line and closes during an ordinary exchange. Shutdown can interrupt the
+exchange with EOF or a connection reset before a reply is delivered. A
+missing reply does not establish whether a mutating command executed.
 
 Requests (validated by `parse_command` in src/supervisor/protocol.cpp —
 these are the real field names):
@@ -884,10 +886,18 @@ flag first and never respawn.
 
 ### Daemon shutdown
 
-Shutdown closes admission and cancels the listener's pending accept and the
-accepted clients' socket reads/writes. An idle peer or a partial JSON line
-therefore needs no additional client traffic to let the daemon stop. The
+Shutdown closes admission and cancels the listener's pending accept,
+accepted clients' socket reads/writes, and forwarded device-channel writes.
+An idle peer, a partial JSON line, or a device that stops reading therefore
+needs no additional peer traffic to let those I/O operations finish. The
 listener and each stream retain their descriptors through I/O completion.
+
+Command admission occurs at the shutdown check after reading a complete
+line. A connection accepted earlier, or even a line fully read before that
+check, can receive EOF/reset without dispatch or a JSON reply when shutdown
+has begun. Already admitted handlers remain owned until completion, which
+may include cancellation or failure; draining them does not guarantee
+successful command execution or response delivery.
 
 The daemon drains accepted handlers first, with device monitors and the
 SIGCHLD reaper still running: an already admitted command may finish a
@@ -906,10 +916,13 @@ The reaper remains pinned to worker 0 because its `signal_fd` caches its
 creating worker's I/O context.
 
 This is a completion guarantee, not a single global shutdown deadline.
-An admitted command retains its existing readiness, device-reply, stop,
-and host-mkfs bounds; local file/seal operations must complete as usual.
-The daemon does not free shared state when a timeout expires while an
-owned task can still access it.
+Readiness, device-reply, stop, and host-mkfs waits retain their existing
+bounds when reached; local file/seal operations must complete as usual.
+Forwarded writes can finish with cancellation before the whole request has
+been sent. The existing 30-second device-reply timeout begins only after a
+complete send, so write cancellation must be available while handlers drain.
+The daemon does not free shared state when a timeout expires while an owned
+task can still access it.
 
 ## Limitations & TODO
 
