@@ -47,11 +47,30 @@ private:
     std::string label_;
 };
 
-LsmtRwLayer::~LsmtRwLayer() = default;
+LsmtRwLayer::~LsmtRwLayer() {
+    // View borrows fd_ and data_bytes_; callers must drain IO before destruction.
+    if (fd_ >= 0) ::close(fd_);
+}
 
 source::BlobSource& LsmtRwLayer::data_source() { return *view_; }
 
 namespace {
+
+// Cold-path descriptors must also close when allocation/serialization throws.
+// For compaction output, unlink the unpublished file during unwinding too.
+struct FdGuard {
+    int fd;
+    const std::string* unlink_path;
+
+    explicit FdGuard(int value, const std::string* path = nullptr)
+        : fd(value), unlink_path(path) {}
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    ~FdGuard() {
+        ::close(fd);
+        if (unlink_path != nullptr) ::unlink(unlink_path->c_str());
+    }
+};
 
 constexpr uint64_t kSector = 512;
 constexpr uint64_t kHeaderSectors = 8;  // 4096B header region
@@ -150,12 +169,11 @@ elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
     if (vsize == 0 || vsize % kSector != 0) {
         throw error(EINVAL, "lsmt rw vsize must be sector aligned");
     }
-    const int fd =
-        ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) throw_errno(errno, "cannot create lsmt rw layer " + path);
-
     auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer);
-    layer->fd_ = fd;
+    layer->fd_ =
+        ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    const int fd = layer->fd_;
+    if (fd < 0) throw_errno(errno, "cannot create lsmt rw layer " + path);
     layer->vsize_.store(vsize, std::memory_order_release);
     layer->data_end_sector_ = kHeaderSectors;
     layer->uuid_ = generate_uuid();
@@ -169,7 +187,6 @@ elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
     ht.serialize(region);
     if (const int rc = co_await write_all(fd, region, sizeof(region), 0);
         rc != 0) {
-        ::close(fd);
         throw_errno(-rc, "cannot write lsmt rw header " + path);
     }
     layer->data_bytes_.store(4096, std::memory_order_release);
@@ -511,6 +528,7 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     const int out_fd =
         ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (out_fd < 0) co_return -errno;
+    FdGuard output(out_fd, &tmp);
 
     int rc = 0;
     std::vector<bytes::segment_mapping> packed;
@@ -607,6 +625,7 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
         rc = -errno;
         goto out;
     }
+    output.unlink_path = nullptr;  // rename published the output
     segments_ = std::move(packed);
     sealed_.store(true, std::memory_order_release);
     {
@@ -618,30 +637,26 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     }
 
 out:
-    ::close(out_fd);
-    if (rc != 0) ::unlink(tmp.c_str());
     co_return rc;
 }
 
 elio::coro::task<std::unique_ptr<LsmtRwLayer>>
 LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
-    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer);
+    layer->fd_ = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    const int fd = layer->fd_;
     if (fd < 0) {
         *error = -errno;
         co_return nullptr;
     }
-    auto fail = [&fd, error](int e) {
-        ::close(fd);
-        *error = e;
-    };
 
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
-        fail(-errno);
+        *error = -errno;
         co_return nullptr;
     }
     if (st.st_size < static_cast<off_t>(2 * lsmt::kSpace)) {
-        fail(-EINVAL);
+        *error = -EINVAL;
         co_return nullptr;
     }
 
@@ -651,27 +666,27 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
     uint8_t region[lsmt::kSpace];
     int rc = co_await read_all(fd, region, sizeof(region), trailer_offset);
     if (rc != 0) {
-        fail(rc);
+        *error = rc;
         co_return nullptr;
     }
     lsmt::HeaderTrailer tht;
     try {
         tht = lsmt::HeaderTrailer::parse(region);
     } catch (const std::exception&) {
-        fail(-EINVAL);
+        *error = -EINVAL;
         co_return nullptr;
     }
     if (!tht.is_trailer() || !tht.is_data_file()) {
-        fail(-EINVAL);
+        *error = -EINVAL;
         co_return nullptr;
     }
     if (tht.is_sealed()) {
-        fail(-EALREADY);
+        *error = -EALREADY;
         co_return nullptr;
     }
     if (tht.virtual_size == 0 || tht.virtual_size % kSector != 0 ||
         tht.index_size > lsmt::kMaxRoIndexSize) {
-        fail(-EINVAL);
+        *error = -EINVAL;
         co_return nullptr;
     }
 
@@ -683,19 +698,19 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
     // uuid and virtual_size authenticates the checkpoint.
     rc = co_await read_all(fd, region, sizeof(region), 0);
     if (rc != 0) {
-        fail(rc);
+        *error = rc;
         co_return nullptr;
     }
     lsmt::HeaderTrailer hht;
     try {
         hht = lsmt::HeaderTrailer::parse(region);
     } catch (const std::exception&) {
-        fail(-EINVAL);
+        *error = -EINVAL;
         co_return nullptr;
     }
     if (!hht.is_header() || !hht.is_data_file() || hht.is_sealed() ||
         hht.uuid != tht.uuid || hht.virtual_size != tht.virtual_size) {
-        fail(-EINVAL);
+        *error = -EINVAL;
         co_return nullptr;
     }
 
@@ -708,7 +723,7 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
     if (tht.index_offset < lsmt::kSpace ||
         tht.index_offset > trailer_offset ||
         index_bytes > trailer_offset - tht.index_offset) {
-        fail(-EINVAL);
+        *error = -EINVAL;
         co_return nullptr;
     }
 
@@ -718,7 +733,7 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
     if (index_bytes > 0) {
         rc = co_await read_all(fd, raw.data(), index_bytes, tht.index_offset);
         if (rc != 0) {
-            fail(rc);
+            *error = rc;
             co_return nullptr;
         }
     }
@@ -733,7 +748,7 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
     }
     for (size_t i = 1; i < segments.size(); ++i) {
         if (segments[i - 1].end() > segments[i].offset) {
-            fail(-EINVAL);
+            *error = -EINVAL;
             co_return nullptr;
         }
     }
@@ -747,13 +762,11 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
                                kHeaderSectors < m.mend() &&
                                m.mend() <= moffset_end);
         if (!ok) {
-            fail(-EINVAL);
+            *error = -EINVAL;
             co_return nullptr;
         }
     }
 
-    auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer());
-    layer->fd_ = fd;
     layer->vsize_.store(tht.virtual_size,
                              std::memory_order_release);
     layer->data_end_sector_ = tht.index_offset / kSector;
@@ -831,11 +844,10 @@ elio::coro::task<int> LsmtRwLayer::seal_file(const std::string& path,
     // during compaction).
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) co_return -errno;
+    FdGuard input(fd);
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
-        const int e = -errno;
-        ::close(fd);
-        co_return e;
+        co_return -errno;
     }
     common::Sha256 hash;
     std::vector<uint8_t> buf(1 << 20);
@@ -846,13 +858,11 @@ elio::coro::task<int> LsmtRwLayer::seal_file(const std::string& path,
             static_cast<uint64_t>(buf.size()), total - off));
         const int rrc = co_await read_all(fd, buf.data(), n, off);
         if (rrc != 0) {
-            ::close(fd);
             co_return rrc;
         }
         hash.update(buf.data(), n);
         off += n;
     }
-    ::close(fd);
     if (sha256_hex) *sha256_hex = hash.final_hex();
     if (size) *size = total;
     co_return 0;

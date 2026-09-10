@@ -213,6 +213,20 @@ Every test, grouped by area, with the property it guards.
   sequence yields a different digest, as does identical data with a
   different packed index (zeroed segments — pinning that the index, not
   only the data, feeds the digest).
+- `format: lsmt rw destruction releases its backing descriptor` — repeated
+  create/read/reset cycles leave no descriptor for the backing device/inode.
+- `format: lsmt rw offline seal releases replaced inode descriptors` —
+  checkpoint/offline seal releases its reopened old inode and digest descriptors;
+  destroying the creator releases its remaining reference, and data round-trips.
+- `format: lsmt rw rejected seal releases its reopened descriptor` — unaligned
+  and shrinking overrides plus output-open failure preserve the checkpoint and
+  release the reopened owner.
+- `format: lsmt rw seal exceptions release temporary descriptors` — a header
+  serialization exception closes both temporary descriptors and removes the
+  compaction file while preserving the original checkpoint.
+- `format: lsmt rw setup failures release their descriptors` — short files,
+  invalid trailers/index entries, and `/dev/full` header-write errors release
+  their descriptors while a separate live layer remains readable.
 - `format: lsmt rw checkpoint persists the index for offline seal` —
   `checkpoint()` persists the RW index as an unsealed trailer (terminal:
   later writes get `-EROFS`), `seal_file()` seals it offline with

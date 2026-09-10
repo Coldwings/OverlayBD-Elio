@@ -132,7 +132,7 @@ private:
     static elio::coro::task<std::unique_ptr<LsmtRwLayer>> open_checkpointed(
         const std::string& path, int* error);
 
-    int fd_ = -1;                   // RW fd (also used for data_source reads)
+    int fd_ = -1;                   // owned RW fd; View only borrows it
     class View;                     // fd-backed BlobSource with dynamic size
     std::unique_ptr<View> view_;
     std::atomic<uint64_t> data_bytes_{0};  // upper bound for view reads

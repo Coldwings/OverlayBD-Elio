@@ -607,6 +607,14 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
 - `data_source()`: an fd-backed `BlobSource` view whose size **tracks
   appends** (an `std::atomic<uint64_t>` upper bound), unlike a
   `LocalFileSource` which pins `st_size` at open.
+- Descriptor lifetime: the layer owns the backing descriptor from successful
+  open through destruction, including setup exceptions. `data_source()` borrows
+  that descriptor and the layer's size state; callers must finish all operations
+  and stop using the view before destroying the layer. A live layer retains its
+  original inode after `seal()` replaces the pathname; destruction closes it.
+  `seal_file()` destroys its reopened layer after sealing (also on rejection or
+  failure), releasing the replaced inode. Compaction and digest descriptors
+  have scoped ownership so exceptions also close them.
 - `checkpoint()` (ADR-0014): appends the in-memory segment index plus an
   **unsealed trailer** at the data end (index region padded to 4096B,
   trailer in the file's last 4096 bytes) and fdatasyncs. Called by
@@ -1017,6 +1025,20 @@ writers and readers agree on the same bytes.
   sequences seal to byte-identical files (equal sha256), their sealed
   uuids match, and a different write sequence yields a different digest.
   Catches accidental time/random fields in the sealed output.
+- `format: lsmt rw destruction releases its backing descriptor` — repeated
+  create/read/reset cycles leave no descriptor for the backing device/inode.
+- `format: lsmt rw offline seal releases replaced inode descriptors` —
+  checkpoint/offline seal releases its reopened old inode and digest descriptors;
+  destroying the creator releases its remaining reference, and data round-trips.
+- `format: lsmt rw rejected seal releases its reopened descriptor` — unaligned
+  and shrinking overrides plus output-open failure preserve the checkpoint and
+  release the reopened owner.
+- `format: lsmt rw seal exceptions release temporary descriptors` — a header
+  serialization exception closes both temporary descriptors and removes the
+  compaction file while preserving the original checkpoint.
+- `format: lsmt rw setup failures release their descriptors` — short files,
+  invalid trailers/index entries, and `/dev/full` header-write errors release
+  their descriptors while a separate live layer remains readable.
 - `format: lsmt rw checkpoint persists the index for offline seal` — the
   ADR-0014 offline-commit machinery: `checkpoint()` persists the index
   (writes afterwards get `-EROFS`), `seal_file()` seals the file from a
