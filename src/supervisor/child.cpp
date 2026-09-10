@@ -34,6 +34,10 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
         std::string recover_flag = "--recover";
         std::string vsize_flag = "--virtual-size";
         std::string vsize;
+        std::string blank_size_flag = "--blank-size";
+        std::string blank_size;
+        std::string blank_dir_flag = "--blank-dir";
+        std::string blank_dir;
         std::vector<char*> argv;
     } a;
     a.bin = spec.device_bin;
@@ -47,8 +51,23 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
         a.vsize = std::to_string(spec.virtual_size);
     }
     a.argv.push_back(a.bin.data());
-    a.argv.push_back(a.config_flag.data());
-    a.argv.push_back(a.config.data());
+    if (spec.blank) {
+        // ADR-0014 modes 2/3: no --config; the device assembles the blank
+        // stack from the size and its per-device workspace.
+        a.blank_size = std::to_string(spec.blank_size);
+        a.blank_dir = spec.blank_dir;
+        a.argv.push_back(a.blank_size_flag.data());
+        a.argv.push_back(a.blank_size.data());
+        a.argv.push_back(a.blank_dir_flag.data());
+        a.argv.push_back(a.blank_dir.data());
+    } else {
+        a.argv.push_back(a.config_flag.data());
+        a.argv.push_back(a.config.data());
+    }
+    // --global applies to BOTH modes (a blank device still reads
+    // ublkConfig.enableRecovery and the other daemon-wide knobs from
+    // overlaybd.json); the ordering matches docs/supervisor.md's argv
+    // contract.
     if (!a.global.empty()) {
         a.argv.push_back(a.global_flag.data());
         a.argv.push_back(a.global.data());

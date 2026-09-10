@@ -127,6 +127,14 @@ are now honored — see above.)
 
 ## Per-image config: `config.json`
 
+> **Blank (raw) devices take no config.** The ADR-0014 blank creation
+> modes (`create-blank` / `create` with a `blank` object) have no
+> `config.json` at all: the device is assembled from the requested size
+> and the supervisor's `--blank-dir` workspace (`overlaybd.zero` zero
+> base + `overlaybd.rw` upper — see [image.md](./image.md) and
+> [supervisor.md](./supervisor.md)). Everything below applies to image
+> (`config`) mode only.
+
 One file per device, passed to `obdctl create <id> <config.json>` and
 through to the `obd-device` child.
 

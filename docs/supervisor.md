@@ -45,6 +45,10 @@ these are the real field names):
  "device_bin":"<obd-device path, optional>",
  "dev_id":<int, optional, -1/absent = auto>,
  "virtual_size":<bytes, optional — D3 headroom override>}
+{"cmd":"create","id":"<name>",
+ "blank":{"size":<bytes>}}                          # mode 2: blank raw
+{"cmd":"create","id":"<name>",
+ "blank":{"size":<bytes>,"mkfs":"<type>"}}          # mode 3: + mkfs
 
 {"cmd":"destroy","id":"<name>"}
 {"cmd":"status","id":"<name>"}
@@ -60,16 +64,25 @@ these are the real field names):
 ```
 
 Validation: the message must be a JSON object with a string `cmd`;
-`create` requires string `id` and `config`; `destroy`/`status`/`commit`
-require a string `id`; `commit`'s optional `user_tag` must be a string;
-`trace_start` requires a string `id`, a string `path`, and an integer
-`duration_sec`; `trace_stop` requires a string `id`; `resize` requires a
-string `id` and a non-negative integer `size`; `create` and `commit`
-accept optional non-negative integer `virtual_size` fields; `hello` and
-`list` take no fields; anything else is "unknown cmd". Field
-TYPES are validated at parse time: a wrong-typed field is answered with a
-clean protocol error, never an exception escaping the handler. Malformed
-input is answered, not dropped.
+`create` requires a string `id` and exactly one of a string `config`
+(image mode) or an object `blank` (blank raw mode, ADR-0014); a `blank`
+object requires an integer `size` and an optional string `mkfs`.
+`destroy`/`status`/`commit` require a string `id`; `commit`'s optional
+`user_tag` must be a string; `trace_start` requires a string `id`, a
+string `path`, and an integer `duration_sec`; `trace_stop` requires a
+string `id`; `resize` requires a string `id` and a non-negative integer
+`size`; `create` and `commit` accept optional non-negative integer
+`virtual_size` fields; `create`'s optional `dev_id` must be an integer
+in `[-1, INT32_MAX]` (an out-of-range JSON integer is rejected here — the
+handler reads it as an `int`, and letting it through would surface as an
+"internal error" instead of a clean parse error); `hello` and `list` take
+no fields; anything else is "unknown cmd". Field TYPES are validated at
+parse time (value-level
+blank rules — positive, 512-aligned, within the sanity bound, safe
+`mkfs` type — are enforced by `parse_blank_spec` when the handler
+runs): a wrong-typed field is answered with a clean protocol error,
+never an exception escaping the handler. Malformed input is answered,
+not dropped.
 
 Replies (`reply_ok` / `reply_error`): success is `{"ok":true,...}` with
 command-specific fields merged in; failure is
@@ -81,14 +94,18 @@ command (`src/supervisor/daemon.cpp`):
   revision (`kProtocolVersion`, currently 4; 1 = initial command set,
   2 = added `commit`, 3 = added `trace_start`/`trace_stop` and the
   additive `trace` status field, 4 = added `resize` and the
-  `virtual_size` create/commit fields — D3); `version` is the project
-  version string wired from CMake (`kProjectVersion`); `features` is a
-  JSON array of strings — the capability gate for optional commands,
-  currently `["commit","trace","resize"]`.
+  `virtual_size` create/commit fields (D3) and the `blank` create mode
+  (ADR-0014)); `version` is the project version string wired from CMake
+  (`kProjectVersion`); `features` is a JSON array of strings — the
+  capability gate for optional commands, currently
+  `["commit","trace","resize","blank"]`.
 - **create**: `{"ok":true,"id","pid","device"}` — `device` is the child's
   reported `/dev/ublkb<N>`. With an optional `virtual_size` (bytes > 0)
   the device is created with that capacity instead of the image's
-  declared size (D3 headroom, "Online resize" below).
+  declared size (D3 headroom, "Online resize" below). A blank create's
+  reply adds `"mode":"blank"`, `"size":<bytes>`, and — only when the
+  request carried an `mkfs` — `"mkfs":"<type>"` (the mode-3 format ran
+  on the new device before the reply).
 - **destroy**: `{"ok":true,"id"}`.
 - **list**: `{"ok":true,"devices":[{"id","pid","state","device","error"}, ...]}`.
 - **status**: `{"ok":true,"id","pid","state","device","error","exit_code"}`
@@ -278,6 +295,67 @@ Contract:
   surfaced as the command's error. The data plane is already grown and
   the retry succeeds once the kernel accepts it).
 
+### Blank (raw) device creation (ADR-0014)
+
+`create` with the additive `blank` object makes a **blank raw device**
+instead of opening an image: no `config`, no lowers, no registry. The
+three creation modes of ADR-0014 are:
+
+1. **From an image** — `create` with `config`, as above.
+2. **Blank raw disk, mandatory size** — `blank:{"size":<bytes>}`: the
+   device serves a **zeroed** block device of exactly `size` bytes with a
+   writable upper from birth. Reads of never-written ranges return zeroes
+   through the ordinary LSMT merge path; writes land in the LSMT-RW upper
+   and `commit` seals it like any other upper. The zero base beneath the
+   upper is a **sealed empty LSMT layer** (no segments, virtual size =
+   `size`; byte-deterministic, see docs/format.md), assembled by
+   `obd::image::open_blank_device` inside a per-device workspace
+   `<blank_dir>/<id>/` (`overlaybd.zero` + `overlaybd.rw`).
+3. **Blank + mkfs convenience** — `blank:{"size":<bytes>,"mkfs":"<type>"}`:
+   mode 2 plus a host `mkfs.<type>` run on the new block device by the
+   **supervisor** (it owns the device lifecycle and the reported
+   `/dev/ublkb<N>` path) before `create` replies. **Runtime convenience
+   ONLY**: host mkfs output is non-deterministic (UUIDs, hash seeds,
+   timestamps) and must never be used as an image-build input — see
+   docs/operations.md. The daemon runs `mkfs.<type>` only when the create
+   explicitly asked for it; a failing mkfs answers with a clean error and
+   removes the freshly created device entry. The boundary is enforced:
+   a mode-3 device is marked with the create-time INTENT (before the
+   entry is published and before mkfs runs), and `commit` refuses to seal
+   its upper ("host mkfs ... cannot be sealed") in every ordering —
+   including a commit that lands while the mkfs step is still running and
+   the device is already reachable. The supervisor never turns its own
+   non-deterministic convenience output into an image layer.
+
+Two workspace caveats for blank devices (both inherited from the
+writable-upper model, documented in docs/operations.md):
+
+- **Respawn truncates the upper.** ADR-0010 crash recovery re-assembles
+  the blank stack, and assembly recreates `overlaybd.rw` with `O_TRUNC`:
+  unsealed writes do not survive a device crash. Commit (or a graceful
+  stop) first.
+- **The committed artifact lives in the workspace.** `commit` seals
+  `<blank_dir>/<id>/overlaybd.rw` in place; `destroy` + re-create of the
+  same id truncates it. Copy the sealed layer out first.
+
+Size rules (enforced at parse/handler time): positive, multiple of 512
+bytes, at most `kMaxBlankSizeBytes` (16 TiB sanity bound — the zero base
+allocates no data, so this only guards a typo'd size). The `mkfs` type is
+validated to a safe `mkfs.<type>` suffix charset (`valid_mkfs_type`:
+`[a-z0-9_]`, 1..16 chars), the injection boundary for the fork/exec
+runner.
+
+The mode-3 runner is bounded twice over: it polls its helper with
+`waitpid(pid, …, WNOHANG)` for at most `mkfs_timeout_sec`, then SIGKILLs
+it and polls for at most ~2 s more — a create never parks on a helper
+wedged in uninterruptible IO. If the helper is still unreaped by then, its
+pid is handed to the daemon's SIGCHLD reaper
+(`MkfsRunner::take_orphan_pids()`), which collects abandoned helpers with
+`WNOHANG` on every wake — so a wedged helper cannot stay a zombie, and
+nothing detached (no coroutine, no thread) is left for shutdown to join.
+The reaper still never uses the wildcard `waitpid(-1, …)`: it waits on a
+helper pid only once its owner has given up on it.
+
 ### Trace recording (ADR-0013)
 
 `trace_start` / `trace_stop` control the record path of ADR-0013: the
@@ -408,9 +486,12 @@ hosts a live Elio runtime and anything else is UB. The child argv is:
 ```
 <device_bin> --config <config.json> [--global <overlaybd.json>] \
              --control-fd 3 [--dev-id <N>]
+<device_bin> --blank-size <bytes> --blank-dir <workspace> \
+             [--global <overlaybd.json>] --control-fd 3 [--dev-id <N>]
 ```
 
-`--global` is omitted when empty; `--dev-id` is omitted when negative.
+The blank form (ADR-0014) replaces `--config`; `--global` is omitted when
+empty; `--dev-id` is omitted when negative.
 There is no PATH lookup — the supervisor resolves the binary itself. On
 `execve` failure the child `_exit(127)`s; the parent observes EOF on the
 channel plus exit code 127 and reports "exec failed (obd-device not found
@@ -420,8 +501,12 @@ or not executable)" (`Child::note_reaped`).
 
 `run_daemon` runs three concurrent activities on the Elio scheduler:
 the **accept loop** (one coroutine per one-shot client), the **reaper** (a
-`signalfd` on SIGCHLD draining `waitpid(-1, …, WNOHANG)` and matching pids
-to children), and one **monitor coroutine per child** (a `LineReader` over
+`signalfd` on SIGCHLD that reaps its registered device children one pid at
+a time with `waitpid(pid, …, WNOHANG)` — never `waitpid(-1)`, so a helper
+child owned by another component, e.g. the mode-3 mkfs runner, keeps its
+exit status; the same sweep collects the helper pids that runner
+ABANDONED via `take_orphan_pids()`, see the mkfs bound above), and one
+**monitor coroutine per child** (a `LineReader` over
 the child's status fd feeding `Child::update_status`). The children
 registry (`std::map<id, std::shared_ptr<Child>>`) is guarded by an
 `elio::sync::mutex` — coroutine-aware, never held across heavy work.
@@ -443,15 +528,25 @@ SIGKILLed+reaped by `~Child`.
 
 - `inline constexpr size_t kMaxMessageBytes = 64 * 1024` — maximum JSON-line
   length on both channels.
-- `inline constexpr int kProtocolVersion = 2` — control-protocol revision;
+- `inline constexpr int kProtocolVersion = 4` — control-protocol revision;
   increments only for additive batches (see the additive-only rule above).
 - `inline constexpr std::string_view kProjectVersion` — the project version
   string, wired from CMake `project(... VERSION ...)` via the
   `OBD_VERSION_STRING` compile definition so it cannot drift; `"dev"` is
   the fallback for non-CMake builds.
-- `struct CreateCommand` — `id`, `config` (required), `global` (`""` =
-  supervisor default), `device_bin` (`""` = supervisor default), `dev_id`
-  (`-1` = auto). Descriptive mirror of the create command's fields.
+- `struct CreateCommand` — `id`, `config`, `global` (`""` = supervisor
+  default), `device_bin` (`""` = supervisor default), `dev_id` (`-1` =
+  auto). Descriptive mirror of the image-mode create command's fields
+  (blank creates carry `BlankSpec` instead).
+- `struct BlankSpec` — `size` (bytes) + optional `mkfs` type; the
+  additive `blank` object of create (ADR-0014 modes 2/3).
+- `inline constexpr uint64_t kMaxBlankSizeBytes` — operator sanity bound
+  for blank device sizes (16 TiB).
+- `bool valid_mkfs_type(const std::string&)` — charset check for a safe
+  `mkfs.<type>` suffix.
+- `std::optional<BlankSpec> parse_blank_spec(const nlohmann::json&,
+  std::string& error)` — value-level blank validation (positive,
+  512-aligned, within the size bound, safe mkfs type).
 - `struct IdCommand` — `cmd`, `id`; shape of `destroy` / `status`.
 - `struct CommitCommand` — `id`, `user_tag` (optional); shape of `commit`
   (ADR-0014).
@@ -467,7 +562,7 @@ SIGKILLed+reaped by `~Child`.
 - `std::string reply_hello()` — the `hello` handshake reply via the
   `reply_ok` envelope: `protocol` (`kProtocolVersion`), `version`
   (`kProjectVersion`), and `features` (a JSON array of capability strings,
-  currently `["commit"]`).
+  currently `["commit","trace","resize","blank"]`).
 - `struct DeviceStatus` — `state` (`starting` | `ready` | `failed` |
   `stopped`), `device` (`/dev/ublkb<N>` when ready), `error` (when failed).
 - `std::optional<DeviceStatus> parse_device_status(std::string_view)` —
@@ -480,7 +575,9 @@ SIGKILLed+reaped by `~Child`.
 ### `src/supervisor/child.hpp`
 
 - `struct ChildSpec` — `id`, `device_bin` (absolute path), `config_path`,
-  `global_path` (may be empty), `dev_id_request` (`-1` = auto).
+  `global_path` (may be empty), `dev_id_request` (`-1` = auto), `recover`,
+  and — for blank devices — `blank` + `blank_size` + `blank_dir`
+  (ADR-0014; a blank spec carries no `config_path`).
 - `static std::unique_ptr<Child> Child::spawn(const ChildSpec&)` — forks
   and execs per the spawning contract above; the parent end of the channel
   is set `O_NONBLOCK`. Throws `obd::error` on socketpair/fork failure.
@@ -514,7 +611,15 @@ SIGKILLed+reaped by `~Child`.
   command has no `global`), `device_bin` (empty = auto-resolved as the
   sibling `obd-device` of `/proc/self/exe`; falls back to the literal
   `"obd-device"` if the readlink fails), `ready_timeout_sec` (60),
-  `stop_timeout_sec` (10).
+  `stop_timeout_sec` (10), `max_recovery_attempts` (3), and the ADR-0014
+  blank-device knobs: `blank_dir` (default
+  `/var/lib/overlaybd-elio/devices` — each blank device owns
+  `<blank_dir>/<id>/`), `mkfs_runner` (the mode-3 `MkfsRunner`;
+  empty = the default fork/exec runner bounded by `mkfs_timeout_sec`,
+  default 300) and `mkfs_timeout_sec`.
+- `class MkfsRunner` (abstract) + `MkfsRunnerPtr` — injectable host
+  `mkfs.<type>` runner (ADR-0014 mode 3); tests install a mock so the
+  suite never executes host mkfs.
 - `elio::coro::task<int> run_daemon(const DaemonConfig&)` — binds the
   socket, runs accept loop + reaper + monitors until SIGTERM/SIGINT, then
   shuts down gracefully (children terminated first). Returns the process
@@ -522,11 +627,18 @@ SIGKILLed+reaped by `~Child`.
   have blocked the handled signals process-wide (signalfd model).
 
 Command handlers are internal to `src/supervisor/daemon.cpp` but define the
-observable semantics: `create` rejects empty ids, ids containing `/`,
-missing config files, missing device binaries, and duplicate ids;
+observable semantics: `create` rejects empty ids, ids containing `/` (and
+`.` / `..` — the id becomes a workspace path for blank devices), missing
+config files, missing device binaries, and duplicate ids; a blank create
+additionally validates the blank spec (size + optional mkfs, see
+`parse_blank_spec`) and, when mode 3 is requested, runs the mkfs runner
+against the ready device's block path before replying;
 `destroy`/`status`/`commit` reject unknown ids with `{"ok":false,"error":"no such
 device: <id>"}`; `commit` additionally rejects upper-less and sparse-upper
 devices and stops a live device before sealing (see "Offline commit").
+Blank-born devices commit exactly like image-born ones: their upper path
+and kind are recorded at create time (from the workspace layout, no config
+pre-parse needed).
 
 ## Invariants & Guarantees
 
@@ -572,25 +684,36 @@ devices and stops a live device before sealing (see "Offline commit").
 - The control fd passes ownership exactly once via `release_control_fd()`
   (to the monitor coroutine, which closes it at EOF); double-close is
   impossible by construction.
-- The reaper is the only `waitpid(-1, …)` caller in the process; it
-  matches pids against the registry and ignores unknown ones.
+- The reaper never calls the wildcard `waitpid(-1, …)`: it sweeps the
+  registry's device pids plus the pids the mode-3 mkfs runner explicitly
+  handed over after abandoning them (`MkfsRunner::take_orphan_pids()`), so
+  it can neither steal a LIVE helper child's exit status (the runner owns
+  its child until it gives up on it) nor wait on a pid it does not
+  manage. A handled pid is dropped from that list as soon as the wait
+  answers with the pid or a terminal error (`ECHILD`). Its registry snapshot is taken under
+  `mu_` and each pid is reaped with `waitpid(pid, …, WNOHANG)`; a child
+  replaced meanwhile is simply already reaped and skipped.
 - Inputs are not mutated: `ChildSpec` and `DaemonConfig` are read at
   spawn/run time; `parse_command` returns an owning `nlohmann::json`.
 
 ## Stability Contract
 
 - **Both wire protocols are T1 wire contracts** (AGENTS.md): the control
-  channel's command/reply shapes (`cmd`, `id`, `config`, `global`,
-  `device_bin`, `dev_id`; `ok`/`error` envelope; the `hello` handshake
-  fields `protocol`/`version`/`features`; per-command success
-  fields) and the status channel's shapes (`state` plus optional `device`/
-  `error`; the state vocabulary `starting`/`ready`/`failed`/`stopped`) may
-  only change with an ADR — and then only **additively** (see the
-  additive-only evolution rule above; ADR-0014). obdctl,
-  obd-supervisor, and obd-device may be upgraded independently.
+  channel's command/reply shapes (`cmd`, `id`, `config`, `blank` with
+  `size`/`mkfs`, `global`, `device_bin`, `dev_id`; `ok`/`error` envelope;
+  the `hello` handshake fields `protocol`/`version`/`features`;
+  per-command success fields — including the blank create reply's
+  additive `mode`/`size`/`mkfs`) and the status channel's shapes (`state`
+  plus optional `device`/`error`; the state vocabulary
+  `starting`/`ready`/`failed`/`stopped`) may only change with an ADR —
+  and then only **additively** (see the additive-only evolution rule
+  above; ADR-0014). obdctl, obd-supervisor, and obd-device may be
+  upgraded independently.
 - **The fd-3 + argv contract** between supervisor and obd-device
-  (`--control-fd 3`, `--config`, optional `--global`, optional `--dev-id`,
-  CLOEXEC-cleared fd 3) is part of the same wire contract.
+  (`--control-fd 3`, `--config` for image mode, `--blank-size
+  <bytes> --blank-dir <workspace>` for blank mode (ADR-0014), optional
+  `--global`, optional `--dev-id`, CLOEXEC-cleared fd 3) is part of the
+  same wire contract.
 - **Exit-code semantics** (127 = exec failure, 128+sig = killed) are part
   of the status surface consumed by operators and tooling.
 - **Default paths** (`/run/overlaybd-elio/supervisor.sock`,
@@ -609,11 +732,44 @@ needing a real ublk device or root.
 
 - `supervisor: protocol commands parse and reject garbage` — guards the
   command validator and the status codec: a well-formed `create`, `list`,
-  and `status` parse; a `create` missing `config`, an unknown `cmd`, and
-  non-JSON input are rejected; a `ready` status line with a `device` field
-  parses; `{}` is rejected; and `make_device_status` → `parse_device_status`
-  round-trips a `failed` status with its `error` field. This pins the exact
-  wire shapes documented above.
+  and `status` parse; a `create` with neither `config` nor `blank`, an
+  unknown `cmd`, and non-JSON input are rejected; a `ready` status line
+  with a `device` field parses; `{}` is rejected; and
+  `make_device_status` → `parse_device_status` round-trips a `failed`
+  status with its `error` field. This pins the exact wire shapes
+  documented above.
+- `supervisor: mkfs runner maps exit codes and bounds the timeout` — the
+  REAL default mkfs runner (no daemon) against throwaway PATH shims:
+  success, a nonzero exit code, the exec-not-found 127 mapping, an unsafe
+  fs type refused before it reaches argv, and a shim sleeping past the
+  bound reported as `-ETIMEDOUT` after SIGKILL (the runner owns its
+  child).
+- `supervisor: blank spawn argv carries the blank flags and global` — the
+  ADR-0014 spawn contract: `--blank-size N --blank-dir D [--global G]
+  --control-fd 3` and never `--config`, asserted on the child's real argv.
+- `supervisor: default mkfs runner completes without the reaper stealing
+  it` (integration, `tests/integration/test_commit.cpp`) — regression for
+  the reaper/mkfs-helper interaction: the daemon runs its REAL runner
+  against a PATH shim, the mode-3 create succeeds with `mkfs:"ext4"`, the
+  shim saw the device path, and the daemon keeps serving afterwards. A
+  wildcard `waitpid(-1)` reaper steals the helper's status and makes this
+  fail.
+- `supervisor: stale blank-create failure leaves a newer device alone`
+  (integration, `tests/integration/test_commit.cpp`) — a create held
+  inside its mkfs step while the id is destroyed and re-created: the
+  stale mkfs failure must clean up only ITS OWN entry, leaving the newer
+  device (and its pid) alive.
+- `supervisor: obd-device rejects malformed blank flags` — the real
+  obd-device binary's `--blank-size`/`--blank-dir` validation: negative,
+  zero, unaligned, junk, overflowing and above-bound sizes, the missing
+  workspace, and `--config` combined with blank are all usage errors
+  (exit 2) before any device work.
+- `supervisor: create blank spec parses and validates size and mkfs` —
+  pins the ADR-0014 blank create grammar: `create` with `blank` (mode 2,
+  and mode 3 with `mkfs`) parses; `config` and `blank` are mutually
+  exclusive and one is mandatory; wrong-typed `blank`/`size`/`mkfs`
+  fields are parse errors; and `parse_blank_spec` rejects zero, unaligned,
+  oversized sizes and unsafe `mkfs` types (`valid_mkfs_type` charset).
 - `supervisor: hello handshake replies with protocol version and features` —
   pins the documented `hello` reply shape (`ok`, integer `protocol` ≥ 1,
   non-empty string `version`, array `features`), that `hello` parses with
@@ -641,6 +797,21 @@ needing a real ublk device or root.
   `path`/`sha256`/`size`; a second commit fails with "already sealed";
   the sealed file re-opens as a valid LSMT RO layer with the
   checkpointed content (ADR-0014). Runs without privileges.
+- `supervisor: blank create serves a writable zero base and commit seals its upper` (integration, `tests/integration/test_commit.cpp`) — the
+  ADR-0014 mode-2 path end to end with the fake device: `create` with
+  `blank` (no config) builds the workspace (`overlaybd.zero` + the
+  writable `overlaybd.rw`) via `open_blank_device`, the fake round-trips
+  a payload through the merged stack with unwritten regions reading zero,
+  commit stops it and seals the blank-born upper, and a second commit is
+  "already sealed". A recording mkfs mock asserts host mkfs is never
+  invoked in mode 2.
+- `supervisor: mode-3 mkfs runs only when the blank spec requests it` (integration, `tests/integration/test_commit.cpp`) — the mode-3 gate
+  and error path: a plain blank create never invokes the (mock) mkfs
+  runner; `blank.mkfs` invokes it exactly once with the requested type
+  and the reported device path; commit of a formatted (mode-3) upper is
+  refused with the "host mkfs" boundary error; a failing mkfs is a clean
+  create error and the half-created device entry is removed. Host mkfs
+  is never executed by the suite.
 - `supervisor: device trace control answers malformed-typed fields with clean errors` —
   the device-side trace command loop over a real socketpair:
   wrong-typed `trace_start` fields get a clean error reply (seq echoed)
@@ -674,7 +845,12 @@ Each device is supervised for its whole lifetime by one coroutine
 **unexpected** exit (not a requested `destroy`, not daemon shutdown),
 respawns the child with `--recover --dev-id N`: the ublk device was
 created with `UBLK_F_USER_RECOVERY` and survives serverless in the kernel,
-so the replacement *attaches* instead of re-creating. The dev id is parsed
+so the replacement *attaches* instead of re-creating.
+**Blank-device caveat:** the respawn re-runs the blank assembly, which
+recreates the writable upper (`overlaybd.rw`) with `O_TRUNC` — unsealed
+writes are lost across a device crash, exactly as for an image-mode
+writable upper. Commit (or stop gracefully) before letting a valuable
+blank device crash-recover. The dev id is parsed
 from the ready status's bdev path by the supervising coroutine itself, so
 an instant crash can never be observed before the id is recorded.
 Respawns are bounded by `DaemonConfig::max_recovery_attempts` (default 3);

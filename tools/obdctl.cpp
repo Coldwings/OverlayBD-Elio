@@ -9,10 +9,13 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace {
@@ -24,6 +27,7 @@ void usage(const char* argv0) {
                  "usage:\n"
                  "  %s [--socket PATH] hello\n"
                  "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N] [--virtual-size BYTES]\n"
+                 "  %s [--socket PATH] create-blank <id> --size BYTES [--mkfs TYPE] [--global PATH] [--dev-id N]\n"
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
@@ -32,7 +36,30 @@ void usage(const char* argv0) {
                  "  %s [--socket PATH] trace_stop <id>\n"
                  "  %s [--socket PATH] resize <id> <size-bytes>\n",
                  argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-                 argv0);
+                 argv0, argv0);
+}
+
+/// Strict `--dev-id N` parse shared by every create form: `std::stoi`
+/// would abort the CLI (uncaught exception) on junk or overflow instead of
+/// the documented usage error, so validate fully and report like every
+/// other malformed argument. The accepted range is the protocol's, not a
+/// stricter one: `-1` is the documented "auto-assign" spelling that
+/// `parse_command` accepts, so the CLI must forward it rather than refuse
+/// what the supervisor would have taken. Returns false after printing.
+bool parse_dev_id(const char* v, nlohmann::json* req) {
+    char* end = nullptr;
+    errno = 0;
+    const long id = std::strtol(v, &end, 10);
+    if (errno != 0 || end == v || *end != '\0' || id < -1 ||
+        id > std::numeric_limits<int32_t>::max()) {
+        std::fprintf(stderr,
+                     "invalid --dev-id '%s' (want an integer >= -1; -1 = "
+                     "auto)\n",
+                     v);
+        return false;
+    }
+    (*req)["dev_id"] = static_cast<int>(id);
+    return true;
 }
 
 bool send_all(int fd, const std::string& data) {
@@ -75,9 +102,9 @@ int main(int argc, char** argv) {
         while (i < argc) {
             const std::string a = argv[i++];
             if (a == "--global" && i < argc) req["global"] = argv[i++];
-            else if (a == "--dev-id" && i < argc)
-                req["dev_id"] = std::stoi(argv[i++]);
-            else if (a == "--virtual-size" && i < argc) {
+            else if (a == "--dev-id" && i < argc) {
+                if (!parse_dev_id(argv[i++], &req)) return 2;
+            } else if (a == "--virtual-size" && i < argc) {
                 // D3 headroom override (bytes): full strtoull validation
                 // for a fast, clear error; the grow-only/alignment
                 // semantics are decided where sizes are comparable
@@ -106,6 +133,66 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+    } else if (cmd == "create-blank") {
+        // ADR-0014 modes 2/3: the WIRE command is plain `create` with the
+        // additive "blank" object (create-blank is only the CLI spelling
+        // of that mode — the supervisor has no `create-blank` command).
+        req["cmd"] = "create";
+        if (i >= argc) {
+            usage(argv[0]);
+            return 2;
+        }
+        req["id"] = argv[i++];
+        nlohmann::json blank;
+        bool have_size = false;
+        while (i < argc) {
+            const std::string a = argv[i++];
+            if (a == "--size" && i < argc) {
+                const char* v = argv[i++];
+                char* end = nullptr;
+                errno = 0;
+                const long long n = std::strtoll(v, &end, 10);
+                if (errno != 0 || end == v || *end != '\0' || n <= 0 ||
+                    n % 512 != 0 ||
+                    static_cast<uint64_t>(n) >
+                        obd::supervisor::kMaxBlankSizeBytes) {
+                    std::fprintf(stderr,
+                                 "invalid --size '%s' (want a positive "
+                                 "multiple of 512 bytes, at most %llu)\n",
+                                 v,
+                                 static_cast<unsigned long long>(
+                                     obd::supervisor::kMaxBlankSizeBytes));
+                    return 2;
+                }
+                blank["size"] = static_cast<uint64_t>(n);
+                have_size = true;
+            } else if (a == "--mkfs" && i < argc) {
+                const char* v = argv[i++];
+                // The supervisor's own predicate, not a mirror of it: the
+                // CLI must accept exactly what the daemon accepts (a copy
+                // here had already drifted once, mis-describing `_`).
+                const std::string t(v);
+                if (!obd::supervisor::valid_mkfs_type(t)) {
+                    std::fprintf(stderr,
+                                 "invalid --mkfs '%s' (want a 1..16 char "
+                                 "[a-z0-9_] type)\n",
+                                 v);
+                    return 2;
+                }
+                blank["mkfs"] = t;
+            } else if (a == "--global" && i < argc) req["global"] = argv[i++];
+            else if (a == "--dev-id" && i < argc) {
+                if (!parse_dev_id(argv[i++], &req)) return 2;
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
+        }
+        if (!have_size) {
+            std::fprintf(stderr, "create-blank requires --size BYTES\n");
+            return 2;
+        }
+        req["blank"] = std::move(blank);
     } else if (cmd == "destroy" || cmd == "status") {
         if (i >= argc) {
             usage(argv[0]);

@@ -21,7 +21,8 @@ namespace obd::supervisor {
 struct ChildSpec {
     std::string id;
     std::string device_bin;   // absolute path to obd-device
-    std::string config_path;  // per-image config.json
+    std::string config_path;  // per-image config.json (blank devices leave
+                              // this empty and set `blank` instead)
     std::string global_path;  // overlaybd.json (may be empty = device default)
     int dev_id_request = -1;
     /// ADR-0010: spawn in recovery mode (obd-device --recover): attach to
@@ -30,7 +31,15 @@ struct ChildSpec {
     /// D3 create-time headroom: optional dev_size override in bytes
     /// (0 = derive from the image's declared virtual size). The device
     /// validates it grow-only (>= the image size) before sizing itself.
+    /// Unused (0) for a blank create, which sizes itself to blank_size.
     uint64_t virtual_size = 0;
+    /// ADR-0014 creation modes 2/3 (blank raw device): when true the
+    /// device builds an empty sealed LSMT zero base plus a writable
+    /// LSMT-RW upper of `blank_size` bytes inside `blank_dir` instead of
+    /// opening an image config (obd-device --blank-size/--blank-dir).
+    bool blank = false;
+    uint64_t blank_size = 0;  // bytes; positive, sector aligned
+    std::string blank_dir;    // per-device workspace (device creates files)
 };
 
 class Child {

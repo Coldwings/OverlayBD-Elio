@@ -37,6 +37,7 @@ in `src/supervisor/protocol.hpp` and documented in
 ```
 obd-supervisor [--socket PATH] [--global PATH] [--device-bin PATH]
                [--ready-timeout SEC] [--stop-timeout SEC]
+               [--blank-dir PATH] [--mkfs-timeout SEC]
 ```
 
 Runs in the foreground until SIGTERM/SIGINT. Options (defaults from
@@ -49,17 +50,22 @@ Runs in the foreground until SIGTERM/SIGINT. Options (defaults from
 | `--device-bin PATH` | empty = sibling of the supervisor executable | obd-device binary to exec for each device. |
 | `--ready-timeout SEC` | `60` | How long `create` waits for the child's `ready` status before failing the request. |
 | `--stop-timeout SEC` | `10` | `destroy` grace period: SIGTERM first, SIGKILL after this many seconds. |
+| `--blank-dir PATH` | `/var/lib/overlaybd-elio/devices` | ADR-0014: root of the per-device workspaces for blank (raw) devices — each owns `<blank-dir>/<id>/` with `overlaybd.zero` (sealed empty LSMT zero base) and `overlaybd.rw` (writable upper). |
+| `--mkfs-timeout SEC` | `300` | ADR-0014 mode 3: bound for the host `mkfs.<type>` run on a new blank device. |
 | `--help`, `-h` | — | Print usage and exit 0. |
 
 ### obd-device
 
 ```
-obd-device --config PATH [--global PATH] [--control-fd N] [--dev-id N] [--recover]
+obd-device (--config PATH | --blank-size BYTES --blank-dir PATH)
+          [--global PATH] [--control-fd N] [--dev-id N] [--recover]
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--config PATH` | required | Per-image `config.json` (overlaybd-snapshotter format). Missing → usage error, exit 2. |
+| `--config PATH` | — | Per-image `config.json` (overlaybd-snapshotter format). Mutually exclusive with the blank form. |
+| `--blank-size BYTES` | — | ADR-0014 modes 2/3: create a blank (raw) device of this many bytes (no config) — the empty LSMT zero base + a writable LSMT-RW upper are assembled in `--blank-dir`. Strictly validated here too (positive, 512-aligned, ≤ 16 TiB; a negative or overflowing value is a usage error, exit 2), not only by the supervisor's `parse_blank_spec`. |
+| `--blank-dir PATH` | — | ADR-0014: per-device workspace for a blank device (files `overlaybd.zero` / `overlaybd.rw`). |
 | `--global PATH` | empty = built-in defaults | Global `overlaybd.json`; when omitted, a default-constructed `GlobalConfig` is used. |
 | `--control-fd N` | `-1` (no reporting) | Inherited fd for JSON-lines lifecycle status reports (the socketpair end installed by the supervisor). |
 | `--dev-id N` | `-1` (auto-assign) | Requested ublk device id; the kernel picks a free id when negative. |
@@ -74,6 +80,8 @@ backend; the source does not compile otherwise).
 ```
 obdctl [--socket PATH] hello
 obdctl [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N]
+obdctl [--socket PATH] create-blank <id> --size BYTES [--mkfs TYPE]
+                                      [--global PATH] [--dev-id N]
 obdctl [--socket PATH] destroy <id>
 obdctl [--socket PATH] list
 obdctl [--socket PATH] status <id>
@@ -92,6 +100,20 @@ present, must precede the command word. Commands:
   supervisor's default global config for this device; optional `--dev-id N`
   requests a specific ublk id. The reply blocks until the child reports
   `ready` (carrying the `/dev/ublkb<N>` path) or fails/times out.
+  `--dev-id -1` (or omitting the flag) means auto-assign, exactly as the
+  protocol defines it — the CLI forwards the range the daemon accepts,
+  `[-1, INT32_MAX]`.
+- `create-blank <id> --size BYTES [--mkfs TYPE]` — ADR-0014 modes 2/3:
+  create a blank raw device of `BYTES` (positive, multiple of 512, at
+  most `kMaxBlankSizeBytes` = 16 TiB — the same bound the supervisor and
+  obd-device enforce, so an absurd size is a local usage error rather
+  than a server round trip) with no image config — the wire form is `create` with the additive `blank`
+  object (`{"size":...}` plus optional `"mkfs"`). `--mkfs ext4` (mode 3)
+  asks the supervisor to run host `mkfs.<type>` on the new block device
+  before replying — a runtime-only convenience whose output is never an
+  image-build input (see [operations.md](./operations.md)); mode-2
+  devices (no `--mkfs`) are formatted by the caller. The reply carries
+  `mode`, `size`, and `mkfs` when requested.
 - `destroy <id>` — stop the child (SIGTERM, then SIGKILL after the
   supervisor's stop timeout) and remove the device.
 - `list` — list known devices and their states.
@@ -194,7 +216,12 @@ connection, one JSON-lines reply, max 64 KiB per message
 (`src/supervisor/protocol.hpp::kMaxMessageBytes`). `create` spawns one
 obd-device child per request — process isolation per device is the ADR-0004
 guarantee. `destroy` sends SIGTERM and escalates to SIGKILL after
-`--stop-timeout` seconds.
+`--stop-timeout` seconds. A blank (`create-blank`) request spawns the same
+kind of child with `--blank-size`/`--blank-dir` (ADR-0014); when the blank
+carries an `mkfs` type, the supervisor additionally runs host
+`mkfs.<type>` against the reported `/dev/ublkb<N>` before answering — and
+refuses `commit` for such a device afterwards (never seals host-mkfs
+output).
 
 ### Concurrency and stability notes
 
@@ -218,6 +245,15 @@ guarantee. `destroy` sends SIGTERM and escalates to SIGKILL after
   `protocol`/`version`/`features` and never drops malformed input.
 - `supervisor: commit stops the device and seals its upper offline` — the
   `obdctl commit` path end to end against a real daemon (ADR-0014).
+- `cli: obdctl create-blank sends a create command with the blank object` —
+  the real obdctl binary executed against a test-owned UDS: the wire line
+  is `cmd:"create"` with the `blank` object (`size`, optional `mkfs`) plus
+  `global`/`dev_id`, image-mode create still sends `config`, an `ok:false`
+  reply exits 1, and malformed CLI input exits 2 without connecting.
+- `supervisor: blank create serves a writable zero base and commit seals its upper` — the `obdctl create-blank` mode-2 path against a real daemon (ADR-0014).
+- `supervisor: mode-3 mkfs runs only when the blank spec requests it` — the `obdctl create-blank --mkfs` gate and error path against a real daemon (ADR-0014).
+- `supervisor: default mkfs runner completes without the reaper stealing it` — the daemon's real fork/exec mkfs runner against a PATH shim: the helper child's status stays with its owner (the reaper reaps device pids only) and mode 3 succeeds.
+- `supervisor: mkfs runner maps exit codes and bounds the timeout` — the real runner's mappings: success, nonzero exit, exec-not-found (127), an unsafe type refused before argv, and a bounded timeout that SIGKILLs the helper.
 - `supervisor: child spawn execs and reports through the channel` — guards
   the fork/exec path the supervisor uses to start obd-device and the
   JSON-lines status channel back.
@@ -257,5 +293,8 @@ ctest --test-dir build --output-on-failure
 - obd-mkimage builds single-layer images only, on a synchronous cold path;
   it is a fixture generator, not a replacement for the upstream
   `overlaybd-*` image toolchain.
+- obd-supervisor runs host `mkfs.<type>` for mode-3 blank creates only;
+  the mkfs binaries are host prerequisites for that mode, never bundled
+  (ADR-0014).
 - obd-device supports exactly one image per process by design (ADR-0004);
   multi-device serving will not be added to it.

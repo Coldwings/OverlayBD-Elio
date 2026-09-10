@@ -1,6 +1,9 @@
 // Supervisor wire protocol. See protocol.hpp.
 #include "supervisor/protocol.hpp"
 
+#include <climits>
+#include <cstdint>
+
 namespace obd::supervisor {
 
 std::optional<nlohmann::json> parse_command(std::string_view line,
@@ -21,13 +24,53 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
     // malformed field is answered with a clean protocol error instead of
     // a json::type_error escaping the handler.
     if (cmd == "create") {
-        if (!j.contains("id") || !j.contains("config")) {
-            error = "create requires 'id' and 'config'";
+        if (!j.contains("id")) {
+            error = "create requires 'id'";
             return std::nullopt;
         }
-        if (!j["id"].is_string() || !j["config"].is_string()) {
-            error = "create 'id' and 'config' must be strings";
+        if (!j["id"].is_string()) {
+            error = "create 'id' must be a string";
             return std::nullopt;
+        }
+        // ADR-0014 three creation modes, one create command: from an image
+        // (`config`, mandatory for that mode) or blank raw (`blank`, size +
+        // optional mkfs). Exactly one of the two must be present — old
+        // supervisors ignore the additive `blank` object and would answer
+        // the config-less form with their own "requires config" error.
+        const bool has_config = j.contains("config");
+        const bool has_blank = j.contains("blank");
+        if (has_config == has_blank) {
+            error = "create requires exactly one of 'config' (image) or "
+                    "'blank' (raw disk)";
+            return std::nullopt;
+        }
+        if (has_config) {
+            if (!j["config"].is_string()) {
+                error = "create 'config' must be a string";
+                return std::nullopt;
+            }
+        } else {  // has_blank
+            if (!j["blank"].is_object()) {
+                error = "create 'blank' must be an object";
+                return std::nullopt;
+            }
+            if (!j["blank"].contains("size")) {
+                error = "create blank requires 'size'";
+                return std::nullopt;
+            }
+            const auto& size = j["blank"]["size"];
+            const bool ok_int =
+                size.is_number_unsigned() ||
+                (size.is_number_integer() && size.get<int64_t>() >= 0);
+            if (!ok_int) {
+                error = "create blank 'size' must be a non-negative integer";
+                return std::nullopt;
+            }
+            if (j["blank"].contains("mkfs") &&
+                !j["blank"]["mkfs"].is_string()) {
+                error = "create blank 'mkfs' must be a string";
+                return std::nullopt;
+            }
         }
         if ((j.contains("global") && !j["global"].is_string()) ||
             (j.contains("device_bin") && !j["device_bin"].is_string()) ||
@@ -35,6 +78,18 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
             error = "create 'global'/'device_bin' must be strings, "
                     "'dev_id' an integer";
             return std::nullopt;
+        }
+        // 'dev_id' is an OPTIONAL kernel device id (-1/absent = auto). The
+        // range check belongs here, with the other type validation: a JSON
+        // integer is 'is_number_integer' even when it cannot fit an int, and
+        // the handler's get<int>() would then throw out of the handler (an
+        // "internal error" reply) instead of a clean parse error.
+        if (j.contains("dev_id")) {
+            const int64_t dev_id = j["dev_id"].get<int64_t>();
+            if (dev_id < -1 || dev_id > INT32_MAX) {
+                error = "create 'dev_id' must be an integer >= -1";
+                return std::nullopt;
+            }
         }
         // D3 create-time headroom: optional 'virtual_size' override in
         // bytes. Semantic rules (positive, 512-aligned, grow-only vs the
@@ -128,6 +183,60 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
     return j;
 }
 
+bool valid_mkfs_type(const std::string& type) {
+    if (type.empty() || type.size() > 16) return false;
+    for (const char c : type) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+std::optional<BlankSpec> parse_blank_spec(const nlohmann::json& blank,
+                                          std::string& error) {
+    if (!blank.is_object() || !blank.contains("size")) {
+        error = "'blank' object with 'size' required";
+        return std::nullopt;
+    }
+    const auto& size = blank["size"];
+    uint64_t vsize = 0;
+    if (size.is_number_unsigned()) {
+        vsize = size.get<uint64_t>();
+    } else if (size.is_number_integer() && size.get<int64_t>() >= 0) {
+        vsize = static_cast<uint64_t>(size.get<int64_t>());
+    } else {
+        error = "blank 'size' must be a non-negative integer";
+        return std::nullopt;
+    }
+    if (vsize == 0) {
+        error = "blank 'size' must be positive";
+        return std::nullopt;
+    }
+    if (vsize % 512 != 0) {
+        error = "blank 'size' must be a multiple of 512";
+        return std::nullopt;
+    }
+    if (vsize > kMaxBlankSizeBytes) {
+        error = "blank 'size' exceeds the sanity bound of " +
+                std::to_string(kMaxBlankSizeBytes) + " bytes";
+        return std::nullopt;
+    }
+    BlankSpec spec;
+    spec.size = vsize;
+    if (blank.contains("mkfs")) {
+        const std::string mkfs = blank["mkfs"].get<std::string>();
+        if (!valid_mkfs_type(mkfs)) {
+            error = "invalid blank 'mkfs' type '" + mkfs +
+                    "' (want mkfs.<type> with a 1..16 char [a-z0-9_] "
+                    "type)";
+            return std::nullopt;
+        }
+        spec.mkfs = mkfs;
+    }
+    return spec;
+}
+
 std::string reply_ok(const nlohmann::json& fields) {
     nlohmann::json j = fields.is_object() ? fields : nlohmann::json::object();
     j["ok"] = true;
@@ -148,9 +257,10 @@ std::string reply_hello() {
     // Capability gate (additive-only rule): "commit" = the ADR-0014
     // offline commit command is served; "trace" = the ADR-0013 record
     // path (trace_start/trace_stop) is served; "resize" = the D3
-    // grow-only online resize command is served.
+    // grow-only online resize command is served; "blank" = create
+    // accepts the ADR-0014 blank (raw) device modes 2/3.
     fields["features"] =
-        nlohmann::json::array({"commit", "trace", "resize"});
+        nlohmann::json::array({"commit", "trace", "resize", "blank"});
     return reply_ok(fields);
 }
 

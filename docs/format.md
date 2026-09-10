@@ -114,7 +114,11 @@ The result is a single sorted, disjoint index whose `tag` records the owning
 layer (0 = topmost). Reads dispatch per segment to that layer's data source.
 Topmost wins; holes (ranges no layer covers) and `zeroed` segments read as
 zeroes. The device virtual size is the topmost non-zero layer
-`virtual_size`.
+`virtual_size`. A sealed layer with an **empty index** (`index_size = 0`,
+no data) is valid: every read falls into a hole, so it serves its whole
+`virtual_size` as zeroes through the ordinary path — the ADR-0014 blank
+(raw) device zero base is exactly such a layer
+(`create_empty_lsmt_layer` in src/format/lsmt_rw.hpp).
 
 ### Writable layers (ADR-0008)
 
@@ -627,6 +631,32 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
   across process restarts** (`create()` truncates). Checkpoint on graceful
   shutdown and seal (possibly offline, via `seal_file`) to persist.
 
+`src/format/lsmt_rw.hpp` — `create_empty_lsmt_layer`
+
+```cpp
+elio::coro::task<int> create_empty_lsmt_layer(const std::string& path,
+                                              uint64_t vsize,
+                                              const std::string& user_tag = "");
+```
+
+The ADR-0014 blank (raw) device **zero base** writer: creates a **sealed,
+empty** LSMT RO layer at `path` — `virtual_size = vsize`, `index_size = 0`
+(no segments, no data), so reads through the normal merge path serve the
+whole `[0, vsize)` range as zeroes. Layout is the same as `seal()`'s
+compaction output for an empty index: header region at byte 0, trailer
+region as the file's last 4096 bytes, `index_offset = 4096` (the
+data-region start / first allowed index position), total file size 8192 —
+every reader bound check in `LsmtLayer::open` is satisfiable. Returns 0 or
+a negative -errno (`-EINVAL` when `vsize` is not a positive multiple of
+512; an error path unlinks the partial file).
+
+**Determinism.** The layer obeys the seal determinism rule with no data
+and no index entries, so its bytes are a pure function of `vsize` (and the
+empty default `user_tag`): the uuid derives from
+`sha256(vsize as LE u64)`. In particular, committing a blank upper that
+never received a write (empty content, empty `user_tag`) reproduces the
+zero base byte-for-byte.
+
 ### `src/format/merged_writable.hpp` — `MergedWritable`
 
 `src/format/merged_writable.hpp::MergedWritable`
@@ -842,6 +872,13 @@ features (not yet implemented).
   (`src/format/lsmt.cpp`) nor upstream validates a child's `parent_uuid`
   against the parent's `uuid` — the field is informational. Pinned by
   `format: lsmt rw seal is deterministic for identical content`.
+- **Empty-layer determinism (ADR-0014).** A sealed empty layer
+  (`create_empty_lsmt_layer`) follows the same rule with no data and no
+  index entries — digest = `sha256(vsize as LE u64)` — so identical
+  `vsize` writes byte-identical files (pinned by
+  `format: empty lsmt layer bytes are deterministic per virtual size`);
+  an empty commit (`seal` of a never-written upper, empty `user_tag`)
+  reproduces the base exactly.
 - **Error channels.** Cold paths (`open`, `parse`, writers) throw
   `obd::format_error` / `obd::error`; hot paths (`pread`/`pwrite`/`flush`)
   return negative -errno and never throw (the `source::BlobSource`
@@ -967,6 +1004,17 @@ writers and readers agree on the same bytes.
   fresh open with digest/size reported, the sealed output loads as a valid
   RO layer, and the error channels are precise (`-EALREADY` sealed,
   `-ENOENT` missing, `-EINVAL` never checkpointed).
+- `format: empty sealed lsmt layer is a zero base of its virtual size` —
+  a sealed empty LSMT layer opens as a valid RO layer with the requested
+  `virtual_size`, zero segments, minimal 8192-byte geometry
+  (`index_offset = 4096`, empty index), and a merged single-layer view
+  reads the whole requested range — head and tail — as zeroes. Guards the
+  ADR-0014 zero-base format.
+- `format: empty lsmt layer bytes are deterministic per virtual size` —
+  two empty layers of the same `vsize` are byte-identical; a different
+  `vsize` differs. The header uuid is pinned against an independently
+  computed `sha256(vsize as LE u64)` digest (the content-derived rule for
+  an empty index), not just asserted by self-consistency.
 - `format: merged writable falls through and copy-on-writes` — before any
   write the merged view is pure fall-through; after a patch write, reads see
   the patch while the lower blob is verified **byte-identical** afterwards.

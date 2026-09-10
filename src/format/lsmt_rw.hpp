@@ -27,6 +27,28 @@
 
 namespace obd::format {
 
+/// ADR-0014 blank (raw) device zero base: writes a sealed EMPTY LSMT RO
+/// layer at `path` — virtual_size = `vsize`, index_size = 0 (no segments,
+/// no data). Reads through the ordinary merge path therefore serve the
+/// whole [0, vsize) range as zeroes (LsmtLayer/MergedLsmt zero-fill holes),
+/// which is what makes a blank disk read as zeroed from birth.
+///
+/// Byte-deterministic with the same rule as seal(): the sealed uuid is
+/// derived from sha256(vsize as LE u64 || packed data (none) || packed
+/// index entries (none)), formatted as a 8-4-4-4-12 uuid string — a pure
+/// function of `vsize`, no randomness, no clock. Identical vsize writes
+/// identical bytes (docs/format.md); an untouched blank upper that seals
+/// with an empty user_tag reproduces this base byte-for-byte.
+///
+/// Layout mirrors seal()'s compaction output for an empty index: header
+/// region at byte 0, trailer region as the file's last 4096 bytes,
+/// index_offset = 4096 (the data-region start / first allowed index
+/// position), total file size 8192. Returns 0 or a negative -errno
+/// (-EINVAL when vsize is not a positive multiple of 512).
+elio::coro::task<int> create_empty_lsmt_layer(const std::string& path,
+                                              uint64_t vsize,
+                                              const std::string& user_tag = "");
+
 class LsmtRwLayer final : public WritableLayer {
 public:
     ~LsmtRwLayer() override;  // out-of-line: View is an incomplete type here

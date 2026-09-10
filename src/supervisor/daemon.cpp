@@ -30,6 +30,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace obd::supervisor {
@@ -132,6 +133,129 @@ struct SyncMutexGuard {
     ~SyncMutexGuard() { m.unlock(); }
 };
 
+/// Default MkfsRunner (ADR-0014 mode 3): fork `mkfs.<type> <device>` and
+/// reap it without blocking an Elio worker (a WNOHANG poll between async
+/// sleeps, bounded by mkfs_timeout_sec — the daemon process blocks the
+/// signalfd signals process-wide, and waitpid works independently of the
+/// blocked SIGCHLD). `mkfs.<type>` is resolved on PATH by name; the type
+/// charset is validated (valid_mkfs_type) before it reaches argv.
+class ForkExecMkfsRunner final : public MkfsRunner {
+public:
+    explicit ForkExecMkfsRunner(int timeout_sec) : timeout_sec_(timeout_sec) {}
+
+    elio::coro::task<int> run(const std::string& fs_type,
+                              const std::string& device,
+                              std::string* error) override {
+        if (!valid_mkfs_type(fs_type)) {
+            if (error) *error = "invalid fs type '" + fs_type + "'";
+            co_return -EINVAL;
+        }
+        const std::string prog = "mkfs." + fs_type;
+        const pid_t pid = ::fork();
+        if (pid < 0) {
+            if (error) {
+                *error = std::string("fork for ") + prog + " failed: " +
+                         std::strerror(errno);
+            }
+            const int e = -errno;
+            co_return e;
+        }
+        if (pid == 0) {
+            // Child: async-signal-safe only. execvp semantics with argv[0]
+            // = the program name (PATH lookup happens in the child).
+            ::execlp(prog.c_str(), prog.c_str(), device.c_str(),
+                     static_cast<char*>(nullptr));
+            _exit(127);
+        }
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(timeout_sec_);
+        for (;;) {
+            int wstatus = 0;
+            const pid_t r = ::waitpid(pid, &wstatus, WNOHANG);
+            if (r == pid) {
+                if (WIFEXITED(wstatus)) {
+                    const int code = WEXITSTATUS(wstatus);
+                    if (code == 0) co_return 0;
+                    if (code == 127 && error) {
+                        *error = prog + ": not found or not executable";
+                    } else if (error) {
+                        *error = prog + " exited with code " +
+                                 std::to_string(code);
+                    }
+                    co_return code;
+                }
+                if (WIFSIGNALED(wstatus)) {
+                    if (error) {
+                        *error = prog + " killed by signal " +
+                                 std::to_string(WTERMSIG(wstatus));
+                    }
+                    co_return 128 + WTERMSIG(wstatus);
+                }
+                if (error) *error = prog + ": unexpected reap state";
+                co_return -ECHILD;
+            }
+            if (r < 0 && errno != EINTR) {
+                if (error) {
+                    *error = std::string("waitpid for ") + prog +
+                             " failed: " + std::strerror(errno);
+                }
+                const int e = -errno;
+                co_return e;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                ::kill(pid, SIGKILL);
+                // Bounded reap, then hand the wait off if it is still not
+                // done. SIGKILL normally lands immediately, but a helper
+                // wedged in uninterruptible IO would otherwise stall this
+                // coroutine — and with it the whole create — forever; the
+                // create path must never park on it. WNOHANG polling for at
+                // most ~2 s covers the ordinary case.
+                bool reaped = false;
+                for (int i = 0; i < 200; ++i) {
+                    int ws = 0;
+                    const pid_t got = ::waitpid(pid, &ws, WNOHANG);
+                    if (got == pid || (got < 0 && errno != EINTR)) {
+                        reaped = true;
+                        break;
+                    }
+                    co_await elio::time::sleep_for(
+                        std::chrono::milliseconds(10));
+                }
+                if (!reaped) {
+                    // Hand the pid to the daemon's reaper rather than
+                    // parking a detached task on it: a detached coroutine
+                    // (or a blocking waitpid) would keep shutdown from
+                    // draining deterministically and could pin a
+                    // blocking-pool thread forever, while the reaper
+                    // already wakes on SIGCHLD and can reap this helper the
+                    // moment it finally dies — so it never becomes a zombie
+                    // that outlives the device it was formatting.
+                    std::lock_guard<std::mutex> lk(orphan_mu_);
+                    orphans_.push_back(pid);
+                }
+                if (error) {
+                    *error = prog + " timed out after " +
+                             std::to_string(timeout_sec_) + " s";
+                }
+                co_return -ETIMEDOUT;
+            }
+            co_await elio::time::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    std::vector<pid_t> take_orphan_pids() override {
+        std::lock_guard<std::mutex> lk(orphan_mu_);
+        std::vector<pid_t> out;
+        out.swap(orphans_);
+        return out;
+    }
+
+private:
+    int timeout_sec_;
+    std::mutex orphan_mu_;
+    std::vector<pid_t> orphans_;  // abandoned helpers awaiting a WNOHANG reap
+};
+
 class Daemon {
     /// Per-device bookkeeping (ADR-0010): the spec is the respawn
     /// template; dev_id is learned from the ready status's bdev path.
@@ -153,7 +277,22 @@ class Daemon {
         bool destroying = false;  // intentional teardown: never respawn
         std::string upper_path;   // <upper.dir>/overlaybd.rw when lsmt
         std::string upper_type;   // "" = no writable upper recorded
-        bool image_config_ok = false;  // config parsed at create time
+        /// True once the entry's writable upper is KNOWN — from the image
+        /// config parsed at create time, or (blank devices, ADR-0014) from
+        /// the workspace layout. Named for what commit actually needs; the
+        /// old "image_config_ok" name lied for config-less blank devices.
+        bool upper_known = false;
+        // ADR-0014 blank provenance: no image config (the upper path comes
+        // from the workspace layout); `mkfs_requested` records that the
+        // create asked for host mkfs (mode 3) — such uppers are never
+        // sealed (commit refuses). It is set BEFORE the entry is published
+        // to `children_`, i.e. on the CREATE's INTENT, not on mkfs having
+        // finished: the device is already reachable by a concurrent commit
+        // while mkfs runs, and a flag that only flips afterwards would let
+        // that commit seal a supervisor-formatted upper (the ADR-0014
+        // boundary must not depend on a race).
+        bool blank = false;
+        bool mkfs_requested = false;
         bool committing = false;      // a commit is in flight
         elio::sync::mutex op_mu;      // commit/destroy vs recovery respawn
 
@@ -182,6 +321,14 @@ public:
     explicit Daemon(DaemonConfig cfg) : cfg_(std::move(cfg)) {
         if (cfg_.device_bin.empty()) {
             cfg_.device_bin = default_device_bin();
+        }
+        // ADR-0014 mode 3: host mkfs runs only on an explicit blank.mkfs
+        // request; the default runner is the fork/exec one (bounded by
+        // mkfs_timeout_sec). Tests install a mock so the suite never
+        // executes host mkfs.
+        if (!cfg_.mkfs_runner) {
+            cfg_.mkfs_runner =
+                make_default_mkfs_runner(cfg_.mkfs_timeout_sec);
         }
     }
 
@@ -244,7 +391,7 @@ public:
         }
         // Wake the reaper: it is parked in a signal wait with no cancel
         // path; a synthetic SIGCHLD makes it re-check stopping_ and exit.
-        // Harmless: the waitpid scan just finds nothing.
+        // Harmless: its per-pid sweep just finds nothing.
         ::kill(::getpid(), SIGCHLD);
         // Join both before returning: detached tasks must not outlive the
         // scheduler (teardown drains forever on parked tasks).
@@ -464,31 +611,95 @@ private:
         }
     }
 
+    /// Reaps the daemon's own device children, one pid at a time.
+    ///
+    /// Deliberately NOT `waitpid(-1, ...)`: the daemon also forks
+    /// out-of-band helper processes (the ADR-0014 mode-3 mkfs runner),
+    /// whose exit status belongs to their owner. A wildcard wait would
+    /// steal it, leaving the owner's `waitpid` with ECHILD — mode 3 would
+    /// fail on every create. The reaper therefore knows exactly which
+    /// pids are device children (the registry) and never touches anything
+    /// else.
     elio::coro::task<void> reaper(elio::signal::signal_fd& sigfd) {
         while (!stopping_.load()) {
             auto info = co_await sigfd.wait();
             if (!info) break;
+            // A coalesced SIGCHLD can cover several exits: sweep until a
+            // full pass reaps nothing.
             for (;;) {
-                int wstatus = 0;
-                const pid_t pid = ::waitpid(-1, &wstatus, WNOHANG);
-                if (pid <= 0) break;
-                co_await mu_.lock();
-                for (auto& [id, entry] : children_) {
-                    if (entry->child->pid() == pid) {
-                        entry->child->note_reaped(wstatus);
-                        ELIO_LOG_INFO("device {} exited (code {})", id,
-                                      entry->child->status().exit_code);
-                        break;
+                std::vector<std::pair<std::string, std::shared_ptr<Child>>>
+                    snapshot;
+                {
+                    co_await mu_.lock();
+                    snapshot.reserve(children_.size());
+                    for (auto& [id, entry] : children_) {
+                        snapshot.emplace_back(id, entry->child);
+                    }
+                    mu_.unlock();
+                }
+                bool reaped_any = false;
+                for (auto& [id, child] : snapshot) {
+                    const pid_t pid = child->pid();
+                    if (pid <= 0) continue;
+                    int wstatus = 0;
+                    const pid_t r = ::waitpid(pid, &wstatus, WNOHANG);
+                    if (r != pid) continue;  // still alive, or already reaped
+                    child->note_reaped(wstatus);
+                    ELIO_LOG_INFO("device {} exited (code {})", id,
+                                  child->status().exit_code);
+                    reaped_any = true;
+                }
+                // Abandoned out-of-band helpers (a mode-3 mkfs that
+                // outlived its bounded post-SIGKILL reap) are collected
+                // here too: their owner has given up on them, and no other
+                // wait may touch them (a wildcard wait would steal a LIVE
+                // helper's status — see above), so the reaper is the only
+                // place that can keep them from zombifying.
+                for (const pid_t orphan :
+                     cfg_.mkfs_runner->take_orphan_pids()) {
+                    abandoned_helpers_.push_back(orphan);
+                }
+                for (auto it = abandoned_helpers_.begin();
+                     it != abandoned_helpers_.end();) {
+                    int wstatus = 0;
+                    const pid_t r = ::waitpid(*it, &wstatus, WNOHANG);
+                    // Erase on the pid (we reaped it) or on a TERMINAL error
+                    // (ECHILD: it was reaped elsewhere; anything but EINTR
+                    // means this wait will never succeed). Keeping such a pid
+                    // would grow the list forever and re-issue a syscall for
+                    // it on every SIGCHLD wake.
+                    if (r == *it) {
+                        ELIO_LOG_INFO(
+                            "reaped abandoned mkfs helper (pid {})", *it);
+                        it = abandoned_helpers_.erase(it);
+                    } else if (r < 0 && errno != EINTR) {
+                        ELIO_LOG_WARNING(
+                            "abandoned mkfs helper pid {} is unreapable "
+                            "(waitpid: {}); dropping it",
+                            *it, std::strerror(errno));
+                        it = abandoned_helpers_.erase(it);
+                    } else {
+                        ++it;
                     }
                 }
-                mu_.unlock();
+                if (!reaped_any) break;
             }
         }
     }
 
     elio::coro::task<std::string> cmd_create(const nlohmann::json& j) {
         const std::string id = j["id"].get<std::string>();
-        const std::string config = j["config"].get<std::string>();
+        const bool blank_mode = j.contains("blank");
+        std::optional<BlankSpec> blank;
+        if (blank_mode) {
+            std::string blank_err;
+            blank = parse_blank_spec(j["blank"], blank_err);
+            if (!blank) {
+                co_return reply_error("invalid create: " + blank_err);
+            }
+        }
+        const std::string config =
+            blank_mode ? "" : j["config"].get<std::string>();
         const std::string global = j.value("global", cfg_.global_config);
         const std::string bin = j.value("device_bin", cfg_.device_bin);
         const int dev_id = j.value("dev_id", -1);
@@ -505,7 +716,10 @@ private:
                                      j["virtual_size"].get<int64_t>());
         }
 
-        if (id.empty() || id.find('/') != std::string::npos) {
+        // The id becomes a per-device workspace path (<blank_dir>/<id>) for
+        // blank creates, so "." / ".." are rejected alongside "/".
+        if (id.empty() || id == "." || id == ".." ||
+            id.find('/') != std::string::npos) {
             co_return reply_error("invalid id");
         }
         if (virtual_size > 0 && virtual_size % 512 != 0) {
@@ -513,7 +727,9 @@ private:
                 "create virtual_size must be a positive multiple of 512 "
                 "bytes");
         }
-        if (!file_exists(config)) {
+        // A blank create carries no image config (the child builds the
+        // blank stack); an image create must name an existing config.
+        if (!blank_mode && !file_exists(config)) {
             co_return reply_error("config file not found: " + config);
         }
         if (!file_exists(bin)) {
@@ -527,27 +743,61 @@ private:
         }
 
         auto entry = std::make_shared<DeviceEntry>();
-        entry->spec =
-            ChildSpec{id, bin, config, global, dev_id, false, virtual_size};
-        // ADR-0014: record the upper's path/kind for a later commit.
-        // Provenance is the config as of create time — a later edit of the
-        // config file must not redirect commit. A parse failure leaves the
-        // entry without upper info (commit then reports it); the child
-        // reports the config error itself.
-        try {
-            const std::string text = co_await read_text_file(config);
-            const image::ImageConfig img = image::ImageConfig::from_json_text(
-                text, image::DownloadConfig{});
-            entry->image_config_ok = true;
-            if (img.writable()) {
-                entry->upper_type = img.upper.type;
-                if (img.upper.type == "lsmt") {
-                    entry->upper_path = img.upper.dir + "/overlaybd.rw";
+        if (blank_mode) {
+            // ADR-0014 modes 2/3: no image config. The child builds the
+            // blank stack (empty LSMT zero base + LSMT-RW upper) inside its
+            // workspace; the upper path/kind below is the exact path the
+            // device assembly uses, and commit provenance needs no config
+            // pre-parse.
+            ChildSpec spec;
+            spec.id = id;
+            spec.device_bin = bin;
+            spec.global_path = global;
+            spec.dev_id_request = dev_id;
+            spec.blank = true;
+            spec.blank_size = blank->size;
+            spec.blank_dir = cfg_.blank_dir + "/" + id;
+            entry->spec = std::move(spec);
+            entry->upper_known = true;  // no config; upper known by layout
+            entry->upper_type = "lsmt";
+            entry->upper_path = cfg_.blank_dir + "/" + id + "/overlaybd.rw";
+            entry->blank = true;
+            // Recorded NOW (before the entry is published and before mkfs
+            // runs) so the unsealable-upper rule holds in every ordering.
+            entry->mkfs_requested = !blank->mkfs.empty();
+        } else {
+            ChildSpec spec;
+            spec.id = id;
+            spec.device_bin = bin;
+            spec.config_path = config;
+            spec.global_path = global;
+            spec.dev_id_request = dev_id;
+            // D3 create-time headroom: the device grows itself to this
+            // override (grow-only vs the image's declared size).
+            spec.virtual_size = virtual_size;
+            entry->spec = std::move(spec);
+            // ADR-0014: record the upper's path/kind for a later commit.
+            // Provenance is the config as of create time — a later edit of
+            // the config file must not redirect commit. A parse failure
+            // leaves the entry without upper info (commit then reports it);
+            // the child reports the config error itself.
+            try {
+                const std::string text = co_await read_text_file(config);
+                const image::ImageConfig img =
+                    image::ImageConfig::from_json_text(
+                        text, image::DownloadConfig{});
+                entry->upper_known = true;
+                if (img.writable()) {
+                    entry->upper_type = img.upper.type;
+                    if (img.upper.type == "lsmt") {
+                        entry->upper_path = img.upper.dir + "/overlaybd.rw";
+                    }
                 }
+            } catch (const std::exception& e) {
+                ELIO_LOG_WARNING(
+                    "device {}: cannot pre-parse image config ({})", id,
+                    e.what());
             }
-        } catch (const std::exception& e) {
-            ELIO_LOG_WARNING("device {}: cannot pre-parse image config ({})",
-                             id, e.what());
         }
         try {
             entry->child =
@@ -588,7 +838,100 @@ private:
         fields["id"] = id;
         fields["pid"] = child->pid();
         fields["device"] = st.device;
+        if (blank_mode) {
+            fields["mode"] = "blank";
+            fields["size"] = blank->size;
+            // ADR-0014 mode 3: the host `mkfs.<type>` convenience runs only
+            // when the create explicitly asked for it (never otherwise, and
+            // never from tests — tests inject a mock runner). A failure
+            // leaves a freshly created but unusable (unformatted) device:
+            // stop it and remove the entry before replying with the error.
+            if (!blank->mkfs.empty()) {
+                if (st.device.empty() ||
+                    dev_id_from_bdev_path(st.device) < 0) {
+                    co_await stop_entry_and_erase(entry);
+                    co_return reply_error(
+                        "blank device reported no /dev/ublkbN path; "
+                        "cannot run mkfs." +
+                        blank->mkfs);
+                }
+                std::string mkfs_err;
+                const int mkrc = co_await cfg_.mkfs_runner->run(
+                    blank->mkfs, st.device, &mkfs_err);
+                if (mkrc != 0) {
+                    co_await stop_entry_and_erase(entry);
+                    co_return reply_error(
+                        "mkfs." + blank->mkfs + " on " + st.device +
+                        " failed: " +
+                        (mkfs_err.empty() ? std::to_string(mkrc)
+                                          : mkfs_err));
+                }
+                // `mkfs_requested` was already set when the entry was
+                // created (see DeviceEntry): the upper of a mode-3 device
+                // is unsealable from the moment the create is visible.
+                fields["mkfs"] = blank->mkfs;
+            }
+        }
         co_return reply_ok(fields);
+    }
+
+    /// Stops and removes EXACTLY the given device entry (used on
+    /// create-time failures such as a failed mode-3 mkfs). The entry is
+    /// passed in — not looked up by id — and re-checked under mu_ before
+    /// anything is stopped or erased: a stale failure path (a create that
+    /// spent minutes in mkfs while the id was destroyed and re-created)
+    /// must never terminate or remove a NEWER device that happens to own
+    /// the same id. Mirrors cmd_destroy otherwise: `destroying` set under
+    /// mu_ so supervise_entry never respawns, op_mu around the stop, the
+    /// entry erased (again identity-checked) at the end.
+    elio::coro::task<void> stop_entry_and_erase(
+        const std::shared_ptr<DeviceEntry>& entry) {
+        if (!entry) co_return;
+        {
+            co_await mu_.lock();
+            auto it = children_.find(entry->spec.id);
+            if (it == children_.end() || it->second != entry) {
+                // The id now belongs to a different (or no) device: the
+                // registration of this stale entry is gone, and whatever
+                // removed it (destroy) already stopped its child. Just
+                // mark it so a late supervise_entry pass never respawns.
+                entry->destroying = true;
+                mu_.unlock();
+                co_return;
+            }
+            entry->destroying = true;
+            mu_.unlock();
+        }
+        co_await entry->op_mu.lock();
+        {
+            SyncMutexGuard op_guard{entry->op_mu};
+            std::shared_ptr<Child> child = entry->child;
+            child->terminate();
+            auto done = co_await elio::with_timeout(
+                std::chrono::seconds(cfg_.stop_timeout_sec),
+                [&child](elio::coro::cancel_token tok)
+                    -> elio::coro::task<void> {
+                    co_await child->exit_event().wait(std::move(tok));
+                });
+            if (!done) {
+                child->kill();
+                co_await elio::with_timeout(
+                    std::chrono::seconds(2),
+                    [&child](elio::coro::cancel_token tok)
+                        -> elio::coro::task<void> {
+                        co_await child->exit_event().wait(std::move(tok));
+                    });
+            }
+        }
+        {
+            co_await mu_.lock();
+            auto it = children_.find(entry->spec.id);
+            if (it != children_.end() && it->second == entry) {
+                children_.erase(it);
+            }
+            mu_.unlock();
+        }
+        co_return;
     }
 
     /// Routes a device "reply"-discriminated line (ADR-0013): command
@@ -1000,7 +1343,7 @@ private:
     elio::coro::task<std::string> commit_stop_and_seal(
         const std::shared_ptr<DeviceEntry>& entry, const std::string& id,
         const std::string& user_tag, uint64_t virtual_size) {
-        if (!entry->image_config_ok) {
+        if (!entry->upper_known) {
             co_return reply_error(
                 "image config unreadable at create; upper unknown: " + id);
         }
@@ -1009,6 +1352,21 @@ private:
         }
         if (entry->upper_type != "lsmt") {
             co_return reply_error("sparse uppers cannot be sealed: " + id);
+        }
+        // ADR-0014 mode 3 boundary: a blank device the supervisor itself
+        // was asked to format with host mkfs is never sealed. Host mkfs
+        // output is non-deterministic (UUIDs, hash seeds, timestamps) and
+        // ADR-0014 excludes it from image building — this is where the
+        // daemon can enforce that its own convenience run never becomes an
+        // image layer. The check keys on the create-time INTENT
+        // (`mkfs_requested`), not on mkfs having finished: the entry is
+        // reachable while its mkfs step is still running, and a commit
+        // landing in that window must be refused just the same. Mode-2
+        // blanks (the caller formats) remain committable.
+        if (entry->blank && entry->mkfs_requested) {
+            co_return reply_error(
+                "device was created with host mkfs (create mode 3); its "
+                "non-deterministic upper cannot be sealed: " + id);
         }
         const std::string& upper = entry->upper_path;
 
@@ -1134,9 +1492,17 @@ private:
     elio::sync::mutex mu_;
     std::map<std::string, std::shared_ptr<DeviceEntry>> children_;
     std::atomic<bool> stopping_{false};
+    /// Abandoned mkfs-helper pids the reaper still owes a reap (see
+    /// reaper()): drained on every SIGCHLD wake, including the synthetic
+    /// one that unparks the reaper at shutdown.
+    std::vector<pid_t> abandoned_helpers_;
 };
 
 }  // namespace
+
+MkfsRunnerPtr make_default_mkfs_runner(int timeout_sec) {
+    return std::make_shared<ForkExecMkfsRunner>(timeout_sec);
+}
 
 elio::coro::task<int> run_daemon(const DaemonConfig& cfg) {
     Daemon d(cfg);

@@ -53,6 +53,17 @@
 
 namespace obd::image {
 
+/// ADR-0014 blank (raw) device spec: no image, no lowers. `size` is the
+/// device size in bytes (positive, sector aligned); `dir` is the per-device
+/// workspace the assembly owns files in:
+///
+///   <dir>/overlaybd.zero  — sealed EMPTY LSMT layer: the zero base
+///   <dir>/overlaybd.rw    — LSMT-RW writable upper (ADR-0008), commit-able
+struct BlankDeviceSpec {
+    uint64_t size = 0;  // bytes
+    std::string dir;    // per-device workspace (created if missing)
+};
+
 struct OpenedImage {
     source::BlobSourcePtr root;  // MergedLsmt or MergedWritable
     uint64_t virtual_size = 0;
@@ -92,6 +103,14 @@ struct OpenedImage {
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                          const GlobalConfig& global,
                                          uint64_t writable_override_bytes = 0);
+
+/// Assembles the blank (raw) device view for a BlankDeviceSpec: the opened
+/// device is a MergedWritable over the empty LSMT zero base with a fresh
+/// LSMT-RW writable upper on top (both sized to the requested size), so it
+/// reads as a zeroed block device from birth and every write lands in the
+/// upper — the same stack a later `commit` (ADR-0014) seals offline.
+/// Throws obd::error on an invalid spec or IO failure.
+elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec);
 
 /// Parks every background fill in the assembled chain: stop_fill() on
 /// each store, then a bounded wait for a terminal fill_status. Call before

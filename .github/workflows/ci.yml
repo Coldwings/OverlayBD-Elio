@@ -19,6 +19,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:  # manual trigger (also lets a branch head be verified
+                      # when the pull_request event does not schedule a run)
 
 jobs:
   build-test:

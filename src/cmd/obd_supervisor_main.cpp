@@ -15,7 +15,8 @@ namespace {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [--socket PATH] [--global PATH] [--device-bin PATH]\n"
-                 "          [--ready-timeout SEC] [--stop-timeout SEC]\n",
+                 "          [--ready-timeout SEC] [--stop-timeout SEC]\n"
+                 "          [--blank-dir PATH] [--mkfs-timeout SEC]\n",
                  argv0);
 }
 
@@ -39,6 +40,9 @@ int main(int argc, char** argv) {
             cfg.ready_timeout_sec = std::stoi(next("--ready-timeout"));
         else if (a == "--stop-timeout")
             cfg.stop_timeout_sec = std::stoi(next("--stop-timeout"));
+        else if (a == "--blank-dir") cfg.blank_dir = next("--blank-dir");
+        else if (a == "--mkfs-timeout")
+            cfg.mkfs_timeout_sec = std::stoi(next("--mkfs-timeout"));
         else if (a == "--help" || a == "-h") {
             usage(argv[0]);
             return 0;

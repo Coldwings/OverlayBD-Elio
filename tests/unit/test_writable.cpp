@@ -961,6 +961,56 @@ TEST_CASE("format: lsmt rw grow extends the write window and persists the size",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("format: empty sealed lsmt layer is a zero base of its virtual size",
+          "[format]") {
+    // ADR-0014 blank-device zero base: a sealed LSMT RO layer with no
+    // segments reads as zeroes across its whole virtual size through the
+    // ordinary merge path (holes zero-fill), which is what makes a blank
+    // raw disk read zeroed from birth.
+    TempDir dir;
+    const std::string base_path = dir / "zero.lsmt";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const uint64_t vsize = 512 * 128;
+        const int crc = co_await format::create_empty_lsmt_layer(base_path,
+                                                                 vsize);
+        REQUIRE(crc == 0);
+        // Minimal sealed geometry: header region + trailer region, no data
+        // and no index region (index_offset = 4096, index_size = 0).
+        REQUIRE(file_bytes(base_path) == 2 * 4096);
+
+        auto ro = co_await source::LocalFileSource::open(base_path);
+        source::BlobSourcePtr base = std::move(ro);
+        auto layer = co_await format::LsmtLayer::open(std::move(base));
+        REQUIRE(layer->virtual_size() == vsize);
+        REQUIRE(layer->segments().empty());
+        REQUIRE(layer->header().is_sealed());
+
+        // A merged view over the single empty layer serves zeroes across
+        // the requested range — including the tail, which never maps to a
+        // segment of any layer.
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(std::move(layer));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        REQUIRE(merged->size() == vsize);
+        // Prefilled with 0xFF (not zeroes): a no-op pread must fail the
+        // all-zero assertion instead of passing on a pre-zeroed buffer.
+        std::vector<uint8_t> head(512 * 16, 0xFF);
+        const ssize_t r =
+            co_await merged->pread(head.data(), head.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(head.size()));
+        REQUIRE(std::all_of(head.begin(), head.end(),
+                            [](uint8_t b) { return b == 0; }));
+        std::vector<uint8_t> tail(512, 0xFF);
+        const ssize_t r2 = co_await merged->pread(
+            tail.data(), tail.size(), vsize - tail.size());
+        REQUIRE(r2 == static_cast<ssize_t>(tail.size()));
+        REQUIRE(std::all_of(tail.begin(), tail.end(),
+                            [](uint8_t b) { return b == 0; }));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("format: sparse layer grow extends the write window", "[format]") {
     // D3 data-plane grow for the sparse upper: ftruncate extends the
     // sparse file; pwrite/pread accept the new range (sparse uppers never
@@ -1145,6 +1195,133 @@ TEST_CASE("format: offline seal rejects a virtual_size below the content extent"
         REQUIRE(src == -EINVAL);
         REQUIRE(reject.find("content extent") != std::string::npos);
         REQUIRE(reject.find("grow-only") != std::string::npos);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: empty lsmt layer bytes are deterministic per virtual size",
+          "[format]") {
+    // ADR-0014: the empty layer's uuid is derived from the content digest
+    // sha256(vsize as LE u64 || no data || no index), so the file bytes are
+    // a pure function of vsize. The expected uuid is computed here with an
+    // independent digest oracle (test-side), pinning the derivation rather
+    // than asserting only by self-consistency.
+    TempDir dir;
+    const uint64_t vsize = 512 * 256;
+    const std::string a = dir / "zero-a.lsmt";
+    const std::string b = dir / "zero-b.lsmt";
+    const std::string c = dir / "zero-c.lsmt";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const int ca = co_await format::create_empty_lsmt_layer(a, vsize);
+        REQUIRE(ca == 0);
+        const int cb = co_await format::create_empty_lsmt_layer(b, vsize);
+        REQUIRE(cb == 0);
+        const int cc =
+            co_await format::create_empty_lsmt_layer(c, vsize * 2);
+        REQUIRE(cc == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(file_sha256(a) == file_sha256(b));
+    REQUIRE(file_sha256(a) != file_sha256(c));
+
+    // Content-derived uuid: sha256(LE64 vsize), first 32 hex chars as a
+    // 8-4-4-4-12 uuid string.
+    common::Sha256 h;
+    uint8_t le[8];
+    bytes::store_u64_le(le, vsize);
+    h.update(le, sizeof(le));
+    std::string want = h.final_hex().substr(0, 32);
+    want.insert(20, 1, '-');
+    want.insert(16, 1, '-');
+    want.insert(12, 1, '-');
+    want.insert(8, 1, '-');
+    REQUIRE(sealed_header_uuid(a) == want);
+    REQUIRE(sealed_header_uuid(b) == want);
+    REQUIRE(sealed_header_uuid(c) != want);
+}
+
+TEST_CASE("image: blank device rejects an unusable workspace path", "[image]") {
+    // Review finding: a workspace path occupied by a REGULAR FILE sets
+    // create_directories' error_code while exists() stays true, so the
+    // old check fell through and the failure surfaced later as a confusing
+    // overlaybd.zero error. Every unusable workspace must be reported as
+    // such, before any layer work.
+    TempDir dir;
+    const std::string ws = dir / "not-a-dir";
+    test::write_file(ws, std::vector<uint8_t>{'x'});
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        image::BlankDeviceSpec spec;
+        spec.size = 512 * 64;
+        spec.dir = ws;
+        try {
+            (void)co_await image::open_blank_device(spec);
+            REQUIRE(false);  // a file as the workspace must not succeed
+        } catch (const std::exception& e) {
+            const std::string msg = e.what();
+            REQUIRE(msg.find("workspace") != std::string::npos);
+            REQUIRE(msg.find(ws) != std::string::npos);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("image: blank device assembles a zeroed writable upper", "[image]") {
+    // ADR-0014 mode 2: open_blank_device produces a MergedWritable over a
+    // sealed EMPTY LSMT zero base + a fresh LSMT-RW upper, both sized to
+    // the requested size — the device reads as zeroed from birth and
+    // writes land in the upper (commit-able like any ADR-0008 upper).
+    TempDir dir;
+    const uint64_t vsize = 512 * 64;
+    const std::string ws = dir / "blank-ws";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        image::BlankDeviceSpec spec;
+        spec.size = vsize;
+        spec.dir = ws;
+        auto opened = co_await image::open_blank_device(spec);
+        REQUIRE(opened.writable);
+        REQUIRE(opened.virtual_size == vsize);
+        REQUIRE(opened.upper_path == ws + "/overlaybd.rw");
+
+        // The zero base on disk is a sealed empty LSMT layer of the
+        // requested size.
+        auto ro = co_await source::LocalFileSource::open(ws +
+                                                         "/overlaybd.zero");
+        source::BlobSourcePtr base = std::move(ro);
+        auto zero_layer =
+            co_await format::LsmtLayer::open(std::move(base));
+        REQUIRE(zero_layer->virtual_size() == vsize);
+        REQUIRE(zero_layer->segments().empty());
+        REQUIRE(zero_layer->header().is_sealed());
+
+        auto* w =
+            dynamic_cast<source::WritableBlobSource*>(opened.root.get());
+        REQUIRE(w != nullptr);
+
+        // A fresh blank device reads zeroes across its whole range.
+        std::vector<uint8_t> expect(512 * 32, 0);
+        std::vector<uint8_t> buf(512 * 32, 0xFF);
+        const ssize_t r0 = co_await w->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r0 == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == expect);
+
+        // Writes land in the upper and read back; the untouched regions
+        // around them stay zero.
+        const auto patch = sectors_pattern(4, 8, 555);
+        const ssize_t r1 =
+            co_await w->pwrite(patch.data(), patch.size(), 4 * 512);
+        REQUIRE(r1 == static_cast<ssize_t>(patch.size()));
+        buf.assign(buf.size(), 0xFF);
+        const ssize_t r2 = co_await w->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r2 == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data() + 4 * 512, patch.data(),
+                            patch.size()) == 0);
+        REQUIRE(std::memcmp(buf.data(), expect.data(), 4 * 512) == 0);
+        REQUIRE(std::memcmp(buf.data() + 4 * 512 + patch.size(),
+                            expect.data(),
+                            buf.size() - (4 * 512 + patch.size())) == 0);
         co_return 0;
     });
     REQUIRE(rc == 0);

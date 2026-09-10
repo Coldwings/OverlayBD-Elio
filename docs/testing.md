@@ -192,6 +192,14 @@ Every test, grouped by area, with the property it guards.
   `index_size == 0` (uuid intact, cross-check would pass) is rejected by
   the index bounds guard instead of underflowing into an empty seal
   (ADR-0014).
+- `format: empty sealed lsmt layer is a zero base of its virtual size` —
+  the ADR-0014 blank-device zero base: a sealed LSMT layer with an empty
+  index opens with the requested `virtual_size` and reads the whole
+  range as zeroes through the normal merge path.
+- `format: empty lsmt layer bytes are deterministic per virtual size` —
+  identical sizes produce byte-identical sealed empty layers (content-
+  derived uuid pinned against an independent digest), different sizes
+  differ (ADR-0014 determinism).
 - `format: merged writable falls through and copy-on-writes` —
   `MergedWritable` reads fall through the upper to sealed lowers, and
   writes shadow lowers copy-on-write without mutating them (ADR-0008).
@@ -457,6 +465,17 @@ Every test, grouped by area, with the property it guards.
 - `image: writable upper assembles and serves writes` — a config with
   `upper.dir` opens a `MergedWritable` root that accepts and serves
   back writes (ADR-0008).
+- `image: blank device rejects an unusable workspace path` — the
+  ADR-0014 workspace preflight: a regular FILE sitting where the
+  per-device workspace must be is reported as a workspace error naming
+  the path (create_directories sets an error_code while `exists()` stays
+  true, so an `ec && !exists` check let it through and the failure
+  surfaced later as a confusing `overlaybd.zero` error), before any layer
+  work happens.
+- `image: blank device assembles a zeroed writable upper` — no config:
+  `open_blank_device` opens a writable root of the requested size over a
+  sealed empty LSMT zero base; fresh reads are zero, writes land in the
+  upper and read back, untouched ranges stay zero (ADR-0014 mode 2).
 - `image: trace replay populates traced extents in recorded order` —
   records interleaving two lowers issue `populate` on the right target in
   the trace's exact order (ADR-0013).
@@ -585,7 +604,10 @@ Every test, grouped by area, with the property it guards.
 
 - `supervisor: protocol commands parse and reject garbage` — the
   control-protocol parser accepts the four commands and rejects
-  malformed JSON, missing fields, and unknown commands.
+  malformed JSON, missing fields, unknown commands, and a `create`
+  `dev_id` outside `[-1, INT32_MAX]` (in range: accepted; `4294967296`
+  and `-2`: clean parse errors naming `dev_id`, never a thrown
+  `get<int>()`).
 - `supervisor: hello handshake replies with protocol version and features` —
   the `hello` reply carries an integer `protocol` ≥ 1, a non-empty
   `version` string, and a `features` array; `hello` requires no fields and
@@ -607,6 +629,59 @@ Every test, grouped by area, with the property it guards.
   field types are parse-time protocol errors, not handler exceptions),
   ignores unknown fields, and the `hello` reply pins the `protocol` field
   plus the `commit` feature advertisement (ADR-0014).
+- `supervisor: mkfs runner maps exit codes and bounds the timeout` — the
+  real default mkfs runner against throwaway PATH shims: exit 0 → ok,
+  exit 1 → code+message, absent `mkfs.<type>` → the 127 "not found"
+  mapping, an unsafe type refused before argv, and a shim sleeping past
+  the bound reported as `-ETIMEDOUT` (helper SIGKILLed) — the runner owns
+  its child (ADR-0014 mode 3).
+- `supervisor: blank spawn argv carries the blank flags and global` — a
+  blank child's real argv is `--blank-size N --blank-dir D --global G
+  --control-fd 3` with no `--config`, pinning the spawn contract for both
+  creation modes.
+- `supervisor: commit is refused while a mode-3 create is still in mkfs` —
+  the ADR-0014 unsealable-upper rule under concurrency: a mode-3 create is
+  parked inside its mkfs step (the mock runner's release gate) while the
+  device is already created and reachable, then a `commit` for that id
+  must be refused with the "host mkfs" error and must NOT stop the device
+  being formatted — a rule keyed on mkfs having finished would seal the
+  supervisor-formatted upper here; the same create is also refused after
+  mkfs completes.
+- `supervisor: the reaper collects helpers a runner had to abandon` — a
+  mode-3 mkfs helper that outlives its bounded post-SIGKILL reap is handed
+  to the reaper (`MkfsRunner::take_orphan_pids()`) instead of parking a
+  detached task on it: the test registers a real forked helper as
+  abandoned plus an already-reaped pid (whose wait answers `ECHILD`, which
+  must be terminal for that entry) and requires the daemon to reap the
+  live helper (the test's own `waitpid` then answers `ECHILD`) — a
+  returned pid means the zombie survived.
+- `supervisor: stale blank-create failure leaves a newer device alone` —
+  F1/F3-scale concurrency: a create parked inside its (slow) mkfs step,
+  the id destroyed and re-created underneath it, then the stale mkfs
+  failure released: the stale cleanup must leave the NEWER device
+  untouched (same pid, still served) and the daemon healthy.
+- `supervisor: obd-device rejects malformed blank flags` — the real
+  obd-device binary's own `--blank-size` validation (negative, zero,
+  unaligned, junk, overflowing, above the 16 TiB bound, missing
+  `--blank-dir`, and `--config` combined with blank) is a usage error
+  (exit 2) before any device work — obd-device is a standalone entry
+  point, not only a supervisor child.
+- `supervisor: fake device rejects malformed blank flags like obd-device` —
+  the same matrix against the test-only fake device binary: its
+  `--blank-size` parsing must accept and reject exactly what the
+  production binary does (a `std::stoull` parse used to turn `-512` into
+  1.8e19 and drive blank-mode integration tests with a size production
+  refuses); a well-formed size paired with an unwritable workspace exits 1
+  (failed device), proving the validator is not merely rejecting
+  everything. The wait is bounded, so a validator regression fails the
+  assertion instead of hanging the job (#11).
+- `supervisor: create blank spec parses and validates size and mkfs` —
+  the ADR-0014 blank create grammar end to end: `create` parses with a
+  `blank` object (mode 2, and mode 3 with `mkfs`); `config` and `blank`
+  are mutually exclusive with one mandatory; wrong-typed
+  `blank`/`size`/`mkfs` are parse-time errors; `parse_blank_spec`
+  rejects zero, unaligned, and oversized sizes and unsafe `mkfs` types
+  (`valid_mkfs_type`), accepting `ext4`/`xfs` (ADR-0014).
 - `supervisor: device trace control answers malformed-typed fields with clean errors` —
   the device-side trace command loop (`src/supervisor/device_control.hpp`)
   over a real socketpair: a `trace_start` with a wrong-typed `path` or
@@ -669,6 +744,24 @@ Every test, grouped by area, with the property it guards.
   upper uncommittable), the gate serializes concurrent applies so the
   shutdown path can drain an in-flight grow before checkpointing, and a
   malformed construction is refused (D3).
+
+### cli
+
+- `cli: obdctl create-blank sends a create command with the blank object` —
+  the REAL obdctl binary executed against a test-owned UDS server:
+  `create-blank --size --mkfs --global --dev-id` becomes the wire line
+  `{"cmd":"create","blank":{"size":...,"mkfs":...},...}` (the supervisor
+  has no `create-blank` command), mode 2 omits `mkfs`, image-mode create
+  still sends `config`, an `ok:false` reply exits 1, and malformed input
+  (`--size -512` / `100` / missing / above the 16 TiB bound / bad
+  `--mkfs` / unknown flag / junk, overflowing or below `-1` `--dev-id` in
+  either create form — `std::stoi` would abort the process instead of
+  exiting 2) exits 2 without connecting, while `--dev-id -1` (the
+  documented auto-assign spelling) and a `--mkfs` type using `_` are
+  forwarded, not refused. The test server's accept is bounded, so a CLI
+  that wrongly rejects an argument fails the assertion instead of hanging
+  the job (#11).
+
 ### integration
 
 - `integration: layered stack stages over a mock registry` — the full
@@ -772,6 +865,23 @@ Every test, grouped by area, with the property it guards.
   succeeds, the loser gets a precise error ("commit already in progress"
   or "already sealed"), and the sealed file is intact (no interleaved
   tmp-file writes) (ADR-0014). Runs without privileges.
+- `supervisor: blank create serves a writable zero base and commit seals its upper` — ADR-0014 mode 2 with the fake device: `create` with
+  `blank` (no config) assembles the workspace (`overlaybd.zero` +
+  `overlaybd.rw`) via `open_blank_device`; the fake round-trips a
+  payload through the merged stack (unwritten regions read zero); commit
+  stops it and seals the blank-born upper (path/sha256/size); a second
+  commit is "already sealed"; the sealed file re-opens as a valid LSMT
+  RO layer carrying the payload. A recording mock mkfs runner asserts
+  mode 2 never invokes host mkfs (ADR-0014). Runs without privileges.
+- `supervisor: mode-3 mkfs runs only when the blank spec requests it` —
+  ADR-0014 mode 3 with a mock mkfs runner (host mkfs is never executed
+  by the suite): a plain blank create never invokes the runner; a
+  `blank.mkfs` create invokes it exactly once with the requested type
+  and the reported device path and replies ok with the `mkfs` field;
+  commit of a mode-3 (supervisor-formatted) upper is refused with the
+  "host mkfs ... cannot be sealed" boundary error; a failing mkfs is a
+  clean create error and the half-created device entry is removed. Runs
+  without privileges.
 - `integration: trace recording captures remote reads end to end` — a
   real daemon with the extended fake obd-device (opens a REAL image
   against the mock registry, speaks the real device-side trace protocol,
