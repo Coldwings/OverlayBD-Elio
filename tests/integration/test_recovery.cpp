@@ -40,8 +40,16 @@ std::string uds_rpc(const std::string& path, const std::string& line) {
     const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) throw std::system_error(errno, std::generic_category());
     const timeval timeout{8, 0};
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        const int e = errno;
+        ::close(fd);
+        throw std::system_error(e, std::generic_category(), "set RPC receive timeout");
+    }
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        const int e = errno;
+        ::close(fd);
+        throw std::system_error(e, std::generic_category(), "set RPC send timeout");
+    }
     sockaddr_un sa {};
     sa.sun_family = AF_UNIX;
     std::snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path.c_str());
