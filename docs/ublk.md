@@ -451,6 +451,14 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   `ublk_drv` not loaded); the integration test target is registered with
   CTest property `SKIP_RETURN_CODE 4` ("all selected tests skipped"), so an
   unprivileged run stays green. See `tests/CMakeLists.txt`.
+- `integration: ublk device grows online and serves the new capacity` —
+  privileged E2E: grows the writable data plane and kernel capacity, verifies
+  `BLKGETSIZE64`, writes and reads in the added region, preserves original
+  content, and rejects shrink attempts. Its dedicated privileged CI step
+  accepts only the explicit unsupported-`UPDATE_SIZE` skip (kernel
+  ENOTSUPP/524 or EOPNOTSUPP/95); unavailable control access fails that step.
+  A supported pass and an unsupported skip are reported separately in the
+  retained grow log. See `docs/testing.md` for timeouts and CI evidence.
 
 Run: `ctest --test-dir build --output-on-failure` (the E2E test requires
 root or `CAP_SYS_ADMIN` plus a loaded `ublk_drv` to actually execute).
