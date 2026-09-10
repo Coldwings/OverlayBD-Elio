@@ -205,7 +205,7 @@ std::string write_config(const test::TempDir& dir, const std::string& name,
 /// through the fake's SIGTERM-triggered checkpoint.
 void require_sealed_payload(const std::string& upper,
                             const std::string& user_tag) {
-    REQUIRE(test::run_coro([&]() -> elio::coro::task<int> {
+    const int result = test::run_coro([&]() -> elio::coro::task<int> {
         auto ro = co_await source::LocalFileSource::open(upper);
         source::BlobSourcePtr base = std::move(ro);
         auto layer = co_await format::LsmtLayer::open(std::move(base));
@@ -220,7 +220,8 @@ void require_sealed_payload(const std::string& upper,
         REQUIRE(r == static_cast<ssize_t>(buf.size()));
         REQUIRE(std::memcmp(buf.data(), payload.data(), buf.size()) == 0);
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(result == 0);
 }
 
 }  // namespace
@@ -521,7 +522,7 @@ private:
 /// virtual size.
 void require_sealed_blank_upper(const std::string& upper,
                                 const std::string& user_tag) {
-    REQUIRE(test::run_coro([&]() -> elio::coro::task<int> {
+    const int result = test::run_coro([&]() -> elio::coro::task<int> {
         auto ro = co_await source::LocalFileSource::open(upper);
         source::BlobSourcePtr base = std::move(ro);
         auto layer = co_await format::LsmtLayer::open(std::move(base));
@@ -536,7 +537,8 @@ void require_sealed_blank_upper(const std::string& upper,
         REQUIRE(r == static_cast<ssize_t>(buf.size()));
         REQUIRE(std::memcmp(buf.data(), payload.data(), buf.size()) == 0);
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(result == 0);
 }
 
 /// Saves/restores PATH: the daemon's DEFAULT mkfs runner resolves

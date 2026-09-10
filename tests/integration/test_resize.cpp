@@ -196,7 +196,7 @@ std::string write_config(const test::TempDir& dir, const std::string& name,
 /// Re-opens the (sealed) upper and asserts its declared virtual size and
 /// the fake's payload (data region starts at sector 8).
 void require_sealed_layer(const std::string& upper, uint64_t expected_vsize) {
-    REQUIRE(test::run_coro([&]() -> elio::coro::task<int> {
+    const int result = test::run_coro([&]() -> elio::coro::task<int> {
         auto ro = co_await source::LocalFileSource::open(upper);
         source::BlobSourcePtr base = std::move(ro);
         auto layer = co_await format::LsmtLayer::open(std::move(base));
@@ -210,7 +210,8 @@ void require_sealed_layer(const std::string& upper, uint64_t expected_vsize) {
         REQUIRE(r == static_cast<ssize_t>(buf.size()));
         REQUIRE(std::memcmp(buf.data(), payload.data(), buf.size()) == 0);
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(result == 0);
 }
 
 }  // namespace
