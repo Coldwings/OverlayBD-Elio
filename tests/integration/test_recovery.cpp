@@ -19,11 +19,14 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 
 #include <atomic>
+#include <charconv>
 #include <condition_variable>
+#include <fstream>
 #include <mutex>
 #include <system_error>
 #include <chrono>
@@ -404,6 +407,80 @@ TEST_CASE("supervisor: list owns its child generation and trace snapshot", "[sup
 
 namespace {
 
+// These cleanup helpers run only on ordinary fixture threads, never workers.
+pid_t read_fixture_pid(const std::string& path,
+                       std::chrono::milliseconds grace = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + grace;
+    for (;;) {
+        std::ifstream input(path);
+        char record[32]{};
+        input.getline(record, sizeof(record));
+        const std::string_view line(record);
+        pid_t pid = -1;
+        const auto parsed = std::from_chars(line.data(), line.data() + line.size(), pid);
+        // getline must have consumed the newline, not just reached EOF in a
+        // partially published number. Oversized or malformed records fail too.
+        if (input && !input.eof() && parsed.ec == std::errc{} &&
+            parsed.ptr == line.data() + line.size() && pid > 0) return pid;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("fixture PID publication timed out: " + path);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+bool fixture_child_exited(pid_t pid, std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        const pid_t result = ::waitpid(pid, nullptr, WNOHANG);
+        if (result == pid) return true;
+        if (result == 0) return false;
+        const int error = errno;
+        if (error == ECHILD) return true;  // The daemon may have reaped it.
+        if (error != EINTR) {
+            throw std::system_error(error, std::generic_category(), "fixture waitpid");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("fixture waitpid interrupted until deadline");
+        }
+    }
+}
+
+void terminate_fixture_child(pid_t pid) {
+    // Pin the signal target before checking child ownership: the daemon's
+    // reaper may collect it between waitpid and signalling. Never signal a
+    // numeric PID that could have been recycled in that interval.
+    const int pidfd = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+    if (pidfd < 0) {
+        const int error = errno;
+        if (error == ESRCH) return;
+        throw std::system_error(error, std::generic_category(), "fixture pidfd_open");
+    }
+    try {
+        if (!fixture_child_exited(pid, std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(5))) {
+            if (::syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, nullptr, 0) < 0 &&
+                errno != ESRCH) {
+                throw std::system_error(errno, std::generic_category(), "fixture pidfd_send_signal");
+            }
+        }
+    } catch (...) {
+        ::close(pidfd);
+        throw;
+    }
+    ::close(pidfd);
+}
+
+void reap_fixture_child(pid_t pid,
+                        std::chrono::milliseconds grace = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + grace;
+    while (!fixture_child_exited(pid, deadline)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("fixture child reap timed out: " + std::to_string(pid));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
 void check_daemon_lifetime(const std::string& point) {
     test::TempDir dir;
     const std::string sock = dir / "s.sock";
@@ -429,6 +506,7 @@ while IFS= read -r line <&3; do :; done
     std::atomic<bool> client_done{false};
     std::vector<std::string> failures;
     std::string daemon_error;
+    pid_t child_pid = -1;  // Written by client; reused only after its join.
     auto check = [&](bool ok, const char* error) {
         if (!ok) failures.emplace_back(error);
     };
@@ -546,14 +624,14 @@ while IFS= read -r line <&3; do :; done
         // The fixture also owns its fake process independently of the daemon.
         // A broken daemon may have returned before an admitted create spawns
         // it, so cleanup cannot depend on the already-closed control listener.
-        if (point == "command") {
-            wait_until([&] { return std::filesystem::exists(pid_file); });
-        }
-        std::ifstream pid_input(pid_file);
-        pid_t child_pid = -1;
-        if (pid_input >> child_pid; child_pid > 0 &&
-            ::waitpid(child_pid, nullptr, WNOHANG) == 0) {
-            ::kill(child_pid, SIGKILL);
+        if (point == "command" || point == "monitor_eof") {
+            try {
+                // Redirection creates an empty file before echo publishes PID.
+                child_pid = read_fixture_pid(pid_file);
+                terminate_fixture_child(child_pid);
+            } catch (const std::exception& error) {
+                failures.emplace_back(error.what());
+            }
         }
         // Releasing the startup gate already injects its shutdown exception;
         // a SIGTERM here could remain unread when the signal mask is restored.
@@ -586,10 +664,12 @@ while IFS= read -r line <&3; do :; done
     client.join();
     // The scheduler has drained every monitor; reap any fake that a broken
     // baseline failed to include in its shutdown registry snapshot.
-    std::ifstream pid_input(pid_file);
-    pid_t child_pid = -1;
-    if (pid_input >> child_pid; child_pid > 0) {
-        ::waitpid(child_pid, nullptr, WNOHANG);
+    if (child_pid > 0) {
+        try {
+            reap_fixture_child(child_pid);
+        } catch (const std::exception& error) {
+            failures.emplace_back(error.what());
+        }
     }
     const int mask_rc = ::sigprocmask(SIG_SETMASK, &prev, nullptr);
     std::string failure_text;

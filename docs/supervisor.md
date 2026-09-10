@@ -735,6 +735,14 @@ pre-parse needed).
 
 ## Testing
 
+The daemon-lifetime fixture waits for a positive fake-child PID to be
+published, signals through a pidfd after checking child ownership, and
+confirms reaping (or that the daemon already reaped it) after the runtime
+and client thread finish. PID publication and final reaping each have a
+five-second fixture deadline; cleanup errors fail the test. The early
+signal also releases monitors left behind by a broken daemon. These waits
+run on fixture threads and do not define a product shutdown deadline.
+
 The controlled recovery tests pause real command/monitor paths on a
 four-worker runtime, while a synchronous client kills the fake child and
 queries its replacement. The internal bounded coroutine gate adds no child

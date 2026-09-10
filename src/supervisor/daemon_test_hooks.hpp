@@ -27,7 +27,8 @@ public:
     }
     size_t count(const std::string& point) {
         std::lock_guard lock(mu);
-        return observations[point];
+        const auto it = observations.find(point);
+        return it == observations.end() ? 0 : it->second;
     }
     bool is_armed(std::string_view point) {
         std::lock_guard lock(mu);
