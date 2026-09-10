@@ -640,6 +640,12 @@ Every test, grouped by area, with the property it guards.
   being formatted — a rule keyed on mkfs having finished would seal the
   supervisor-formatted upper here; the same create is also refused after
   mkfs completes.
+- `supervisor: the reaper collects helpers a runner had to abandon` — a
+  mode-3 mkfs helper that outlives its bounded post-SIGKILL reap is handed
+  to the reaper (`MkfsRunner::take_orphan_pids()`) instead of parking a
+  detached task on it: the test registers a real forked helper as
+  abandoned and requires the daemon to reap it (the test's own `waitpid`
+  answers `ECHILD`) — a returned pid means the zombie survived.
 - `supervisor: stale blank-create failure leaves a newer device alone` —
   F1/F3-scale concurrency: a create parked inside its (slow) mkfs step,
   the id destroyed and re-created underneath it, then the stale mkfs

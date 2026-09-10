@@ -5,8 +5,11 @@
 
 #include <elio/coro/task.hpp>
 
+#include <sys/types.h>
+
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace obd::supervisor {
 
@@ -28,6 +31,15 @@ public:
     virtual elio::coro::task<int> run(const std::string& fs_type,
                                       const std::string& device,
                                       std::string* error) = 0;
+
+    /// Pids whose reap `run()` had to ABANDON: the bounded post-SIGKILL
+    /// wait expired, so the helper is still dying somewhere. The daemon's
+    /// reaper drains this and reaps them with WNOHANG whenever it wakes on
+    /// SIGCHLD, which keeps a wedged helper from becoming a zombie that
+    /// outlives the device it was formatting — deterministically, without a
+    /// detached task or thread that shutdown would have to wait for.
+    /// Default (mocks): nothing to hand over.
+    virtual std::vector<pid_t> take_orphan_pids() { return {}; }
 };
 using MkfsRunnerPtr = std::shared_ptr<MkfsRunner>;
 
@@ -35,7 +47,9 @@ using MkfsRunnerPtr = std::shared_ptr<MkfsRunner>;
 /// `mkfs.<type> <device>` resolved on PATH and reaps it with a
 /// non-blocking WNOHANG poll bounded by `timeout_sec`, mapping exit
 /// codes (127 → "not found or not executable"), signals, and a timeout
-/// (SIGKILL, `-ETIMEDOUT`) into the result. Installed by the daemon when
+/// (SIGKILL, `-ETIMEDOUT`, with the pid handed to the reaper via
+/// take_orphan_pids() if the bounded reap expires) into the result.
+/// Installed by the daemon when
 /// `DaemonConfig::mkfs_runner` is empty; exposed so tests can exercise
 /// the REAL runner's mappings without a daemon (and so the runner's
 /// child ownership is testable against the daemon's reaper).

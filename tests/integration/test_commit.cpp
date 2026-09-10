@@ -32,6 +32,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
@@ -482,6 +484,21 @@ struct MockMkfs final : public supervisor::MkfsRunner {
         co_return 0;
     }
 
+    /// Pids this runner "abandoned" (the REAL runner abandons a helper that
+    /// outlives its bounded post-SIGKILL reap): the daemon's reaper must
+    /// collect them. Touched by the test thread and the daemon's reaper, so
+    /// both the queue and the drain are mutex-guarded.
+    void add_orphan(pid_t pid) {
+        std::lock_guard<std::mutex> lk(mu_);
+        orphans_.push_back(pid);
+    }
+    std::vector<pid_t> take_orphan_pids() override {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<pid_t> out;
+        out.swap(orphans_);
+        return out;
+    }
+
     std::string last_type() const {
         std::lock_guard<std::mutex> lk(mu_);
         return last_type_;
@@ -495,6 +512,7 @@ private:
     mutable std::mutex mu_;
     std::string last_type_;
     std::string last_device_;
+    std::vector<pid_t> orphans_;
 };
 
 /// The sealed blank upper must re-open as a standard sealed LSMT RO layer
@@ -989,6 +1007,64 @@ TEST_CASE("supervisor: commit is refused while a mode-3 create is still in mkfs"
                   "post-mkfs commit on a mode-3 device was not refused");
             check(rpc_json({{"cmd", "hello"}}).value("ok", false),
                   "daemon unusable after the window commit");
+        });
+    REQUIRE(failures == 0);
+}
+
+TEST_CASE("supervisor: the reaper collects helpers a runner had to abandon",
+          "[supervisor]") {
+    // Review finding (round 8): the bounded post-SIGKILL reap of a mode-3
+    // mkfs helper must not park a detached task or a blocking thread on the
+    // straggler — the daemon's SIGCHLD reaper collects the pid instead, via
+    // MkfsRunner::take_orphan_pids(), so the helper cannot stay a zombie
+    // and shutdown stays drainable. A helper process that dies while
+    // "abandoned" is the observable: after the reaper swept, the TEST's own
+    // waitpid must answer ECHILD (someone else reaped it) — a pid returned
+    // here means the zombie survived.
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+
+    auto mock = std::make_shared<MockMkfs>();
+    auto guard = block_daemon_signals();
+
+    const pid_t helper = ::fork();
+    REQUIRE(helper >= 0);
+    if (helper == 0) {
+        ::usleep(300 * 1000);  // dies well inside the observation window
+        _exit(0);
+    }
+    mock->add_orphan(helper);
+
+    const int failures = run_daemon_case(
+        [&] {
+            supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+            cfg.mkfs_runner = mock;
+            return cfg;
+        }(),
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+            check(rpc_json({{"cmd", "hello"}}).value("ok", false),
+                  "daemon not serving");
+            // Give the helper time to die and the reaper to sweep it before
+            // asking: whoever waits first owns the status, so the check must
+            // not race the reaper.
+            std::this_thread::sleep_for(1200ms);
+            int wstatus = 0;
+            errno = 0;
+            const pid_t r = ::waitpid(helper, &wstatus, WNOHANG);
+            // -1/ECHILD = reaped by the daemon (the intent); the pid itself
+            // means the zombie was still there for us to collect.
+            check(r < 0 && errno == ECHILD,
+                  "abandoned helper was not reaped by the daemon");
         });
     REQUIRE(failures == 0);
 }

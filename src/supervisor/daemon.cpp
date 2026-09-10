@@ -12,7 +12,6 @@
 #include <elio/log/macros.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/runtime/spawn.hpp>
-#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/sync/mutex.hpp>
@@ -223,20 +222,16 @@ public:
                         std::chrono::milliseconds(10));
                 }
                 if (!reaped) {
-                    // Hand-off reap: the daemon's SIGCHLD reaper sweeps
-                    // only REGISTERED device pids, so nothing else would
-                    // collect this helper — a detached blocking waitpid
-                    // keeps it from becoming a zombie that outlives the
-                    // device it was formatting. It costs one blocking-pool
-                    // thread until the helper finally dies.
-                    elio::go([pid]() -> elio::coro::task<void> {
-                        co_await elio::spawn_blocking([pid] {
-                            int ws = 0;
-                            while (::waitpid(pid, &ws, 0) < 0 &&
-                                   errno == EINTR) {
-                            }
-                        });
-                    });
+                    // Hand the pid to the daemon's reaper rather than
+                    // parking a detached task on it: a detached coroutine
+                    // (or a blocking waitpid) would keep shutdown from
+                    // draining deterministically and could pin a
+                    // blocking-pool thread forever, while the reaper
+                    // already wakes on SIGCHLD and can reap this helper the
+                    // moment it finally dies — so it never becomes a zombie
+                    // that outlives the device it was formatting.
+                    std::lock_guard<std::mutex> lk(orphan_mu_);
+                    orphans_.push_back(pid);
                 }
                 if (error) {
                     *error = prog + " timed out after " +
@@ -248,8 +243,17 @@ public:
         }
     }
 
+    std::vector<pid_t> take_orphan_pids() override {
+        std::lock_guard<std::mutex> lk(orphan_mu_);
+        std::vector<pid_t> out;
+        out.swap(orphans_);
+        return out;
+    }
+
 private:
     int timeout_sec_;
+    std::mutex orphan_mu_;
+    std::vector<pid_t> orphans_;  // abandoned helpers awaiting a WNOHANG reap
 };
 
 class Daemon {
@@ -644,6 +648,27 @@ private:
                     ELIO_LOG_INFO("device {} exited (code {})", id,
                                   child->status().exit_code);
                     reaped_any = true;
+                }
+                // Abandoned out-of-band helpers (a mode-3 mkfs that
+                // outlived its bounded post-SIGKILL reap) are collected
+                // here too: their owner has given up on them, and no other
+                // wait may touch them (a wildcard wait would steal a LIVE
+                // helper's status — see above), so the reaper is the only
+                // place that can keep them from zombifying.
+                for (const pid_t orphan :
+                     cfg_.mkfs_runner->take_orphan_pids()) {
+                    abandoned_helpers_.push_back(orphan);
+                }
+                for (auto it = abandoned_helpers_.begin();
+                     it != abandoned_helpers_.end();) {
+                    int wstatus = 0;
+                    if (::waitpid(*it, &wstatus, WNOHANG) == *it) {
+                        ELIO_LOG_INFO(
+                            "reaped abandoned mkfs helper (pid {})", *it);
+                        it = abandoned_helpers_.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
                 if (!reaped_any) break;
             }
@@ -1455,6 +1480,10 @@ private:
     elio::sync::mutex mu_;
     std::map<std::string, std::shared_ptr<DeviceEntry>> children_;
     std::atomic<bool> stopping_{false};
+    /// Abandoned mkfs-helper pids the reaper still owes a reap (see
+    /// reaper()): drained on every SIGCHLD wake, including the synthetic
+    /// one that unparks the reaper at shutdown.
+    std::vector<pid_t> abandoned_helpers_;
 };
 
 }  // namespace

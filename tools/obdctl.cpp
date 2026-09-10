@@ -9,9 +9,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#include <cerrno>
-#include <climits>
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
