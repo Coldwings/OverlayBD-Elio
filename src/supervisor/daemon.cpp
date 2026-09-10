@@ -330,6 +330,15 @@ private:
 };
 
 class Daemon {
+    // Protected by mu_. The handler owns this state after routing releases
+    // admission, so later commands cannot replace its result or event.
+    struct DeviceCommand {
+        uint64_t seq = 0;
+        elio::sync::event waiter;
+        bool terminal = false;
+        nlohmann::json reply;
+    };
+
     /// Per-device bookkeeping (ADR-0010): the spec is the respawn
     /// template; dev_id is learned from the ready status's bdev path.
     ///
@@ -377,21 +386,12 @@ class Daemon {
         // supervisor end of the device command channel, published by
         // supervise_entry under mu_ (null when unavailable). Writers retain
         // the same stream until their in-flight I/O has completed. One device
-        // command is outstanding at a time: cmd_pending is guarded by
-        // mu_; the reply waiter is a FRESH event per command (manual-
-        // reset events have no reset race this way). `trace` is the
-        // additive status/list field: null until the first trace_start.
+        // command is outstanding at a time. The active slot releases on a
+        // matching reply; the handler keeps its operation through consumption.
+        // `trace` is null until the first trace_start.
         std::shared_ptr<elio::net::uds_stream> control;
-        bool cmd_pending = false;
-        nlohmann::json pending_reply;
-        std::shared_ptr<elio::sync::event> reply_waiter;
-        // L2 correlation: every forwarded command carries a fresh
-        // `seq`; the device echoes it in the reply. A late reply to a
-        // TIMED-OUT command would otherwise complete the NEXT pending
-        // command with the wrong fields — mismatches are dropped
-        // (logged), the pending command times out on its own.
-        uint64_t cmd_seq = 0;
-        uint64_t pending_seq = 0;
+        std::shared_ptr<DeviceCommand> active_command;
+        uint64_t cmd_seq = 0;  // fresh correlation token for each admission
         nlohmann::json trace;
     };
 
@@ -616,7 +616,10 @@ private:
                             *line, nullptr, false);
                         if (!j.is_discarded() && is_device_reply_line(j)) {
                             co_await route_device_reply(entry, std::move(j));
-                            if (test_gate_) co_await test_gate_->observe("device_reply", {});
+                            if (test_gate_) {
+                                test_gate_->mark("device_reply_routed");
+                                co_await test_gate_->observe("device_reply", {});
+                            }
                             continue;
                         }
                     }
@@ -648,12 +651,14 @@ private:
                 {
                     co_await mu_.lock();
                     entry->control.reset();
-                    if (entry->cmd_pending) {
-                        entry->cmd_pending = false;
-                        entry->pending_reply =
+                    if (entry->active_command) {
+                        auto operation = entry->active_command;
+                        operation->reply =
                             {{"ok", false},
                              {"error", "device control channel closed"}};
-                        if (entry->reply_waiter) entry->reply_waiter->set();
+                        operation->terminal = true;
+                        entry->active_command.reset();
+                        operation->waiter.set();
                     }
                     // Crash/exit mid-record: queued records were
                     // memory-only and died with the device — never
@@ -667,6 +672,7 @@ private:
                     }
                     mu_.unlock();
                 }
+                if (test_gate_) test_gate_->mark("device_eof_completed");
                 // EOF: the process is gone (or closing); mark exited if not
                 // reaped yet. The reaper fills in the exit code on SIGCHLD.
                 Child::Status cur = entry->child->status();
@@ -1124,7 +1130,7 @@ private:
         // timed-out command carries an old seq and is dropped, never
         // completing the wrong command.
         co_await mu_.lock();
-        if (entry->cmd_pending) {
+        if (entry->active_command) {
             // Protocol input: parse `seq` defensively — a wrong-typed
             // value() would throw type_error and tear down the routing
             // coroutine. Missing or non-integer seq never matches.
@@ -1133,15 +1139,17 @@ private:
             if (sit != j.end() && sit->is_number_unsigned()) {
                 echoed = sit->get<uint64_t>();
             }
-            if (echoed == entry->pending_seq) {
-                entry->cmd_pending = false;
-                entry->pending_reply = std::move(j);
-                if (entry->reply_waiter) entry->reply_waiter->set();
+            auto operation = entry->active_command;
+            if (echoed == operation->seq) {
+                operation->reply = std::move(j);
+                operation->terminal = true;
+                entry->active_command.reset();
+                operation->waiter.set();
             } else {
                 ELIO_LOG_WARNING(
                     "device {}: dropping stale command reply (seq {}, "
                     "pending seq {})",
-                    entry->spec.id, echoed, entry->pending_seq);
+                    entry->spec.id, echoed, operation->seq);
             }
         }
         mu_.unlock();
@@ -1156,8 +1164,7 @@ private:
     elio::coro::task<std::string> forward_device_command(
         const std::string& id, nlohmann::json cmd) {
         std::shared_ptr<DeviceEntry> entry;
-        std::shared_ptr<elio::sync::event> waiter =
-            std::make_shared<elio::sync::event>();
+        auto operation = std::make_shared<DeviceCommand>();
         std::shared_ptr<elio::net::uds_stream> channel;
         bool command_busy = false;  // admission-time snapshot, guarded by mu_
         uint64_t seq = 0;  // captured under mu_: never read the member
@@ -1167,12 +1174,11 @@ private:
             co_await mu_.lock();
             auto it = children_.find(id);
             if (it != children_.end()) entry = it->second;
-            command_busy = entry && entry->cmd_pending;
+            command_busy = entry && entry->active_command;
             if (entry && !command_busy && entry->control) {
-                entry->cmd_pending = true;
-                entry->reply_waiter = waiter;
-                entry->pending_seq = ++entry->cmd_seq;
-                seq = entry->pending_seq;
+                operation->seq = ++entry->cmd_seq;
+                seq = operation->seq;
+                entry->active_command = operation;
                 channel = entry->control;
             }
             mu_.unlock();
@@ -1187,64 +1193,82 @@ private:
         }
         auto fail_pending = [&]() -> elio::coro::task<void> {
             co_await mu_.lock();
-            entry->cmd_pending = false;
-            entry->reply_waiter.reset();
+            if (entry->active_command == operation) {
+                operation->terminal = true;
+                entry->active_command.reset();
+            }
             mu_.unlock();
         };
-        cmd["seq"] = seq;  // the device echoes it back
-        const std::string line = cmd.dump() + "\n";
-        // Loop the write: a short write on SOCK_STREAM is legal and
-        // retryable (buffer pressure), not a hard failure — same rule
-        // as the device side's ControlChannelWriter.
-        size_t sent = 0;
-        while (sent < line.size()) {
-            const auto w = co_await channel->write(
-                line.data() + sent, line.size() - sent, client_cancel_.get_token());
-            if (w.result < 0) {
-                co_await fail_pending();
-                co_return reply_error("cannot reach the device control "
-                                      "channel: " + id);
+        auto execute = [&]() -> elio::coro::task<std::string> {
+            if (test_gate_) co_await test_gate_->observe("command_write", {});
+            cmd["seq"] = seq;  // the device echoes it back
+            const std::string line = cmd.dump() + "\n";
+            // Loop the write: a short write on SOCK_STREAM is legal and
+            // retryable (buffer pressure), not a hard failure — same rule
+            // as the device side's ControlChannelWriter.
+            size_t sent = 0;
+            while (sent < line.size()) {
+                const auto w = co_await channel->write(
+                    line.data() + sent, line.size() - sent, client_cancel_.get_token());
+                if (w.result < 0) {
+                    co_await fail_pending();
+                    co_return reply_error("cannot reach the device control "
+                                          "channel: " + id);
+                }
+                if (w.result == 0) {
+                    co_await fail_pending();
+                    co_return reply_error("cannot reach the device control "
+                                          "channel (short write): " + id);
+                }
+                sent += static_cast<size_t>(w.result);
             }
-            if (w.result == 0) {
-                co_await fail_pending();
-                co_return reply_error("cannot reach the device control "
-                                      "channel (short write): " + id);
+            // Resolve optional test configuration before constructing the
+            // awaitable; the normal path never dereferences a test gate.
+            std::chrono::milliseconds command_timeout{30000};
+            if (test_gate_) command_timeout = test_gate_->command_timeout;
+            auto got = co_await elio::with_timeout(
+                command_timeout,
+                [&operation](elio::coro::cancel_token tok)
+                    -> elio::coro::task<void> {
+                    co_await operation->waiter.wait(std::move(tok));
+                });
+            if (test_gate_) {
+                test_gate_->mark(got ? "command_wait_completed" : "command_wait_timeout");
+                co_await test_gate_->observe("command_result", {});
             }
-            sent += static_cast<size_t>(w.result);
-        }
-        auto got = co_await elio::with_timeout(
-            std::chrono::seconds(30),
-            [&waiter](elio::coro::cancel_token tok)
-                -> elio::coro::task<void> {
-                co_await waiter->wait(std::move(tok));
-            });
-        nlohmann::json reply;
-        {
-            // ONE lock scope for timeout and success cleanup alike: the
-            // timeout path previously reset reply_waiter here and only
-            // cleared cmd_pending later (fail_pending), leaving a window
-            // where a late matching reply was accepted into pending_reply
-            // with nobody signaled and cmd_pending still true. Clearing
-            // everything atomically makes a late reply fall into the
-            // ordinary "cmd_pending == false → stale, drop" path.
-            co_await mu_.lock();
-            reply = entry->pending_reply;
-            entry->pending_reply = nlohmann::json();
-            entry->reply_waiter.reset();
-            if (!got) entry->cmd_pending = false;
-            mu_.unlock();
-        }
-        if (!got) {
-            co_return reply_error("device control channel timeout: " + id);
-        }
-        if (!bool_or(reply, "ok", false)) {
-            co_return reply_error(str_or(
-                reply, "error", "device rejected the command"));
-        }
-        // The device reply fields INCLUDING the "reply" discriminator;
-        // cmd_trace_start/stop erase it before forwarding to the
-        // client.
-        co_return reply.dump();
+            nlohmann::json reply;
+            {
+                co_await mu_.lock();
+                SyncMutexGuard registry_guard{mu_};
+                // Preserve the timeout winner even if a reply races collection.
+                // Only this operation's slot may be retired by its handler.
+                if (!got && entry->active_command == operation) {
+                    operation->terminal = true;
+                    entry->active_command.reset();
+                }
+                if (got && operation->terminal) reply = std::move(operation->reply);
+            }
+            if (!got) {
+                co_return reply_error("device control channel timeout: " + id);
+            }
+            if (!bool_or(reply, "ok", false)) {
+                co_return reply_error(str_or(
+                    reply, "error", "device rejected the command"));
+            }
+            // The device reply fields INCLUDING the "reply" discriminator;
+            // cmd_trace_start/stop erase it before forwarding to the
+            // client.
+            co_return reply.dump();
+        };
+        std::string result;
+        std::exception_ptr failure;
+        try { result = co_await execute(); }
+        catch (...) { failure = std::current_exception(); }
+        // Includes serialization/allocation and I/O exceptions after admission.
+        // A previous terminal result or a newer operation is never modified.
+        co_await fail_pending();
+        if (failure) std::rethrow_exception(failure);
+        co_return result;
     }
 
     /// ADR-0013 record path: start a server-side-duration-bounded trace
