@@ -58,11 +58,20 @@ std::string uds_rpc(const std::string& path, const std::string& line) {
         ::close(fd);
         throw std::system_error(e, std::generic_category());
     }
-    if (::write(fd, line.data(), line.size()) !=
-        static_cast<ssize_t>(line.size())) {
-        const int e = errno;
-        ::close(fd);
-        throw std::system_error(e, std::generic_category());
+    size_t sent = 0;
+    while (sent < line.size()) {
+        const ssize_t n = ::write(fd, line.data() + sent, line.size() - sent);
+        if (n < 0) {
+            const int e = errno;
+            if (e == EINTR) continue;
+            ::close(fd);
+            throw std::system_error(e, std::generic_category(), "write RPC request");
+        }
+        if (n == 0) {
+            ::close(fd);
+            throw std::runtime_error("RPC write made no progress");
+        }
+        sent += static_cast<size_t>(n);
     }
     std::string reply;
     char buf[4096];
@@ -70,8 +79,9 @@ std::string uds_rpc(const std::string& path, const std::string& line) {
         const ssize_t r = ::read(fd, buf, sizeof(buf));
         if (r < 0) {
             const int e = errno;
+            if (e == EINTR) continue;
             ::close(fd);
-            throw std::system_error(e, std::generic_category());
+            throw std::system_error(e, std::generic_category(), "read RPC reply");
         }
         if (r == 0) break;
         reply.append(buf, static_cast<size_t>(r));
