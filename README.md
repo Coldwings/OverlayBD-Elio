@@ -55,7 +55,8 @@ Prerequisites: Linux, GCC 12+ or Clang 15+ (C++20), CMake ≥ 3.20,
 `liburing-dev`, `zlib1g-dev`, OpenSSL headers, kernel headers ≥ 6.0
 (`<linux/ublk_cmd.h>`). Dependencies (Elio, nlohmann/json, lz4, zstd,
 Catch2) are fetched by CMake FetchContent — the first configure needs
-network access.
+network access. Python 3.8+ is required when `OBD_BUILD_TESTS=ON` (the
+default) for the test-source assertion guard and its self-tests.
 
 ```bash
 cmake -S . -B build

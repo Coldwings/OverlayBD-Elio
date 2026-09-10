@@ -5,6 +5,18 @@ list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(CTest)
 include(Catch)
 
+# Required when tests are enabled: never silently skip the source safety guard.
+find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
+add_test(NAME test-await-assertions
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/scripts/check_test_awaits.py
+        ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test-await-assertions-selftest
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_test_awaits.py)
+set_tests_properties(test-await-assertions test-await-assertions-selftest
+    PROPERTIES TIMEOUT 30)
+
 add_executable(obd_unit_tests
     unit/test_common.cpp
     unit/test_format.cpp

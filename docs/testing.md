@@ -10,6 +10,7 @@ each guards.
 |---|---|---|
 | `tests/unit/` | Catch2 unit tests, one file per module area | `obd_unit_tests` |
 | `tests/integration/` | End-to-end tests over a mock registry; the ublk E2E | `obd_integration_tests` |
+| `tests/scripts/` | Source-guard regression tests | Python standard library, via CTest |
 | `tests/support.hpp` | Shared fixtures (below) | header-only |
 | `tests/fixtures/` | (reserved for on-disk fixtures) | — |
 
@@ -64,9 +65,7 @@ Never pass a `co_await` expression directly to a Catch2 assertion macro:
 ```cpp
 // WRONG — REQUIRE/CHECK decompose and can evaluate their argument more
 // than once; a co_await inside one is not a single evaluation. The bad
-// form is sketched below with the tokens spaced apart on purpose, so the
-// literal anti-pattern appears nowhere in the repo (grep stays clean) and
-// nobody copy-pastes it by accident:
+// form below is an example only:
 //   REQUIRE(  co_await  src->pread(buf.data(), buf.size(), 0)  == 1024 );
 
 // RIGHT — await once into a named local, then assert on the value.
@@ -80,6 +79,28 @@ Awaiting the same coroutine a second time corrupts coroutine semantics
 directly — in any form of the pattern, whether the awaited expression is
 compared, negated, or spans several lines. Assign the awaited result to a
 named local first, then assert on the local.
+
+CTest enforces this existing rule with `test-await-assertions`, which runs
+`scripts/check_test_awaits.py` over all C++ sources and headers in `tests/`
+(including ublk sources even when that backend is disabled).
+`test-await-assertions-selftest` checks rejection and harmless-text cases.
+Both have a 30-second timeout. Python 3.8+ is an explicit configure-time
+requirement when `OBD_BUILD_TESTS=ON`; the guard is never silently skipped.
+
+The guard recognizes the `REQUIRE` and `CHECK` runtime assertion families:
+the base macros and `_FALSE`, `_THROWS`, `_THROWS_AS`, `_THROWS_WITH`,
+`_THROWS_MATCHES`, `_NOTHROW`, and `_THAT`. It balances parentheses across
+lines, including nested calls and lambda bodies, while ignoring comments,
+quoted/character literals, and raw strings. Any `co_await` token inside an
+assertion's arguments is rejected, including inside a nested lambda. This
+also means assigning a synchronous `test::run_coro(...)` result to a local
+before asserting when its coroutine lambda contains awaits. Such a
+synchronous wrapper does not itself directly await in the assertion; the
+same spelling rule keeps the guard simple and consistent.
+This is a conservative lexical check, not a C++ parser: it does not expand
+macro aliases, process line splices, or evaluate conditional compilation
+(disabled branches are checked too). Keep coroutine work outside assertion
+arguments instead of wrapping it in another macro.
 
 ## Golden values and cross-validation
 

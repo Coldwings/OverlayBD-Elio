@@ -310,22 +310,23 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
             // plane and the kernel rejected these offsets.
             const auto patch = test::pattern_bytes(4096, 86);
             stage("grow: write into grown region");
-            REQUIRE(co_await bdev_io([&] {
-                        return ::pwrite(fd, patch.data(), patch.size(),
-                                        data.size() + 1024);
-                    }) == 4096);
+            const auto grown_written = co_await bdev_io([&] {
+                return ::pwrite(fd, patch.data(), patch.size(),
+                                data.size() + 1024);
+            });
+            REQUIRE(grown_written == 4096);
             std::vector<uint8_t> buf(4096);
-            REQUIRE(co_await bdev_io([&] {
-                        return ::pread(fd, buf.data(), buf.size(),
-                                       data.size() + 1024);
-                    }) == 4096);
+            const auto grown_read = co_await bdev_io([&] {
+                return ::pread(fd, buf.data(), buf.size(), data.size() + 1024);
+            });
+            REQUIRE(grown_read == 4096);
             REQUIRE(buf == patch);
 
             // The grown device still serves the original content.
-            REQUIRE(co_await bdev_io([&] {
-                        return ::pread(fd, buf.data(), buf.size(),
-                                       data.size() / 2);
-                    }) == 4096);
+            const auto original_read = co_await bdev_io([&] {
+                return ::pread(fd, buf.data(), buf.size(), data.size() / 2);
+            });
+            REQUIRE(original_read == 4096);
             REQUIRE(buf ==
                     std::vector<uint8_t>(data.begin() + static_cast<long>(
                                                               data.size() / 2),
