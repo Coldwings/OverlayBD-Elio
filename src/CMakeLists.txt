@@ -54,11 +54,7 @@ else()
     target_compile_definitions(obd_core PUBLIC OBD_HAVE_ZSTD=0)
 endif()
 
-if(OBD_WARNINGS_AS_ERRORS)
-    target_compile_options(obd_core PRIVATE -Wall -Wextra -Werror)
-else()
-    target_compile_options(obd_core PRIVATE -Wall -Wextra)
-endif()
+obd_target_warnings(obd_core)
 
 if(OBD_ENABLE_UBLK)
     add_library(obd_ublk STATIC
@@ -66,6 +62,7 @@ if(OBD_ENABLE_UBLK)
         ublk/queue.cpp
         ublk/device.cpp
         ublk/elio_bridge.cpp)
+    obd_target_warnings(obd_ublk)
     target_include_directories(obd_ublk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(obd_ublk PUBLIC OBD_HAVE_UBLK=1)
     target_link_libraries(obd_ublk PUBLIC obd_core liburing::liburing)

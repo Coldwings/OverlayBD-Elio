@@ -28,7 +28,12 @@ CMake options (all declared in the top-level `CMakeLists.txt`):
 | `OBD_BUILD_TESTS` | `ON` | Build the Catch2 unit and integration tests. |
 | `OBD_ENABLE_UBLK` | `ON` | Build the ublk backend. Fails at configure time when `<linux/ublk_cmd.h>` is missing; obd-device cannot be built without it. |
 | `OBD_ENABLE_ZSTD` | `ON` | Zstd compression support in ZFile (OverlayBD algo 2). |
-| `OBD_WARNINGS_AS_ERRORS` | `OFF` | Treat compiler warnings as errors (CI/developer setting). |
+| `OBD_WARNINGS_AS_ERRORS` | `OFF` | Treat compiler warnings as errors for all project libraries, binaries and test helpers (CI/developer setting). |
+
+All project targets compile with `-Wall -Wextra`; the optional strict setting
+adds `-Werror`. These flags are private to project targets and do not change
+the warning policy of fetched dependencies. CI opts into strict warnings;
+local builds keep warnings non-fatal by default.
 
 Typical build:
 

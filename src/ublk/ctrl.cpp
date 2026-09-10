@@ -114,12 +114,7 @@ uint32_t Ctrl::add_dev(const DeviceParams& p) {
     info.ublksrv_pid = static_cast<int32_t>(::getpid());
     info.flags = dev_info_flags(p);
 
-    ublksrv_ctrl_cmd cmd {};
-    cmd.queue_id = static_cast<uint16_t>(-1);
-    cmd.len = sizeof(info);
-    cmd.addr = reinterpret_cast<uint64_t>(&info);
     for (;;) {
-        cmd.dev_id = info.dev_id;
         const int res = ctrl_cmd_raw(UBLK_U_CMD_ADD_DEV, info.dev_id,
                                      static_cast<uint16_t>(-1), &info,
                                      sizeof(info), 0);

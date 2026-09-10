@@ -101,7 +101,15 @@ ctest --test-dir build --output-on-failure
 bash scripts/check-docs.sh   # documentation governance floor
 ```
 
-Tests are registered with CTest via `catch_discover_tests`, so each
+The `build-warning-coverage` CTest entry (Makefiles/Ninja generators) checks
+the generated compile command for every project translation unit, including
+CLI binaries and test helpers, for `-Wall -Wextra` and, when requested,
+`-Werror`. This catches a target omitted from the warning policy even when
+its current sources happen to compile cleanly. CI's ordinary build opts in
+with `-DOBD_WARNINGS_AS_ERRORS=ON`; local builds retain the default `OFF`.
+For strict local verification, configure with that option and build all targets.
+
+Catch2 tests are registered with CTest via `catch_discover_tests`, so each
 `TEST_CASE` is its own CTest entry (`ctest -R '<name>'`). For Catch2
 filters directly:
 
