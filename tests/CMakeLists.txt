@@ -21,6 +21,7 @@ add_executable(obd_unit_tests
     unit/test_writable.cpp
     unit/test_cli.cpp
     unit/test_supervisor.cpp)
+obd_target_warnings(obd_unit_tests)
 target_include_directories(obd_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
 # The CLI test EXECUTES the real obdctl binary (argv → wire translation),
@@ -43,6 +44,7 @@ endif()
 # Test-only fake obd-device for the commit integration test (L6: it
 # checkpoints its LSMT-RW upper only on SIGTERM, like the real device).
 add_executable(obd-test-fake-device fake_device_main.cpp)
+obd_target_warnings(obd-test-fake-device)
 target_include_directories(obd-test-fake-device
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd-test-fake-device PRIVATE obd_core)
@@ -59,6 +61,7 @@ add_executable(obd_integration_tests
     integration/test_trace_record.cpp
     integration/test_hello.cpp
     integration/test_resize.cpp)
+obd_target_warnings(obd_integration_tests)
 target_include_directories(obd_integration_tests
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_integration_tests
@@ -72,3 +75,14 @@ if(OBD_ENABLE_UBLK)
 endif()
 catch_discover_tests(obd_integration_tests
     PROPERTIES SKIP_RETURN_CODE 4)  # Catch2 "all selected tests skipped"
+
+# Inspect every first-party translation unit, including binary/test helpers.
+# The check uses the real build commands, so a forgotten target is observable.
+if(CMAKE_GENERATOR MATCHES "Makefiles|Ninja")
+    add_test(NAME build-warning-coverage
+        COMMAND ${CMAKE_COMMAND}
+            -DCOMPILE_COMMANDS=${CMAKE_BINARY_DIR}/compile_commands.json
+            -DPROJECT_SOURCE=${PROJECT_SOURCE_DIR}
+            -DWARNINGS_AS_ERRORS=${OBD_WARNINGS_AS_ERRORS}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_warning_flags.cmake)
+endif()

@@ -92,6 +92,8 @@ endif()
 # ---------------------------------------------------------------------------
 # Project targets
 # ---------------------------------------------------------------------------
+include(ProjectWarnings)
+
 add_subdirectory(src)
 add_subdirectory(tools)
 

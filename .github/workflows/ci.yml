@@ -54,6 +54,7 @@ jobs:
           cmake -S . -B build -G Ninja
           -DOBD_BUILD_TESTS=ON
           -DOBD_ENABLE_UBLK=ON
+          -DOBD_WARNINGS_AS_ERRORS=ON
 
       - name: Build
         run: cmake --build build -j"$(nproc)"

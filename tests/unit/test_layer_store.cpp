@@ -769,8 +769,8 @@ TEST_CASE("source: layer store accepts digest forms and rejects malformed",
     REQUIRE(rc == 0);
 
     // Malformed digests fail open with EINVAL.
-    for (const std::string bad : {std::string("not-a-digest"),
-                                  std::string("sha256:abcd")}) {
+    for (const std::string& bad : {std::string("not-a-digest"),
+                                   std::string("sha256:abcd")}) {
         test::TempDir dir3;
         rc = test::run_coro([&]() -> elio::coro::task<int> {
             try {
