@@ -104,9 +104,10 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
         REQUIRE(fd >= 0);
         std::vector<uint8_t> buf(4096);
         stage("reads: pread");
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pread(fd, buf.data(), buf.size(), 1024);
-                }) == 4096);
+        const ssize_t nread = co_await bdev_io([&] {
+            return ::pread(fd, buf.data(), buf.size(), 1024);
+        });
+        REQUIRE(nread == 4096);
         stage("reads: pread done");
         REQUIRE(buf == std::vector<uint8_t>(data.begin() + 1024,
                                             data.begin() + 1024 + 4096));
@@ -145,35 +146,40 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
         // Write through the block device, read back through it.
         const auto patch = test::pattern_bytes(4096, 83);
         stage("writes: pwrite");
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pwrite(fd, patch.data(), patch.size(), 1024);
-                }) == 4096);
+        const ssize_t nwritten = co_await bdev_io([&] {
+            return ::pwrite(fd, patch.data(), patch.size(), 1024);
+        });
+        REQUIRE(nwritten == 4096);
         stage("writes: pwrite done");
         std::vector<uint8_t> buf(4096);
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pread(fd, buf.data(), buf.size(), 1024);
-                }) == 4096);
+        const ssize_t nread = co_await bdev_io([&] {
+            return ::pread(fd, buf.data(), buf.size(), 1024);
+        });
+        REQUIRE(nread == 4096);
         REQUIRE(buf == patch);
 
         // BLKDISCARD the range: the bridge maps it to root->discard, and
         // the range reads back as zeroes (ADR-0009).
         stage("writes: blkdiscard");
         uint64_t range[2] = {1024, 4096};
-        REQUIRE(co_await bdev_io([&] {
-                    return ::ioctl(fd, BLKDISCARD, &range);
-                }) == 0);
+        const int discard_rc = co_await bdev_io([&] {
+            return ::ioctl(fd, BLKDISCARD, &range);
+        });
+        REQUIRE(discard_rc == 0);
         REQUIRE(raw->discards() >= 1);
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pread(fd, buf.data(), buf.size(), 1024);
-                }) == 4096);
+        const ssize_t nread2 = co_await bdev_io([&] {
+            return ::pread(fd, buf.data(), buf.size(), 1024);
+        });
+        REQUIRE(nread2 == 4096);
         REQUIRE(buf == std::vector<uint8_t>(4096, 0));
 
         // Untouched prefix (before the discarded range) still reads
         // correctly — note [1024, 5120) is now zeroed by the discard,
         // so only [0, 1024) may be compared against the original.
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pread(fd, buf.data(), 1024, 0);
-                }) == 1024);
+        const ssize_t prefix_rd = co_await bdev_io([&] {
+            return ::pread(fd, buf.data(), 1024, 0);
+        });
+        REQUIRE(prefix_rd == 1024);
         REQUIRE(std::vector<uint8_t>(buf.begin(), buf.begin() + 1024) ==
                 std::vector<uint8_t>(data.begin(), data.begin() + 1024));
         // close() flushes the dirty bdev page cache (writeback IO that
@@ -265,9 +271,10 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
         });
         REQUIRE(fd2 >= 0);
         std::vector<uint8_t> buf2(4096);
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pread(fd2, buf2.data(), buf2.size(), 2048);
-                }) == 4096);
+        const ssize_t nread2 = co_await bdev_io([&] {
+            return ::pread(fd2, buf2.data(), buf2.size(), 2048);
+        });
+        REQUIRE(nread2 == 4096);
         REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
                                              expected.begin() + 2048 + 4096));
         co_await bdev_io([&] { return ::close(fd2); });
