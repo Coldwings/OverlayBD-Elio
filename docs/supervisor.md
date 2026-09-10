@@ -380,7 +380,12 @@ device over channel 2 and relays the reply. Contract:
   the wrong fields. One device command is outstanding per device at a
   time; a wedged or ancient device answers as "device control channel
   timeout". A dead device (channel EOF) fails a pending command
-  immediately.
+  immediately. A matching reply releases admission, but its handler retains
+  that operation's response and event until consumption. A later command or
+  channel EOF cannot replace an already accepted response; timeout and
+  write-failure cleanup can retire only the operation they belong to. If the
+  bounded wait reports timeout, the caller receives the timeout error even
+  when a reply races the later result-collection step.
 - **Server-side duration bound.** The duration timer lives in the
   DEVICE process: expiry finalizes the recording exactly like an
   explicit stop, so a dead, crashed, or disconnected CLI can never leak
@@ -756,6 +761,16 @@ commands and monitors to distinct workers. No kernel ublk is required.
 
 | Regression | Evidence |
 | --- | --- |
+| `supervisor: old command cleanup preserves the next waiter` | A consumes its response while B awaits its own device reply; B and C complete. |
+| `supervisor: completed commands retain their distinct payloads` | B completes while A is parked; both retain their own sizes. |
+| `supervisor: earlier device error survives later success` | A retains its device error after B succeeds. |
+| `supervisor: earlier success survives later device error` | A retains its success after B receives a device error. |
+| `supervisor: terminal command reply survives later channel EOF` | EOF fails only active B while accepted A keeps its response. |
+| `supervisor: stale and malformed replies cannot complete a newer command` | Real routing processes old, mismatched, malformed and missing sequence replies before the valid B reply. |
+| `supervisor: late reply after timeout cannot complete the next command` | A really times out; its later reply cannot complete B. |
+| `supervisor: timed-out handler cleanup preserves a newer command` | A times out and parks; a late reply releases admission, and A cleanup cannot retire B. |
+| `supervisor: closed peer fails an admitted command write` | The fake exits after admission and before the actual write; the handler reports its write error. |
+| `supervisor: shutdown drains an active device command reply` | The real fake reply completes an active handler after shutdown begins, before daemon task drain returns. |
 | `supervisor: rejected command keeps busy reason after pending reply` | Hold a rejected resize after admission unlock; the real monitor accepts the earlier command's matching reply on another worker before the rejected client receives its original busy reason. |
 | `supervisor: rejected command keeps busy reason after channel EOF` | Hold the same rejection while device EOF fails the earlier request; the admission-time busy reason survives channel closure. |
 | `supervisor: recovery publishes child and count together` | Status/list observed at the publication boundary agree on the replacement PID and recovery count. |

@@ -1075,3 +1075,33 @@ Both cases verify that handlers and monitors overlap on distinct workers
 and only the first command reaches the fake. Gates are released, RPC peers
 joined, the independently owned fake child terminated and reaped, daemon
 tasks drained, and the signal mask restored before Catch assertions.
+
+The `[command-ownership]` cases use the same bounded unprivileged process
+and FIFO discipline. The first handler can pause after its real event wait
+and before result collection while another handler and the monitor execute.
+Each operation has distinct reply fields; a third command checks continued
+admission and notification after the competing cleanup. The internal test
+gate uses a one-second command deadline; normal daemon commands retain the
+30-second deadline. Timeout cases require the daemon's timeout error, not a
+fixture socket receive timeout. Routing observations prove the stale records
+were processed before the correct reply is sent.
+
+- `supervisor: old command cleanup preserves the next waiter` — A consumes its response while B awaits its own device reply; B and C complete.
+- `supervisor: completed commands retain their distinct payloads` — B completes while A is parked; both retain their own sizes.
+- `supervisor: earlier device error survives later success` — A retains its device error after B succeeds.
+- `supervisor: earlier success survives later device error` — A retains its success after B receives a device error.
+- `supervisor: terminal command reply survives later channel EOF` — EOF fails only active B while accepted A keeps its response.
+- `supervisor: stale and malformed replies cannot complete a newer command` — Real routing processes old, mismatched, malformed and missing sequence replies before the valid B reply.
+- `supervisor: late reply after timeout cannot complete the next command` — A really times out; its later reply cannot complete B.
+- `supervisor: timed-out handler cleanup preserves a newer command` — A times out and parks; a late reply releases admission, and A cleanup cannot retire B.
+- `supervisor: closed peer fails an admitted command write` — The fake exits after admission and before the actual write; the handler reports its write error.
+- `supervisor: shutdown drains an active device command reply` — The real fake reply completes an active handler after shutdown begins, before daemon task drain returns.
+
+The closed-peer case executes a real failed channel write after admission.
+It does not simulate partial writes or a newer operation during old write
+cleanup; that ownership is also checked in the implementation's common
+identity-checked retirement path. Shutdown may cancel client response
+delivery: its case observes a real command event completion during handler
+drain and requires the daemon to return, without requiring a reply to reach
+the canceled client. Peer threads and the independently owned child are
+cleaned up before assertions, including exceptions during C's setup.

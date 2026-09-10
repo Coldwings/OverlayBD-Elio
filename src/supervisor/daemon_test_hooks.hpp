@@ -21,6 +21,11 @@ namespace obd::supervisor::detail {
 // child reference and runs outside mu_; it cannot repair product ownership.
 class DaemonTestGate {
 public:
+    explicit DaemonTestGate(std::chrono::milliseconds timeout = std::chrono::seconds(30))
+        : command_timeout(timeout) {}
+    // Internal immutable deadline seam; normal run_daemon still uses 30 s.
+    const std::chrono::milliseconds command_timeout;
+
     void mark(std::string point) {
         std::lock_guard lock(mu);
         ++observations[std::move(point)];
