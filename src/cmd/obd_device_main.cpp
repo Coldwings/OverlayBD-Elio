@@ -29,6 +29,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unistd.h>
 
@@ -79,12 +80,19 @@ elio::coro::task<int> device_main(Args args) {
                   args.control_fd)
             : nullptr;
     report(channel, DeviceStatus{"starting", "", ""});
+    // Owners survive the protected body, so exceptions use the same awaited
+    // cleanup as a normal shutdown instead of destructing on this worker.
+    std::shared_ptr<obd::ublk::Device> dev;
+    obd::image::OpenedImage opened;
+    auto stopping = std::make_shared<std::atomic<bool>>(false);
+    auto resize_gate = std::make_shared<std::mutex>();
+    std::optional<elio::coro::join_handle<void>> control;
+    int result = 0;
     try {
         obd::image::GlobalConfig global =
             args.global.empty()
                 ? obd::image::GlobalConfig{}
                 : obd::image::GlobalConfig::from_file(args.global);
-        obd::image::OpenedImage opened;
         if (args.blank) {
             if (args.blank_size == 0 || args.blank_size % 512 != 0) {
                 ELIO_LOG_ERROR("blank size {} is not sector aligned",
@@ -173,7 +181,6 @@ elio::coro::task<int> device_main(Args args) {
         // Refcounted: the control coroutine below captures a copy, so a
         // resize in flight can never outlive the Device (destroyed only
         // when the LAST reference drops, after the control loop exits).
-        std::shared_ptr<obd::ublk::Device> dev;
         if (args.recover) {
             // ADR-0010: replace a crashed server for an existing device.
             if (args.dev_id < 0) {
@@ -212,12 +219,10 @@ elio::coro::task<int> device_main(Args args) {
         // that completes before this point is followed by a checkpoint
         // at the grown size (consistent), and everything after it is
         // rejected cleanly.
-        auto stopping = std::make_shared<std::atomic<bool>>(false);
         // Serializes an in-flight grow against the shutdown checkpoint:
         // the shutdown path sets `stopping` and then drains this gate, so
         // a grow can never rewrite the layer's declared-size header after
         // the checkpoint wrote its trailer at the old size.
-        auto resize_gate = std::make_shared<std::mutex>();
         if (channel) {
             obd::supervisor::DeviceControlHooks hooks;
             // D3 resize executor seam (built by make_resize_apply so the
@@ -241,11 +246,9 @@ elio::coro::task<int> device_main(Args args) {
                           })
                     : std::function<int(uint64_t)>(),
                 [dev](uint64_t bytes) { return dev->resize_blocking(bytes); });
-            elio::go([channel, rec = opened.recorder, hooks]() mutable
-                     -> elio::coro::task<void> {
-                co_await obd::supervisor::run_device_control(channel, rec,
-                                                             hooks);
-            });
+            control.emplace(elio::spawn(obd::supervisor::run_device_control,
+                                        channel, opened.recorder,
+                                        std::move(hooks)));
         }
 
         // Serve until SIGTERM/SIGINT.
@@ -273,7 +276,7 @@ elio::coro::task<int> device_main(Args args) {
         co_await elio::spawn_blocking([&] {
             std::lock_guard<std::mutex> drain(*resize_gate);
         });
-        dev->stop();
+        co_await dev->stop_async();
         // ADR-0013: finalize any active trace recording BEFORE the source
         // chain can go away (the taps feed the recorder; a shutdown
         // finalize keeps the produced blob valid).
@@ -298,12 +301,8 @@ elio::coro::task<int> device_main(Args args) {
         // Park background fills before the source chain is destroyed
         // (the LayerStore lifetime contract; no-op when fill is off).
         co_await obd::image::park_image_fills(opened);
-        // Drop this coroutine's reference to the Device. The control
-        // loop holds its own shared_ptr copy until it sees the channel
-        // EOF below, so the Device and its source chain are destroyed
-        // only after that — no resize in flight can ever touch a dead
-        // object (the loop exits on EOF, then the last reference drops).
-        dev.reset();
+        // Keep our owning reference until the control task's captures have
+        // been destroyed; its last reference must not destroy Device on a worker.
         report(channel, DeviceStatus{"stopped", "", ""});
         // Unblock the trace control loop only AFTER the checkpoint and
         // the stopped report are out: it is parked in a control-channel
@@ -315,16 +314,49 @@ elio::coro::task<int> device_main(Args args) {
         if (args.control_fd >= 0) {
             ::shutdown(args.control_fd, SHUT_RDWR);
         }
-        co_return 0;
     } catch (const std::system_error& e) {
         ELIO_LOG_ERROR("device failed: {}", e.what());
         report(channel, DeviceStatus{"failed", "", e.what()});
-        co_return 1;
+        result = 1;
     } catch (const std::exception& e) {
         ELIO_LOG_ERROR("device failed: {}", e.what());
         report(channel, DeviceStatus{"failed", "", e.what()});
-        co_return 1;
+        result = 1;
+    } catch (...) {
+        ELIO_LOG_ERROR("device failed: unknown exception");
+        report(channel, DeviceStatus{"failed", "", "unknown exception"});
+        result = 1;
     }
+    // Also covers exceptions after successful create/attach. First exclude
+    // resizes, then finish the control body before waiting for frame teardown:
+    // the body may need the sole blocking thread to complete a resize.
+    stopping->store(true, std::memory_order_release);
+    co_await elio::spawn_blocking([&] {
+        std::lock_guard<std::mutex> drain(*resize_gate);
+    });
+    if (control) {
+        ::shutdown(args.control_fd, SHUT_RDWR);
+        auto& control_task = *control;
+        try {
+            co_await control_task;
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR("device control failed during shutdown: {}", e.what());
+            result = 1;
+        } catch (...) {
+            ELIO_LOG_ERROR("device control failed during shutdown: unknown exception");
+            result = 1;
+        }
+        co_await elio::spawn_blocking([&] { control->wait_destroyed(); });
+        control.reset();
+    }
+    if (dev) {
+        co_await dev->stop_async();
+        // The normal path already parks fills before reporting stopped.
+        // Retain the same owners during exceptional cleanup as well.
+        if (result != 0) co_await obd::image::park_image_fills(opened);
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }
+    co_return result;
 }
 
 }  // namespace

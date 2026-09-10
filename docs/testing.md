@@ -610,6 +610,24 @@ Every test, grouped by area, with the property it guards.
   grow-only reason (ADR-0014).
 ### ublk
 
+- `ublk: control task releases its device owner before final destruction` —
+  actual control-loop EOF and frame/capture teardown precede final off-worker
+  Device destruction, with one worker and one blocking thread.
+- `ublk: failed setup drains partial state before rethrowing its error` —
+  the create/attach cleanup routine preserves the original exception and
+  destroys partial state off-worker, before and after bridge registration.
+- `ublk: blocking stop waits for a slow source to finish` — a normal read
+  completes after eight seconds while a dedicated off-worker caller drains;
+  stop must not return before completion, and owners remain valid throughout.
+- `ublk: async stop drains an idle bridge before source destruction` — real
+  Device/bridge/eventfd shutdown on one worker, both parked and newly scheduled
+  bridges, sequential repeated stop, and final off-worker source destruction.
+- `ublk: async stop lets a source finish on the sole blocking thread` — normal
+  pending read completion after shutdown starts, with one worker and one
+  blocking thread; verifies source retention and completion before release.
+- `ublk: async stop handles a partially initialized device` — the same drain
+  and destruction path before queue setup. These nonprivileged tests bypass
+  only kernel registration and are bounded by a 30-second CTest timeout.
 - `ublk: command buffer geometry matches the driver layout` — the
   command-buffer stride and descriptor layout match `<linux/ublk_cmd.h>`
   exactly (uapi compatibility).

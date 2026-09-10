@@ -303,7 +303,8 @@ Full lifecycle of one image as one ublk device. Non-copyable.
   queue → `START_DEV`, retrying `EBUSY` up to 100 × 50 ms (5 s). Throws
   `obd::error(EINVAL)` for a null source or `dev_sectors == 0`, and
   `obd::error` on any setup failure (partial state is torn down via
-  `stop()` first).
+  `stop_async()` and off-worker destruction before the original error is
+  rethrown).
 - `uint64_t size_bytes() const` — the current device capacity in bytes
   (the D3 grow-only resize baseline: params-derived on create, kernel-
   derived via `Ctrl::get_params` on a recovery attach — which may exceed
@@ -317,8 +318,14 @@ Full lifecycle of one image as one ublk device. Non-copyable.
   `/dev/ublkb<N>`.
 - `bool started() const` — true once the kernel gendisk is live
   (`START_DEV` succeeded).
-- `void stop() noexcept` — signals queue threads and bridges, wakes and
-  joins all queue threads. Idempotent.
+- `void stop() noexcept` — blocking: signals queue threads and bridges,
+  waits for every bridge and source I/O handler to finish, then joins queue
+  threads. Idempotent. Call off an Elio worker with source executors still
+  able to progress; elapsed time never permits release of unfinished I/O.
+- `elio::coro::task<void> stop_async()` — scheduler-side equivalent: signals
+  stop and awaits I/O completion without occupying a worker or the blocking
+  pool, then joins queue threads off-worker. Retain the Device until the
+  await completes. Use this from coroutines, including setup-error cleanup.
 - `~Device()` — `stop()`, then `STOP_DEV` / `DEL_DEV` via `~Ctrl`.
 
 ## Invariants & Guarantees
@@ -365,12 +372,20 @@ Three distinct execution contexts, with strict permissions:
 - `Device::create` must run on the Elio scheduler; `Ctrl` methods are plain
   blocking calls and must not be issued from a latency-sensitive coroutine
   path. `Device::stop` / `~Device` join threads — call them from a context
-  where blocking is acceptable.
+  where blocking is acceptable and source completion can still progress.
+  Coroutine callers await `stop_async()` before offloading final destruction;
+  they must do so on exceptions and early returns as well as success. Awaiting
+  source I/O must not occupy the sole blocking thread: the source may need it
+  to complete. Stop calls for a Device are sequential, not concurrent.
 - `run_bridge` and `handle_io` are Elio coroutines; all source IO goes
   through the Elio IO backend (no blocking syscalls on the scheduler).
 - Inputs are not mutated: `DeviceParams` is read-only after `create`;
   `src` ownership moves into `Device` and outlives all bridges (destruction
-  order: `stop()` joins threads before members die).
+  order: stop drains bridges and handlers and joins queue threads before
+  members die). The daemon retains its owner until the control task body and
+  captures are destroyed, then releases the Device off-worker. Its successful
+  shutdown drains resize, drains device I/O, finalizes recording, checkpoints,
+  parks fills, reports stopped, and closes/joins the control loop in that order.
 
 ## Stability Contract
 
@@ -402,6 +417,23 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 `OBD_ENABLE_UBLK` is on); the kernel-dependent end-to-end test lives in
 `tests/integration/test_ublk_e2e.cpp`.
 
+- `ublk: control task releases its device owner before final destruction` —
+  actual control-loop EOF and frame/capture teardown precede final off-worker
+  Device destruction, with one worker and one blocking thread.
+- `ublk: failed setup drains partial state before rethrowing its error` —
+  the create/attach cleanup routine preserves the original exception and
+  destroys partial state off-worker, before and after bridge registration.
+- `ublk: blocking stop waits for a slow source to finish` — a normal read
+  completes after eight seconds while a dedicated off-worker caller drains;
+  stop must not return before completion, and owners remain valid throughout.
+- `ublk: async stop drains an idle bridge before source destruction` — real
+  bridge/eventfd shutdown on one worker, including a not-yet-started bridge.
+- `ublk: async stop lets a source finish on the sole blocking thread` — a
+  pending read completes through the single blocking thread after stop begins;
+  the source remains owned until the handler posts its completion and exits.
+- `ublk: async stop handles a partially initialized device` — cleanup before
+  any queue is opened. These unit tests bypass kernel registration only and
+  have a 30-second CTest timeout.
 - `ublk: command buffer geometry matches the driver layout` — pins the mmap
   geometry against the driver formulas: stride = 98304 for the 24-byte
   descriptor, `cmd_buf_size(128, …)` = 4096, `cmd_buf_size(4096, …)` =

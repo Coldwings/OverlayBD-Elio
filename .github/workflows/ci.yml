@@ -136,7 +136,10 @@ jobs:
       - name: "E2E - block device reads"
         timeout-minutes: 5
         run: |
-          sudo -E ./build/tests/obd_integration_tests             "integration: ublk device serves sector reads from a blob" -s &
+          trap 'rc=$?; echo "ublk reads: exit=$rc" | tee -a build/ublk-e2e-read.log' EXIT
+          sudo -E ./build/tests/obd_integration_tests \
+            "integration: ublk device serves sector reads from a blob" -s \
+            > >(tee build/ublk-e2e-read.log) 2>&1 &
           TESTPID=$!
           # Poll instead of a fixed sleep: fast when the test is fast,
           # still dumps kernel stacks for every thread if it hangs.
@@ -158,15 +161,39 @@ jobs:
 
       - name: "E2E - writes and discard"
         timeout-minutes: 5
-        run: >
-          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
-          "integration: ublk writable device serves writes and discard" -s
+        run: |
+          set -o pipefail
+          trap 'rc=$?; echo "ublk writes/discard: exit=$rc" | tee -a build/ublk-e2e-write.log' EXIT
+          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests \
+            "integration: ublk writable device serves writes and discard" -s \
+            2>&1 | tee build/ublk-e2e-write.log
 
       - name: "E2E - USER_RECOVERY handshake"
         timeout-minutes: 5
-        run: >
-          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests
-          "integration: ublk device survives server death via USER_RECOVERY" -s
+        run: |
+          set -o pipefail
+          trap 'rc=$?; echo "ublk recovery: exit=$rc" | tee -a build/ublk-e2e-recovery.log' EXIT
+          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests \
+            "integration: ublk device survives server death via USER_RECOVERY" -s \
+            2>&1 | tee build/ublk-e2e-recovery.log
+
+      - name: Capture available shutdown diagnostics
+        if: failure()
+        run: |
+          mkdir -p build
+          sudo dmesg > build/ublk-e2e-kernel.log 2>&1 || true
+          if command -v coredumpctl >/dev/null; then
+            sudo coredumpctl --no-pager info obd_integration_tests \
+              > build/ublk-e2e-core.log 2>&1 || true
+          fi
+
+      - name: Preserve ublk E2E logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ublk-e2e-logs
+          path: build/ublk-e2e-*.log
+          if-no-files-found: ignore
 
   docs-governance:
     name: docs governance

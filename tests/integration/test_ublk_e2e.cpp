@@ -32,6 +32,28 @@ auto bdev_io(F&& f) {
     return elio::spawn_blocking(std::forward<F>(f));
 }
 
+// Retain the Device across assertions, early returns (including unsupported
+// resize), and exceptions. Closing a dirty bdev must precede the IO drain.
+template <typename F>
+elio::coro::task<int> with_device_cleanup(
+    std::unique_ptr<ublk::Device>& dev, int& fd, F body) {
+    int result = 0;
+    std::exception_ptr failure;
+    try {
+        result = co_await body();
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    if (fd >= 0) {
+        co_await bdev_io([&] { return ::close(fd); });
+        fd = -1;
+    }
+    co_await dev->stop_async();
+    co_await bdev_io([&] { dev.reset(); });
+    if (failure) std::rethrow_exception(failure);
+    co_return result;
+}
+
 void stage(const char* msg) {
     std::fprintf(stderr, "[e2e-stage] %s\n", msg);
     std::fflush(stderr);
@@ -110,26 +132,27 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
         params.dev_sectors = data.size() / 512;
         stage("reads: create");
         auto dev = co_await ublk::Device::create(params, std::move(src));
-        stage("reads: created, open bdev");
-        const int fd = co_await bdev_io([&] {
-            return ::open(dev->bdev_path().c_str(), O_RDONLY);
+        int fd = -1;
+        co_return co_await with_device_cleanup(dev, fd, [&]()
+            -> elio::coro::task<int> {
+            stage("reads: created, open bdev");
+            fd = co_await bdev_io([&] {
+                return ::open(dev->bdev_path().c_str(), O_RDONLY);
+            });
+            REQUIRE(fd >= 0);
+            std::vector<uint8_t> buf(4096);
+            stage("reads: pread");
+            const ssize_t nread = co_await bdev_io([&] {
+                return ::pread(fd, buf.data(), buf.size(), 1024);
+            });
+            REQUIRE(nread == 4096);
+            stage("reads: pread done");
+            REQUIRE(buf == std::vector<uint8_t>(data.begin() + 1024,
+                                                data.begin() + 1024 + 4096));
+            // close() also belongs off-scheduler: closing a dirty bdev fd
+            // issues writeback IO that our bridges must service.
+            co_return 0;
         });
-        REQUIRE(fd >= 0);
-        std::vector<uint8_t> buf(4096);
-        stage("reads: pread");
-        const ssize_t nread = co_await bdev_io([&] {
-            return ::pread(fd, buf.data(), buf.size(), 1024);
-        });
-        REQUIRE(nread == 4096);
-        stage("reads: pread done");
-        REQUIRE(buf == std::vector<uint8_t>(data.begin() + 1024,
-                                            data.begin() + 1024 + 4096));
-        // close() also belongs off-scheduler: closing a dirty bdev fd
-        // issues writeback IO that our bridges must service.
-        co_await bdev_io([&] { return ::close(fd); });
-        dev->stop();
-        dev.reset();
-        co_return 0;
     });
     REQUIRE(rc == 0);
 }
@@ -149,58 +172,59 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
         stage("writes: create");
         auto dev = co_await ublk::Device::create(
             params, source::BlobSourcePtr(std::move(src)));
-        stage("writes: created");
-        const int fd = co_await bdev_io([&] {
-            return ::open(dev->bdev_path().c_str(), O_RDWR);
-        });
-        REQUIRE(fd >= 0);
-        stage("writes: opened");
+        int fd = -1;
+        co_return co_await with_device_cleanup(dev, fd, [&]()
+            -> elio::coro::task<int> {
+            stage("writes: created");
+            fd = co_await bdev_io([&] {
+                return ::open(dev->bdev_path().c_str(), O_RDWR);
+            });
+            REQUIRE(fd >= 0);
+            stage("writes: opened");
 
-        // Write through the block device, read back through it.
-        const auto patch = test::pattern_bytes(4096, 83);
-        stage("writes: pwrite");
-        const ssize_t nwritten = co_await bdev_io([&] {
-            return ::pwrite(fd, patch.data(), patch.size(), 1024);
-        });
-        REQUIRE(nwritten == 4096);
-        stage("writes: pwrite done");
-        std::vector<uint8_t> buf(4096);
-        const ssize_t nread = co_await bdev_io([&] {
-            return ::pread(fd, buf.data(), buf.size(), 1024);
-        });
-        REQUIRE(nread == 4096);
-        REQUIRE(buf == patch);
+            // Write through the block device, read back through it.
+            const auto patch = test::pattern_bytes(4096, 83);
+            stage("writes: pwrite");
+            const ssize_t nwritten = co_await bdev_io([&] {
+                return ::pwrite(fd, patch.data(), patch.size(), 1024);
+            });
+            REQUIRE(nwritten == 4096);
+            stage("writes: pwrite done");
+            std::vector<uint8_t> buf(4096);
+            const ssize_t nread = co_await bdev_io([&] {
+                return ::pread(fd, buf.data(), buf.size(), 1024);
+            });
+            REQUIRE(nread == 4096);
+            REQUIRE(buf == patch);
 
-        // BLKDISCARD the range: the bridge maps it to root->discard, and
-        // the range reads back as zeroes (ADR-0009).
-        stage("writes: blkdiscard");
-        uint64_t range[2] = {1024, 4096};
-        const int discard_rc = co_await bdev_io([&] {
-            return ::ioctl(fd, BLKDISCARD, &range);
-        });
-        REQUIRE(discard_rc == 0);
-        REQUIRE(raw->discards() >= 1);
-        const ssize_t nread2 = co_await bdev_io([&] {
-            return ::pread(fd, buf.data(), buf.size(), 1024);
-        });
-        REQUIRE(nread2 == 4096);
-        REQUIRE(buf == std::vector<uint8_t>(4096, 0));
+            // BLKDISCARD the range: the bridge maps it to root->discard, and
+            // the range reads back as zeroes (ADR-0009).
+            stage("writes: blkdiscard");
+            uint64_t range[2] = {1024, 4096};
+            const int discard_rc = co_await bdev_io([&] {
+                return ::ioctl(fd, BLKDISCARD, &range);
+            });
+            REQUIRE(discard_rc == 0);
+            REQUIRE(raw->discards() >= 1);
+            const ssize_t nread2 = co_await bdev_io([&] {
+                return ::pread(fd, buf.data(), buf.size(), 1024);
+            });
+            REQUIRE(nread2 == 4096);
+            REQUIRE(buf == std::vector<uint8_t>(4096, 0));
 
-        // Untouched prefix (before the discarded range) still reads
-        // correctly — note [1024, 5120) is now zeroed by the discard,
-        // so only [0, 1024) may be compared against the original.
-        const ssize_t prefix_rd = co_await bdev_io([&] {
-            return ::pread(fd, buf.data(), 1024, 0);
+            // Untouched prefix (before the discarded range) still reads
+            // correctly — note [1024, 5120) is now zeroed by the discard,
+            // so only [0, 1024) may be compared against the original.
+            const ssize_t prefix_rd = co_await bdev_io([&] {
+                return ::pread(fd, buf.data(), 1024, 0);
+            });
+            REQUIRE(prefix_rd == 1024);
+            REQUIRE(std::vector<uint8_t>(buf.begin(), buf.begin() + 1024) ==
+                    std::vector<uint8_t>(data.begin(), data.begin() + 1024));
+            // close() flushes the dirty bdev page cache (writeback IO that
+            // our bridges must service) — keep it off the scheduler.
+            co_return 0;
         });
-        REQUIRE(prefix_rd == 1024);
-        REQUIRE(std::vector<uint8_t>(buf.begin(), buf.begin() + 1024) ==
-                std::vector<uint8_t>(data.begin(), data.begin() + 1024));
-        // close() flushes the dirty bdev page cache (writeback IO that
-        // our bridges must service) — keep it off the scheduler.
-        co_await bdev_io([&] { return ::close(fd); });
-        dev->stop();
-        dev.reset();
-        co_return 0;
     });
     REQUIRE(rc == 0);
 }
@@ -230,97 +254,98 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
         stage("grow: create");
         auto dev = co_await ublk::Device::create(
             params, source::BlobSourcePtr(std::move(src)));
-        REQUIRE(dev->size_bytes() == data.size());
-        const int fd = co_await bdev_io([&] {
-            return ::open(dev->bdev_path().c_str(), O_RDWR);
+        int fd = -1;
+        co_return co_await with_device_cleanup(dev, fd, [&]()
+            -> elio::coro::task<int> {
+            REQUIRE(dev->size_bytes() == data.size());
+            fd = co_await bdev_io([&] {
+                return ::open(dev->bdev_path().c_str(), O_RDWR);
+            });
+            REQUIRE(fd >= 0);
+
+            // Grow-only is enforced device-side BEFORE any kernel IO: a
+            // shrink (or no-op) attempt throws EINVAL even on kernels without
+            // UPDATE_SIZE support.
+            bool shrink_rejected = false;
+            try {
+                co_await elio::spawn_blocking([&] {
+                    return dev->resize_blocking(data.size() / 2);
+                });
+            } catch (const std::exception&) {
+                shrink_rejected = true;
+            }
+            if (!shrink_rejected) co_return 2;
+
+            // Data-plane grow FIRST (the real device grows the writable
+            // merged view before touching the kernel), then the kernel grow.
+            const uint64_t grown = data.size() * 2;
+            raw->grow(grown);
+            uint64_t new_size = 0;
+            try {
+                new_size = co_await elio::spawn_blocking([&] {
+                    return dev->resize_blocking(grown);
+                });
+            } catch (const std::system_error& e) {
+                // ONLY a missing command means "kernel too old" (kernel
+                // ENOTSUPP/524 on pre-6.15 control dispatch, EOPNOTSUPP/95
+                // on 6.15+). Any other failure — a malformed request, an
+                // ABI/driver regression, an I/O error — must FAIL the test,
+                // not silently skip it.
+                const int ev = e.code().value();
+                if (ev == kKernelEnNotSupp || ev == EOPNOTSUPP) co_return 3;
+                co_return 7;
+            }
+            if (new_size != grown) co_return 4;
+            if (dev->size_bytes() != new_size) co_return 4;
+
+            // The kernel gendisk reports the new capacity.
+            unsigned long long cap = 0;
+            const int ir = co_await bdev_io([&] {
+                return ::ioctl(fd, BLKGETSIZE64, &cap);
+            });
+            if (ir != 0 || cap != new_size) co_return 5;
+
+            // WRITE into the grown region (beyond the original size) and read
+            // it back through the block device: before the grow both the data
+            // plane and the kernel rejected these offsets.
+            const auto patch = test::pattern_bytes(4096, 86);
+            stage("grow: write into grown region");
+            REQUIRE(co_await bdev_io([&] {
+                        return ::pwrite(fd, patch.data(), patch.size(),
+                                        data.size() + 1024);
+                    }) == 4096);
+            std::vector<uint8_t> buf(4096);
+            REQUIRE(co_await bdev_io([&] {
+                        return ::pread(fd, buf.data(), buf.size(),
+                                       data.size() + 1024);
+                    }) == 4096);
+            REQUIRE(buf == patch);
+
+            // The grown device still serves the original content.
+            REQUIRE(co_await bdev_io([&] {
+                        return ::pread(fd, buf.data(), buf.size(),
+                                       data.size() / 2);
+                    }) == 4096);
+            REQUIRE(buf ==
+                    std::vector<uint8_t>(data.begin() + static_cast<long>(
+                                                              data.size() / 2),
+                                         data.begin() +
+                                             static_cast<long>(data.size() / 2) +
+                                             4096));
+
+            // A shrink after the grow is rejected too (no-op <= current).
+            bool post_shrink_rejected = false;
+            try {
+                co_await elio::spawn_blocking([&] {
+                    return dev->resize_blocking(data.size());
+                });
+            } catch (const std::exception&) {
+                post_shrink_rejected = true;
+            }
+            if (!post_shrink_rejected) co_return 6;
+
+            co_return 0;
         });
-        REQUIRE(fd >= 0);
-
-        // Grow-only is enforced device-side BEFORE any kernel IO: a
-        // shrink (or no-op) attempt throws EINVAL even on kernels without
-        // UPDATE_SIZE support.
-        bool shrink_rejected = false;
-        try {
-            co_await elio::spawn_blocking([&] {
-                return dev->resize_blocking(data.size() / 2);
-            });
-        } catch (const std::exception&) {
-            shrink_rejected = true;
-        }
-        if (!shrink_rejected) co_return 2;
-
-        // Data-plane grow FIRST (the real device grows the writable
-        // merged view before touching the kernel), then the kernel grow.
-        const uint64_t grown = data.size() * 2;
-        raw->grow(grown);
-        uint64_t new_size = 0;
-        try {
-            new_size = co_await elio::spawn_blocking([&] {
-                return dev->resize_blocking(grown);
-            });
-        } catch (const std::system_error& e) {
-            // ONLY a missing command means "kernel too old" (kernel
-            // ENOTSUPP/524 on pre-6.15 control dispatch, EOPNOTSUPP/95
-            // on 6.15+). Any other failure — a malformed request, an
-            // ABI/driver regression, an I/O error — must FAIL the test,
-            // not silently skip it.
-            const int ev = e.code().value();
-            if (ev == kKernelEnNotSupp || ev == EOPNOTSUPP) co_return 3;
-            co_return 7;
-        }
-        if (new_size != grown) co_return 4;
-        if (dev->size_bytes() != new_size) co_return 4;
-
-        // The kernel gendisk reports the new capacity.
-        unsigned long long cap = 0;
-        const int ir = co_await bdev_io([&] {
-            return ::ioctl(fd, BLKGETSIZE64, &cap);
-        });
-        if (ir != 0 || cap != new_size) co_return 5;
-
-        // WRITE into the grown region (beyond the original size) and read
-        // it back through the block device: before the grow both the data
-        // plane and the kernel rejected these offsets.
-        const auto patch = test::pattern_bytes(4096, 86);
-        stage("grow: write into grown region");
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pwrite(fd, patch.data(), patch.size(),
-                                    data.size() + 1024);
-                }) == 4096);
-        std::vector<uint8_t> buf(4096);
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pread(fd, buf.data(), buf.size(),
-                                   data.size() + 1024);
-                }) == 4096);
-        REQUIRE(buf == patch);
-
-        // The grown device still serves the original content.
-        REQUIRE(co_await bdev_io([&] {
-                    return ::pread(fd, buf.data(), buf.size(),
-                                   data.size() / 2);
-                }) == 4096);
-        REQUIRE(buf ==
-                std::vector<uint8_t>(data.begin() + static_cast<long>(
-                                                          data.size() / 2),
-                                     data.begin() +
-                                         static_cast<long>(data.size() / 2) +
-                                         4096));
-
-        // A shrink after the grow is rejected too (no-op <= current).
-        bool post_shrink_rejected = false;
-        try {
-            co_await elio::spawn_blocking([&] {
-                return dev->resize_blocking(data.size());
-            });
-        } catch (const std::exception&) {
-            post_shrink_rejected = true;
-        }
-        if (!post_shrink_rejected) co_return 6;
-
-        co_await bdev_io([&] { return ::close(fd); });
-        dev->stop();
-        dev.reset();
-        co_return 0;
     });
     if (rc == 3) {
         SKIP("kernel driver lacks UBLK_U_CMD_UPDATE_SIZE (needs the 6.16 "
@@ -406,21 +431,22 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
         params.dev_sectors = data.size() / 512;
         auto dev = co_await ublk::Device::attach(
             static_cast<uint32_t>(dev_id), params, std::move(src));
-        const int fd2 = co_await bdev_io([&] {
-            return ::open(dev->bdev_path().c_str(), O_RDONLY);
+        int fd2 = -1;
+        co_return co_await with_device_cleanup(dev, fd2, [&]()
+            -> elio::coro::task<int> {
+            fd2 = co_await bdev_io([&] {
+                return ::open(dev->bdev_path().c_str(), O_RDONLY);
+            });
+            REQUIRE(fd2 >= 0);
+            std::vector<uint8_t> buf2(4096);
+            const ssize_t nread2 = co_await bdev_io([&] {
+                return ::pread(fd2, buf2.data(), buf2.size(), 2048);
+            });
+            REQUIRE(nread2 == 4096);
+            REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
+                                                 expected.begin() + 2048 + 4096));
+            co_return 0;
         });
-        REQUIRE(fd2 >= 0);
-        std::vector<uint8_t> buf2(4096);
-        const ssize_t nread2 = co_await bdev_io([&] {
-            return ::pread(fd2, buf2.data(), buf2.size(), 2048);
-        });
-        REQUIRE(nread2 == 4096);
-        REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
-                                             expected.begin() + 2048 + 4096));
-        co_await bdev_io([&] { return ::close(fd2); });
-        dev->stop();
-        dev.reset();
-        co_return 0;
     });
     REQUIRE(rc == 0);
 }
