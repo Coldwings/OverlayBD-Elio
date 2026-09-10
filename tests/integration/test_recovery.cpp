@@ -481,6 +481,193 @@ void reap_fixture_child(pid_t pid,
     }
 }
 
+void check_command_rejection(bool close_channel) {
+    test::TempDir dir;
+    const std::string sock = dir / "s.sock";
+    const std::string config = test::write_file(
+        dir / "config.json", std::vector<uint8_t>{'{', '}'});
+    const std::string script = dir / "device.sh";
+    const std::string pid_file = dir / "child.pid";
+    const std::string commands = dir / "commands";
+    const std::string control = dir / "control";
+    REQUIRE(::mkfifo(control.c_str(), 0600) == 0);
+    const std::string content = "#!/bin/sh\necho $$ > \"" + pid_file + "\"\n" +
+        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+        "while IFS= read -r line <&3; do\n"
+        "    printf '%s\\n' \"$line\" >> \"" + commands + "\"\n"
+        "    seq=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"seq\":\\([0-9][0-9]*\\).*/\\1/p')\n"
+        "    IFS= read -r action < \"" + control + "\" || exit 1\n"
+        "    [ \"$action\" = reply ] || exit 0\n"
+        "    printf '{\"reply\":\"resize\",\"seq\":%s,\"ok\":true,\"size\":4096}\\n' \"$seq\" >&3\n"
+        "done\n";
+    test::write_file(script, std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+
+    // Restore the process signal mask even if runtime setup throws. Peer
+    // threads are joined before this guard leaves scope.
+    struct SignalMask {
+        sigset_t previous{};
+        bool active = false;
+        int restore() {
+            if (!active) return 0;
+            const int rc = ::sigprocmask(SIG_SETMASK, &previous, nullptr);
+            if (rc == 0) active = false;
+            return rc;
+        }
+        ~SignalMask() { restore(); }
+    } mask;
+    sigset_t block;
+    ::sigemptyset(&block);
+    ::sigaddset(&block, SIGTERM);
+    ::sigaddset(&block, SIGINT);
+    ::sigaddset(&block, SIGCHLD);
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &mask.previous) == 0);
+    mask.active = true;
+
+    auto gate = std::make_shared<supervisor::detail::DaemonTestGate>();
+    std::atomic<bool> client_done{false};
+    std::atomic<int> daemon_rc{-1};
+    std::vector<std::string> failures;
+    std::string daemon_error;
+    nlohmann::json first_reply, rejected_reply;
+    pid_t child_pid = -1;
+    auto check = [&](bool ok, const char* message) {
+        if (!ok) failures.emplace_back(message);
+    };
+    auto wait_until = [](auto&& condition) {
+        for (int i = 0; i < 500; ++i) {
+            if (condition()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return condition();
+    };
+    std::jthread client([&] {
+        std::thread first, rejected;
+        std::string first_error, rejected_error;
+        int control_fd = -1;
+        bool create_sent = false;
+        auto rpc = [&](const nlohmann::json& command) {
+            return nlohmann::json::parse(uds_rpc(sock, command.dump() + "\n"));
+        };
+        try {
+            // A read/write fixture endpoint makes open and the tiny action
+            // write nonblocking even before the child opens its FIFO reader.
+            control_fd = ::open(control.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+            if (control_fd < 0) throw std::system_error(errno, std::generic_category(), "fixture FIFO open");
+            if (!wait_until([&] { return std::filesystem::exists(sock); })) {
+                throw std::runtime_error("listener did not appear");
+            }
+            create_sent = true;
+            const auto created = rpc({{"cmd", "create"}, {"id", "d1"}, {"config", config}});
+            if (!created.value("ok", false)) throw std::runtime_error("create failed");
+            child_pid = read_fixture_pid(pid_file);
+            first = std::thread([&] {
+                try {
+                    first_reply = rpc({{"cmd", "resize"}, {"id", "d1"}, {"size", 4096}});
+                } catch (const std::exception& error) { first_error = error.what(); }
+            });
+            if (!wait_until([&] { return count_lines(commands) == 1; })) {
+                throw std::runtime_error("fake did not receive the first command");
+            }
+            std::ifstream input(commands);
+            std::string line;
+            std::getline(input, line);
+            const auto forwarded = nlohmann::json::parse(line);
+            check(forwarded.at("cmd") == "resize", "wrong forwarded command");
+            check(forwarded.at("seq").get<uint64_t>() > 0, "missing forwarding sequence");
+            check(forwarded.at("size") == 4096, "wrong forwarded size");
+            gate->arm("command_rejected");
+            rejected = std::thread([&] {
+                try {
+                    rejected_reply = rpc({{"cmd", "resize"}, {"id", "d1"}, {"size", 8192}});
+                } catch (const std::exception& error) { rejected_error = error.what(); }
+            });
+            if (!gate->wait()) throw std::runtime_error("rejected handler did not reach gate");
+            const std::string action = close_channel ? "eof\n" : "reply\n";
+            ssize_t written;
+            do { written = ::write(control_fd, action.data(), action.size()); }
+            while (written < 0 && errno == EINTR);
+            if (written != static_cast<ssize_t>(action.size())) {
+                throw std::runtime_error("fixture action write failed");
+            }
+            // Complete A's real monitor transition and handler cleanup while
+            // B stays parked. No later admission can steal A's pending reply.
+            first.join();
+            if (!first_error.empty()) throw std::runtime_error(first_error);
+            if (close_channel) {
+                check(!first_reply.value("ok", true), "EOF did not fail first command");
+                check(first_reply.value("error", "") == "device control channel closed", "wrong first command EOF error");
+            } else {
+                check(first_reply.value("ok", false), "matching reply did not complete first command");
+                check(first_reply.value("size", 0) == 4096, "first reply lost device fields");
+            }
+            check(wait_until([&] { return gate->concurrent_workers(); }), "handler and monitor did not overlap on distinct workers");
+        } catch (const std::exception& error) {
+            failures.emplace_back(error.what());
+        }
+        // Cleanup is unconditional and independent of daemon RPC service.
+        // Killing the fixture also releases A if setup failed before action.
+        gate->release();
+        if (control_fd >= 0) ::close(control_fd);
+        if (create_sent) {
+            try {
+                if (child_pid <= 0) child_pid = read_fixture_pid(pid_file);
+                terminate_fixture_child(child_pid);
+            } catch (const std::exception& error) { failures.emplace_back(error.what()); }
+        }
+        if (first.joinable()) first.join();
+        if (rejected.joinable()) rejected.join();
+        if (!first_error.empty()) failures.push_back(first_error);
+        if (!rejected_error.empty()) failures.push_back(rejected_error);
+        check(count_lines(commands) == 1, "rejected command reached the fake device");
+        client_done.store(true);
+    });
+    supervisor::DaemonConfig cfg;
+    cfg.socket_path = sock;
+    cfg.device_bin = script;
+    cfg.global_config = "";
+    cfg.ready_timeout_sec = 2;
+    cfg.stop_timeout_sec = 1;
+    cfg.max_recovery_attempts = 0;
+    elio::run_config runtime;
+    runtime.num_threads = 4;
+    int rc = -1;
+    try {
+        rc = elio::run([&]() -> elio::coro::task<int> {
+            elio::go_to(0, [&]() -> elio::coro::task<void> {
+                try {
+                    daemon_rc.store(co_await supervisor::detail::run_daemon_with_test_gate(cfg, gate));
+                } catch (const std::exception& error) {
+                    daemon_error = error.what();
+                    daemon_rc.store(1);
+                }
+            });
+            while (!client_done.load()) co_await elio::time::sleep_for(std::chrono::milliseconds(10));
+            if (daemon_rc.load() < 0) ::kill(::getpid(), SIGTERM);
+            while (daemon_rc.load() < 0) co_await elio::time::sleep_for(std::chrono::milliseconds(10));
+            co_return 0;
+        }, runtime);
+    } catch (const std::exception& error) { daemon_error = error.what(); }
+    client.join();
+    if (child_pid > 0) {
+        try { reap_fixture_child(child_pid); }
+        catch (const std::exception& error) { failures.emplace_back(error.what()); }
+    }
+    const int mask_rc = mask.restore();
+    std::string failure_text;
+    for (const auto& failure : failures) failure_text += failure + "\n";
+    INFO(failure_text);
+    INFO(daemon_error);
+    CHECK(failures.empty());
+    CHECK_FALSE(gate->timeout());
+    CHECK(rc == 0);
+    CHECK(daemon_rc.load() == 0);
+    CHECK(daemon_error.empty());
+    CHECK(mask_rc == 0);
+    CHECK_FALSE(rejected_reply.value("ok", true));
+    CHECK(rejected_reply.value("error", "") == "another device command is in flight: d1");
+}
+
 void check_daemon_lifetime(const std::string& point) {
     test::TempDir dir;
     const std::string sock = dir / "s.sock";
@@ -684,6 +871,14 @@ while IFS= read -r line <&3; do :; done
 }
 
 }  // namespace
+
+TEST_CASE("supervisor: rejected command keeps busy reason after pending reply", "[supervisor][command-rejection]") {
+    check_command_rejection(false);
+}
+
+TEST_CASE("supervisor: rejected command keeps busy reason after channel EOF", "[supervisor][command-rejection]") {
+    check_command_rejection(true);
+}
 
 TEST_CASE("supervisor: shutdown drains a monitor after its entry was erased", "[supervisor][daemon-lifetime]") {
     check_daemon_lifetime("monitor_eof");
