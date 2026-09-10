@@ -63,8 +63,19 @@ public:
             line.append(buf, static_cast<size_t>(r));
             if (line.find('\n') != std::string::npos) break;
         }
-        const size_t w = ::write(conn_, reply.data(), reply.size());
-        REQUIRE(w == reply.size());
+        // A stream socket may accept only part of the reply; loop so a
+        // short write cannot truncate the JSON and flake the test.
+        size_t sent = 0;
+        while (sent < reply.size()) {
+            const ssize_t w = ::write(conn_, reply.data() + sent,
+                                      reply.size() - sent);
+            if (w <= 0) {
+                if (w < 0 && errno == EINTR) continue;
+                break;
+            }
+            sent += static_cast<size_t>(w);
+        }
+        REQUIRE(sent == reply.size());
         ::close(conn_);
         conn_ = -1;
         const auto nl = line.find('\n');

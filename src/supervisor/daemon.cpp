@@ -204,8 +204,16 @@ public:
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 ::kill(pid, SIGKILL);
-                int ws = 0;
-                ::waitpid(pid, &ws, 0);
+                // Reap with WNOHANG polling, never a blocking waitpid: a
+                // child slow to die would otherwise pin an Elio worker.
+                // SIGKILL is already delivered, so this terminates.
+                for (;;) {
+                    int ws = 0;
+                    const pid_t got = ::waitpid(pid, &ws, WNOHANG);
+                    if (got == pid || (got < 0 && errno != EINTR)) break;
+                    co_await elio::time::sleep_for(
+                        std::chrono::milliseconds(10));
+                }
                 if (error) {
                     *error = prog + " timed out after " +
                              std::to_string(timeout_sec_) + " s";

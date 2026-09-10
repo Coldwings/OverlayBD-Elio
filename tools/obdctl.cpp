@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <climits>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -77,9 +78,20 @@ int main(int argc, char** argv) {
         while (i < argc) {
             const std::string a = argv[i++];
             if (a == "--global" && i < argc) req["global"] = argv[i++];
-            else if (a == "--dev-id" && i < argc)
-                req["dev_id"] = std::stoi(argv[i++]);
-            else if (a == "--virtual-size" && i < argc) {
+            else if (a == "--dev-id" && i < argc) {
+                // std::stoi would abort the CLI on junk; validate fully and
+                // fail like every other malformed argument (exit 2).
+                const char* v = argv[i++];
+                char* end = nullptr;
+                errno = 0;
+                const long id = std::strtol(v, &end, 10);
+                if (errno != 0 || end == v || *end != '\0' || id < 0 ||
+                    id > INT32_MAX) {
+                    std::fprintf(stderr, "invalid --dev-id '%s'\n", v);
+                    return 2;
+                }
+                req["dev_id"] = static_cast<int>(id);
+            } else if (a == "--virtual-size" && i < argc) {
                 // D3 headroom override (bytes): full strtoull validation
                 // for a fast, clear error; the grow-only/alignment
                 // semantics are decided where sizes are comparable
