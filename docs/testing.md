@@ -77,9 +77,9 @@ REQUIRE(got == 1024);
 Awaiting the same coroutine a second time corrupts coroutine semantics
 (re-suspension on an already-driven awaitable), so `REQUIRE`,
 `CHECK`, `REQUIRE_FALSE` and `CHECK_FALSE` must never wrap `co_await`
-directly — in any form of the pattern, including negations
-(`REQUIRE(!co_await ...)`) and multi-line arguments. Assign the awaited
-result to a named local first, then assert on the local.
+directly — in any form of the pattern, whether the awaited expression is
+compared, negated, or spans several lines. Assign the awaited result to a
+named local first, then assert on the local.
 
 ## Golden values and cross-validation
 
