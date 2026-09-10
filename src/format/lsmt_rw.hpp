@@ -1,7 +1,7 @@
 // LSMT writable layer (ADR-0008): an unsealed single-file LSMT supporting
-// in-place edit. Write ranges already covered (fully or partially) by this
-// layer's segment index overwrite their data blocks in place; only
-// previously-uncovered subranges append new data at the data end. seal()
+// in-place edit. Write ranges covered by live segments overwrite their
+// data blocks in place; uncovered or discarded (zeroed) subranges append
+// new data at the data end. Zeroed segments own no physical blocks. seal()
 // compacts the file into a standard sealed LSMT RO file (garbage from
 // superseded in-place regions is dropped), readable by LsmtLayer.
 //

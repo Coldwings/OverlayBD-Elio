@@ -17,6 +17,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -648,6 +650,196 @@ TEST_CASE("format: lsmt rw discard masks coverage with zeroed segments",
         REQUIRE(std::memcmp(buf2.data(), a.data(), 4 * 512) == 0);
         REQUIRE(std::memcmp(buf2.data() + 12 * 512, a.data() + 12 * 512,
                             4 * 512) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: lsmt rw pwrite over a discarded range appends fresh data",
+          "[format]") {
+    // Virtual sectors deliberately differ from the physical data start (8).
+    // Reusing the discarded tail's placeholder overwrites the live head.
+    TempDir dir;
+    const auto a = sectors_pattern(24, 16, 1300);  // v[24,40)
+    const auto b = sectors_pattern(32, 8, 1400);   // v[32,40)
+    REQUIRE(std::memcmp(b.data(), a.data(), b.size()) != 0);
+    const std::string path = dir / "upper.rw";
+    const std::string control = dir / "control.rw";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        ssize_t r = co_await layer->pwrite(a.data(), a.size(), 24 * 512);
+        REQUIRE(r == static_cast<ssize_t>(a.size()));
+        const int dr = co_await layer->discard(32 * 512, 8 * 512);
+        REQUIRE(dr == 0);
+        REQUIRE(layer->segments().size() == 2);
+        REQUIRE_FALSE(layer->segments()[0].zeroed);
+        REQUIRE(layer->segments()[1].zeroed);
+        const uint64_t before = file_bytes(path);
+
+        r = co_await layer->pwrite(b.data(), b.size(), 32 * 512);
+        REQUIRE(r == static_cast<ssize_t>(b.size()));
+        // Check virtual content first: the regression must demonstrate data
+        // corruption, not merely a different allocation strategy/file size.
+        std::vector<uint8_t> buf(16 * 512, 0xff);
+        r = co_await layer->pread(buf.data(), buf.size(), 24 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), a.data(), 8 * 512) == 0);
+        REQUIRE(std::memcmp(buf.data() + 8 * 512, b.data(), b.size()) == 0);
+        REQUIRE(file_bytes(path) == before + b.size());
+
+        std::vector<std::pair<uint64_t, uint64_t>> phys;
+        for (const auto& seg : layer->segments()) {
+            if (seg.zeroed) continue;
+            for (const auto& [lo, hi] : phys) {
+                REQUIRE_FALSE((seg.moffset < hi && lo < seg.mend()));
+            }
+            phys.emplace_back(seg.moffset, seg.mend());
+        }
+        const int sealed = co_await layer->seal("issue-13");
+        REQUIRE(sealed == 0);
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(co_await format::LsmtLayer::open(
+            co_await source::LocalFileSource::open(path)));
+        auto ro = co_await format::MergedLsmt::open(std::move(layers));
+        // Include the leading hole: physical pread at virtual offset 16
+        // cannot accidentally stand in for the layer's mapping here.
+        std::vector<uint8_t> actual(24 * 512, 0xff);
+        r = co_await ro->pread(actual.data(), actual.size(), 16 * 512);
+        REQUIRE(r == static_cast<ssize_t>(actual.size()));
+        const std::vector<uint8_t> zeros(8 * 512, 0);
+        REQUIRE(std::memcmp(actual.data(), zeros.data(), zeros.size()) == 0);
+        REQUIRE(std::memcmp(actual.data() + 8 * 512, a.data(), 8 * 512) == 0);
+        REQUIRE(std::memcmp(actual.data() + 16 * 512, b.data(), b.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    const int crc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto ctl = co_await format::LsmtRwLayer::create(control, 512 * 64);
+        ssize_t r = co_await ctl->pwrite(a.data(), a.size(), 24 * 512);
+        REQUIRE(r == static_cast<ssize_t>(a.size()));
+        r = co_await ctl->pwrite(b.data(), b.size(), 32 * 512);
+        REQUIRE(r == static_cast<ssize_t>(b.size()));
+        const int sealed = co_await ctl->seal("issue-13");
+        REQUIRE(sealed == 0);
+        co_return 0;
+    });
+    REQUIRE(crc == 0);
+    // Packing coalesces both histories to the same live index and bytes.
+    REQUIRE(file_sha256(path) == file_sha256(control));
+}
+
+TEST_CASE("format: lsmt rw straddling pwrite keeps live and discarded parts apart",
+          "[format]") {
+    TempDir dir;
+    const auto a = sectors_pattern(24, 16, 1300);  // v[24,40)
+    const auto c = sectors_pattern(30, 6, 1500);   // v[30,36)
+    REQUIRE(std::memcmp(c.data(), a.data() + 6 * 512, 2 * 512) != 0);
+    const std::string path = dir / "upper.rw";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        ssize_t r = co_await layer->pwrite(a.data(), a.size(), 24 * 512);
+        REQUIRE(r == static_cast<ssize_t>(a.size()));
+        const int dr = co_await layer->discard(32 * 512, 8 * 512);
+        REQUIRE(dr == 0);
+        const uint64_t before = file_bytes(path);
+        // [30,32) stays in place; only discarded [32,36) appends.
+        r = co_await layer->pwrite(c.data(), c.size(), 30 * 512);
+        REQUIRE(r == static_cast<ssize_t>(c.size()));
+        std::vector<uint8_t> expected(16 * 512, 0);
+        std::memcpy(expected.data(), a.data(), 6 * 512);
+        std::memcpy(expected.data() + 6 * 512, c.data(), c.size());
+        std::vector<uint8_t> actual(expected.size(), 0xff);
+        r = co_await layer->pread(actual.data(), actual.size(), 24 * 512);
+        REQUIRE(r == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        REQUIRE(file_bytes(path) == before + 4 * 512);
+        std::vector<std::pair<uint64_t, uint64_t>> phys;
+        for (const auto& seg : layer->segments()) {
+            if (seg.zeroed) continue;
+            for (const auto& [lo, hi] : phys) {
+                REQUIRE_FALSE((seg.moffset < hi && lo < seg.mend()));
+            }
+            phys.emplace_back(seg.moffset, seg.mend());
+        }
+        const int sealed = co_await layer->seal("issue-13");
+        REQUIRE(sealed == 0);
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(co_await format::LsmtLayer::open(
+            co_await source::LocalFileSource::open(path)));
+        auto ro = co_await format::MergedLsmt::open(std::move(layers));
+        std::fill(actual.begin(), actual.end(), 0xff);
+        r = co_await ro->pread(actual.data(), actual.size(), 24 * 512);
+        REQUIRE(r == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);  // includes the still-discarded tail
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: lsmt rw partial zeroed rewrites survive offline sealing",
+          "[format]") {
+    // A large virtual zero range owns no matching physical extent. Trimming
+    // it must not advance its placeholder beyond the real data region.
+    bool discard_again = false;
+    uint64_t live_sector = 1000;
+    uint64_t virtual_sectors = 1024;
+    uint64_t patch_sector = 500;
+    uint64_t patch_sectors = 1;
+    SECTION("pwrite splits zeroed coverage") {}
+    SECTION("discard splits zeroed coverage before pwrite") {
+        discard_again = true;
+    }
+    SECTION("rewrite crosses the maximum segment and write-piece length") {
+        live_sector = 32768;
+        virtual_sectors = live_sector + 16;
+        patch_sector = 8190;
+        patch_sectors = bytes::segment_mapping::kMaxLength + 1;
+    }
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto live = sectors_pattern(live_sector, 8, 1600);
+    const auto patch = sectors_pattern(patch_sector, patch_sectors, 1700);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(
+            path, virtual_sectors * 512);
+        ssize_t r = co_await layer->pwrite(
+            live.data(), live.size(), live_sector * 512);
+        REQUIRE(r == static_cast<ssize_t>(live.size()));
+        int dr = co_await layer->discard(0, live_sector * 512);
+        REQUIRE(dr == 0);
+        if (discard_again) {
+            dr = co_await layer->discard(100 * 512, 100 * 512);
+            REQUIRE(dr == 0);
+        }
+        r = co_await layer->pwrite(
+            patch.data(), patch.size(), patch_sector * 512);
+        REQUIRE(r == static_cast<ssize_t>(patch.size()));
+        const int checkpointed = co_await layer->checkpoint();
+        REQUIRE(checkpointed == 0);
+        layer.reset();
+        std::string digest;
+        uint64_t size = 0;
+        const int sealed = co_await format::LsmtRwLayer::seal_file(
+            path, "issue-13", &digest, &size);
+        REQUIRE(sealed == 0);
+        REQUIRE(size == file_bytes(path));
+        REQUIRE(digest == file_sha256(path));
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(co_await format::LsmtLayer::open(
+            co_await source::LocalFileSource::open(path)));
+        auto ro = co_await format::MergedLsmt::open(std::move(layers));
+        std::vector<uint8_t> expected(virtual_sectors * 512, 0);
+        std::memcpy(expected.data() + patch_sector * 512,
+                    patch.data(), patch.size());
+        std::memcpy(expected.data() + live_sector * 512,
+                    live.data(), live.size());
+        std::vector<uint8_t> actual(expected.size(), 0xff);
+        r = co_await ro->pread(actual.data(), actual.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
         co_return 0;
     });
     REQUIRE(rc == 0);

@@ -573,13 +573,20 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
   `O_RDWR | O_CREAT | O_TRUNC` — **any existing file is truncated** (v0.2
   limitation, see below). It writes an unsealed header and generates a fresh
   layer UUID.
-- `pwrite`: for each ≤ 16383-sector piece of the request, subranges already
-  covered by the layer's segment index **overwrite their data blocks in
-  place**; previously-uncovered subranges **append** at the data end. The
-  in-memory index is updated accordingly (old coverage split/trimmed, new
-  subranges inserted and coalesced with contiguous neighbors). Returns
-  `count`, `-EINVAL` on unaligned/empty/out-of-`vsize` requests, `-EROFS`
-  once sealed, or a propagated -errno.
+- `pwrite`: for each ≤ 16383-sector piece of the request, subranges covered
+  by **live** segments **overwrite their data blocks in place**;
+  previously-uncovered subranges **append** at the data end. A subrange
+  whose only coverage is a discarded (zeroed) segment owns no data blocks
+  in the file, so it also appends: a pwrite over a discarded range never
+  reuses the zeroed segment's placeholder `moffset` (which would land on
+  whatever live data occupies those physical sectors, corrupting it — see
+  issue #13). The in-memory index is updated accordingly (old coverage
+  split/trimmed, new subranges inserted and coalesced with contiguous
+  neighbors). Trimming zeroed coverage preserves its placeholder physical
+  offset: a virtual trim distance cannot advance it into unrelated data
+  or beyond the checkpoint's data region. Returns `count`, `-EINVAL` on
+  unaligned/empty/out-of-`vsize` requests, `-EROFS` once checkpointed or
+  sealed, or a propagated -errno.
 - `pread`: sector-aligned; holes and zeroed segments read as zeroes; clamped
   at `virtual_size()`.
 - `flush()`: `fdatasync`; 0 or `-errno`.
@@ -593,9 +600,10 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
   (split/trimming overlapped segments exactly like `pwrite`); no data is
   written and superseded blocks become garbage that `seal()` drops. Zeroed
   segments carry a valid in-data-region `moffset` (never read, but the
-  read-only loader validates the range), so a sealed file keeps them
-  intact. `-EINVAL` on unaligned/out-of-`vsize` ranges, `-EROFS` once
-  sealed.
+  read-only loader validates the range). Splitting an existing zeroed
+  segment preserves that placeholder, so repeated discards followed by
+  checkpoint/offline seal stay valid. `-EINVAL` on unaligned/out-of-`vsize`
+  ranges, `-EROFS` once checkpointed or sealed.
 - `data_source()`: an fd-backed `BlobSource` view whose size **tracks
   appends** (an `std::atomic<uint64_t>` upper bound), unlike a
   `LocalFileSource` which pins `st_size` at open.
@@ -988,6 +996,17 @@ writers and readers agree on the same bytes.
   disjoint and straddling writes append exactly their uncovered bytes; the
   index coalesces back to contiguous segments; the patched view reads back
   correctly with zeros in the holes.
+- `format: lsmt rw pwrite over a discarded range appends fresh data` —
+  rewritten zeroed coverage appends without corrupting a surviving live
+  neighbor; reopened virtual reads match, and the sealed digest equals an
+  ordinary overwrite with the same final content.
+- `format: lsmt rw straddling pwrite keeps live and discarded parts apart` —
+  live subranges remain in place, discarded subranges append, and virtual
+  reads before and after sealing preserve the remaining zeroed tail.
+- `format: lsmt rw partial zeroed rewrites survive offline sealing` —
+  pwrite/discard splits preserve valid zeroed placeholders through
+  checkpoint/offline seal, including a maximum-length piece boundary;
+  reopened virtual reads verify the patch, live neighbor and zero ranges.
 - `format: lsmt rw seal compacts into a standard sealed layer` — after
   in-place edits, `seal()` produces the exact sealed geometry (packed data +
   padded index + trailer), post-seal `pwrite` returns `-EROFS`, and the
