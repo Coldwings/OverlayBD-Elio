@@ -27,6 +27,10 @@ struct ChildSpec {
     /// ADR-0010: spawn in recovery mode (obd-device --recover): attach to
     /// the existing dev_id device instead of creating a new one.
     bool recover = false;
+    /// D3 create-time headroom: optional dev_size override in bytes
+    /// (0 = derive from the image's declared virtual size). The device
+    /// validates it grow-only (>= the image size) before sizing itself.
+    uint64_t virtual_size = 0;
 };
 
 class Child {

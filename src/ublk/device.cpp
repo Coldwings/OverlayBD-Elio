@@ -98,6 +98,8 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
             throw error(EBUSY, "ublk START_DEV not ready after 5s");
         }
         dev->started_ = true;
+        dev->cur_bytes_.store(params.dev_sectors * 512,
+                              std::memory_order_release);
         ELIO_LOG_INFO("ublk device {} ready ({})", dev->dev_id_,
                       dev->bdev_path());
     } catch (...) {
@@ -170,13 +172,52 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         }
         dev->ctrl_->adopt_dev(dev_id);
         dev->started_ = true;
-        ELIO_LOG_INFO("ublk device {} recovered ({})", dev_id,
-                      dev->bdev_path());
+        // D3/FIX-2 grow-only baseline: a recovered device's kernel gendisk
+        // KEEPS the capacity it had when the previous server died
+        // (USER_RECOVERY never resets it, and attach issues no
+        // SET_PARAMS/UPDATE_SIZE), which may be LARGER than the
+        // create-time params. Seeding the baseline from the params would
+        // let a post-recovery "resize" pass the grow-only check and then
+        // actually SHRINK the gendisk via UPDATE_SIZE. Read the kernel's
+        // REAL current capacity (GET_PARAMS) instead; grow-only then
+        // rejects anything at or below it.
+        dev->cur_bytes_.store(
+            co_await elio::spawn_blocking([&]() -> uint64_t {
+                const ublk_params p = dev->ctrl_->get_params(dev_id);
+                return p.basic.dev_sectors * 512;
+            }),
+            std::memory_order_release);
+        ELIO_LOG_INFO("ublk device {} recovered ({}, {} bytes)",
+                      dev_id, dev->bdev_path(), dev->size_bytes());
     } catch (...) {
         dev->stop();
         throw;
     }
     co_return dev;
+}
+
+uint64_t Device::resize_blocking(uint64_t bytes) {
+    // D3 grow-only online resize. BLOCKING (kernel control call): every
+    // caller must route this off an Elio worker via spawn_blocking —
+    // the device command loop does so (see run_device_control).
+    if (bytes == 0 || bytes % 512 != 0) {
+        throw error(EINVAL, "resize size must be a positive multiple of "
+                            "512 bytes");
+    }
+    const uint64_t cur = cur_bytes_.load(std::memory_order_acquire);
+    // Grow-only (ADR-0014 dev_size model): shrinking or no-op'ing a live
+    // device is rejected cleanly here — the executor's reply surfaces
+    // this message to the CLI.
+    if (bytes <= cur) {
+        throw error(EINVAL, "resize rejected: grow-only (requested " +
+                                std::to_string(bytes) +
+                                " <= current " + std::to_string(cur) +
+                                " bytes)");
+    }
+    ctrl_->update_size(dev_id_, bytes / 512);
+    cur_bytes_.store(bytes, std::memory_order_release);
+    ELIO_LOG_INFO("ublk device {} grew to {} bytes", dev_id_, bytes);
+    return bytes;
 }
 
 void Device::stop() noexcept {

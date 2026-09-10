@@ -36,6 +36,17 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
                     "'dev_id' an integer";
             return std::nullopt;
         }
+        // D3 create-time headroom: optional 'virtual_size' override in
+        // bytes. Semantic rules (positive, 512-aligned, grow-only vs the
+        // image size) live in the handlers, where the image's declared
+        // size is known (the device's opened.virtual_size).
+        if (j.contains("virtual_size") &&
+            !j["virtual_size"].is_number_unsigned() &&
+            !(j["virtual_size"].is_number_integer() &&
+              j["virtual_size"].get<int64_t>() >= 0)) {
+            error = "create 'virtual_size' must be a non-negative integer";
+            return std::nullopt;
+        }
     } else if (cmd == "destroy" || cmd == "status") {
         if (!j.contains("id")) {
             error = cmd + " requires 'id'";
@@ -56,6 +67,17 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
         }
         if (j.contains("user_tag") && !j["user_tag"].is_string()) {
             error = "commit 'user_tag' must be a string";
+            return std::nullopt;
+        }
+        // D3 commit re-baseline: optional 'virtual_size' override in
+        // bytes (0 = absent). Semantic rules (positive, 512-aligned,
+        // grow-only vs the layer's declared size and content extent)
+        // live in the handlers/seal path, where the upper is readable.
+        if (j.contains("virtual_size") &&
+            !j["virtual_size"].is_number_unsigned() &&
+            !(j["virtual_size"].is_number_integer() &&
+              j["virtual_size"].get<int64_t>() >= 0)) {
+            error = "commit 'virtual_size' must be a non-negative integer";
             return std::nullopt;
         }
     } else if (cmd == "trace_start") {
@@ -79,6 +101,24 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
         }
         if (!j["id"].is_string()) {
             error = "trace_stop 'id' must be a string";
+            return std::nullopt;
+        }
+    } else if (cmd == "resize") {
+        if (!j.contains("id") || !j.contains("size")) {
+            error = "resize requires 'id' and 'size'";
+            return std::nullopt;
+        }
+        if (!j["id"].is_string()) {
+            error = "resize 'id' must be a string";
+            return std::nullopt;
+        }
+        // 'size' is a byte count: accept unsigned or non-negative signed
+        // integers (semantic rules — positive, 512-aligned, grow-only —
+        // live in the handlers, which know the current size).
+        if (!j["size"].is_number_unsigned() &&
+            !(j["size"].is_number_integer() &&
+              j["size"].get<int64_t>() >= 0)) {
+            error = "resize 'size' must be a non-negative integer (bytes)";
             return std::nullopt;
         }
     } else if (cmd != "list" && cmd != "hello") {
@@ -107,8 +147,10 @@ std::string reply_hello() {
     fields["version"] = kProjectVersion;
     // Capability gate (additive-only rule): "commit" = the ADR-0014
     // offline commit command is served; "trace" = the ADR-0013 record
-    // path (trace_start/trace_stop) is served.
-    fields["features"] = nlohmann::json::array({"commit", "trace"});
+    // path (trace_start/trace_stop) is served; "resize" = the D3
+    // grow-only online resize command is served.
+    fields["features"] =
+        nlohmann::json::array({"commit", "trace", "resize"});
     return reply_ok(fields);
 }
 

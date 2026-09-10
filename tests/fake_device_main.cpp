@@ -22,15 +22,21 @@
 #include <elio/log/macros.hpp>
 #include <elio/runtime/async_main.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
 
 #include <sys/socket.h>
 
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <system_error>
 #include <unistd.h>
 
 namespace {
@@ -44,6 +50,10 @@ constexpr size_t kPayloadBytes = 512 * 16;
 struct Args {
     std::string config;
     int control_fd = -1;
+    /// D3 create-time headroom override (bytes; 0 = none), validated
+    /// against the fake's declared image size with the same single-source
+    /// rule (image::device_capacity_bytes) the real device uses.
+    uint64_t virtual_size = 0;
 };
 
 void report(const obd::supervisor::ControlChannelWriterPtr& channel,
@@ -86,59 +96,135 @@ elio::coro::task<int> fake_main(Args args) {
             opened.emplace(co_await obd::image::open_image(img, g));
         }
 
-        // With an lsmt upper: write the payload and leave the file
-        // unsealed (checkpoint only on SIGTERM, like the real device).
-        std::unique_ptr<obd::format::LsmtRwLayer> lsmt;
+        // D3 create-time headroom: mirror the real device's grow-only
+        // validation against the fake's declared image size (the merged
+        // lowers when present, else the writable upper's kVsize) using
+        // the same single-source rule. A rejected override fails create
+        // with the rule's message, exactly like the real device — and
+        // BEFORE the writable upper is created below.
+        {
+            const uint64_t declared = opened.has_value()
+                                          ? opened->virtual_size
+                                          : (img.writable() ? kVsize : 0);
+            if (args.virtual_size > 0 && declared > 0) {
+                std::string cap_error;
+                const uint64_t cap = obd::image::device_capacity_bytes(
+                    declared, args.virtual_size, &cap_error);
+                if (cap == 0) {
+                    report(channel, DeviceStatus{"failed", "", cap_error});
+                    co_return 1;
+                }
+            }
+        }
+
+        // With an lsmt/sparse upper: like the real device's writable
+        // assembly, the writable layer is sized at the D3 headroom
+        // override when given (so a commit of a headroom-created device
+        // seals that declared size), else kVsize; the standard payload is
+        // written at offset 0 (what the commit integration reads back)
+        // and the file is left unsealed — checkpoint only on SIGTERM,
+        // exactly like the real device.
+        std::shared_ptr<obd::format::WritableLayer> upper;
+        // D3 shutdown guard + drain gate (created here so the SIGTERM
+        // path below can set/drain them; see make_resize_apply).
+        auto stopping = std::make_shared<std::atomic<bool>>(false);
+        auto resize_gate = std::make_shared<std::mutex>();
+        const uint64_t layer_vsize =
+            args.virtual_size > 0 ? args.virtual_size : kVsize;
         if (img.writable() && img.upper.type == "lsmt") {
             std::filesystem::create_directories(img.upper.dir);
-            lsmt = co_await obd::format::LsmtRwLayer::create(
-                img.upper.dir + "/overlaybd.rw", kVsize);
+            auto lsmt = co_await obd::format::LsmtRwLayer::create(
+                img.upper.dir + "/overlaybd.rw", layer_vsize);
             const auto payload =
                 obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
-            const ssize_t w = co_await lsmt->pwrite(payload.data(),
-                                                  payload.size(), 0);
+            const ssize_t w =
+                co_await lsmt->pwrite(payload.data(), payload.size(), 0);
             if (w != static_cast<ssize_t>(payload.size())) {
-                report(channel, DeviceStatus{"failed", "", "payload write failed"});
+                report(channel, DeviceStatus{"failed", "",
+                                          "payload write failed"});
                 co_return 1;
             }
+            upper = std::move(lsmt);
         } else if (img.writable()) {
             // Sparse: open the file so the device is plausible; sparse
             // state is durable via fiemap and never seals.
             std::filesystem::create_directories(img.upper.dir);
             auto sparse = co_await obd::format::SparseRwLayer::open(
-                img.upper.dir + "/overlaybd.sparse", kVsize);
-            (void)sparse;
+                img.upper.dir + "/overlaybd.sparse", layer_vsize);
+            upper = std::move(sparse);
         }
         report(channel, DeviceStatus{"ready", "/dev/ublkb70", ""});
 
-        // Trace command channel (protocol v3), like the real obd-device.
-        // The workload hook runs inside the recording window: a
-        // deterministic read pattern through the merged root. The offsets
-        // target MIDDLE extents (assembly probes pre-warm the header
-        // extent and the trailer/index extents; reads there would be
-        // local hits and record nothing).
-        if (opened.has_value() && args.control_fd >= 0) {
-            auto* root = opened->root.get();
-            obd::supervisor::TraceControlHooks hooks;
-            hooks.on_start = [root]() {
-                elio::go([root]() -> elio::coro::task<void> {
-                    char buf[4096];
-                    for (const uint64_t off : {uint64_t{65536},
-                                               uint64_t{131072},
-                                               uint64_t{196608}}) {
-                        const ssize_t r =
-                            co_await root->pread(buf, sizeof(buf), off);
-                        if (r < 0) {
-                            ELIO_LOG_WARNING("fake workload read at {} "
-                                             "failed: {}", off, (int)-r);
+        // Serve the supervisor's device commands on the control channel
+        // (trace record path + D3 resize), exactly like the real
+        // obd-device. The resize executor mirrors the real device's
+        // grow-only semantics without a kernel: the loop enforces
+        // grow-only against the fake's current size; apply records the
+        // grow. A shared_ptr keeps `fake_size` alive for the detached
+        // loop (which may outlive this coroutine's frame).
+        if (args.control_fd >= 0) {
+            // The fake's declared device size: the writable layer's
+            // (override-size or kVsize) when present, else the assembled
+            // image's size, else 0.
+            const uint64_t base_size =
+                upper != nullptr
+                    ? upper->virtual_size()
+                    : (opened.has_value() ? opened->virtual_size : 0);
+            // Shared state for the detached control loop (which may
+            // outlive this coroutine's frame): the tracked current size,
+            // and — for the layer-backed fakes — a shared_ptr to the
+            // writable layer so an in-flight grow can never outlive it.
+            auto fake_size = std::make_shared<uint64_t>(base_size);
+            // Shutdown guard + drain gate, exactly like the real device:
+            // set/drained before the SIGTERM checkpoint below so a grow
+            // can never rewrite the layer header after the trailer.
+            obd::supervisor::DeviceControlHooks hooks;
+            if (opened.has_value()) {
+                auto* root = opened->root.get();
+                hooks.on_start = [root]() {
+                    elio::go([root]() -> elio::coro::task<void> {
+                        char buf[4096];
+                        for (const uint64_t off : {uint64_t{65536},
+                                                   uint64_t{131072},
+                                                   uint64_t{196608}}) {
+                            const ssize_t r =
+                                co_await root->pread(buf, sizeof(buf), off);
+                            if (r < 0) {
+                                ELIO_LOG_WARNING(
+                                    "fake workload read at {} failed: {}",
+                                    off, (int)-r);
+                            }
                         }
-                    }
-                });
+                    });
+                };
+            }
+            // D3 resize executor seam (no kernel): current_size returns
+            // the fake's tracked size; apply is the SAME
+            // make_resize_apply policy the real obd-device installs —
+            // grow-only ordering (data plane via the REAL format grow
+            // path, so a later checkpoint/commit seals the grown
+            // declared size), plus the shutdown guard and gate that keep
+            // a grow from interleaving with the shutdown checkpoint.
+            hooks.resize.current_size = [fake_size]() -> uint64_t {
+                return *fake_size;
             };
-            elio::go([channel, rec = opened->recorder,
+            hooks.resize.apply_resize = obd::supervisor::make_resize_apply(
+                stopping, resize_gate,
+                upper != nullptr
+                    ? std::function<int(uint64_t)>([upper](uint64_t bytes) {
+                          return upper->grow(bytes);
+                      })
+                    : std::function<int(uint64_t)>(),
+                [fake_size](uint64_t bytes) {
+                    *fake_size = bytes;
+                    return bytes;
+                });
+            elio::go([channel, rec = opened.has_value()
+                                     ? opened->recorder
+                                     : obd::image::TraceRecorderPtr{},
                       hooks = std::move(hooks)]() mutable
                      -> elio::coro::task<void> {
-                co_await obd::supervisor::run_trace_control(
+                co_await obd::supervisor::run_device_control(
                     channel, rec, std::move(hooks));
             });
         }
@@ -166,8 +252,17 @@ elio::coro::task<int> fake_main(Args args) {
             }
             co_await obd::image::park_image_fills(*opened);
         }
-        if (lsmt) {
-            const int crc = co_await lsmt->checkpoint();
+        // Stop accepting resizes and drain any in-flight grow BEFORE the
+        // checkpoint writes its trailer (the real device's contract;
+        // make_resize_apply re-checks `stopping` under the gate).
+        if (channel) {
+            stopping->store(true, std::memory_order_release);
+            co_await elio::spawn_blocking([&] {
+                std::lock_guard<std::mutex> drain(*resize_gate);
+            });
+        }
+        if (upper != nullptr) {
+            const int crc = co_await upper->checkpoint();
             if (crc != 0) {
                 report(channel, DeviceStatus{"failed", "",
                                           "checkpoint failed"});
@@ -210,6 +305,22 @@ int main(int argc, char** argv) {
             args.control_fd = std::stoi(next("--control-fd"));
         else if (a == "--global") (void)next("--global");  // accepted, unused
         else if (a == "--dev-id") (void)next("--dev-id");  // accepted, unused
+        else if (a == "--virtual-size") {
+            const std::string vs = next("--virtual-size");
+            const char* v = vs.c_str();
+            if (v[0] == '-') {
+                std::fprintf(stderr, "invalid --virtual-size '%s'\n", v);
+                return 2;
+            }
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long b = std::strtoull(v, &end, 10);
+            if (errno != 0 || end == v || *end != '\0') {
+                std::fprintf(stderr, "invalid --virtual-size '%s'\n", v);
+                return 2;
+            }
+            args.virtual_size = b;
+        }
         else if (a == "--recover") { /* accepted, unused */ }
         else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());

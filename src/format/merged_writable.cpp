@@ -22,10 +22,11 @@ elio::coro::task<std::unique_ptr<MergedWritable>> MergedWritable::open(
         out->layers_.push_back(std::move(layers_bottom_up.back()));
         layers_bottom_up.pop_back();
     }
-    out->vsize_ = top->virtual_size();
+    uint64_t vsize = top->virtual_size();
     for (const auto& l : out->layers_) {
-        out->vsize_ = std::max(out->vsize_, l->virtual_size());
+        vsize = std::max(vsize, l->virtual_size());
     }
+    out->vsize_.store(vsize, std::memory_order_release);
     out->top_ = std::move(top);
     out->label_ = "merged-writable(" + std::to_string(out->layers_.size() + 1) +
                   " layers)";
@@ -47,8 +48,9 @@ elio::coro::task<ssize_t> MergedWritable::pread(void* buf, size_t count,
     if ((offset % kSector) != 0 || (count % kSector) != 0) {
         co_return -EINVAL;
     }
-    if (offset >= vsize_) co_return 0;
-    if (count > vsize_ - offset) count = static_cast<size_t>(vsize_ - offset);
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset >= cur_vsize) co_return 0;
+    if (count > cur_vsize - offset) count = static_cast<size_t>(cur_vsize - offset);
     if (count == 0) co_return 0;
 
     const uint64_t start_sec = offset / kSector;
@@ -115,7 +117,8 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
     if ((offset % kSector) != 0 || (count % kSector) != 0) {
         co_return -EINVAL;
     }
-    if (offset + count > vsize_) co_return -EINVAL;
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset + count > cur_vsize) co_return -EINVAL;
     const ssize_t r = co_await top_->pwrite(buf, count, offset);
     if (r < 0) co_return r;
     rebuild_index();
@@ -125,7 +128,8 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
 elio::coro::task<int> MergedWritable::discard(uint64_t offset,
                                               uint64_t len) {
     if ((offset % kSector) != 0 || (len % kSector) != 0) co_return -EINVAL;
-    if (offset + len > vsize_) co_return -EINVAL;
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset + len > cur_vsize) co_return -EINVAL;
     const int r = co_await top_->discard(offset, len);
     if (r != 0) co_return r;
     rebuild_index();
@@ -134,6 +138,24 @@ elio::coro::task<int> MergedWritable::discard(uint64_t offset,
 
 elio::coro::task<int> MergedWritable::flush() {
     co_return co_await top_->flush();
+}
+
+int MergedWritable::grow(uint64_t vsize) {
+    // D3 grow-only vsize extension (see MergedWritable::grow doc in the
+    // header). BLOCKING: run off an Elio worker via elio::spawn_blocking
+    // — the device resize executor does. The top must accept the new
+    // range before the merged view widens, so writes into the headroom
+    // land in the writable upper.
+    if (vsize == 0 || vsize % kSector != 0) return -EINVAL;
+    const uint64_t cur = vsize_.load(std::memory_order_acquire);
+    if (vsize < cur) return -EINVAL;  // grow-only (equal = no-op)
+    if (vsize == cur) return 0;
+    if (vsize > top_->virtual_size()) {
+        const int r = top_->grow(vsize);
+        if (r != 0) return r;
+    }
+    vsize_.store(vsize, std::memory_order_release);
+    return 0;
 }
 
 }  // namespace obd::format

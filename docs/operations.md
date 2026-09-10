@@ -178,6 +178,15 @@ Contract and runbook notes:
   editing the image config afterwards does not redirect it.
 - The sealed file is a standard LSMT layer: reference it as a `lowers[]`
   entry (with its sha256 as the digest) in subsequent image configs.
+- **Re-baseline (D3).** `obdctl commit myimg --virtual-size <bytes>`
+  seals with that value as the layer's declared virtual size, so the
+  next `create` from this layer yields the larger device. The override
+  is grow-only: it must be a positive multiple of 512 and at least both
+  the layer's declared size and its content extent — a smaller value
+  fails with a precise error and the upper stays committable at its
+  declared size. (Deterministic output caveat: the virtual size feeds
+  the content digest, so a re-baselined seal hashes differently from an
+  identical-content seal at the old size.)
 
 ## Recording a prefetch trace (ADR-0013)
 
@@ -245,6 +254,83 @@ Runbook notes:
   file — created O_TRUNC at start — remains a 0-byte non-blob. Treat a
   lost window as "no trace" and record again.
 
+## Growing a device (D3: dev_size is the quota boundary)
+
+The ADR-0014 resize model treats `dev_size` as the hard quota boundary:
+**shrink is unsupported** — a device (and any layer derived from it)
+only ever grows. Growth is a three-step chain:
+
+1. **Resize the live device** — runtime headroom for the guest:
+   ```bash
+   obdctl resize myimg 17179869184        # 16 GiB, bytes
+   # → {"ok":true,"id":"myimg","size":17179869184}
+   ```
+   The device's grow-only executor validates against its current size
+   (a request at or below it fails with a "grow-only" error). For a
+   WRITABLE device it first grows the data plane (merged view + writable
+   top; docs/format.md), then issues the kernel's
+   `UBLK_U_CMD_UPDATE_SIZE` (docs/ublk.md). The size must be a positive
+   multiple of 512.
+2. **Grow the filesystem inside the device** (guest side, e.g.
+   `resize2fs`/`growpart` + fs-specific grow) to use the new capacity —
+   writes into the headroom now land in the writable upper.
+3. **Commit** so the growth is durable:
+   ```bash
+   obdctl commit myimg
+   # → {"ok":true,...,"path":".../overlaybd.rw","sha256":"<hex>","size":<bytes>}
+   ```
+   Because the live grow rewrote the upper's declared-size header (and
+   the graceful shutdown checkpointed at the same size), a PLAIN commit
+   seals the grown declared size — no `--virtual-size` needed. A later
+   `create` from that layer is created with the larger `dev_size`.
+   `commit --virtual-size <bytes>` remains the explicit re-baseline for
+   layers whose declared size was NOT grown live (e.g. a manually sealed
+   upper you want to re-declare larger).
+
+Contract and runbook notes:
+
+- **Grow-only everywhere.** Resize rejects a request at or below the
+  current device size; the writable layers' grow rejects below-current
+  requests (equal is an idempotent no-op); `create --virtual-size`
+  rejects an override below the assembled image size;
+  `commit --virtual-size` rejects an override below the layer's declared
+  size or its content extent. There is no shrink path.
+- **The data plane grows with the device (writable).** Online resize and
+  create-time `--virtual-size` extend the merged view AND the writable
+  top, so headroom writes are real data in the upper — and, for LSMT
+  uppers, durable at the next commit (see step 3). A read-only image has
+  no data plane to grow: its headroom is dev-size-only and reads past
+  the image's end are zero-filled.
+- **Recovery of a grown device.** The kernel keeps a grown device's
+  capacity across a crash-recovery respawn (ADR-0010) — USER_RECOVERY
+  never resets it and the replacement re-attaches without SET_PARAMS.
+  The replacement baselines its grow-only check against that real kernel
+  capacity (read via GET_PARAMS), so a post-recovery resize can never
+  silently shrink the gendisk. The unsealed LSMT-RW upper itself is
+  truncated on recovery (ADR-0008 — its pre-crash writes are gone), and
+  the fresh upper starts at the image's declared size; a grow resize
+  restores the larger window for new writes. Do not rely on a
+  resized-but-uncommitted device surviving a crash.
+- **Create-time headroom (optional).** `obdctl create myimg config.json
+  --virtual-size 17179869184` creates the device directly at the larger
+  size (sanctioned headroom) instead of the image's declared size — for
+  a writable image the writable upper is assembled at the override too.
+  Useful when you know the workload will grow the filesystem later.
+  Default remains dev_size = image-declared size. The override must be
+  a positive multiple of 512.
+- `obdctl resize <id> <size-bytes>` and the `--virtual-size` options
+  require supervisor protocol ≥ 4 (`hello`'s `features` lists
+  `"resize"`); against an older supervisor, `resize` is answered as a
+  clean `unknown cmd` protocol error.
+- **Requires a recent kernel driver** for the online grow itself:
+  `UBLK_U_CMD_UPDATE_SIZE` landed in the 6.16 development cycle; a
+  driver without it rejects the command with `ENOTSUPP` (524) on
+  pre-6.15 kernels, or `EOPNOTSUPP` (95) on 6.15+ (the resize reply
+  reports the failure — the kernel capacity is unchanged; the writable
+  data plane has already grown and the retry succeeds once the kernel
+  accepts the command). Create-time headroom and commit re-baseline need
+  no kernel support.
+
 ## Logging
 
 Logging goes to stderr (journald when run under systemd). The level comes
@@ -265,6 +351,11 @@ correlate by device id and by the supervisor's spawn logs.
 | `commit` fails with "no valid shutdown checkpoint" | The device crashed or was SIGKILLed instead of shutting down gracefully, so its LSMT-RW index never reached the disk. The unsealed upper is unsealable (ADR-0014); start over from the lowers. |
 | `commit` fails with "sparse uppers cannot be sealed" | Sparse uppers never seal (upstream parity, ADR-0014). Use `type: "lsmt"` uppers for content you intend to commit. |
 | `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard is supported only on writable devices (ADR-0009). |
+| `resize` fails with a "grow-only" error | The requested size is at or below the device's current capacity; shrink is unsupported (ADR-0014). Grow to a larger size, or create with `--virtual-size` headroom if you need to plan ahead. |
+| `resize` fails with an `UPDATE_SIZE`-related error (`ENOTSUPP` 524 or `EOPNOTSUPP` 95) | The kernel driver predates `UBLK_U_CMD_UPDATE_SIZE` (needs the 6.16 cycle; pre-6.15 drivers answer `ENOTSUPP` 524, 6.15+ answer `EOPNOTSUPP` 95); the kernel capacity is unchanged and a retry succeeds once the driver accepts the command. `create --virtual-size` and `commit --virtual-size` do not need kernel support. |
+| A grown device crashes and its replacement rejects any resize back down toward the image size | Correct: the kernel kept the grown capacity across USER_RECOVERY, and the replacement seeds its grow-only baseline from that real capacity (GET_PARAMS) — shrinking is unsupported (ADR-0014). The fresh upper starts at the image's declared size (ADR-0008); grow further, or destroy + re-create from a committed layer, to change the size. |
+| `create --virtual-size` fails with a grow-only error | The override is smaller than the image's declared size (that would shrink the device below its content). Use a larger value or drop the option. |
+| `commit --virtual-size` fails with a grow-only error | The override is below the layer's declared size or its content extent; the upper is untouched and still committable at its declared size. |
 
 ## Known operational limitations
 

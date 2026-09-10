@@ -51,7 +51,9 @@ public:
     /// or a negative -errno; -EROFS when already sealed or checkpointed.
     elio::coro::task<int> checkpoint() override;
 
-    uint64_t virtual_size() const override { return vsize_; }
+    uint64_t virtual_size() const override {
+        return vsize_.load(std::memory_order_acquire);
+    }
     const std::vector<bytes::segment_mapping>& segments() const override {
         return segments_;
     }
@@ -59,7 +61,16 @@ public:
     /// (unlike a LocalFileSource, which pins the size at open).
     source::BlobSource& data_source() override;
 
-    bool sealed() const noexcept { return sealed_; }
+    bool sealed() const noexcept {
+        return sealed_.load(std::memory_order_acquire);
+    }
+
+    /// D3 grow-only vsize extension (see WritableLayer::grow): also
+    /// rewrites the on-disk declared-size header (uuid preserved) so a
+    /// later checkpoint/offline seal stays consistent with the grown
+    /// size. BLOCKING (header rewrite + fsync): run off an Elio worker
+    /// via elio::spawn_blocking. Returns 0 or a negative -errno.
+    int grow(uint64_t vsize) override;
 
     /// Compacts and seals the file in place (atomic rename); afterwards it
     /// is a standard sealed LSMT RO file. Subsequent pwrite returns -EROFS.
@@ -74,10 +85,21 @@ public:
     /// -ENOENT when the file is missing, -EALREADY when it is already
     /// sealed, -EINVAL when it is not a valid checkpointed LSMT-RW file
     /// (e.g. the device crashed before checkpointing).
+    ///
+    /// D3 commit re-baseline: `virtual_size` (bytes, 0 = keep the
+    /// checkpointed size) overrides the virtual size written into the
+    /// sealed header/trailer (and hashed into the content digest), so a
+    /// commit can declare a larger device. Grow-only, validated here
+    /// before any compaction: the override must be 512-aligned and at
+    /// least both the layer's declared virtual size and its content
+    /// extent (the highest covered sector). A rejected override returns
+    /// -EINVAL with a human-readable reason in `reject` (when non-null).
     static elio::coro::task<int> seal_file(const std::string& path,
                                            const std::string& user_tag,
                                            std::string* sha256_hex,
-                                           uint64_t* size);
+                                           uint64_t* size,
+                                           uint64_t virtual_size = 0,
+                                           std::string* reject = nullptr);
 
 private:
     LsmtRwLayer() = default;
@@ -92,12 +114,22 @@ private:
     class View;                     // fd-backed BlobSource with dynamic size
     std::unique_ptr<View> view_;
     std::atomic<uint64_t> data_bytes_{0};  // upper bound for view reads
-    uint64_t vsize_ = 0;            // bytes
+    /// Declared size in bytes. Atomic: the device resize executor (a
+    /// spawn_blocking pool thread) grows the layer while bridge
+    /// coroutines on Elio workers read/write through it.
+    std::atomic<uint64_t> vsize_{0};
     uint64_t data_end_sector_ = 0;  // append position, sectors
     std::string uuid_;
     std::string path_;
-    bool sealed_ = false;
-    bool checkpointed_ = false;  // terminal: no more pwrite/discard
+    /// Terminal-state flags. ATOMIC on purpose: grow() runs on a
+    /// spawn_blocking pool thread (the device resize executor) while
+    /// checkpoint()/seal() — which set them — run on Elio workers, the
+    /// same cross-thread class the vsize_ atomic covers. Invariant:
+    /// once either is set, no pwrite/discard/grow may mutate the layer
+    /// (they return -EROFS), so the on-disk header can never be
+    /// rewritten after the shutdown checkpoint. (No TSAN in this build.)
+    std::atomic<bool> sealed_{false};
+    std::atomic<bool> checkpointed_{false};  // terminal: no more pwrite/discard
     std::vector<bytes::segment_mapping> segments_;
 };
 

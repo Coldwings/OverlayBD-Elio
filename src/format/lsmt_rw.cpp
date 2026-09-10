@@ -6,6 +6,7 @@
 #include "format/writer.hpp"  // generate_uuid
 
 #include <elio/io/io_awaitables.hpp>
+#include <elio/log/macros.hpp>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -155,7 +156,7 @@ elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
 
     auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer);
     layer->fd_ = fd;
-    layer->vsize_ = vsize;
+    layer->vsize_.store(vsize, std::memory_order_release);
     layer->data_end_sector_ = kHeaderSectors;
     layer->uuid_ = generate_uuid();
     layer->path_ = path;
@@ -177,13 +178,89 @@ elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
     co_return layer;
 }
 
+int LsmtRwLayer::grow(uint64_t vsize) {
+    // D3 grow-only vsize extension. BLOCKING (a 4096B header rewrite plus
+    // fsync on fd_): callers must run this off an Elio worker via
+    // elio::spawn_blocking — the device resize executor does. Grow-only:
+    // an equal request is an idempotent no-op (retried grows after a
+    // partial kernel failure land here); smaller is a shrink and is
+    // rejected.
+    if (sealed_.load(std::memory_order_acquire) ||
+        checkpointed_.load(std::memory_order_acquire)) {
+        return -EROFS;
+    }
+    if (vsize == 0 || vsize % kSector != 0) return -EINVAL;
+    const uint64_t cur = vsize_.load(std::memory_order_acquire);
+    if (vsize < cur) return -EINVAL;  // grow-only (equal = no-op)
+    if (vsize == cur) return 0;
+    // Rebuild the on-disk header (the 4096B region at offset 0) with the
+    // new declared size, preserving the uuid/flags exactly as create()
+    // wrote them. This keeps the checkpoint-vs-header cross-check and the
+    // offline seal (open_checkpointed/seal_file) consistent after a live
+    // grow: the graceful-shutdown checkpoint later writes a trailer at
+    // the same grown size, and a plain commit then seals that declared
+    // size without any --virtual-size override.
+    //
+    // Failure atomicity: the checkpoint trailer is written from vsize_,
+    // and open_checkpointed rejects a header/trailer pair whose virtual
+    // sizes disagree — so a header rewritten to M while vsize_ stays N
+    // would make the upper UNCOMMITTABLE. Therefore: back the header up
+    // first, and on ANY failure restore it and leave vsize_ untouched.
+    uint8_t backup[4096];
+    if (::pread(fd_, backup, sizeof(backup), 0) !=
+        static_cast<ssize_t>(sizeof(backup))) {
+        return -EIO;  // cannot guarantee rollback: do not touch anything
+    }
+    uint8_t region[4096];
+    std::memset(region, 0, sizeof(region));
+    const auto ht =
+        make_ht(/*header=*/true, /*sealed=*/false, 0, 0, vsize, uuid_, "");
+    ht.serialize(region);
+    // A SHORT write is a hard error: errno may be stale (or 0) after a
+    // partial ::pwrite, so it is never trusted here.
+    if (::pwrite(fd_, region, sizeof(region), 0) !=
+        static_cast<ssize_t>(sizeof(region))) {
+        if (::pwrite(fd_, backup, sizeof(backup), 0) !=
+            static_cast<ssize_t>(sizeof(backup))) {
+            ELIO_LOG_ERROR(
+                "lsmt rw grow: header restore FAILED after a short write; "
+                "{} may no longer be committable (header inconsistent)",
+                path_);
+        } else {
+            ::fsync(fd_);
+        }
+        return -EIO;
+    }
+    if (::fsync(fd_) != 0) {
+        const int e = errno;
+        if (::pwrite(fd_, backup, sizeof(backup), 0) !=
+            static_cast<ssize_t>(sizeof(backup))) {
+            ELIO_LOG_ERROR(
+                "lsmt rw grow: header restore FAILED after fsync error; "
+                "{} may no longer be committable (header inconsistent)",
+                path_);
+        } else {
+            ::fsync(fd_);
+        }
+        return -e;
+    }
+    // Header on disk and in-memory state transition together, only after
+    // the new header is durable.
+    vsize_.store(vsize, std::memory_order_release);
+    return 0;
+}
+
 elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
                                               uint64_t offset) {
-    if (sealed_ || checkpointed_) co_return -EROFS;
+    if (sealed_.load(std::memory_order_acquire) ||
+        checkpointed_.load(std::memory_order_acquire)) {
+        co_return -EROFS;
+    }
     if (offset % kSector != 0 || count % kSector != 0 || count == 0) {
         co_return -EINVAL;
     }
-    if (offset + count > vsize_) co_return -EINVAL;
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset + count > cur_vsize) co_return -EINVAL;
 
     const uint8_t* src = static_cast<const uint8_t*>(buf);
     size_t done = 0;
@@ -275,8 +352,9 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
 elio::coro::task<ssize_t> LsmtRwLayer::pread(void* buf, size_t count,
                                              uint64_t offset) {
     if (offset % kSector != 0 || count % kSector != 0) co_return -EINVAL;
-    if (offset >= vsize_) co_return 0;
-    if (count > vsize_ - offset) count = static_cast<size_t>(vsize_ - offset);
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset >= cur_vsize) co_return 0;
+    if (count > cur_vsize - offset) count = static_cast<size_t>(cur_vsize - offset);
     uint8_t* out = static_cast<uint8_t*>(buf);
     size_t done = 0;
     while (done < count) {
@@ -314,11 +392,15 @@ elio::coro::task<ssize_t> LsmtRwLayer::pread(void* buf, size_t count,
 }
 
 elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
-    if (sealed_ || checkpointed_) co_return -EROFS;
+    if (sealed_.load(std::memory_order_acquire) ||
+        checkpointed_.load(std::memory_order_acquire)) {
+        co_return -EROFS;
+    }
     if (offset % kSector != 0 || len % kSector != 0 || len == 0) {
         co_return -EINVAL;
     }
-    if (offset + len > vsize_) co_return -EINVAL;
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset + len > cur_vsize) co_return -EINVAL;
     const uint64_t lo = offset / kSector;
     const uint64_t hi = lo + len / kSector;
 
@@ -371,7 +453,10 @@ elio::coro::task<int> LsmtRwLayer::flush() {
 }
 
 elio::coro::task<int> LsmtRwLayer::checkpoint() {
-    if (sealed_ || checkpointed_) co_return -EROFS;
+    if (sealed_.load(std::memory_order_acquire) ||
+        checkpointed_.load(std::memory_order_acquire)) {
+        co_return -EROFS;
+    }
 
     // Appended at the data end: index (SegmentMapping array, padded to
     // 4096B) | unsealed trailer (4096B). The trailer sits in the file's
@@ -397,8 +482,9 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
     uint8_t region[4096];
     std::memset(region, 0, sizeof(region));
     const auto trailer = make_ht(/*header=*/false, /*sealed=*/false,
-                                 index_offset, index_size, vsize_, uuid_,
-                                 "");
+                                 index_offset, index_size,
+                                 vsize_.load(std::memory_order_acquire),
+                                 uuid_, "");
     trailer.serialize(region);
     rc = co_await write_all(fd_, region, sizeof(region),
                             index_offset + index_region);
@@ -406,12 +492,12 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
     if (::fdatasync(fd_) != 0) co_return -errno;
     data_bytes_.store(index_offset + index_region + sizeof(region),
                       std::memory_order_release);
-    checkpointed_ = true;
+    checkpointed_.store(true, std::memory_order_release);
     co_return 0;
 }
 
 elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
-    if (sealed_) co_return -EROFS;
+    if (sealed_.load(std::memory_order_acquire)) co_return -EROFS;
 
     // Compaction: live segments are copied out packed sequentially; the
     // garbage left behind by in-place edits is dropped. The tmp name is
@@ -431,9 +517,12 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     // content digest sha256(vsize as LE u64 || packed data bytes in
     // segment order || packed index entries as stored). user_tag is
     // caller input and deliberately excluded from the digest.
+    // One consistent load: the same value feeds the content digest and
+    // the header/trailer writes below (deterministic seal output).
+    const uint64_t seal_vsize = vsize_.load(std::memory_order_acquire);
     common::Sha256 content_hash;
     uint8_t vsize_le[8];
-    bytes::store_u64_le(vsize_le, vsize_);
+    bytes::store_u64_le(vsize_le, seal_vsize);
     content_hash.update(vsize_le, sizeof(vsize_le));
     for (const auto& s : segments_) {
         bytes::segment_mapping m = s;
@@ -488,7 +577,7 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
 
         std::memset(region, 0, sizeof(region));
         const auto header = make_ht(true, true, index_offset, index_size,
-                                    vsize_, uuid_, user_tag);
+                                    seal_vsize, uuid_, user_tag);
         header.serialize(region);
         rc = co_await write_all(out_fd, region, sizeof(region), 0);
         if (rc != 0) goto out;
@@ -499,7 +588,7 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
 
         std::memset(region, 0, sizeof(region));
         const auto trailer = make_ht(false, true, index_offset, index_size,
-                                     vsize_, uuid_, user_tag);
+                                     seal_vsize, uuid_, user_tag);
         trailer.serialize(region);
         rc = co_await write_all(out_fd, region, sizeof(region),
                                 index_offset + index_region);
@@ -516,7 +605,7 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
         goto out;
     }
     segments_ = std::move(packed);
-    sealed_ = true;
+    sealed_.store(true, std::memory_order_release);
     {
         struct stat st {};
         if (::fstat(fd_, &st) == 0) {
@@ -662,11 +751,13 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
 
     auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer());
     layer->fd_ = fd;
-    layer->vsize_ = tht.virtual_size;
+    layer->vsize_.store(tht.virtual_size,
+                             std::memory_order_release);
     layer->data_end_sector_ = tht.index_offset / kSector;
     layer->uuid_ = tht.uuid;
     layer->path_ = path;
-    layer->checkpointed_ = true;  // terminal: no more pwrite/discard
+    // terminal: no more pwrite/discard
+    layer->checkpointed_.store(true, std::memory_order_release);
     layer->segments_ = std::move(segments);
     layer->data_bytes_.store(static_cast<uint64_t>(st.st_size),
                              std::memory_order_release);
@@ -678,10 +769,56 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
 elio::coro::task<int> LsmtRwLayer::seal_file(const std::string& path,
                                              const std::string& user_tag,
                                              std::string* sha256_hex,
-                                             uint64_t* size) {
+                                             uint64_t* size,
+                                             uint64_t virtual_size,
+                                             std::string* reject) {
     int err = 0;
     auto layer = co_await open_checkpointed(path, &err);
     if (!layer) co_return err;
+    if (virtual_size > 0) {
+        // D3 commit re-baseline: grow-only vs the layer's declared size
+        // AND its content extent (the highest covered sector end — the
+        // checkpoint index is loaded by open_checkpointed). An override
+        // smaller than either would re-baseline below existing content
+        // or below what the layer already declares (shrink), which is
+        // rejected here with a precise reason BEFORE any compaction, so
+        // the upper stays committable at the declared size.
+        if (virtual_size % kSector != 0) {
+            if (reject != nullptr) {
+                *reject = "commit virtual_size must be a positive multiple "
+                          "of 512 bytes";
+            }
+            co_return -EINVAL;
+        }
+        const uint64_t declared = layer->virtual_size();
+        if (virtual_size < declared) {
+            if (reject != nullptr) {
+                *reject = "commit virtual_size " +
+                          std::to_string(virtual_size) +
+                          " is smaller than the layer's declared size " +
+                          std::to_string(declared) +
+                          " (grow-only re-baseline)";
+            }
+            co_return -EINVAL;
+        }
+        uint64_t content_extent = 0;
+        for (const auto& s : layer->segments()) {
+            content_extent = std::max(content_extent, s.end() * kSector);
+        }
+        if (virtual_size < content_extent) {
+            if (reject != nullptr) {
+                *reject = "commit virtual_size " +
+                          std::to_string(virtual_size) +
+                          " is smaller than the layer's content extent " +
+                          std::to_string(content_extent) +
+                          " (grow-only re-baseline)";
+            }
+            co_return -EINVAL;
+        }
+        // The seal writes header/trailer and hashes virtual_size from
+        // the layer's vsize_ member; re-baseline by overriding it.
+        layer->vsize_.store(virtual_size, std::memory_order_release);
+    }
     const int rc = co_await layer->seal(user_tag);
     if (rc != 0) co_return rc;
     layer.reset();  // seal renamed over path; drop the stale inode's fd

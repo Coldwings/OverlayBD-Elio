@@ -42,7 +42,7 @@ elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
 
     auto layer = std::unique_ptr<SparseRwLayer>(new SparseRwLayer);
     layer->fd_ = fd;
-    layer->vsize_ = vsize;
+    layer->vsize_.store(vsize, std::memory_order_release);
     layer->ro_ = co_await source::LocalFileSource::open(path);
 
     if (!fresh) {
@@ -104,12 +104,27 @@ void SparseRwLayer::insert_extent(uint64_t off, uint64_t len) {
     segments_.swap(out);
 }
 
+int SparseRwLayer::grow(uint64_t vsize) {
+    // D3 grow-only vsize extension. BLOCKING (ftruncate): callers must
+    // run this off an Elio worker via elio::spawn_blocking — the device
+    // resize executor does. Equal is an idempotent no-op (retried grows);
+    // smaller is a shrink and is rejected.
+    if (vsize == 0 || vsize % kSector != 0) return -EINVAL;
+    const uint64_t cur = vsize_.load(std::memory_order_acquire);
+    if (vsize < cur) return -EINVAL;  // grow-only (equal = no-op)
+    if (vsize == cur) return 0;
+    if (::ftruncate(fd_, static_cast<off_t>(vsize)) != 0) return -errno;
+    vsize_.store(vsize, std::memory_order_release);
+    return 0;
+}
+
 elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
                                                 uint64_t offset) {
     if (offset % kSector != 0 || count % kSector != 0 || count == 0) {
         co_return -EINVAL;
     }
-    if (offset + count > vsize_) co_return -EINVAL;
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset + count > cur_vsize) co_return -EINVAL;
     const uint8_t* p = static_cast<const uint8_t*>(buf);
     size_t done = 0;
     while (done < count) {
@@ -130,8 +145,9 @@ elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
 elio::coro::task<ssize_t> SparseRwLayer::pread(void* buf, size_t count,
                                                uint64_t offset) {
     if (offset % kSector != 0 || count % kSector != 0) co_return -EINVAL;
-    if (offset >= vsize_) co_return 0;
-    if (count > vsize_ - offset) count = static_cast<size_t>(vsize_ - offset);
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset >= cur_vsize) co_return 0;
+    if (count > cur_vsize - offset) count = static_cast<size_t>(cur_vsize - offset);
     uint8_t* out = static_cast<uint8_t*>(buf);
     size_t done = 0;
     while (done < count) {
@@ -177,7 +193,8 @@ elio::coro::task<int> SparseRwLayer::discard(uint64_t offset, uint64_t len) {
     if (offset % kSector != 0 || len % kSector != 0 || len == 0) {
         co_return -EINVAL;
     }
-    if (offset + len > vsize_) co_return -EINVAL;
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset + len > cur_vsize) co_return -EINVAL;
     // Real deallocation: the blocks return to the filesystem and the range
     // reads back as zeroes. Metadata-only syscall (same duration class as
     // the fdatasync in flush()).

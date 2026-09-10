@@ -4,6 +4,7 @@
 #include "image/config.hpp"
 #include "image/image_file.hpp"
 #include "format/merged_writable.hpp"
+#include "common/errors.hpp"
 #include "supervisor/device_control.hpp"
 #include "supervisor/protocol.hpp"
 
@@ -16,13 +17,18 @@
 #include <elio/log/macros.hpp>
 #include <elio/runtime/async_main.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
 
 #include <sys/socket.h>
 
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <unistd.h>
 
@@ -31,7 +37,7 @@ namespace {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --config PATH [--global PATH] [--control-fd N] "
-                 "[--dev-id N] [--recover]\n",
+                 "[--dev-id N] [--recover] [--virtual-size BYTES]\n",
                  argv0);
 }
 
@@ -41,6 +47,9 @@ struct Args {
     int control_fd = -1;
     int dev_id = -1;
     bool recover = false;  // ADR-0010: attach to an existing device
+    /// D3 create-time headroom: dev_size override in bytes (0 = derive
+    /// from the image's declared virtual size).
+    uint64_t virtual_size = 0;
 };
 
 void report(const obd::supervisor::ControlChannelWriterPtr& channel,
@@ -69,7 +78,16 @@ elio::coro::task<int> device_main(Args args) {
         const obd::image::ImageConfig img =
             obd::image::ImageConfig::from_file(args.config, global.download);
 
-        auto opened = co_await obd::image::open_image(img, global);
+        // D3 create-time headroom (--virtual-size, bytes): for a WRITABLE
+        // image the override is threaded into open_image, which sizes the
+        // writable top — and hence the merged DATA PLANE — to the
+        // override (grow-only vs the image's declared size, rejected
+        // inside open_image with the single-source rule). A read-only
+        // image ignores the override in assembly: its headroom is
+        // dev-size-only, validated below with device_capacity_bytes (reads
+        // past the image's end are zero-filled by the bridge).
+        auto opened = co_await obd::image::open_image(
+            img, global, args.virtual_size);
         if (opened.virtual_size == 0 || opened.virtual_size % 512 != 0) {
             ELIO_LOG_ERROR("image virtual size {} is not sector aligned",
                            opened.virtual_size);
@@ -77,24 +95,59 @@ elio::coro::task<int> device_main(Args args) {
                                       "virtual size not sector aligned"});
             co_return 1;
         }
+        uint64_t dev_bytes = opened.virtual_size;
+        if (args.virtual_size > 0) {
+            if (args.virtual_size % 512 != 0) {
+                ELIO_LOG_ERROR(
+                    "virtual-size override {} is not sector aligned",
+                    args.virtual_size);
+                report(channel, DeviceStatus{"failed", "",
+                                          "virtual_size not sector aligned"});
+                co_return 1;
+            }
+            if (!opened.writable) {
+                std::string cap_error;
+                dev_bytes = obd::image::device_capacity_bytes(
+                    opened.virtual_size, args.virtual_size, &cap_error);
+                if (dev_bytes == 0) {
+                    ELIO_LOG_ERROR("virtual-size override rejected: {}",
+                                   cap_error);
+                    report(channel, DeviceStatus{"failed", "", cap_error});
+                    co_return 1;
+                }
+            }
+            // Writable: opened.virtual_size already reflects the override
+            // (open_image grew the data plane), so dev_bytes stays as-is.
+        }
 
         obd::ublk::DeviceParams params;
-        params.dev_sectors = opened.virtual_size / 512;
+        params.dev_sectors = dev_bytes / 512;
         params.read_only = !opened.writable;  // ADR-0008
         params.enable_recovery = global.ublk_recovery;  // ADR-0010
         if (args.dev_id >= 0) {
             params.dev_id = static_cast<uint32_t>(args.dev_id);
         }
-        // ADR-0014: keep a handle on the writable top so the graceful-
-        // shutdown path can checkpoint it (persist its index) after the
-        // queues drain, enabling the supervisor's offline commit.
+        // ADR-0014: keep a handle on the writable top (checkpointed on
+        // graceful shutdown, enabling the supervisor's offline commit)
+        // and on the merged root itself — the D3 resize executor grows
+        // the merged data plane through it. Both pointers are owned by
+        // `dev` below (it takes the source chain); the executor holds a
+        // shared_ptr to `dev`, so they cannot dangle (FIX: refcounted
+        // lifetime, no TOCTOU seam).
         obd::format::WritableLayer* writable_top = nullptr;
+        obd::format::MergedWritable* merged_root = nullptr;
         if (opened.writable) {
             auto* mw = dynamic_cast<obd::format::MergedWritable*>(
                 opened.root.get());
-            if (mw != nullptr) writable_top = &mw->writable_top();
+            if (mw != nullptr) {
+                merged_root = mw;
+                writable_top = &mw->writable_top();
+            }
         }
-        std::unique_ptr<obd::ublk::Device> dev;
+        // Refcounted: the control coroutine below captures a copy, so a
+        // resize in flight can never outlive the Device (destroyed only
+        // when the LAST reference drops, after the control loop exits).
+        std::shared_ptr<obd::ublk::Device> dev;
         if (args.recover) {
             // ADR-0010: replace a crashed server for an existing device.
             if (args.dev_id < 0) {
@@ -111,13 +164,61 @@ elio::coro::task<int> device_main(Args args) {
         }
         report(channel, DeviceStatus{"ready", dev->bdev_path(), ""});
 
-        // ADR-0013 record path: serve the supervisor's trace commands on
-        // the control channel (EOF = supervisor gone; the loop exits and
-        // the device keeps serving).
-        if (channel && opened.recorder) {
-            elio::go([channel,
-                      rec = opened.recorder]() -> elio::coro::task<void> {
-                co_await obd::supervisor::run_trace_control(channel, rec);
+        // Serve the supervisor's device commands (ADR-0013 trace record
+        // path, D3 resize) on the control channel (EOF = supervisor
+        // gone; the loop exits and the device keeps serving). The loop
+        // may outlive this coroutine's frame, so everything it touches
+        // is refcounted: channel, recorder, and `dev` (a shared_ptr copy
+        // keeps the Device — and the source chain it owns, including
+        // merged_root/writable_top — alive until the loop exits; a
+        // resize in flight inside spawn_blocking therefore can never
+        // dereference a destroyed Device). recorder may be null
+        // (recorder-less images) — trace commands are answered
+        // "unavailable" while resize still works.
+        // D3 shutdown guard, shared with the resize executor seam: set
+        // BEFORE dev->stop() below. Once the graceful shutdown has
+        // begun, the shutdown checkpoint writes (or has written) the
+        // upper's trailer at the CURRENT size — a resize landing in the
+        // window up to the channel EOF would rewrite the on-disk
+        // declared-size header to a different size and leave the
+        // header/trailer pair inconsistent, i.e. the upper
+        // UNCOMMITTABLE. The guard makes every ordering safe: a grow
+        // that completes before this point is followed by a checkpoint
+        // at the grown size (consistent), and everything after it is
+        // rejected cleanly.
+        auto stopping = std::make_shared<std::atomic<bool>>(false);
+        // Serializes an in-flight grow against the shutdown checkpoint:
+        // the shutdown path sets `stopping` and then drains this gate, so
+        // a grow can never rewrite the layer's declared-size header after
+        // the checkpoint wrote its trailer at the old size.
+        auto resize_gate = std::make_shared<std::mutex>();
+        if (channel) {
+            obd::supervisor::DeviceControlHooks hooks;
+            // D3 resize executor seam (built by make_resize_apply so the
+            // ordering + shutdown contract are unit-tested without a
+            // device): grow-only is enforced by the command loop against
+            // current_size BEFORE any IO; apply (a) rejects when the
+            // device is shutting down, (b) grows the writable DATA PLANE
+            // — so writes into the headroom land in the upper and commit
+            // can seal them — then (c) issues the blocking ublk
+            // UPDATE_SIZE. The loop runs apply via spawn_blocking, per
+            // the ublk control-plane rule; the layer grows are BLOCKING
+            // by design and run on that same pool thread.
+            hooks.resize.current_size =
+                [dev]() -> uint64_t { return dev->size_bytes(); };
+            hooks.resize.apply_resize = obd::supervisor::make_resize_apply(
+                stopping, resize_gate,
+                merged_root != nullptr
+                    ? std::function<int(uint64_t)>(
+                          [merged_root](uint64_t bytes) {
+                              return merged_root->grow(bytes);
+                          })
+                    : std::function<int(uint64_t)>(),
+                [dev](uint64_t bytes) { return dev->resize_blocking(bytes); });
+            elio::go([channel, rec = opened.recorder, hooks]() mutable
+                     -> elio::coro::task<void> {
+                co_await obd::supervisor::run_device_control(channel, rec,
+                                                             hooks);
             });
         }
 
@@ -132,6 +233,20 @@ elio::coro::task<int> device_main(Args args) {
             }
         }
         ELIO_LOG_INFO("device {} shutting down", dev->bdev_path());
+        // Refuse further resizes from here on: the checkpoint below
+        // writes its trailer at the current size, so a grow after this
+        // point would desynchronize the on-disk header (see the guard's
+        // comment where it is created). Set BEFORE stop().
+        stopping->store(true, std::memory_order_release);
+        // Drain the resize gate: taking and releasing it waits for a grow
+        // already IN FLIGHT (which holds it for its whole duration) and,
+        // because every apply re-checks `stopping` while holding it,
+        // guarantees that no grow is running — or can start — from here
+        // through the checkpoint below. Off-worker: the wait is bounded
+        // by one grow's 4K header write + fsync.
+        co_await elio::spawn_blocking([&] {
+            std::lock_guard<std::mutex> drain(*resize_gate);
+        });
         dev->stop();
         // ADR-0013: finalize any active trace recording BEFORE the source
         // chain can go away (the taps feed the recorder; a shutdown
@@ -157,6 +272,11 @@ elio::coro::task<int> device_main(Args args) {
         // Park background fills before the source chain is destroyed
         // (the LayerStore lifetime contract; no-op when fill is off).
         co_await obd::image::park_image_fills(opened);
+        // Drop this coroutine's reference to the Device. The control
+        // loop holds its own shared_ptr copy until it sees the channel
+        // EOF below, so the Device and its source chain are destroyed
+        // only after that — no resize in flight can ever touch a dead
+        // object (the loop exits on EOF, then the last reference drops).
         dev.reset();
         report(channel, DeviceStatus{"stopped", "", ""});
         // Unblock the trace control loop only AFTER the checkpoint and
@@ -199,6 +319,26 @@ int main(int argc, char** argv) {
         else if (a == "--control-fd")
             args.control_fd = std::stoi(next("--control-fd"));
         else if (a == "--dev-id") args.dev_id = std::stoi(next("--dev-id"));
+        else if (a == "--virtual-size") {
+            // Byte count via strtoull (std::stoull would throw on bad
+            // input): negative wraps through unsigned — reject it
+            // explicitly; the positive/alignment/grow-only semantic
+            // checks live in device_main where sizes are comparable.
+            const std::string vs = next("--virtual-size");
+            const char* v = vs.c_str();
+            if (v[0] == '-') {
+                std::fprintf(stderr, "invalid --virtual-size '%s'\n", v);
+                return 2;
+            }
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long b = std::strtoull(v, &end, 10);
+            if (errno != 0 || end == v || *end != '\0') {
+                std::fprintf(stderr, "invalid --virtual-size '%s'\n", v);
+                return 2;
+            }
+            args.virtual_size = b;
+        }
         else if (a == "--recover") args.recover = true;
         else if (a == "--help" || a == "-h") {
             usage(argv[0]);

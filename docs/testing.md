@@ -225,7 +225,43 @@ Every test, grouped by area, with the property it guards.
 - `format: trace writer enforces the conforming-writer contract` — count 0
   and > 1 MiB, op 'W', and negative offsets are rejected
   (trace-format.md §10 rule 4).
-
+- `format: offline seal rejects a virtual_size below the declared size` —
+  the D3 commit re-baseline rejection side: `seal_file` with a
+  `virtual_size` override smaller than the layer's declared size (or
+  misaligned) returns `-EINVAL` with a precise reason BEFORE any
+  compaction, and the upper stays committable at its declared size
+  (ADR-0014).
+- `format: offline seal re-baselines the sealed virtual size grow-only` —
+  the D3 commit re-baseline acceptance side: an override at least the
+  declared size (and content extent) is written into the sealed
+  header/trailer and content digest, and the sealed layer re-opens with
+  the larger declared size and byte-exact content (ADR-0014).
+- `format: lsmt rw grow extends the write window and persists the size` —
+  the D3 data-plane grow for the LSMT upper: after `grow()`, pwrite
+  into the region past the original declared size succeeds and reads
+  back; shrink/misaligned grow requests are rejected (equal is an
+  idempotent no-op); the on-disk declared-size header is rewritten, so
+  a checkpoint and a plain offline seal stay consistent and the sealed
+  layer re-opens at the grown size with both content regions intact
+  (ADR-0014).
+- `format: sparse layer grow extends the write window` — the D3 grow for
+  the sparse upper (ftruncate): pwrite/pread accept the new range and
+  shrink is rejected (ADR-0014).
+- `format: merged writable grows with its writable top` — the D3 merged-
+  view grow: `MergedWritable::grow` extends the writable top first and
+  then the merged view; pwrite/discard accept the grown range, an
+  unwritten headroom gap reads as zeroes, and shrink is rejected
+  (ADR-0014).
+- `image: writable assembly grows to the virtual_size headroom override` —
+  `open_image(..., override)` on the real writable assembly path sizes
+  the writable top — and hence the merged data plane — at the override:
+  writes past the lowers' content into the headroom land in the upper
+  and read back through the merge (D3; ADR-0014).
+- `format: offline seal rejects a virtual_size below the content extent` —
+  the D3 re-baseline content-extent guard on a synthetic fixture whose
+  checkpointed declared size was patched below its real content extent:
+  the seal rejects with the precise "content extent" grow-only reason
+  (ADR-0014).
 ### source
 
 - `source: tar adapter detects ustar wrapper and skips the header` — a
@@ -523,7 +559,11 @@ Every test, grouped by area, with the property it guards.
   `prefetch.enable = false` no structural warm-up runs (stats zero)
   while the device assembles and reads byte-exactly; enabled, the local
   lower's merged window is populated (ADR-0012).
-
+- `image: device capacity honors the virtual_size headroom override grow-only` —
+  `device_capacity_bytes` (D3 create-time headroom): no override = the
+  image's declared size; an override >= the image size is sanctioned
+  headroom (equal is a no-op); a smaller override is rejected with a
+  grow-only reason (ADR-0014).
 ### ublk
 
 - `ublk: command buffer geometry matches the driver layout` — the
@@ -534,7 +574,13 @@ Every test, grouped by area, with the property it guards.
 - `ublk: recovery feature flags follow device params` — `dev_info_flags`
   adds `UBLK_F_USER_RECOVERY | _REISSUE` exactly when
   `DeviceParams::enable_recovery` is set (ADR-0010).
-
+- `integration: ublk device grows online and serves the new capacity` —
+  the D3 privileged E2E: `Device::resize_blocking` issues
+  `UBLK_U_CMD_UPDATE_SIZE`, the kernel gendisk reports the new
+  capacity, and the original content still reads back; shrink attempts
+  are rejected device-side before any kernel IO. Self-skips without
+  `/dev/ublk-control` or on kernels whose driver lacks the command (it
+  landed in the 6.16 cycle).
 ### supervisor
 
 - `supervisor: protocol commands parse and reject garbage` — the
@@ -584,7 +630,45 @@ Every test, grouped by area, with the property it guards.
   an EPIPE (the supervisor vanishing mid-write) is reported as a dropped
   line (false) instead of SIGPIPE-terminating the process: sockets are
   written via `send(MSG_NOSIGNAL)` (ADR-0013).
-
+- `supervisor: resize command parses and validates its fields` — the D3
+  resize command requires a string `id` and a non-negative integer
+  `size` (bytes); wrong-typed, negative, or float `size` are clean
+  parse-time protocol errors, and the `hello` reply advertises the
+  `resize` feature with the protocol version bumped by the D3 batch
+  (ADR-0014).
+- `supervisor: create virtual_size override parses and validates` — the
+  D3 headroom override is an optional non-negative integer on `create`;
+  other types are clean parse-time errors (grow-only/alignment live in
+  the handlers) (ADR-0014).
+- `supervisor: commit virtual_size override parses and validates` — the
+  D3 re-baseline override is an optional non-negative integer on
+  `commit`; other types are clean parse-time errors (the grow-only
+  rules need the checkpoint, so they live in the seal path)
+  (ADR-0014).
+- `supervisor: device resize executor grows and rejects shrink or no-op` —
+  the device-side `run_device_control` "resize" branch over a real
+  socketpair: a grow is applied once (seq echoed, new size reported),
+  an equal (no-op) or smaller (shrink) request is a clean ok:false
+  "grow-only" reply that never reaches the apply seam, misaligned
+  sizes are clean errors, and a recorder-less device still serves
+  resize while trace commands answer "unavailable" (D3; ADR-0014).
+- `supervisor: device resize answers unsupported without a seam and survives malformed sizes` —
+  the same loop: a device without a resize executor seam answers resize
+  with a clean "unsupported" error; wrong-typed `size` (float, negative,
+  missing) are clean error replies — never an exception escaping the
+  loop — and a valid grow afterwards proves the loop stayed alive (D3).
+- `supervisor: resize executor grows the data plane first and rejects during shutdown` —
+  `make_resize_apply` (the exact closure obd-device installs as its
+  resize seam), tested without a device or kernel: it grows the writable
+  data plane BEFORE the kernel gendisk, passes a read-only image
+  straight to the kernel grow, surfaces a data-plane failure without
+  touching the kernel and a kernel failure without swallowing it, and —
+  once the shutdown flag is set — rejects with
+  `ECANCELED`/"device is shutting down" WITHOUT calling either grow
+  (the guard that keeps a post-checkpoint header rewrite from making the
+  upper uncommittable), the gate serializes concurrent applies so the
+  shutdown path can drain an in-flight grow before checkpointing, and a
+  malformed construction is refused (D3).
 ### integration
 
 - `integration: layered stack stages over a mock registry` — the full
@@ -729,3 +813,34 @@ Every test, grouped by area, with the property it guards.
   START/END_USER_RECOVERY handshake and keeps serving reads
   (ADR-0010; self-skips without ublk or on kernels without the
   feature).
+- `supervisor: resize grows a device and rejects shrink or no-op cleanly` —
+  a real daemon with the fake obd-device (which serves the device
+  command channel and executes resize grow-only without a kernel):
+  unknown ids, wrong-typed `size`, and misaligned sizes are clean
+  errors; a grow replies with the new size and id; a resize to the
+  current size or smaller is rejected grow-only (D3; ADR-0014). Runs
+  without privileges.
+- `supervisor: create virtual_size headroom override is validated grow-only` —
+  the same daemon/fake pair: a create override smaller than the image's
+  declared size fails create with the grow-only message (the device
+  validates, where the assembled size is known), an override larger
+  than the image creates fine and that device stays grow-only
+  (D3; ADR-0014). Runs without privileges.
+- `supervisor: commit virtual_size re-baselines the sealed layer grow-only` —
+  the same daemon/fake pair: a commit override below the layer's
+  declared size is rejected with a precise grow-only reason, and an
+  override at least the declared size seals with the override in the
+  header (verified by re-opening the sealed layer) (D3; ADR-0014).
+  Runs without privileges.
+- `supervisor: resize of a writable device grows its data plane and persists it` —
+  a real daemon with the fake obd-device: a resize grows the fake's
+  writable layer through the REAL format grow path, and a subsequent
+  plain commit seals the grown declared size — the data plane grew with
+  the device and the growth is durable at commit (D3; ADR-0014). Runs
+  without privileges.
+- `supervisor: create virtual_size headroom sizes the writable upper` —
+  the same daemon/fake pair: a create with `--virtual-size` assembles
+  the writable upper at the override (like the real device's writable
+  assembly), so a plain commit seals that declared size — the headroom
+  reaches the data plane, not just the device size (D3; ADR-0014). Runs
+  without privileges.

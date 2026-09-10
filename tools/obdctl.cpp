@@ -23,14 +23,16 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage:\n"
                  "  %s [--socket PATH] hello\n"
-                 "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N]\n"
+                 "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N] [--virtual-size BYTES]\n"
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
-                 "  %s [--socket PATH] commit <id> [--tag TAG]\n"
+                 "  %s [--socket PATH] commit <id> [--tag TAG] [--virtual-size BYTES]\n"
                  "  %s [--socket PATH] trace_start <id> <output.trace> [--duration SEC]\n"
-                 "  %s [--socket PATH] trace_stop <id>\n",
-                 argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+                 "  %s [--socket PATH] trace_stop <id>\n"
+                 "  %s [--socket PATH] resize <id> <size-bytes>\n",
+                 argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
+                 argv0);
 }
 
 bool send_all(int fd, const std::string& data) {
@@ -75,7 +77,31 @@ int main(int argc, char** argv) {
             if (a == "--global" && i < argc) req["global"] = argv[i++];
             else if (a == "--dev-id" && i < argc)
                 req["dev_id"] = std::stoi(argv[i++]);
-            else {
+            else if (a == "--virtual-size" && i < argc) {
+                // D3 headroom override (bytes): full strtoull validation
+                // for a fast, clear error; the grow-only/alignment
+                // semantics are decided where sizes are comparable
+                // (supervisor + device).
+                const char* v = argv[i++];
+                if (v[0] == '-') {
+                    std::fprintf(stderr,
+                                 "invalid --virtual-size '%s' (want a "
+                                 "positive byte count)\n",
+                                 v);
+                    return 2;
+                }
+                char* end = nullptr;
+                errno = 0;
+                const unsigned long long b = std::strtoull(v, &end, 10);
+                if (errno != 0 || end == v || *end != '\0' || b == 0) {
+                    std::fprintf(stderr,
+                                 "invalid --virtual-size '%s' (want a "
+                                 "positive byte count)\n",
+                                 v);
+                    return 2;
+                }
+                req["virtual_size"] = b;
+            } else {
                 usage(argv[0]);
                 return 2;
             }
@@ -95,7 +121,30 @@ int main(int argc, char** argv) {
         while (i < argc) {
             const std::string a = argv[i++];
             if (a == "--tag" && i < argc) req["user_tag"] = argv[i++];
-            else {
+            else if (a == "--virtual-size" && i < argc) {
+                // D3 commit re-baseline override (bytes): full strtoull
+                // validation; grow-only/alignment semantics are decided
+                // where the upper is readable (supervisor + seal path).
+                const char* v = argv[i++];
+                if (v[0] == '-') {
+                    std::fprintf(stderr,
+                                 "invalid --virtual-size '%s' (want a "
+                                 "positive byte count)\n",
+                                 v);
+                    return 2;
+                }
+                char* end = nullptr;
+                errno = 0;
+                const unsigned long long b = std::strtoull(v, &end, 10);
+                if (errno != 0 || end == v || *end != '\0' || b == 0) {
+                    std::fprintf(stderr,
+                                 "invalid --virtual-size '%s' (want a "
+                                 "positive byte count)\n",
+                                 v);
+                    return 2;
+                }
+                req["virtual_size"] = b;
+            } else {
                 usage(argv[0]);
                 return 2;
             }
@@ -142,6 +191,39 @@ int main(int argc, char** argv) {
         if (i != argc) {
             // Silent extra-arg acceptance would mask typos (trace_start
             // validates its full remainder too).
+            usage(argv[0]);
+            return 2;
+        }
+    } else if (cmd == "resize") {
+        if (i + 2 > argc) {
+            usage(argv[0]);
+            return 2;
+        }
+        req["id"] = argv[i++];
+        // Byte count: full strtoull validation for a fast, clear error
+        // instead of a supervisor/device rejection (grow-only itself is
+        // decided device-side, where the current size is known). A
+        // negative value wraps through unsigned; reject it explicitly.
+        const char* v = argv[i++];
+        if (v[0] == '-') {
+            std::fprintf(stderr,
+                         "invalid resize size '%s' (want a positive byte "
+                         "count)\n",
+                         v);
+            return 2;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long bytes = std::strtoull(v, &end, 10);
+        if (errno != 0 || end == v || *end != '\0' || bytes == 0) {
+            std::fprintf(stderr,
+                         "invalid resize size '%s' (want a positive byte "
+                         "count)\n",
+                         v);
+            return 2;
+        }
+        req["size"] = bytes;
+        if (i != argc) {
             usage(argv[0]);
             return 2;
         }

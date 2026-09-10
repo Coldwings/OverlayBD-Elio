@@ -313,6 +313,7 @@ private:
                     reply = co_await cmd_trace_start(*cmd);
                 else if (c == "trace_stop")
                     reply = co_await cmd_trace_stop(*cmd);
+                else if (c == "resize") reply = co_await cmd_resize(*cmd);
                 else if (c == "list") reply = co_await cmd_list();
                 else if (c == "hello") reply = reply_hello();
                 else reply = co_await cmd_status(*cmd);
@@ -491,9 +492,26 @@ private:
         const std::string global = j.value("global", cfg_.global_config);
         const std::string bin = j.value("device_bin", cfg_.device_bin);
         const int dev_id = j.value("dev_id", -1);
+        // D3 create-time headroom (bytes; 0 = size the device to the
+        // image). parse_command validated the type; positivity/alignment
+        // are checked here, and grow-only vs the image's declared size is
+        // enforced by the device after assembly (the supervisor cannot
+        // know the image size without opening every layer).
+        uint64_t virtual_size = 0;
+        if (j.contains("virtual_size")) {
+            virtual_size = j["virtual_size"].is_number_unsigned()
+                               ? j["virtual_size"].get<uint64_t>()
+                               : static_cast<uint64_t>(
+                                     j["virtual_size"].get<int64_t>());
+        }
 
         if (id.empty() || id.find('/') != std::string::npos) {
             co_return reply_error("invalid id");
+        }
+        if (virtual_size > 0 && virtual_size % 512 != 0) {
+            co_return reply_error(
+                "create virtual_size must be a positive multiple of 512 "
+                "bytes");
         }
         if (!file_exists(config)) {
             co_return reply_error("config file not found: " + config);
@@ -509,7 +527,8 @@ private:
         }
 
         auto entry = std::make_shared<DeviceEntry>();
-        entry->spec = ChildSpec{id, bin, config, global, dev_id, false};
+        entry->spec =
+            ChildSpec{id, bin, config, global, dev_id, false, virtual_size};
         // ADR-0014: record the upper's path/kind for a later commit.
         // Provenance is the config as of create time — a later edit of the
         // config file must not redirect commit. A parse failure leaves the
@@ -654,12 +673,12 @@ private:
         co_return;
     }
 
-    /// Shared forward-and-await for device-executed trace commands
-    /// (ADR-0013): sends `cmd` to the device over the control channel
-    /// and waits (bounded) for its reply line. The duration bound is
-    /// enforced DEVICE-side, so a client disconnect is harmless — this
-    /// timeout only covers a wedged/dead device.
-    elio::coro::task<std::string> forward_trace_command(
+    /// Shared forward-and-await for device-executed commands (ADR-0013
+    /// trace path; D3 resize): sends `cmd` to the device over the control
+    /// channel and waits (bounded) for its reply line. The trace duration
+    /// bound is enforced DEVICE-side, so a client disconnect is harmless —
+    /// this timeout only covers a wedged/dead device.
+    elio::coro::task<std::string> forward_device_command(
         const std::string& id, nlohmann::json cmd) {
         std::shared_ptr<DeviceEntry> entry;
         std::shared_ptr<elio::sync::event> waiter =
@@ -744,7 +763,7 @@ private:
         }
         if (!bool_or(reply, "ok", false)) {
             co_return reply_error(str_or(
-                reply, "error", "device rejected the trace command"));
+                reply, "error", "device rejected the command"));
         }
         // The device reply fields INCLUDING the "reply" discriminator;
         // cmd_trace_start/stop erase it before forwarding to the
@@ -761,7 +780,7 @@ private:
         nlohmann::json cmd = {{"cmd", "trace_start"},
                               {"path", j["path"]},
                               {"duration_sec", j["duration_sec"]}};
-        std::string r = co_await forward_trace_command(id, std::move(cmd));
+        std::string r = co_await forward_device_command(id, std::move(cmd));
         auto rj = nlohmann::json::parse(r, nullptr, false);
         if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
             co_await mu_.lock();
@@ -786,7 +805,7 @@ private:
         // Named local: a brace-init json temporary as a coroutine
         // argument trips GCC 12's "array used as initializer" bug.
         nlohmann::json cmd = {{"cmd", "trace_stop"}};
-        std::string r = co_await forward_trace_command(id, std::move(cmd));
+        std::string r = co_await forward_device_command(id, std::move(cmd));
         auto rj = nlohmann::json::parse(r, nullptr, false);
         if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
             co_await mu_.lock();
@@ -811,6 +830,51 @@ private:
                 it->second->trace = std::move(t);
             }
             mu_.unlock();
+            rj.erase("reply");
+            rj.erase("seq");  // internal routing token, not client API
+            rj["id"] = id;
+            rj["ok"] = true;
+            co_return rj.dump() + "\n";
+        }
+        co_return r;
+    }
+
+    /// D3 grow-only online resize (ADR-0014 dev_size model): forwards the
+    /// byte-count `size` to the device, whose executor enforces the
+    /// grow-only rule (the current size is known only there) and issues
+    /// the ublk UPDATE_SIZE. The reply carries the new size in bytes.
+    /// Semantics validated here before forwarding: `size` is a positive
+    /// multiple of 512 (ublk sector granularity); anything else is a
+    /// clean error without a round-trip. Shrink attempts reach the device
+    /// and are rejected there with a clear message.
+    ///
+    /// Deliberately NOT serialized against cmd_commit: commit stops the
+    /// device over signals + the entry's op_mu while resize rides the
+    /// device command channel, but every ordering is safe because the
+    /// DEVICE arbitrates — a grow completing before its shutdown is
+    /// followed by a checkpoint at the grown size (consistent pair), and
+    /// once the shutdown begins the device rejects resizes with
+    /// "device is shutting down; resize ignored" (see make_resize_apply),
+    /// so a header rewrite can never land after the checkpoint trailer.
+    /// A resize racing a stop may instead see the channel close, also a
+    /// clean error (docs/supervisor.md).
+    elio::coro::task<std::string> cmd_resize(const nlohmann::json& j) {
+        const std::string id = j["id"].get<std::string>();
+        // parse_command validated 'size' as a non-negative integer.
+        const uint64_t size = j["size"].is_number_unsigned()
+                                  ? j["size"].get<uint64_t>()
+                                  : static_cast<uint64_t>(
+                                        j["size"].get<int64_t>());
+        if (size == 0 || size % 512 != 0) {
+            co_return reply_error(
+                "resize size must be a positive multiple of 512 bytes");
+        }
+        // Named local: a brace-init json temporary as a coroutine
+        // argument trips GCC 12's "array used as initializer" bug.
+        nlohmann::json cmd = {{"cmd", "resize"}, {"size", size}};
+        std::string r = co_await forward_device_command(id, std::move(cmd));
+        auto rj = nlohmann::json::parse(r, nullptr, false);
+        if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
             rj.erase("reply");
             rj.erase("seq");  // internal routing token, not client API
             rj["id"] = id;
@@ -877,6 +941,24 @@ private:
     elio::coro::task<std::string> cmd_commit(const nlohmann::json& j) {
         const std::string id = j["id"].get<std::string>();
         const std::string user_tag = j.value("user_tag", "");
+        // D3 commit re-baseline: optional virtual_size override (bytes)
+        // written into the sealed header (0 = keep the layer's declared
+        // size). parse_command validated the type; alignment/positivity
+        // are checked here (before the device is stopped); grow-only vs
+        // the layer's declared size and content extent is validated in
+        // the seal path, where the checkpoint is readable.
+        uint64_t virtual_size = 0;
+        if (j.contains("virtual_size")) {
+            virtual_size = j["virtual_size"].is_number_unsigned()
+                               ? j["virtual_size"].get<uint64_t>()
+                               : static_cast<uint64_t>(
+                                     j["virtual_size"].get<int64_t>());
+        }
+        if (virtual_size > 0 && virtual_size % 512 != 0) {
+            co_return reply_error(
+                "commit virtual_size must be a positive multiple of 512 "
+                "bytes");
+        }
         std::shared_ptr<DeviceEntry> entry;
         {
             co_await mu_.lock();
@@ -898,7 +980,8 @@ private:
 
         std::string reply;
         try {
-            reply = co_await commit_stop_and_seal(entry, id, user_tag);
+            reply = co_await commit_stop_and_seal(entry, id, user_tag,
+                                                  virtual_size);
         } catch (const std::exception& e) {
             reply = reply_error(std::string("commit failed for ") + id +
                                 ": " + e.what());
@@ -912,10 +995,11 @@ private:
     }
 
     /// The commit critical section (see cmd_commit). Runs with the entry's
-    /// op_mu held across the stop and the seal.
+    /// op_mu held across the stop and the seal. `virtual_size` is the D3
+    /// re-baseline override (0 = keep the layer's declared size).
     elio::coro::task<std::string> commit_stop_and_seal(
         const std::shared_ptr<DeviceEntry>& entry, const std::string& id,
-        const std::string& user_tag) {
+        const std::string& user_tag, uint64_t virtual_size) {
         if (!entry->image_config_ok) {
             co_return reply_error(
                 "image config unreadable at create; upper unknown: " + id);
@@ -972,13 +1056,19 @@ private:
 
         std::string sha256;
         uint64_t size = 0;
+        std::string seal_reject;
         const int rc = co_await format::LsmtRwLayer::seal_file(
-            upper, user_tag, &sha256, &size);
+            upper, user_tag, &sha256, &size, virtual_size, &seal_reject);
         if (rc == -ENOENT) {
             co_return reply_error("upper file not found: " + upper);
         }
         if (rc == -EALREADY) {
             co_return reply_error("upper already sealed: " + upper);
+        }
+        if (rc == -EINVAL && !seal_reject.empty()) {
+            // D3 re-baseline rejected (grow-only/alignment): precise
+            // reason; the upper is untouched and remains committable.
+            co_return reply_error(seal_reject);
         }
         if (rc == -EINVAL) {
             co_return reply_error("upper has no valid shutdown checkpoint "

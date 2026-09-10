@@ -3,18 +3,19 @@
 //
 // Two channels, both JSON-lines (one message per line, UTF-8, <= 64KiB):
 //
-//   obdctl --UDS--> supervisor:    {"cmd":"hello"|"create"|"destroy"|"list"|"status"|"commit"|"trace_start"|"trace_stop", ...}
+//   obdctl --UDS--> supervisor:    {"cmd":"hello"|"create"|"destroy"|"list"|"status"|"commit"|"trace_start"|"trace_stop"|"resize", ...}
 //   supervisor --> obdctl:         {"ok":true,...} | {"ok":false,"error":"..."}
 //
 //   obd-device --socketpair--> supervisor: {"state":"starting"|"ready"|"failed"|"stopped", ...}
-//                                        | {"reply":"trace_start"|"trace_stop"|"trace_event", ...}
+//                                        | {"reply":"trace_start"|"trace_stop"|"trace_event"|"resize", ...}
 //   supervisor --> obd-device:     signals (SIGTERM = shutdown), plus
 //                                  JSON-lines commands on the same
-//                                  socketpair: {"cmd":"trace_start"|"trace_stop", ...}
-//                                  (ADR-0013 record path; devices that
-//                                  predate trace control never read the
-//                                  channel, so old pairings degrade to
-//                                  "device control channel timeout")
+//                                  socketpair: {"cmd":"trace_start"|"trace_stop"|"resize", ...}
+//                                  (ADR-0013 record path + D3 resize;
+//                                  devices that predate command control
+//                                  never read the channel, so old
+//                                  pairings degrade to "device control
+//                                  channel timeout")
 //
 // Additive-only evolution rule (current law; governing decision ADR-0014,
 // currently proposed):
@@ -47,7 +48,10 @@ inline constexpr size_t kMaxMessageBytes = 64 * 1024;
 ///   3 — adds trace_start/trace_stop (ADR-0013 record path; feature
 ///       "trace"), the bidirectional supervisor-to-device command
 ///       channel, and the additive "trace" field in status/list replies.
-inline constexpr int kProtocolVersion = 3;
+///   4 — adds the resize command and the optional create/commit
+///       `virtual_size` fields (D3 grow-only resize chain; feature
+///       "resize").
+inline constexpr int kProtocolVersion = 4;
 
 /// Project version string, wired from CMake `project(... VERSION ...)` so
 /// it cannot drift; "dev" is the fallback for non-CMake builds.
@@ -65,6 +69,11 @@ struct CreateCommand {
     std::string global;      // overlaybd.json path ("" = supervisor default)
     std::string device_bin;  // obd-device path ("" = supervisor default)
     int dev_id = -1;         // requested ublk dev id (-1 = auto)
+    /// D3 create-time headroom: optional dev_size override in bytes
+    /// (0 = absent; the device is sized to the image's virtual size).
+    /// Positive + 512-aligned, and grow-only vs the image size (checked
+    /// device-side after assembly, where the image size is known).
+    uint64_t virtual_size = 0;
 };
 
 struct IdCommand {  // destroy / status
@@ -75,6 +84,11 @@ struct IdCommand {  // destroy / status
 struct CommitCommand {  // commit (ADR-0014: offline seal of the upper)
     std::string id;
     std::string user_tag;  // optional; recorded in the sealed header
+    /// D3 commit re-baseline: optional sealed virtual size in bytes
+    /// (0 = keep the checkpointed size). Grow-only: must be >= the
+    /// layer's declared size and its content extent (validated in the
+    /// seal path).
+    uint64_t virtual_size = 0;
 };
 
 // Trace recording (ADR-0013 record path): wire shapes.
@@ -109,6 +123,25 @@ struct CommitCommand {  // commit (ADR-0014: offline seal of the upper)
 //      "duration_sec":...,
 //      "reason":"stopped"|"expired"|"device_exit","sha256":...,"size":...,
 //      "records":...,"dropped":...}
+
+// D3 grow-only online resize (ADR-0014 dev_size model): wire shapes.
+//
+//   obdctl -> supervisor:
+//     {"cmd":"resize","id":"<device>","size":<bytes>}
+//     (size must be a positive multiple of 512 — validated supervisor-
+//      side before forwarding; whether a request GROWS is decided
+//      device-side, where the current size is known)
+//   supervisor -> device (control socketpair):
+//     {"cmd":"resize","size":<bytes>,"seq":N}
+//   device -> supervisor (same socketpair, "reply" discriminator):
+//     {"reply":"resize","ok":true,"size":<new bytes>,"seq":N}
+//     {"reply":"resize","ok":false,"error":"...","seq":N}
+//     (grow-only: the device rejects a request <= its current size with
+//      ok:false BEFORE issuing any kernel command)
+//   obdctl <- supervisor: the device reply fields plus "id":
+//     {"ok":true,"size":<new bytes>,"id":"<device>"}
+//     (additive-only: older supervisors reject "resize" as an unknown
+//      cmd — clients gate on the "resize" feature from hello)
 
 /// True when a device-to-supervisor line is a command reply/event (the
 /// "reply" discriminator) rather than a lifecycle status.

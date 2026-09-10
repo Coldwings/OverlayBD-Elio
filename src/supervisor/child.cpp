@@ -32,6 +32,8 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
         std::string devid_flag = "--dev-id";
         std::string dev_id;
         std::string recover_flag = "--recover";
+        std::string vsize_flag = "--virtual-size";
+        std::string vsize;
         std::vector<char*> argv;
     } a;
     a.bin = spec.device_bin;
@@ -40,6 +42,9 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
     a.ctl_fd = "3";  // see dup2 below: the status channel is always fd 3
     if (spec.dev_id_request >= 0) {
         a.dev_id = std::to_string(spec.dev_id_request);
+    }
+    if (spec.virtual_size > 0) {
+        a.vsize = std::to_string(spec.virtual_size);
     }
     a.argv.push_back(a.bin.data());
     a.argv.push_back(a.config_flag.data());
@@ -53,6 +58,10 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
     if (!a.dev_id.empty()) {
         a.argv.push_back(a.devid_flag.data());
         a.argv.push_back(a.dev_id.data());
+    }
+    if (!a.vsize.empty()) {
+        a.argv.push_back(a.vsize_flag.data());
+        a.argv.push_back(a.vsize.data());
     }
     if (spec.recover) {
         a.argv.push_back(a.recover_flag.data());
