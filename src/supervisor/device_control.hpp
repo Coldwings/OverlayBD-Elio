@@ -2,7 +2,7 @@
 // forwarded device commands (ADR-0013 trace record path + D3 resize).
 //
 // The supervisor forwards commands as JSON-lines on the same control
-// socketpair the device reports lifecycle status on (protocol v3). This
+// socketpair the device reports lifecycle status on (protocol v4). This
 // loop is the device's single reader of that channel; it drives the
 // image's TraceRecorder, executes D3 resizes through the caller-supplied
 // executor seam, and writes reply lines back with the "reply"

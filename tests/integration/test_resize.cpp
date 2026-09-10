@@ -54,7 +54,10 @@ constexpr size_t kFakePayloadBytes = 512 * 16;
 /// Runs on a helper thread, so NO Catch2 macros here (Catch2 assertion
 /// state is not thread-safe by default); failures surface as exceptions.
 std::string uds_rpc(const std::string& path, const std::string& line) {
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    // SOCK_CLOEXEC: the supervisor forks/execs device processes while these
+    // RPCs are in flight; a leaked fd would keep the connection alive and
+    // produce subtle hangs.
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) throw std::system_error(errno, std::generic_category());
     sockaddr_un sa {};
     sa.sun_family = AF_UNIX;
@@ -89,6 +92,7 @@ std::string uds_rpc(const std::string& path, const std::string& line) {
     char buf[4096];
     for (;;) {
         const ssize_t r = ::read(fd, buf, sizeof(buf));
+        if (r < 0 && errno == EINTR) continue;  // mirror the send loop
         if (r < 0) {
             const int e = errno;
             ::close(fd);
