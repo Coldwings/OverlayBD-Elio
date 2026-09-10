@@ -63,8 +63,10 @@ Never pass a `co_await` expression directly to a Catch2 assertion macro:
 
 ```cpp
 // WRONG — REQUIRE/CHECK decompose and can evaluate their argument more
-// than once; a co_await inside one is not a single evaluation.
-REQUIRE(co_await src->pread(buf.data(), buf.size(), 0) == 1024);
+// than once; a co_await inside one is not a single evaluation. (Kept
+// commented out below so the anti-pattern never appears as live code:
+// a repo-wide grep for it stays clean, and no test copies it by accident.)
+//   REQUIRE(co_await src->pread(buf.data(), buf.size(), 0) == 1024);
 
 // RIGHT — await once into a named local, then assert on the value.
 const ssize_t got = co_await src->pread(buf.data(), buf.size(), 0);
