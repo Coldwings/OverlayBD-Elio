@@ -619,6 +619,27 @@ Every test, grouped by area, with the property it guards.
   field types are parse-time protocol errors, not handler exceptions),
   ignores unknown fields, and the `hello` reply pins the `protocol` field
   plus the `commit` feature advertisement (ADR-0014).
+- `supervisor: mkfs runner maps exit codes and bounds the timeout` — the
+  real default mkfs runner against throwaway PATH shims: exit 0 → ok,
+  exit 1 → code+message, absent `mkfs.<type>` → the 127 "not found"
+  mapping, an unsafe type refused before argv, and a shim sleeping past
+  the bound reported as `-ETIMEDOUT` (helper SIGKILLed) — the runner owns
+  its child (ADR-0014 mode 3).
+- `supervisor: blank spawn argv carries the blank flags and global` — a
+  blank child's real argv is `--blank-size N --blank-dir D --global G
+  --control-fd 3` with no `--config`, pinning the spawn contract for both
+  creation modes.
+- `supervisor: stale blank-create failure leaves a newer device alone` —
+  F1/F3-scale concurrency: a create parked inside its (slow) mkfs step,
+  the id destroyed and re-created underneath it, then the stale mkfs
+  failure released: the stale cleanup must leave the NEWER device
+  untouched (same pid, still served) and the daemon healthy.
+- `supervisor: obd-device rejects malformed blank flags` — the real
+  obd-device binary's own `--blank-size` validation (negative, zero,
+  unaligned, junk, overflowing, above the 16 TiB bound, missing
+  `--blank-dir`, and `--config` combined with blank) is a usage error
+  (exit 2) before any device work — obd-device is a standalone entry
+  point, not only a supervisor child.
 - `supervisor: create blank spec parses and validates size and mkfs` —
   the ADR-0014 blank create grammar end to end: `create` parses with a
   `blank` object (mode 2, and mode 3 with `mkfs`); `config` and `blank`
@@ -688,6 +709,18 @@ Every test, grouped by area, with the property it guards.
   upper uncommittable), the gate serializes concurrent applies so the
   shutdown path can drain an in-flight grow before checkpointing, and a
   malformed construction is refused (D3).
+
+### cli
+
+- `cli: obdctl create-blank sends a create command with the blank object` —
+  the REAL obdctl binary executed against a test-owned UDS server:
+  `create-blank --size --mkfs --global --dev-id` becomes the wire line
+  `{"cmd":"create","blank":{"size":...,"mkfs":...},...}` (the supervisor
+  has no `create-blank` command), mode 2 omits `mkfs`, image-mode create
+  still sends `config`, an `ok:false` reply exits 1, and malformed input
+  (`--size -512` / `100` / missing / bad `--mkfs` / unknown flag) exits 2
+  without connecting.
+
 ### integration
 
 - `integration: layered stack stages over a mock registry` — the full
@@ -791,8 +824,7 @@ Every test, grouped by area, with the property it guards.
   succeeds, the loser gets a precise error ("commit already in progress"
   or "already sealed"), and the sealed file is intact (no interleaved
   tmp-file writes) (ADR-0014). Runs without privileges.
-- `supervisor: blank create serves a writable zero base and commit seals
-  its upper` — ADR-0014 mode 2 with the fake device: `create` with
+- `supervisor: blank create serves a writable zero base and commit seals its upper` — ADR-0014 mode 2 with the fake device: `create` with
   `blank` (no config) assembles the workspace (`overlaybd.zero` +
   `overlaybd.rw`) via `open_blank_device`; the fake round-trips a
   payload through the merged stack (unwritten regions read zero); commit

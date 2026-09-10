@@ -1,17 +1,21 @@
 // Unit tests: supervisor module — protocol and child lifecycle with fake
 // device binaries.
 #include "supervisor/child.hpp"
+#include "supervisor/daemon.hpp"
 #include "supervisor/protocol.hpp"
 
 #include "../support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -426,3 +430,188 @@ TEST_CASE("supervisor: create blank spec parses and validates size and mkfs",
     REQUIRE(!supervisor::valid_mkfs_type("e:t4"));
     REQUIRE(!supervisor::valid_mkfs_type(std::string(17, 'a')));
 }
+
+namespace {
+
+/// Creates an executable shell shim under `dir` named `name`.
+void make_shim(const std::string& dir, const std::string& name,
+               const std::string& body) {
+    const std::string path = dir + "/" + name;
+    const std::string content = "#!/bin/sh\n" + body;
+    test::write_file(path,
+                     std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(path.c_str(), 0755) == 0);
+}
+
+/// Saves/restores PATH (the default mkfs runner resolves `mkfs.<type>`
+/// through the process PATH via execlp).
+struct PathGuard {
+    std::string prev;
+    PathGuard() {
+        const char* p = ::getenv("PATH");
+        prev = p != nullptr ? p : "";
+    }
+    ~PathGuard() { ::setenv("PATH", prev.c_str(), 1); }
+    PathGuard(const PathGuard&) = delete;
+    PathGuard& operator=(const PathGuard&) = delete;
+};
+
+}  // namespace
+
+// NOTE: no comma in the name — Catch2 test specs split on commas, so a
+// comma would make the test unreachable by exact-name filters (and via
+// catch_discover_tests' ctest entries).
+TEST_CASE("supervisor: mkfs runner maps exit codes and bounds the timeout",
+          "[supervisor]") {
+    // The REAL default runner (ADR-0014 mode 3), exercised against
+    // throwaway PATH shims: success, a nonzero exit, the 127 "not found"
+    // mapping, and a bounded timeout. No host mkfs is involved — the
+    // shims are test scripts.
+    test::TempDir dir;
+    const std::string bin = dir / "bin";
+    REQUIRE(::mkdir(bin.c_str(), 0755) == 0);
+    const std::string argv_log = dir / "mkfs-argv.log";
+    make_shim(bin, "mkfs.ext4",
+              "echo \"$@\" > \"" + argv_log + "\"\nexit 0\n");
+    make_shim(bin, "mkfs.xfs", "exit 1\n");
+    make_shim(bin, "mkfs.btrfs", "sleep 5\nexit 0\n");
+    PathGuard path_guard;
+    REQUIRE(::setenv("PATH", (bin + ":/usr/bin:/bin").c_str(), 1) == 0);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto runner = supervisor::make_default_mkfs_runner(5);
+        std::string err;
+        int r = co_await runner->run("ext4", "/dev/ublkb70", &err);
+        REQUIRE(r == 0);
+        REQUIRE(err.empty());
+
+        err.clear();
+        r = co_await runner->run("xfs", "/dev/ublkb70", &err);
+        REQUIRE(r == 1);
+        REQUIRE(err.find("exited with code 1") != std::string::npos);
+
+        // An absent mkfs.<type> execs nothing: the child's 127 exit is
+        // mapped to a "not found" message (never ECHILD / a hang).
+        err.clear();
+        r = co_await runner->run("nosuchfs", "/dev/ublkb70", &err);
+        REQUIRE(r == 127);
+        REQUIRE(err.find("not found or not executable") != std::string::npos);
+
+        // A type outside the safe charset never reaches argv.
+        err.clear();
+        r = co_await runner->run("ext4/../sh", "/dev/ublkb70", &err);
+        REQUIRE(r == -EINVAL);
+        REQUIRE(err.find("invalid fs type") != std::string::npos);
+
+        // Bounded: a shim sleeping past the timeout is SIGKILLed and
+        // reported as -ETIMEDOUT (the runner owns its child; the daemon's
+        // reaper must never have reaped it).
+        auto slow = supervisor::make_default_mkfs_runner(1);
+        err.clear();
+        r = co_await slow->run("btrfs", "/dev/ublkb70", &err);
+        REQUIRE(r == -ETIMEDOUT);
+        REQUIRE(err.find("timed out") != std::string::npos);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    // The device argument reached the child's argv (recorded by the shim).
+    const int fd = ::open(argv_log.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    std::string logged;
+    char buf[256];
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    REQUIRE(n > 0);
+    logged.assign(buf, static_cast<size_t>(n));
+    ::close(fd);
+    REQUIRE(logged.find("/dev/ublkb70") != std::string::npos);
+}
+
+TEST_CASE("supervisor: blank spawn argv carries the blank flags and global",
+          "[supervisor]") {
+    // ADR-0014 spawn contract: a blank child gets
+    // `--blank-size N --blank-dir D [--global G] --control-fd 3` and NO
+    // `--config` — and `--global` is passed for blanks too (the device
+    // still reads ublkConfig and the other daemon-wide knobs from it).
+    test::TempDir dir;
+    const std::string log = dir / "argv.log";
+    const std::string script = dir / "fake-device.sh";
+    {
+        const std::string content =
+            "#!/bin/sh\necho \"$@\" > \"" + log + "\"\nexit 0\n";
+        test::write_file(script,
+                         std::vector<uint8_t>(content.begin(),
+                                              content.end()));
+        ::chmod(script.c_str(), 0755);
+    }
+    const std::string ws = dir / "ws";
+    supervisor::ChildSpec spec;
+    spec.id = "blank-argv";
+    spec.device_bin = script;
+    spec.blank = true;
+    spec.blank_size = 4096;
+    spec.blank_dir = ws;
+    spec.global_path = "/etc/g.json";
+    auto child = supervisor::Child::spawn(spec);
+    REQUIRE(child->pid() > 0);
+    int wstatus = 0;
+    REQUIRE(::waitpid(child->pid(), &wstatus, 0) == child->pid());
+    child->note_reaped(wstatus);
+    ::close(child->release_control_fd());
+
+    struct stat st {};
+    REQUIRE(::stat(log.c_str(), &st) == 0);
+    std::string argv(static_cast<size_t>(st.st_size), '\0');
+    const int fd = ::open(log.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    REQUIRE(::read(fd, argv.data(), argv.size()) ==
+            static_cast<ssize_t>(argv.size()));
+    ::close(fd);
+    REQUIRE(argv.find("--blank-size 4096") != std::string::npos);
+    REQUIRE(argv.find("--blank-dir " + ws) != std::string::npos);
+    REQUIRE(argv.find("--global /etc/g.json") != std::string::npos);
+    REQUIRE(argv.find("--control-fd 3") != std::string::npos);
+    REQUIRE(argv.find("--config") == std::string::npos);
+}
+
+
+#ifdef OBD_TEST_DEVICE_BIN
+TEST_CASE("supervisor: obd-device rejects malformed blank flags",
+          "[supervisor]") {
+    // F9 regression: obd-device is a standalone entry point too, so its
+    // --blank-size validation must be as strict as the supervisor's
+    // parse_blank_spec (a negative value must not become 1.8e19 and slip
+    // past the alignment check). Every malformed form is a usage error
+    // (exit 2) BEFORE any device/ublk work.
+    auto run_device = [](const std::vector<std::string>& args) {
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(OBD_TEST_DEVICE_BIN));
+        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        const pid_t pid = ::fork();
+        REQUIRE(pid >= 0);
+        if (pid == 0) {
+            ::execv(OBD_TEST_DEVICE_BIN, argv.data());
+            _exit(127);
+        }
+        int wstatus = 0;
+        REQUIRE(::waitpid(pid, &wstatus, 0) == pid);
+        REQUIRE(WIFEXITED(wstatus));
+        return WEXITSTATUS(wstatus);
+    };
+    const std::string ws = "/tmp/obd-never-used";
+    REQUIRE(run_device({"--blank-size", "-512", "--blank-dir", ws}) == 2);
+    REQUIRE(run_device({"--blank-size", "0", "--blank-dir", ws}) == 2);
+    REQUIRE(run_device({"--blank-size", "100", "--blank-dir", ws}) == 2);
+    REQUIRE(run_device({"--blank-size", "junk", "--blank-dir", ws}) == 2);
+    REQUIRE(run_device({"--blank-size", "18446744073709551616", "--blank-dir",
+                        ws}) == 2);
+    // Above the 16 TiB sanity bound the supervisor enforces.
+    REQUIRE(run_device({"--blank-size", "18014398509481984", "--blank-dir",
+                        ws}) == 2);
+    // Blank mode needs its workspace, and the modes are exclusive.
+    REQUIRE(run_device({"--blank-size", "4096"}) == 2);
+    REQUIRE(run_device({"--config", "/x.json", "--blank-size", "4096",
+                        "--blank-dir", ws}) == 2);
+}
+#endif

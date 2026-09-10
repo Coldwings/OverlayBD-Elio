@@ -27,13 +27,16 @@
 
 #include <nlohmann/json.hpp>
 
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <mutex>
@@ -455,6 +458,10 @@ namespace {
 struct MockMkfs final : public supervisor::MkfsRunner {
     std::atomic<int> calls{0};
     std::atomic<int> fail_rc{0};  // set before the create that should fail
+    /// When false, run() parks (async sleep loop) until the test releases
+    /// it — lets a test hold a create inside its mkfs step and act on the
+    /// device underneath it.
+    std::atomic<bool> release{true};
 
     elio::coro::task<int> run(const std::string& fs_type,
                               const std::string& device,
@@ -464,6 +471,9 @@ struct MockMkfs final : public supervisor::MkfsRunner {
             calls.fetch_add(1);
             last_type_ = fs_type;
             last_device_ = device;
+        }
+        while (!release.load()) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(10));
         }
         if (fail_rc.load() != 0) {
             if (error) *error = "injected mkfs failure";
@@ -511,10 +521,104 @@ void require_sealed_blank_upper(const std::string& upper,
     }) == 0);
 }
 
+/// Saves/restores PATH: the daemon's DEFAULT mkfs runner resolves
+/// `mkfs.<type>` on the process PATH (in-process daemon in these tests).
+struct PathGuard {
+    std::string prev;
+    PathGuard() {
+        const char* p = ::getenv("PATH");
+        prev = p != nullptr ? p : "";
+    }
+    ~PathGuard() { ::setenv("PATH", prev.c_str(), 1); }
+    PathGuard(const PathGuard&) = delete;
+    PathGuard& operator=(const PathGuard&) = delete;
+};
+
 }  // namespace
 
-TEST_CASE("supervisor: blank create serves a writable zero base and commit "
-          "seals its upper",
+// NOTE: the TEST_CASE name stays on ONE source line — scripts/check-docs.sh
+// extracts names line-wise and the docs cite them verbatim.
+TEST_CASE("supervisor: default mkfs runner completes without the reaper stealing it",
+          "[supervisor]") {
+    // F2 regression: the daemon's SIGCHLD reaper must NOT reap the mkfs
+    // helper child. A wildcard waitpid(-1) stole its exit status, so the
+    // runner's waitpid returned ECHILD and every mode-3 create failed.
+    // Here the daemon runs its REAL default runner against a PATH shim
+    // (no host mkfs involved): create must succeed and the shim must have
+    // seen the device path.
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string blank_root = dir / "blank";
+    const std::string bin = dir / "bin";
+    REQUIRE(::mkdir(bin.c_str(), 0755) == 0);
+    const std::string argv_log = dir / "mkfs-argv.log";
+    {
+        const std::string path = bin + "/mkfs.ext4";
+        const std::string content = "#!/bin/sh\necho \"$@\" > \"" +
+                                    argv_log + "\"\nexit 0\n";
+        test::write_file(path,
+                         std::vector<uint8_t>(content.begin(),
+                                              content.end()));
+        REQUIRE(::chmod(path.c_str(), 0755) == 0);
+    }
+    PathGuard path_guard;
+    REQUIRE(::setenv("PATH", (bin + ":/usr/bin:/bin").c_str(), 1) == 0);
+
+    auto guard = block_daemon_signals();
+    const int failures = run_daemon_case(
+        [&] {
+            supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+            cfg.blank_dir = blank_root;
+            cfg.mkfs_timeout_sec = 30;
+            // Deliberately NOT setting mkfs_runner: the daemon installs
+            // its real default (fork/exec) runner.
+            return cfg;
+        }(),
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+            const auto created =
+                rpc_json({{"cmd", "create"},
+                          {"id", "m1"},
+                          {"blank", {{"size", kFakeVsize},
+                                     {"mkfs", "ext4"}}}});
+            check(created.value("ok", false) == true,
+                  "mode-3 create with the default runner failed");
+            if (!created.value("ok", false)) {
+                std::fprintf(stderr, "[default-runner mkfs reply] %s\n",
+                             created.dump().c_str());
+            }
+            check(created.value("mkfs", "") == "ext4",
+                  "default-runner reply lacks mkfs");
+            // The daemon stays healthy after the helper child ran.
+            check(rpc_json({{"cmd", "hello"}}).value("ok", false) == true,
+                  "daemon unusable after the mkfs helper exited");
+        });
+    REQUIRE(failures == 0);
+
+    // The shim really was executed, with the device path the fake
+    // reported — i.e. the runner, not the reaper, owned the child.
+    const int fd = ::open(argv_log.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    std::string logged;
+    char buf[256];
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    REQUIRE(n > 0);
+    logged.assign(buf, static_cast<size_t>(n));
+    ::close(fd);
+    REQUIRE(logged.find("/dev/ublkb70") != std::string::npos);
+}
+
+// NOTE: name on one line (check-docs name extraction is line-wise).
+TEST_CASE("supervisor: blank create serves a writable zero base and commit seals its upper",
           "[supervisor]") {
     // ADR-0014 mode 2 end to end (no ublk): create a blank raw device of a
     // requested size through the real daemon → the fake device assembles
@@ -710,6 +814,98 @@ TEST_CASE("supervisor: mode-3 mkfs runs only when the blank spec requests it",
             const auto ghost = rpc_json({{"cmd", "status"}, {"id", "g1"}});
             check(ghost.value("ok", true) == false,
                   "failed-mkfs device entry still present");
+        });
+    REQUIRE(failures == 0);
+}
+
+
+TEST_CASE("supervisor: stale blank-create failure leaves a newer device alone",
+          "[supervisor]") {
+    // F3 regression: a create can sit inside its (up to 300 s) mkfs step
+    // while the operator destroys that id and creates it again. When the
+    // stale create's mkfs finally fails, its cleanup must not terminate or
+    // remove the NEW device that now owns the id.
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string blank_root = dir / "blank";
+
+    auto mock = std::make_shared<MockMkfs>();
+    mock->release = false;  // hold the first create inside mkfs
+    mock->fail_rc = 1;      // ... and make it fail once released
+    auto guard = block_daemon_signals();
+
+    const int failures = run_daemon_case(
+        [&] {
+            supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+            cfg.blank_dir = blank_root;
+            cfg.mkfs_runner = mock;
+            return cfg;
+        }(),
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+
+            // The blocked create runs on its own thread (its reply only
+            // arrives once the mock is released).
+            nlohmann::json stale_reply;
+            std::thread stale([&] {
+                try {
+                    stale_reply = rpc_json({{"cmd", "create"},
+                                            {"id", "x1"},
+                                            {"blank", {{"size", kFakeVsize},
+                                                       {"mkfs", "ext4"}}}});
+                } catch (const std::exception&) {
+                    stale_reply = nlohmann::json{{"ok", false}};
+                }
+            });
+            for (int i = 0; i < 500 && mock->calls.load() == 0; ++i) {
+                std::this_thread::sleep_for(10ms);
+            }
+            check(mock->calls.load() >= 1, "stale create never reached mkfs");
+
+            // Underneath it: destroy the id and create it again (mode 2,
+            // no mkfs — this one must survive).
+            check(rpc_json({{"cmd", "destroy"}, {"id", "x1"}})
+                      .value("ok", false),
+                  "destroy of the in-mkfs device failed");
+            const auto fresh = rpc_json({{"cmd", "create"},
+                                         {"id", "x1"},
+                                         {"blank", {{"size", kFakeVsize}}}});
+            check(fresh.value("ok", false), "re-create under the same id failed");
+            const int fresh_pid = fresh.value("pid", -1);
+
+            // Release the stale create's mkfs: it fails and its cleanup
+            // runs.
+            mock->release = true;
+            stale.join();
+            check(stale_reply.value("ok", true) == false,
+                  "stale create should have failed");
+            check(stale_reply.contains("error") &&
+                      stale_reply["error"].get<std::string>().find("mkfs") !=
+                          std::string::npos,
+                  "stale create error text mismatch");
+
+            // The NEW device is untouched: same pid, STILL READY (not
+            // stopped), still served. The state assertion is what catches
+            // a cleanup that terminates the newer device without removing
+            // its entry.
+            const auto st = rpc_json({{"cmd", "status"}, {"id", "x1"}});
+            check(st.value("ok", false),
+                  "newer device was removed by the stale failure");
+            check(st.value("pid", -1) == fresh_pid,
+                  "newer device pid changed (stale cleanup hit it)");
+            check(st.value("state", "") == "ready",
+                  "newer device was stopped by the stale cleanup");
+            check(rpc_json({{"cmd", "hello"}}).value("ok", false),
+                  "daemon unusable after the stale failure");
         });
     REQUIRE(failures == 0);
 }

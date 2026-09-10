@@ -241,7 +241,11 @@ class Daemon {
         bool destroying = false;  // intentional teardown: never respawn
         std::string upper_path;   // <upper.dir>/overlaybd.rw when lsmt
         std::string upper_type;   // "" = no writable upper recorded
-        bool image_config_ok = false;  // config parsed at create time
+        /// True once the entry's writable upper is KNOWN — from the image
+        /// config parsed at create time, or (blank devices, ADR-0014) from
+        /// the workspace layout. Named for what commit actually needs; the
+        /// old "image_config_ok" name lied for config-less blank devices.
+        bool upper_known = false;
         // ADR-0014 blank provenance: no image config (the upper path comes
         // from the workspace layout); `mkfs_ran` records that the
         // supervisor itself formatted the blank with host mkfs (create
@@ -283,7 +287,7 @@ public:
         // executes host mkfs.
         if (!cfg_.mkfs_runner) {
             cfg_.mkfs_runner =
-                std::make_shared<ForkExecMkfsRunner>(cfg_.mkfs_timeout_sec);
+                make_default_mkfs_runner(cfg_.mkfs_timeout_sec);
         }
     }
 
@@ -346,7 +350,7 @@ public:
         }
         // Wake the reaper: it is parked in a signal wait with no cancel
         // path; a synthetic SIGCHLD makes it re-check stopping_ and exit.
-        // Harmless: the waitpid scan just finds nothing.
+        // Harmless: its per-pid sweep just finds nothing.
         ::kill(::getpid(), SIGCHLD);
         // Join both before returning: detached tasks must not outlive the
         // scheduler (teardown drains forever on parked tasks).
@@ -566,24 +570,45 @@ private:
         }
     }
 
+    /// Reaps the daemon's own device children, one pid at a time.
+    ///
+    /// Deliberately NOT `waitpid(-1, ...)`: the daemon also forks
+    /// out-of-band helper processes (the ADR-0014 mode-3 mkfs runner),
+    /// whose exit status belongs to their owner. A wildcard wait would
+    /// steal it, leaving the owner's `waitpid` with ECHILD — mode 3 would
+    /// fail on every create. The reaper therefore knows exactly which
+    /// pids are device children (the registry) and never touches anything
+    /// else.
     elio::coro::task<void> reaper(elio::signal::signal_fd& sigfd) {
         while (!stopping_.load()) {
             auto info = co_await sigfd.wait();
             if (!info) break;
+            // A coalesced SIGCHLD can cover several exits: sweep until a
+            // full pass reaps nothing.
             for (;;) {
-                int wstatus = 0;
-                const pid_t pid = ::waitpid(-1, &wstatus, WNOHANG);
-                if (pid <= 0) break;
-                co_await mu_.lock();
-                for (auto& [id, entry] : children_) {
-                    if (entry->child->pid() == pid) {
-                        entry->child->note_reaped(wstatus);
-                        ELIO_LOG_INFO("device {} exited (code {})", id,
-                                      entry->child->status().exit_code);
-                        break;
+                std::vector<std::pair<std::string, std::shared_ptr<Child>>>
+                    snapshot;
+                {
+                    co_await mu_.lock();
+                    snapshot.reserve(children_.size());
+                    for (auto& [id, entry] : children_) {
+                        snapshot.emplace_back(id, entry->child);
                     }
+                    mu_.unlock();
                 }
-                mu_.unlock();
+                bool reaped_any = false;
+                for (auto& [id, child] : snapshot) {
+                    const pid_t pid = child->pid();
+                    if (pid <= 0) continue;
+                    int wstatus = 0;
+                    const pid_t r = ::waitpid(pid, &wstatus, WNOHANG);
+                    if (r != pid) continue;  // still alive, or already reaped
+                    child->note_reaped(wstatus);
+                    ELIO_LOG_INFO("device {} exited (code {})", id,
+                                  child->status().exit_code);
+                    reaped_any = true;
+                }
+                if (!reaped_any) break;
             }
         }
     }
@@ -659,7 +684,7 @@ private:
             spec.blank_size = blank->size;
             spec.blank_dir = cfg_.blank_dir + "/" + id;
             entry->spec = std::move(spec);
-            entry->image_config_ok = true;  // no config; upper is known
+            entry->upper_known = true;  // no config; upper known by layout
             entry->upper_type = "lsmt";
             entry->upper_path = cfg_.blank_dir + "/" + id + "/overlaybd.rw";
             entry->blank = true;
@@ -684,7 +709,7 @@ private:
                 const image::ImageConfig img =
                     image::ImageConfig::from_json_text(
                         text, image::DownloadConfig{});
-                entry->image_config_ok = true;
+                entry->upper_known = true;
                 if (img.writable()) {
                     entry->upper_type = img.upper.type;
                     if (img.upper.type == "lsmt") {
@@ -747,7 +772,7 @@ private:
             if (!blank->mkfs.empty()) {
                 if (st.device.empty() ||
                     dev_id_from_bdev_path(st.device) < 0) {
-                    co_await stop_entry_and_erase(id);
+                    co_await stop_entry_and_erase(entry);
                     co_return reply_error(
                         "blank device reported no /dev/ublkbN path; "
                         "cannot run mkfs." +
@@ -757,7 +782,7 @@ private:
                 const int mkrc = co_await cfg_.mkfs_runner->run(
                     blank->mkfs, st.device, &mkfs_err);
                 if (mkrc != 0) {
-                    co_await stop_entry_and_erase(id);
+                    co_await stop_entry_and_erase(entry);
                     co_return reply_error(
                         "mkfs." + blank->mkfs + " on " + st.device +
                         " failed: " +
@@ -778,22 +803,33 @@ private:
         co_return reply_ok(fields);
     }
 
-    /// Stops and removes a device entry (used on create-time failures such
-    /// as a failed mode-3 mkfs, mirroring cmd_destroy: `destroying` set
-    /// under mu_ so supervise_entry never respawns, op_mu around the stop,
-    /// entry erased at the end).
-    elio::coro::task<void> stop_entry_and_erase(const std::string& id) {
-        std::shared_ptr<DeviceEntry> entry;
+    /// Stops and removes EXACTLY the given device entry (used on
+    /// create-time failures such as a failed mode-3 mkfs). The entry is
+    /// passed in — not looked up by id — and re-checked under mu_ before
+    /// anything is stopped or erased: a stale failure path (a create that
+    /// spent minutes in mkfs while the id was destroyed and re-created)
+    /// must never terminate or remove a NEWER device that happens to own
+    /// the same id. Mirrors cmd_destroy otherwise: `destroying` set under
+    /// mu_ so supervise_entry never respawns, op_mu around the stop, the
+    /// entry erased (again identity-checked) at the end.
+    elio::coro::task<void> stop_entry_and_erase(
+        const std::shared_ptr<DeviceEntry>& entry) {
+        if (!entry) co_return;
         {
             co_await mu_.lock();
-            auto it = children_.find(id);
-            if (it != children_.end()) {
-                entry = it->second;
+            auto it = children_.find(entry->spec.id);
+            if (it == children_.end() || it->second != entry) {
+                // The id now belongs to a different (or no) device: the
+                // registration of this stale entry is gone, and whatever
+                // removed it (destroy) already stopped its child. Just
+                // mark it so a late supervise_entry pass never respawns.
                 entry->destroying = true;
+                mu_.unlock();
+                co_return;
             }
+            entry->destroying = true;
             mu_.unlock();
         }
-        if (!entry) co_return;
         co_await entry->op_mu.lock();
         {
             SyncMutexGuard op_guard{entry->op_mu};
@@ -817,7 +853,10 @@ private:
         }
         {
             co_await mu_.lock();
-            children_.erase(id);
+            auto it = children_.find(entry->spec.id);
+            if (it != children_.end() && it->second == entry) {
+                children_.erase(it);
+            }
             mu_.unlock();
         }
         co_return;
@@ -1232,7 +1271,7 @@ private:
     elio::coro::task<std::string> commit_stop_and_seal(
         const std::shared_ptr<DeviceEntry>& entry, const std::string& id,
         const std::string& user_tag, uint64_t virtual_size) {
-        if (!entry->image_config_ok) {
+        if (!entry->upper_known) {
             co_return reply_error(
                 "image config unreadable at create; upper unknown: " + id);
         }
@@ -1380,6 +1419,10 @@ private:
 };
 
 }  // namespace
+
+MkfsRunnerPtr make_default_mkfs_runner(int timeout_sec) {
+    return std::make_shared<ForkExecMkfsRunner>(timeout_sec);
+}
 
 elio::coro::task<int> run_daemon(const DaemonConfig& cfg) {
     Daemon d(cfg);

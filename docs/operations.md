@@ -144,6 +144,20 @@ created with `obdctl create-blank` (or the equivalent `create` with a
    # → the sealed layer's path/sha256/size (a standard LSMT layer)
    ```
 
+   Two workspace caveats (both inherited from the writable-upper model):
+
+   - **A crash-respawn truncates the upper.** ADR-0010 recovery re-assembles
+     the blank stack when a device process dies, and assembly recreates
+     `overlaybd.rw` with `O_TRUNC`. Unsealed writes do **not** survive a
+     device crash: `obdctl commit` (or a graceful `destroy`, which
+     checkpoints) before letting a valuable device crash-recover. This is
+     the same behavior image-mode writable devices have always had.
+   - **The sealed layer lives inside the workspace.** `commit` seals
+     `<blank-dir>/<id>/overlaybd.rw` in place, so `destroy` followed by
+     re-creating the same id truncates the previously committed sealed
+     layer. Copy the sealed file out (its `path` comes back in the commit
+     reply) before re-creating that id.
+
 3. **Blank + mkfs convenience** (host tooling; runtime only):
 
    ```bash

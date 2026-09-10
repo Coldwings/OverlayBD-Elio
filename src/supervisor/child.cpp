@@ -63,10 +63,14 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
     } else {
         a.argv.push_back(a.config_flag.data());
         a.argv.push_back(a.config.data());
-        if (!a.global.empty()) {
-            a.argv.push_back(a.global_flag.data());
-            a.argv.push_back(a.global.data());
-        }
+    }
+    // --global applies to BOTH modes (a blank device still reads
+    // ublkConfig.enableRecovery and the other daemon-wide knobs from
+    // overlaybd.json); the ordering matches docs/supervisor.md's argv
+    // contract.
+    if (!a.global.empty()) {
+        a.argv.push_back(a.global_flag.data());
+        a.argv.push_back(a.global.data());
     }
     a.argv.push_back(a.ctl_flag.data());
     a.argv.push_back(a.ctl_fd.data());

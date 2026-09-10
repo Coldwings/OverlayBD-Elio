@@ -64,7 +64,7 @@ obd-device (--config PATH | --blank-size BYTES --blank-dir PATH)
 | Option | Default | Meaning |
 |---|---|---|
 | `--config PATH` | — | Per-image `config.json` (overlaybd-snapshotter format). Mutually exclusive with the blank form. |
-| `--blank-size BYTES` | — | ADR-0014 modes 2/3: create a blank (raw) device of this many bytes (no config) — the empty LSMT zero base + a writable LSMT-RW upper are assembled in `--blank-dir`. |
+| `--blank-size BYTES` | — | ADR-0014 modes 2/3: create a blank (raw) device of this many bytes (no config) — the empty LSMT zero base + a writable LSMT-RW upper are assembled in `--blank-dir`. Strictly validated here too (positive, 512-aligned, ≤ 16 TiB; a negative or overflowing value is a usage error, exit 2), not only by the supervisor's `parse_blank_spec`. |
 | `--blank-dir PATH` | — | ADR-0014: per-device workspace for a blank device (files `overlaybd.zero` / `overlaybd.rw`). |
 | `--global PATH` | empty = built-in defaults | Global `overlaybd.json`; when omitted, a default-constructed `GlobalConfig` is used. |
 | `--control-fd N` | `-1` (no reporting) | Inherited fd for JSON-lines lifecycle status reports (the socketpair end installed by the supervisor). |
@@ -240,11 +240,15 @@ output).
   `protocol`/`version`/`features` and never drops malformed input.
 - `supervisor: commit stops the device and seals its upper offline` — the
   `obdctl commit` path end to end against a real daemon (ADR-0014).
-- `supervisor: blank create serves a writable zero base and commit seals
-  its upper` / `supervisor: mode-3 mkfs runs only when the blank spec
-  requests it` — the `obdctl create-blank` paths (mode 2 + the mkfs gate
-  and error path) against a real daemon with a fake device and a mock
-  mkfs runner; host mkfs is never executed by the tests (ADR-0014).
+- `cli: obdctl create-blank sends a create command with the blank object` —
+  the real obdctl binary executed against a test-owned UDS: the wire line
+  is `cmd:"create"` with the `blank` object (`size`, optional `mkfs`) plus
+  `global`/`dev_id`, image-mode create still sends `config`, an `ok:false`
+  reply exits 1, and malformed CLI input exits 2 without connecting.
+- `supervisor: blank create serves a writable zero base and commit seals its upper` — the `obdctl create-blank` mode-2 path against a real daemon (ADR-0014).
+- `supervisor: mode-3 mkfs runs only when the blank spec requests it` — the `obdctl create-blank --mkfs` gate and error path against a real daemon (ADR-0014).
+- `supervisor: default mkfs runner completes without the reaper stealing it` — the daemon's real fork/exec mkfs runner against a PATH shim: the helper child's status stays with its owner (the reaper reaps device pids only) and mode 3 succeeds.
+- `supervisor: mkfs runner maps exit codes and bounds the timeout` — the real runner's mappings: success, nonzero exit, exec-not-found (127), an unsafe type refused before argv, and a bounded timeout that SIGKILLs the helper.
 - `supervisor: child spawn execs and reports through the channel` — guards
   the fork/exec path the supervisor uses to start obd-device and the
   JSON-lines status channel back.

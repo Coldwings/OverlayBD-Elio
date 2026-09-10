@@ -109,8 +109,10 @@ int main(int argc, char** argv) {
             }
         }
     } else if (cmd == "create-blank") {
-        // ADR-0014 modes 2/3: build the wire create with the additive
-        // "blank" object (size mandatory, mkfs optional).
+        // ADR-0014 modes 2/3: the WIRE command is plain `create` with the
+        // additive "blank" object (create-blank is only the CLI spelling
+        // of that mode — the supervisor has no `create-blank` command).
+        req["cmd"] = "create";
         if (i >= argc) {
             usage(argv[0]);
             return 2;

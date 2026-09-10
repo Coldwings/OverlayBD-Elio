@@ -321,6 +321,17 @@ three creation modes of ADR-0014 are:
    turns its own non-deterministic convenience output into an image
    layer.
 
+Two workspace caveats for blank devices (both inherited from the
+writable-upper model, documented in docs/operations.md):
+
+- **Respawn truncates the upper.** ADR-0010 crash recovery re-assembles
+  the blank stack, and assembly recreates `overlaybd.rw` with `O_TRUNC`:
+  unsealed writes do not survive a device crash. Commit (or a graceful
+  stop) first.
+- **The committed artifact lives in the workspace.** `commit` seals
+  `<blank_dir>/<id>/overlaybd.rw` in place; `destroy` + re-create of the
+  same id truncates it. Copy the sealed layer out first.
+
 Size rules (enforced at parse/handler time): positive, multiple of 512
 bytes, at most `kMaxBlankSizeBytes` (16 TiB sanity bound — the zero base
 allocates no data, so this only guards a typo'd size). The `mkfs` type is
@@ -472,8 +483,10 @@ or not executable)" (`Child::note_reaped`).
 
 `run_daemon` runs three concurrent activities on the Elio scheduler:
 the **accept loop** (one coroutine per one-shot client), the **reaper** (a
-`signalfd` on SIGCHLD draining `waitpid(-1, …, WNOHANG)` and matching pids
-to children), and one **monitor coroutine per child** (a `LineReader` over
+`signalfd` on SIGCHLD that reaps its registered device children one pid at
+a time with `waitpid(pid, …, WNOHANG)` — never `waitpid(-1)`, so a helper
+child owned by another component, e.g. the mode-3 mkfs runner, keeps its
+exit status), and one **monitor coroutine per child** (a `LineReader` over
 the child's status fd feeding `Child::update_status`). The children
 registry (`std::map<id, std::shared_ptr<Child>>`) is guarded by an
 `elio::sync::mutex` — coroutine-aware, never held across heavy work.
@@ -651,8 +664,12 @@ pre-parse needed).
 - The control fd passes ownership exactly once via `release_control_fd()`
   (to the monitor coroutine, which closes it at EOF); double-close is
   impossible by construction.
-- The reaper is the only `waitpid(-1, …)` caller in the process; it
-  matches pids against the registry and ignores unknown ones.
+- The reaper never calls the wildcard `waitpid(-1, …)`: it sweeps the
+  registry's device pids only, so it can neither steal a helper child's
+  exit status (the ADR-0014 mode-3 mkfs runner owns its own child) nor
+  wait on a pid it does not manage. Its registry snapshot is taken under
+  `mu_` and each pid is reaped with `waitpid(pid, …, WNOHANG)`; a child
+  replaced meanwhile is simply already reaped and skipped.
 - Inputs are not mutated: `ChildSpec` and `DaemonConfig` are read at
   spawn/run time; `parse_command` returns an owning `nlohmann::json`.
 
@@ -698,6 +715,32 @@ needing a real ublk device or root.
   `make_device_status` → `parse_device_status` round-trips a `failed`
   status with its `error` field. This pins the exact wire shapes
   documented above.
+- `supervisor: mkfs runner maps exit codes and bounds the timeout` — the
+  REAL default mkfs runner (no daemon) against throwaway PATH shims:
+  success, a nonzero exit code, the exec-not-found 127 mapping, an unsafe
+  fs type refused before it reaches argv, and a shim sleeping past the
+  bound reported as `-ETIMEDOUT` after SIGKILL (the runner owns its
+  child).
+- `supervisor: blank spawn argv carries the blank flags and global` — the
+  ADR-0014 spawn contract: `--blank-size N --blank-dir D [--global G]
+  --control-fd 3` and never `--config`, asserted on the child's real argv.
+- `supervisor: default mkfs runner completes without the reaper stealing
+  it` (integration, `tests/integration/test_commit.cpp`) — regression for
+  the reaper/mkfs-helper interaction: the daemon runs its REAL runner
+  against a PATH shim, the mode-3 create succeeds with `mkfs:"ext4"`, the
+  shim saw the device path, and the daemon keeps serving afterwards. A
+  wildcard `waitpid(-1)` reaper steals the helper's status and makes this
+  fail.
+- `supervisor: stale blank-create failure leaves a newer device alone`
+  (integration, `tests/integration/test_commit.cpp`) — a create held
+  inside its mkfs step while the id is destroyed and re-created: the
+  stale mkfs failure must clean up only ITS OWN entry, leaving the newer
+  device (and its pid) alive.
+- `supervisor: obd-device rejects malformed blank flags` — the real
+  obd-device binary's `--blank-size`/`--blank-dir` validation: negative,
+  zero, unaligned, junk, overflowing and above-bound sizes, the missing
+  workspace, and `--config` combined with blank are all usage errors
+  (exit 2) before any device work.
 - `supervisor: create blank spec parses and validates size and mkfs` —
   pins the ADR-0014 blank create grammar: `create` with `blank` (mode 2,
   and mode 3 with `mkfs`) parses; `config` and `blank` are mutually
@@ -731,8 +774,7 @@ needing a real ublk device or root.
   `path`/`sha256`/`size`; a second commit fails with "already sealed";
   the sealed file re-opens as a valid LSMT RO layer with the
   checkpointed content (ADR-0014). Runs without privileges.
-- `supervisor: blank create serves a writable zero base and commit seals
-  its upper` (integration, `tests/integration/test_commit.cpp`) — the
+- `supervisor: blank create serves a writable zero base and commit seals its upper` (integration, `tests/integration/test_commit.cpp`) — the
   ADR-0014 mode-2 path end to end with the fake device: `create` with
   `blank` (no config) builds the workspace (`overlaybd.zero` + the
   writable `overlaybd.rw`) via `open_blank_device`, the fake round-trips
@@ -740,8 +782,7 @@ needing a real ublk device or root.
   commit stops it and seals the blank-born upper, and a second commit is
   "already sealed". A recording mkfs mock asserts host mkfs is never
   invoked in mode 2.
-- `supervisor: mode-3 mkfs runs only when the blank spec requests it`
-  (integration, `tests/integration/test_commit.cpp`) — the mode-3 gate
+- `supervisor: mode-3 mkfs runs only when the blank spec requests it` (integration, `tests/integration/test_commit.cpp`) — the mode-3 gate
   and error path: a plain blank create never invokes the (mock) mkfs
   runner; `blank.mkfs` invokes it exactly once with the requested type
   and the reported device path; commit of a formatted (mode-3) upper is
@@ -781,7 +822,12 @@ Each device is supervised for its whole lifetime by one coroutine
 **unexpected** exit (not a requested `destroy`, not daemon shutdown),
 respawns the child with `--recover --dev-id N`: the ublk device was
 created with `UBLK_F_USER_RECOVERY` and survives serverless in the kernel,
-so the replacement *attaches* instead of re-creating. The dev id is parsed
+so the replacement *attaches* instead of re-creating.
+**Blank-device caveat:** the respawn re-runs the blank assembly, which
+recreates the writable upper (`overlaybd.rw`) with `O_TRUNC` — unsealed
+writes are lost across a device crash, exactly as for an image-mode
+writable upper. Commit (or stop gracefully) before letting a valuable
+blank device crash-recover. The dev id is parsed
 from the ready status's bdev path by the supervising coroutine itself, so
 an instant crash can never be observed before the id is recorded.
 Respawns are bounded by `DaemonConfig::max_recovery_attempts` (default 3);

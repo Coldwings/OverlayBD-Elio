@@ -343,7 +343,39 @@ int main(int argc, char** argv) {
         if (a == "--config") args.config = next("--config");
         else if (a == "--blank-size") {
             args.blank = true;
-            args.blank_size = std::stoull(next("--blank-size"));
+            // Strict decimal validation: std::stoull would happily turn
+            // "-512" into 1.8e19 and pass the alignment check, so nothing
+            // negative/overflowing/junk reaches the assembler. Range and
+            // alignment are enforced HERE as well as in the supervisor's
+            // parse_blank_spec — obd-device is also a standalone entry
+            // point, and a malformed size must be a usage error, not a
+            // device that comes up mis-sized.
+            const std::string v = next("--blank-size");
+            bool bad = v.empty() || v[0] == '-' ||
+                       v.find_first_not_of("0123456789") != std::string::npos;
+            uint64_t parsed = 0;
+            if (!bad) {
+                try {
+                    parsed = std::stoull(v);
+                } catch (const std::exception&) {
+                    bad = true;
+                }
+            }
+            if (!bad &&
+                (parsed == 0 || parsed % 512 != 0 ||
+                 parsed > obd::supervisor::kMaxBlankSizeBytes)) {
+                bad = true;
+            }
+            if (bad) {
+                std::fprintf(stderr,
+                             "invalid --blank-size '%s' (want a positive "
+                             "multiple of 512 bytes, at most %llu)\n",
+                             v.c_str(),
+                             static_cast<unsigned long long>(
+                                 obd::supervisor::kMaxBlankSizeBytes));
+                return 2;
+            }
+            args.blank_size = parsed;
         } else if (a == "--blank-dir") args.blank_dir = next("--blank-dir");
         else if (a == "--global") args.global = next("--global");
         else if (a == "--control-fd")

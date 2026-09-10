@@ -31,6 +31,16 @@ public:
 };
 using MkfsRunnerPtr = std::shared_ptr<MkfsRunner>;
 
+/// Factory for the default MkfsRunner (defined in daemon.cpp): forks
+/// `mkfs.<type> <device>` resolved on PATH and reaps it with a
+/// non-blocking WNOHANG poll bounded by `timeout_sec`, mapping exit
+/// codes (127 → "not found or not executable"), signals, and a timeout
+/// (SIGKILL, `-ETIMEDOUT`) into the result. Installed by the daemon when
+/// `DaemonConfig::mkfs_runner` is empty; exposed so tests can exercise
+/// the REAL runner's mappings without a daemon (and so the runner's
+/// child ownership is testable against the daemon's reaper).
+MkfsRunnerPtr make_default_mkfs_runner(int timeout_sec);
+
 struct DaemonConfig {
     std::string socket_path = "/run/overlaybd-elio/supervisor.sock";
     /// Default overlaybd.json handed to children when a create command

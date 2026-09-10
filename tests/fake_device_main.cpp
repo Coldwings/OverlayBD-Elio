@@ -114,7 +114,8 @@ elio::coro::task<int> fake_main(Args args) {
                                           "blank root is not writable"});
                 co_return 1;
             }
-            std::vector<uint8_t> zero_buf(kPayloadBytes);
+            // 0xFF-prefilled: a no-op pread must fail the all-zero check.
+            std::vector<uint8_t> zero_buf(kPayloadBytes, 0xFF);
             const ssize_t zr = co_await w->pread(zero_buf.data(),
                                                  zero_buf.size(),
                                                  512 * 32);  // unwritten
@@ -434,6 +435,14 @@ int main(int argc, char** argv) {
                          "usage: %s --blank-size BYTES --blank-dir PATH "
                          "[--control-fd N]\n",
                          argv[0]);
+            return 2;
+        }
+        // Parity with the real obd-device: the two creation modes are
+        // mutually exclusive, so a test cannot accidentally exercise a
+        // combination the production binary rejects.
+        if (!args.config.empty()) {
+            std::fprintf(stderr,
+                         "--config and --blank-size are mutually exclusive\n");
             return 2;
         }
     } else if (args.config.empty()) {

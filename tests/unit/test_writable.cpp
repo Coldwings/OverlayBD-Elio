@@ -992,13 +992,15 @@ TEST_CASE("format: empty sealed lsmt layer is a zero base of its virtual size",
         layers.push_back(std::move(layer));
         auto merged = co_await format::MergedLsmt::open(std::move(layers));
         REQUIRE(merged->size() == vsize);
-        std::vector<uint8_t> head(512 * 16);
+        // Prefilled with 0xFF (not zeroes): a no-op pread must fail the
+        // all-zero assertion instead of passing on a pre-zeroed buffer.
+        std::vector<uint8_t> head(512 * 16, 0xFF);
         const ssize_t r =
             co_await merged->pread(head.data(), head.size(), 0);
         REQUIRE(r == static_cast<ssize_t>(head.size()));
         REQUIRE(std::all_of(head.begin(), head.end(),
                             [](uint8_t b) { return b == 0; }));
-        std::vector<uint8_t> tail(512);
+        std::vector<uint8_t> tail(512, 0xFF);
         const ssize_t r2 = co_await merged->pread(
             tail.data(), tail.size(), vsize - tail.size());
         REQUIRE(r2 == static_cast<ssize_t>(tail.size()));
