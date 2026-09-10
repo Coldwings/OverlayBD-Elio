@@ -627,7 +627,8 @@ Every test, grouped by area, with the property it guards.
   blocking thread; verifies source retention and completion before release.
 - `ublk: async stop handles a partially initialized device` — the same drain
   and destruction path before queue setup. These nonprivileged tests bypass
-  only kernel registration and are bounded by a 30-second CTest timeout.
+  kernel registration, command mappings, queue rings and queue threads;
+  each has a 30-second CTest timeout.
 - `ublk: command buffer geometry matches the driver layout` — the
   command-buffer stride and descriptor layout match `<linux/ublk_cmd.h>`
   exactly (uapi compatibility).

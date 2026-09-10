@@ -432,8 +432,8 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   pending read completes through the single blocking thread after stop begins;
   the source remains owned until the handler posts its completion and exits.
 - `ublk: async stop handles a partially initialized device` — cleanup before
-  any queue is opened. These unit tests bypass kernel registration only and
-  have a 30-second CTest timeout.
+  any queue is opened. These unit tests bypass kernel registration, command
+  mappings, queue rings and queue threads; each has a 30-second CTest timeout.
 - `ublk: command buffer geometry matches the driver layout` — pins the mmap
   geometry against the driver formulas: stride = 98304 for the 24-byte
   descriptor, `cmd_buf_size(128, …)` = 4096, `cmd_buf_size(4096, …)` =

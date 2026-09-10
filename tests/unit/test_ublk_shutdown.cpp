@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <system_error>
 #include <thread>
