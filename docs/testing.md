@@ -63,9 +63,8 @@ Async test bodies are coroutines driven to completion by `test::run_coro`.
 Never pass a `co_await` expression directly to a Catch2 assertion macro:
 
 ```cpp
-// WRONG — REQUIRE/CHECK decompose and can evaluate their argument more
-// than once; a co_await inside one is not a single evaluation. The bad
-// form below is an example only:
+// WRONG — keep suspension points outside assertion macro arguments.
+// The bad form below is an example only:
 //   REQUIRE(  co_await  src->pread(buf.data(), buf.size(), 0)  == 1024 );
 
 // RIGHT — await once into a named local, then assert on the value.
@@ -73,12 +72,20 @@ const ssize_t got = co_await src->pread(buf.data(), buf.size(), 0);
 REQUIRE(got == 1024);
 ```
 
-Awaiting the same coroutine a second time corrupts coroutine semantics
-(re-suspension on an already-driven awaitable), so `REQUIRE`,
-`CHECK`, `REQUIRE_FALSE` and `CHECK_FALSE` must never wrap `co_await`
-directly — in any form of the pattern, whether the awaited expression is
-compared, negated, or spans several lines. Assign the awaited result to a
-named local first, then assert on the local.
+Catch2 expands the assertion argument into expression-decomposition and
+compiler-checking code. Repeated appearances in that expansion do not
+by themselves imply repeated runtime evaluation: some appear in branches
+designed never to execute. Historical issue #14 reported repeated token
+exchanges, but that observation alone does not establish a general Catch2
+multiple-evaluation mechanism or identify a compiler/runtime cause.
+
+The project keeps a conservative rule: `REQUIRE`, `CHECK`, `REQUIRE_FALSE`
+and `CHECK_FALSE` must never wrap `co_await` directly, whether the awaited
+expression is compared, negated, or spans several lines. Assign the awaited
+result to a named local first, then assert on the local. This makes the
+suspension and operation order explicit, independent of assertion macro
+expansion. The source guard below enforces that rule; it does not prove a
+runtime failure mechanism for the prohibited spelling.
 
 CTest enforces this existing rule with `test-await-assertions`, which runs
 `scripts/check_test_awaits.py` over all C++ sources and headers in `tests/`
