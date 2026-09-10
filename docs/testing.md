@@ -79,10 +79,10 @@ designed never to execute. Historical issue #14 reported repeated token
 exchanges, but that observation alone does not establish a general Catch2
 multiple-evaluation mechanism or identify a compiler/runtime cause.
 
-The project keeps a conservative rule: `REQUIRE`, `CHECK`, `REQUIRE_FALSE`
-and `CHECK_FALSE` must never wrap `co_await` directly, whether the awaited
-expression is compared, negated, or spans several lines. Assign the awaited
-result to a named local first, then assert on the local. This makes the
+The project keeps a conservative rule: the `REQUIRE` and `CHECK` runtime
+assertion families listed below must never wrap `co_await` directly, whether
+the awaited expression is compared, negated, or spans several lines. Assign
+the awaited result to a named local first, then assert on the local. This makes the
 suspension and operation order explicit, independent of assertion macro
 expansion. The source guard below enforces that rule; it does not prove a
 runtime failure mechanism for the prohibited spelling.
