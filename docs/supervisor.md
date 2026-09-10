@@ -32,7 +32,9 @@ A Unix domain stream socket (default
 UTF-8 JSON object per line, maximum line length **64 KiB**
 (`kMaxMessageBytes`) on both channels. Connections are **one-shot**: the
 client sends exactly one command line, the supervisor replies with exactly
-one line and closes.
+one line and closes during an ordinary exchange. Shutdown can interrupt the
+exchange with EOF or a connection reset before a reply is delivered. A
+missing reply does not establish whether a mutating command executed.
 
 Requests (validated by `parse_command` in src/supervisor/protocol.cpp —
 these are the real field names):
@@ -648,9 +650,10 @@ pre-parse needed).
 - **Reaping completeness**: every spawned child is reaped exactly once —
   by the SIGCHLD reaper during normal operation, by `~Child` (SIGKILL +
   blocking `waitpid`) on teardown paths. No zombies survive the daemon.
-- **One-shot control channel**: one command line in, one reply line out,
-  connection closed. Malformed commands always receive a `{"ok":false,...}`
-  reply — the socket never hangs silently on bad input.
+- **One-shot control channel**: an admitted command produces at most one
+  reply before the connection closes. Malformed commands map to a
+  `{"ok":false,...}` reply; shutdown or I/O failure can prevent delivery
+  (see "Daemon shutdown").
 - **Bounded waits**: `create` never blocks longer than `ready_timeout_sec`
   waiting for readiness; `destroy` never blocks longer than
   `stop_timeout_sec` + 2 s SIGKILL grace.
@@ -689,8 +692,9 @@ pre-parse needed).
   command handlers concurrently. Event publication happens outside the
   mutex.
 - The control fd passes ownership exactly once via `release_control_fd()`
-  (to the monitor coroutine, which closes it at EOF); double-close is
-  impossible by construction.
+  into a shared stream retained by the monitor and in-flight writers.
+  Monitor EOF removes channel availability from the registry; the fd closes
+  when the last stream owner departs, after its pending I/O completes.
 - The reaper never calls the wildcard `waitpid(-1, …)`: it sweeps the
   registry's device pids plus the pids the mode-3 mkfs runner explicitly
   handed over after abandoning them (`MkfsRunner::take_orphan_pids()`), so
@@ -733,6 +737,14 @@ pre-parse needed).
 
 ## Testing
 
+The daemon-lifetime fixture waits for a positive fake-child PID to be
+published, signals through a pidfd after checking child ownership, and
+confirms reaping (or that the daemon already reaped it) after the runtime
+and client thread finish. PID publication and final reaping each have a
+five-second fixture deadline; cleanup errors fail the test. The early
+signal also releases monitors left behind by a broken daemon. These waits
+run on fixture threads and do not define a product shutdown deadline.
+
 The controlled recovery tests pause real command/monitor paths on a
 four-worker runtime, while a synchronous client kills the fake child and
 queries its replacement. The internal bounded coroutine gate adds no child
@@ -744,6 +756,12 @@ commands and monitors to distinct workers. No kernel ublk is required.
 | `supervisor: recovery publishes child and count together` | Status/list observed at the publication boundary agree on the replacement PID and recovery count. |
 | `supervisor: status owns its child generation and trace snapshot` | A paused status retains the old child and reports its PID/count/recording trace after concurrent recovery marks the live trace lost. |
 | `supervisor: list owns its child generation and trace snapshot` | A paused list preserves the same owned generation and trace while recovery and other commands proceed on another worker. |
+| `supervisor: shutdown drains a monitor after its entry was erased` | Hold EOF cleanup after a successful destroy; shutdown must retain the daemon until the erased entry's monitor departs. |
+| `supervisor: shutdown drains an admitted create and its late monitor` | Hold an admitted create across shutdown; drain its handler and the monitor it spawns before returning. |
+| `supervisor: shutdown drains an accept racing handler registration` | Hold an accepted socket before handler registration; cancellation and draining include the late handler. |
+| `supervisor: shutdown wakes an idle accepted client` | An accepted peer sends no bytes and remains open; shutdown cancels the read and closes its stream after completion. |
+| `supervisor: shutdown wakes a partial accepted command` | A peer sends an incomplete JSON line and remains open; shutdown completes without more peer traffic. |
+| `supervisor: startup failure drains already admitted client work` | An injected failure after accept-loop startup cancels and drains the existing idle client before propagating. |
 
 Unit tests live in `tests/unit/test_supervisor.cpp`; they exercise the
 protocol codecs and the child lifecycle with fake device binaries, without
@@ -878,13 +896,43 @@ flag first and never respawn.
 
 ### Daemon shutdown
 
-`run()` wakes and joins its detached tasks before returning: the accept
-loop (a dummy connection, because `close()` does not cancel an in-flight
-accept SQE) and the reaper (a synthetic SIGCHLD, because a parked signalfd
-wait has no cancel path). The reaper constructs its `signal_fd` itself and
-is pinned with `go_to(0)`: `signal_fd` caches the creating worker's
-`io_context`, and `sync::mutex` wakeups could otherwise migrate the
-coroutine to a worker where that context is invalid.
+Shutdown closes admission and cancels the listener's pending accept,
+accepted clients' socket reads/writes, and forwarded device-channel writes.
+An idle peer, a partial JSON line, or a device that stops reading therefore
+needs no additional peer traffic to let those I/O operations finish. The
+listener and each stream retain their descriptors through I/O completion.
+
+Command admission occurs at the shutdown check after reading a complete
+line. A connection accepted earlier, or even a line fully read before that
+check, can receive EOF/reset without dispatch or a JSON reply when shutdown
+has begun. Already admitted handlers remain owned until completion, which
+may include cancellation or failure; draining them does not guarantee
+successful command execution or response delivery.
+
+The daemon drains accepted handlers first, with device monitors and the
+SIGCHLD reaper still running: an already admitted command may finish a
+create, spawn its monitor, or wait for a device reply or exit. It then stops
+the stable set of registered children, cancels remaining monitor reads, and
+drains **all** admitted monitors, including those whose entry was removed
+by `destroy`. Only after this work departs does it wake and drain the reaper.
+Recovery publication still takes `op_mu` followed by the registry mutex;
+shutdown takes `op_mu` before choosing the generation to terminate.
+
+Each spawned task has an owned join handle. Shutdown waits asynchronously
+for frame and callable destruction, not merely the task's result or a
+child's exit event. Startup/signal-wait exceptions follow the same drain
+before propagating. Completed handles are reclaimed during admission.
+The reaper remains pinned to worker 0 because its `signal_fd` caches its
+creating worker's I/O context.
+
+This is a completion guarantee, not a single global shutdown deadline.
+Readiness, device-reply, stop, and host-mkfs waits retain their existing
+bounds when reached; local file/seal operations must complete as usual.
+Forwarded writes can finish with cancellation before the whole request has
+been sent. The existing 30-second device-reply timeout begins only after a
+complete send, so write cancellation must be available while handlers drain.
+The daemon does not free shared state when a timeout expires while an owned
+task can still access it.
 
 ## Limitations & TODO
 

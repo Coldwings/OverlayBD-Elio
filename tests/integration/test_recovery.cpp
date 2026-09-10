@@ -19,10 +19,14 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 
 #include <atomic>
+#include <charconv>
 #include <condition_variable>
+#include <fstream>
 #include <mutex>
 #include <system_error>
 #include <chrono>
@@ -399,4 +403,308 @@ TEST_CASE("supervisor: status owns its child generation and trace snapshot", "[s
 
 TEST_CASE("supervisor: list owns its child generation and trace snapshot", "[supervisor][recovery-snapshot]") {
     check_recovery_observation("list");
+}
+
+namespace {
+
+// These cleanup helpers run only on ordinary fixture threads, never workers.
+pid_t read_fixture_pid(const std::string& path,
+                       std::chrono::milliseconds grace = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + grace;
+    for (;;) {
+        std::ifstream input(path);
+        char record[32]{};
+        input.getline(record, sizeof(record));
+        const std::string_view line(record);
+        pid_t pid = -1;
+        const auto parsed = std::from_chars(line.data(), line.data() + line.size(), pid);
+        // getline must have consumed the newline, not just reached EOF in a
+        // partially published number. Oversized or malformed records fail too.
+        if (input && !input.eof() && parsed.ec == std::errc{} &&
+            parsed.ptr == line.data() + line.size() && pid > 0) return pid;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("fixture PID publication timed out: " + path);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+bool fixture_child_exited(pid_t pid, std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        const pid_t result = ::waitpid(pid, nullptr, WNOHANG);
+        if (result == pid) return true;
+        if (result == 0) return false;
+        const int error = errno;
+        if (error == ECHILD) return true;  // The daemon may have reaped it.
+        if (error != EINTR) {
+            throw std::system_error(error, std::generic_category(), "fixture waitpid");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("fixture waitpid interrupted until deadline");
+        }
+    }
+}
+
+void terminate_fixture_child(pid_t pid) {
+    // Pin the signal target before checking child ownership: the daemon's
+    // reaper may collect it between waitpid and signalling. Never signal a
+    // numeric PID that could have been recycled in that interval.
+    const int pidfd = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+    if (pidfd < 0) {
+        const int error = errno;
+        if (error == ESRCH) return;
+        throw std::system_error(error, std::generic_category(), "fixture pidfd_open");
+    }
+    try {
+        if (!fixture_child_exited(pid, std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(5))) {
+            if (::syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, nullptr, 0) < 0 &&
+                errno != ESRCH) {
+                throw std::system_error(errno, std::generic_category(), "fixture pidfd_send_signal");
+            }
+        }
+    } catch (...) {
+        ::close(pidfd);
+        throw;
+    }
+    ::close(pidfd);
+}
+
+void reap_fixture_child(pid_t pid,
+                        std::chrono::milliseconds grace = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + grace;
+    while (!fixture_child_exited(pid, deadline)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error("fixture child reap timed out: " + std::to_string(pid));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+void check_daemon_lifetime(const std::string& point) {
+    test::TempDir dir;
+    const std::string sock = dir / "s.sock";
+    const std::string config = test::write_file(
+        dir / "config.json", std::vector<uint8_t>{'{', '}'});
+    const std::string script = dir / "device.sh";
+    const std::string pid_file = dir / "child.pid";
+    const std::string content = "#!/bin/sh\necho $$ > \"" + pid_file + "\"\n" + R"(printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
+while IFS= read -r line <&3; do :; done
+)";
+    test::write_file(script, std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    sigset_t block, prev;
+    ::sigemptyset(&block);
+    ::sigaddset(&block, SIGTERM);
+    ::sigaddset(&block, SIGINT);
+    ::sigaddset(&block, SIGCHLD);
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &prev) == 0);
+
+    auto gate = std::make_shared<supervisor::detail::DaemonTestGate>();
+    if (point == "startup_failure") gate->arm(point);
+    std::atomic<int> daemon_rc{-1};
+    std::atomic<bool> client_done{false};
+    std::vector<std::string> failures;
+    std::string daemon_error;
+    pid_t child_pid = -1;  // Written by client; reused only after its join.
+    auto check = [&](bool ok, const char* error) {
+        if (!ok) failures.emplace_back(error);
+    };
+    auto wait_until = [](auto&& condition) {
+        for (int i = 0; i < 500; ++i) {
+            if (condition()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return condition();
+    };
+    std::thread client([&] {
+        int fd = -1;
+        bool signalled = false;
+        auto rpc = [&](const nlohmann::json& command) {
+            return nlohmann::json::parse(uds_rpc(sock, command.dump() + "\n"));
+        };
+        try {
+            if (!wait_until([&] { return std::filesystem::exists(sock); })) {
+                throw std::runtime_error("listener did not appear");
+            }
+            if (point == "monitor_eof") {
+                const auto created = rpc({{"cmd", "create"}, {"id", "d1"},
+                                          {"config", config}});
+                if (!created.value("ok", false)) throw std::runtime_error("create failed");
+                gate->arm(point);
+                const auto destroyed = rpc({{"cmd", "destroy"}, {"id", "d1"}});
+                check(destroyed.value("ok", false), "destroy did not finish before monitor EOF cleanup");
+                if (!gate->wait()) throw std::runtime_error("monitor EOF gate not reached");
+                check(rpc({{"cmd", "list"}}).at("devices").empty(), "destroyed entry remains registered");
+            } else {
+                if (point != "startup_failure") gate->arm(point);
+                fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                if (fd < 0) throw std::system_error(errno, std::generic_category(), "client socket");
+                sockaddr_un address{};
+                address.sun_family = AF_UNIX;
+                std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", sock.c_str());
+                if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+                    throw std::system_error(errno, std::generic_category(), "client connect");
+                }
+                const timeval send_timeout{8, 0};
+                if (::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout)) != 0) {
+                    throw std::system_error(errno, std::generic_category(), "fixture send timeout");
+                }
+                auto send_all = [&](std::string_view bytes) {
+                    size_t sent = 0;
+                    while (sent < bytes.size()) {
+                        const ssize_t n = ::send(fd, bytes.data() + sent, bytes.size() - sent, MSG_NOSIGNAL);
+                        if (n < 0) {
+                            if (errno == EINTR) continue;
+                            throw std::system_error(errno, std::generic_category(), "fixture send");
+                        }
+                        if (n == 0) throw std::runtime_error("fixture send made no progress");
+                        sent += static_cast<size_t>(n);
+                    }
+                };
+                if (point == "command") {
+                    const std::string command = nlohmann::json(
+                        {{"cmd", "create"}, {"id", "late"}, {"config", config}}).dump() + "\n";
+                    send_all(command);
+                    if (!gate->wait()) throw std::runtime_error("active create gate not reached");
+                } else if (point == "accepted") {
+                    if (!gate->wait()) throw std::runtime_error("accept gate not reached");
+                } else {
+                    if (point == "partial") {
+                        send_all("{");
+                    }
+                    if (!wait_until([&] { return gate->count("client_read") != 0; })) {
+                        throw std::runtime_error("accepted handler did not start reading");
+                    }
+                }
+            }
+            if (point == "startup_failure") {
+                if (!gate->wait()) throw std::runtime_error("startup failure gate not reached");
+                gate->release();
+            } else {
+                check(::kill(::getpid(), SIGTERM) == 0, "cannot signal shutdown");
+            }
+            signalled = true;
+            if (!wait_until([&] { return gate->count("shutdown") != 0; })) {
+                throw std::runtime_error("shutdown did not start");
+            }
+            if (point == "monitor_eof" || point == "command" || point == "accepted") {
+                // The held task has genuinely reached a known boundary. A
+                // shutdown already observed by the daemon cannot return until
+                // that admitted task's final frame/captures have departed.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                check(daemon_rc.load() < 0, "daemon returned with a held task still admitted");
+                gate->release();
+            }
+            check(wait_until([&] { return daemon_rc.load() >= 0; }), "daemon did not drain while client remained open");
+            if (fd >= 0) {
+                timeval timeout{1, 0};
+                if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+                    throw std::system_error(errno, std::generic_category(), "fixture receive timeout");
+                }
+                char byte;
+                ssize_t received;
+                do { received = ::recv(fd, &byte, 1, 0); } while (received < 0 && errno == EINTR);
+                check(received == 0 || (received < 0 && errno == ECONNRESET), "shutdown left an accepted socket open");
+            }
+            if (point == "accepted") {
+                check(gate->count("client_read") == 1, "late registered handler did not observe cancelled admission");
+            }
+            if (point == "monitor_eof" || point == "command") {
+                check(wait_until([&] { return gate->count("monitor_started") == 1; }), "expected monitor did not start");
+                check(gate->count("monitor_departed") == 1, "daemon returned before monitor departure");
+            }
+        } catch (const std::exception& error) {
+            failures.emplace_back(error.what());
+        }
+        // Failure cleanup never relies on the parked peer to send more data.
+        // Release every gate and close the peer before any Catch assertion.
+        gate->release();
+        if (fd >= 0) ::close(fd);
+        // The fixture also owns its fake process independently of the daemon.
+        // A broken daemon may have returned before an admitted create spawns
+        // it, so cleanup cannot depend on the already-closed control listener.
+        if (point == "command" || point == "monitor_eof") {
+            try {
+                // Redirection creates an empty file before echo publishes PID.
+                child_pid = read_fixture_pid(pid_file);
+                terminate_fixture_child(child_pid);
+            } catch (const std::exception& error) {
+                failures.emplace_back(error.what());
+            }
+        }
+        // Releasing the startup gate already injects its shutdown exception;
+        // a SIGTERM here could remain unread when the signal mask is restored.
+        if (!signalled && point != "startup_failure") ::kill(::getpid(), SIGTERM);
+        client_done.store(true);
+    });
+    supervisor::DaemonConfig cfg;
+    cfg.socket_path = sock;
+    cfg.device_bin = script;
+    cfg.global_config = "";
+    cfg.ready_timeout_sec = 2;
+    cfg.stop_timeout_sec = 1;
+    cfg.max_recovery_attempts = 0;
+    elio::run_config runtime;
+    runtime.num_threads = 4;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        elio::go_to(0, [&]() -> elio::coro::task<void> {
+            try {
+                daemon_rc.store(co_await supervisor::detail::run_daemon_with_test_gate(cfg, gate));
+            } catch (const std::exception& error) {
+                daemon_error = error.what();
+                daemon_rc.store(1);
+            }
+        });
+        while (!client_done.load() || daemon_rc.load() < 0) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(10));
+        }
+        co_return 0;
+    }, runtime);
+    client.join();
+    // The scheduler has drained every monitor; reap any fake that a broken
+    // baseline failed to include in its shutdown registry snapshot.
+    if (child_pid > 0) {
+        try {
+            reap_fixture_child(child_pid);
+        } catch (const std::exception& error) {
+            failures.emplace_back(error.what());
+        }
+    }
+    const int mask_rc = ::sigprocmask(SIG_SETMASK, &prev, nullptr);
+    std::string failure_text;
+    for (const auto& failure : failures) failure_text += failure + "\n";
+    INFO(failure_text);
+    CHECK(failures.empty());
+    CHECK_FALSE(gate->timeout());
+    CHECK(rc == 0);
+    CHECK(daemon_rc.load() == (point == "startup_failure" ? 1 : 0));
+    CHECK(daemon_error == (point == "startup_failure" ? "injected daemon startup failure" : ""));
+    CHECK(mask_rc == 0);
+}
+
+}  // namespace
+
+TEST_CASE("supervisor: shutdown drains a monitor after its entry was erased", "[supervisor][daemon-lifetime]") {
+    check_daemon_lifetime("monitor_eof");
+}
+
+TEST_CASE("supervisor: shutdown drains an admitted create and its late monitor", "[supervisor][daemon-lifetime]") {
+    check_daemon_lifetime("command");
+}
+
+TEST_CASE("supervisor: shutdown drains an accept racing handler registration", "[supervisor][daemon-lifetime]") {
+    check_daemon_lifetime("accepted");
+}
+
+TEST_CASE("supervisor: shutdown wakes an idle accepted client", "[supervisor][daemon-lifetime]") {
+    check_daemon_lifetime("idle");
+}
+
+TEST_CASE("supervisor: shutdown wakes a partial accepted command", "[supervisor][daemon-lifetime]") {
+    check_daemon_lifetime("partial");
+}
+
+TEST_CASE("supervisor: startup failure drains already admitted client work", "[supervisor][daemon-startup-lifetime]") {
+    check_daemon_lifetime("startup_failure");
 }
