@@ -163,8 +163,8 @@ self-skip the same way. The privileged CI job
 `ublk_drv` and runs these tests individually by exact name under `sudo`,
 with a separate bounded step and log for each. The online-grow step has a
 120-second process timeout and records the commit, kernel, test exit status
-and logging status in `build/ublk-e2e-grow.log`, included in the
-`ublk-e2e-logs` artifact. On a supported driver it must verify capacity,
+and the test-output `tee` exit status in `build/ublk-e2e-grow.log`, included
+in the `ublk-e2e-logs` artifact. On a supported driver it must verify capacity,
 grown-region write/read and original content. Only exit 4 accompanied by
 the test's explicit `kernel driver lacks UBLK_U_CMD_UPDATE_SIZE` reason is
 accepted as an unsupported-driver skip, reported as a workflow warning;
