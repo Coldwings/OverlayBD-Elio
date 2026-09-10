@@ -13,6 +13,8 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <functional>
+#include <stdexcept>
 #include <algorithm>
 #include <cstring>
 #include <optional>
@@ -178,6 +180,51 @@ nlohmann::json finalize_fields(const image::TraceRecorder::FinalizeResult& r) {
 }
 
 }  // namespace
+
+std::function<uint64_t(uint64_t)> make_resize_apply(
+    std::shared_ptr<std::atomic<bool>> stopping,
+    std::shared_ptr<std::mutex> gate,
+    std::function<int(uint64_t)> grow_data_plane,
+    std::function<uint64_t(uint64_t)> grow_device) {
+    // The stopping flag and the kernel grow are required for a real
+    // executor; a missing kernel grow would make every apply a no-op, so
+    // refuse loudly at construction time rather than silently accepting
+    // resizes.
+    if (!stopping || !gate || !grow_device) {
+        throw std::invalid_argument(
+            "make_resize_apply requires a stopping flag, a gate and a "
+            "device grow");
+    }
+    return [stopping, gate, grow_data_plane = std::move(grow_data_plane),
+            grow_device = std::move(grow_device)](uint64_t bytes) -> uint64_t {
+        // The gate is held across the whole grow: the shutdown path sets
+        // `stopping` and then drains the gate, so a grow either finishes
+        // completely BEFORE the shutdown checkpoint runs or is rejected
+        // here — it can never interleave with the checkpoint's trailer
+        // write (see the header).
+        std::lock_guard<std::mutex> grow_guard(*gate);
+        // Shutdown guard (see the header): once the device began its
+        // graceful shutdown, the shutdown checkpoint has (or is about
+        // to have) written its trailer at the CURRENT size — growing
+        // the layer now would rewrite the on-disk header to a different
+        // size and make the checkpoint pair unsealable. Reject without
+        // touching either grow.
+        if (stopping->load(std::memory_order_acquire)) {
+            throw obd::error(ECANCELED,
+                             "device is shutting down; resize ignored");
+        }
+        if (grow_data_plane) {
+            const int r = grow_data_plane(bytes);
+            if (r != 0) {
+                throw obd::error(
+                    -r,
+                    "resize failed: writable data plane grow returned " +
+                        std::to_string(r));
+            }
+        }
+        return grow_device(bytes);
+    };
+}
 
 elio::coro::task<void> run_device_control(
     ControlChannelWriterPtr channel,
@@ -386,12 +433,17 @@ elio::coro::task<void> run_device_control(
                     std::to_string(current) + " bytes)");
                 continue;
             }
-            // The executor's apply issues the ublk UPDATE_SIZE, a
-            // BLOCKING control-plane call that may sleep on our own data
-            // plane — never on an Elio worker (ublk control-plane rule;
-            // the executor may additionally re-check grow-only as
-            // defense in depth). Exceptions (kernel rejection, device
-            // shutting down) become clean error replies.
+            // The executor's apply does the DATA-PLANE grow (blocking
+            // header/truncate IO) and then issues the ublk UPDATE_SIZE —
+            // a BLOCKING control-plane call that may sleep on our own
+            // data plane, never on an Elio worker, hence the
+            // spawn_blocking below (ublk control-plane rule; the
+            // executor may additionally re-check grow-only as defense in
+            // depth). Exceptions (a failed data-plane grow, a rejected
+            // UPDATE_SIZE, or the executor's own "device is shutting
+            // down; resize ignored" rejection, which protects the
+            // post-checkpoint header/trailer consistency) become clean
+            // error replies.
             uint64_t applied = 0;
             try {
                 applied = co_await elio::spawn_blocking(

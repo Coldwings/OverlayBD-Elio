@@ -546,6 +546,15 @@ public:
 };
 ```
 
+Threading: `grow()` is blocking and may run on a spawn_blocking pool
+thread while `checkpoint()`/`seal()` (Elio workers) run — hence the
+declared size (`vsize_`) and the terminal `sealed_`/`checkpointed_`
+flags are `std::atomic` (the device's shutdown path also drains the
+resize gate before checkpointing, so the two never actually overlap;
+this build has no TSAN option to prove it mechanically). A failed grow
+restores the previous 4096-byte header before returning, so the header
+never disagrees with the size the checkpoint trailer will carry.
+
 D3 `grow()`: besides widening the in-memory window, an LSMT grow rewrites
 the file's 4096B declared-size header at offset 0 (uuid preserved) —
 which is what keeps the checkpoint-vs-header cross-check and the offline

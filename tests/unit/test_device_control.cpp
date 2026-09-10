@@ -22,8 +22,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
+#include <mutex>
 #include <optional>
+#include <thread>
+#include <stdexcept>
 #include <string>
+#include <system_error>
+#include <vector>
 
 using namespace obd;
 using namespace std::chrono_literals;
@@ -487,4 +494,142 @@ TEST_CASE("supervisor: device resize answers unsupported without a seam and surv
     REQUIRE(ok_grow.value("ok", false) == true);
     REQUIRE(ok_grow.value("size", 0) == 65536);
     REQUIRE(ok_grow.value("seq", 0) == 5);
+}
+
+TEST_CASE("supervisor: resize executor grows the data plane first and rejects during shutdown",
+          "[supervisor]") {
+    // FIX A regression, deterministic (no device, no kernel):
+    // make_resize_apply is the SAME closure the real obd-device installs
+    // as its resize seam. It must
+    //   (1) reject ONCE the device began its graceful shutdown — without
+    //       calling either grow — because a header rewrite after the
+    //       shutdown checkpoint wrote its trailer leaves the upper
+    //       uncommittable (header/trailer virtual-size mismatch);
+    //   (2) grow the writable data plane BEFORE the kernel gendisk;
+    //   (3) surface a data-plane grow failure without touching the
+    //       kernel, and a kernel failure without swallowing it.
+    auto stopping = std::make_shared<std::atomic<bool>>(false);
+    auto gate = std::make_shared<std::mutex>();
+    std::vector<std::string> order;
+    auto data_plane = [&order](uint64_t) {
+        order.push_back("data-plane");
+        return 0;
+    };
+    auto device_grow = [&order](uint64_t bytes) -> uint64_t {
+        order.push_back("device");
+        return bytes;
+    };
+
+    // (2) Ordering: data plane first, then the kernel.
+    auto apply = supervisor::make_resize_apply(stopping, gate, data_plane,
+                                               device_grow);
+    REQUIRE(apply(65536) == 65536);
+    REQUIRE(order == std::vector<std::string>({"data-plane", "device"}));
+
+    // A read-only image passes no data-plane grow: the kernel alone is
+    // grown (and the request still succeeds).
+    order.clear();
+    auto apply_ro = supervisor::make_resize_apply(
+        stopping, gate, std::function<int(uint64_t)>(), device_grow);
+    REQUIRE(apply_ro(131072) == 131072);
+    REQUIRE(order == std::vector<std::string>({"device"}));
+
+    // (3a) Data-plane failure: the kernel is NOT touched.
+    order.clear();
+    auto data_plane_fail = [&order](uint64_t) {
+        order.push_back("data-plane");
+        return -EINVAL;
+    };
+    auto apply_dp_fail = supervisor::make_resize_apply(
+        stopping, gate, data_plane_fail, device_grow);
+    bool threw = false;
+    std::string what;
+    try {
+        apply_dp_fail(262144);
+    } catch (const std::exception& e) {
+        threw = true;
+        what = e.what();
+    }
+    REQUIRE(threw);
+    REQUIRE(order == std::vector<std::string>({"data-plane"}));
+    REQUIRE(what.find("data plane grow") != std::string::npos);
+
+    // (3b) Kernel failure propagates (never swallowed, so the loop
+    // replies ok:false instead of claiming success).
+    order.clear();
+    auto device_fail = [&order](uint64_t) -> uint64_t {
+        order.push_back("device");
+        // Kernel ENOTSUPP (524) — the pre-6.15 ublk control-dispatch
+        // default for an unknown command; not in glibc's <errno.h>.
+        throw std::system_error(524, std::generic_category(),
+                                "no UPDATE_SIZE");
+        return 0;
+    };
+    auto apply_dev_fail = supervisor::make_resize_apply(
+        stopping, gate, data_plane, device_fail);
+    threw = false;
+    try {
+        apply_dev_fail(524288);
+    } catch (const std::system_error&) {
+        threw = true;
+    }
+    REQUIRE(threw);
+    REQUIRE(order == std::vector<std::string>({"data-plane", "device"}));
+
+    // (1) Shutdown rejection: NEITHER grow runs, and the error is the
+    // documented "device is shutting down" (ECANCELED).
+    stopping->store(true, std::memory_order_release);
+    order.clear();
+    auto apply_stopping = supervisor::make_resize_apply(
+        stopping, gate, data_plane, device_grow);
+    threw = false;
+    what.clear();
+    int code = 0;
+    try {
+        apply_stopping(1048576);
+    } catch (const std::system_error& e) {
+        threw = true;
+        what = e.what();
+        code = e.code().value();
+    }
+    REQUIRE(threw);
+    REQUIRE(order.empty());  // no header rewrite after the checkpoint
+    REQUIRE(what.find("shutting down") != std::string::npos);
+    REQUIRE(code == ECANCELED);
+
+    // The gate serializes applies: two concurrent grows never overlap
+    // (the shutdown path relies on this to drain an in-flight grow
+    // before it checkpoints).
+    auto overlap_gate = std::make_shared<std::mutex>();
+    auto stopping2 = std::make_shared<std::atomic<bool>>(false);
+    std::atomic<int> in_grow{0};
+    std::atomic<int> max_in_grow{0};
+    auto slow_data_plane = [&in_grow, &max_in_grow](uint64_t) {
+        const int now = in_grow.fetch_add(1) + 1;
+        int seen = max_in_grow.load();
+        while (now > seen &&
+               !max_in_grow.compare_exchange_weak(seen, now)) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        in_grow.fetch_sub(1);
+        return 0;
+    };
+    auto apply_gated = supervisor::make_resize_apply(
+        stopping2, overlap_gate, slow_data_plane, device_grow);
+    std::thread t1([&] { apply_gated(65536); });
+    std::thread t2([&] { apply_gated(131072); });
+    t1.join();
+    t2.join();
+    REQUIRE(max_in_grow.load() == 1);
+
+    // A malformed construction (no stopping flag / no gate / no device
+    // grow) is refused loudly instead of silently accepting resizes.
+    bool ctor_threw = false;
+    try {
+        (void)supervisor::make_resize_apply(nullptr, gate, data_plane,
+                                            device_grow);
+    } catch (const std::invalid_argument&) {
+        ctor_threw = true;
+    }
+    REQUIRE(ctor_threw);
 }

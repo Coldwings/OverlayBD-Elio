@@ -76,8 +76,9 @@ public:
     /// <= the current size is rejected with obd::error. Returns the new
     /// size in bytes; throws obd::error (EINVAL for a shrink/no-op or a
     /// misaligned/zero request, the kernel's errno for UPDATE_SIZE
-    /// failure — EOPNOTSUPP on a driver without the command, which
-    /// landed in the 6.16 development cycle).
+    /// failure — on a driver without the command (it landed in the
+    /// 6.16 development cycle: ENOTSUPP/524 on pre-6.15 kernels,
+    /// EOPNOTSUPP/95 on 6.15+)).
     uint64_t resize_blocking(uint64_t bytes);
 
     /// Signals queue threads and bridges to stop, joins the threads, and

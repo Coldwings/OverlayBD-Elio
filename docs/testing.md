@@ -632,6 +632,18 @@ Every test, grouped by area, with the property it guards.
   with a clean "unsupported" error; wrong-typed `size` (float, negative,
   missing) are clean error replies — never an exception escaping the
   loop — and a valid grow afterwards proves the loop stayed alive (D3).
+- `supervisor: resize executor grows the data plane first and rejects during shutdown` —
+  `make_resize_apply` (the exact closure obd-device installs as its
+  resize seam), tested without a device or kernel: it grows the writable
+  data plane BEFORE the kernel gendisk, passes a read-only image
+  straight to the kernel grow, surfaces a data-plane failure without
+  touching the kernel and a kernel failure without swallowing it, and —
+  once the shutdown flag is set — rejects with
+  `ECANCELED`/"device is shutting down" WITHOUT calling either grow
+  (the guard that keeps a post-checkpoint header rewrite from making the
+  upper uncommittable), the gate serializes concurrent applies so the
+  shutdown path can drain an in-flight grow before checkpointing, and a
+  malformed construction is refused (D3).
 ### integration
 
 - `integration: layered stack stages over a mock registry` — the full

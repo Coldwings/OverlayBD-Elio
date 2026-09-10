@@ -15,6 +15,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 
+#include <system_error>
 #include <thread>
 
 #include <fcntl.h>
@@ -39,6 +40,10 @@ void stage(const char* msg) {
 bool ublk_available() {
     return ::access("/dev/ublk-control", F_OK) == 0;
 }
+
+/// Kernel ENOTSUPP: the pre-6.15 ublk control-dispatch default for an
+/// unknown command (524). Not exposed by glibc's <errno.h>.
+constexpr int kKernelEnNotSupp = 524;
 
 /// In-memory writable root: pread/pwrite over a buffer, discard zeroes
 /// the range (mask semantics at the root). Lets the E2E exercise the
@@ -247,8 +252,15 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
             new_size = co_await elio::spawn_blocking([&] {
                 return dev->resize_blocking(grown);
             });
-        } catch (const std::exception&) {
-            co_return 3;  // kernel without UBLK_U_CMD_UPDATE_SIZE
+        } catch (const std::system_error& e) {
+            // ONLY a missing command means "kernel too old" (kernel
+            // ENOTSUPP/524 on pre-6.15 control dispatch, EOPNOTSUPP/95
+            // on 6.15+). Any other failure — a malformed request, an
+            // ABI/driver regression, an I/O error — must FAIL the test,
+            // not silently skip it.
+            const int ev = e.code().value();
+            if (ev == kKernelEnNotSupp || ev == EOPNOTSUPP) co_return 3;
+            co_return 7;
         }
         if (new_size != grown) co_return 4;
         if (dev->size_bytes() != new_size) co_return 4;
@@ -306,8 +318,11 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
     });
     if (rc == 3) {
         SKIP("kernel driver lacks UBLK_U_CMD_UPDATE_SIZE (needs the 6.16 "
-             "cycle update)");
+             "cycle update: ENOTSUPP/524 on pre-6.15, EOPNOTSUPP/95 on "
+             "6.15+)");
     }
+    // rc == 7 is an UNEXPECTED resize failure (anything but "command not
+    // supported"): fail loudly instead of skipping an ABI regression.
     REQUIRE(rc == 0);
 }
 

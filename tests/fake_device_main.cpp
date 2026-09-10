@@ -22,15 +22,19 @@
 #include <elio/log/macros.hpp>
 #include <elio/runtime/async_main.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
 
 #include <sys/socket.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <unistd.h>
@@ -121,6 +125,10 @@ elio::coro::task<int> fake_main(Args args) {
         // and the file is left unsealed — checkpoint only on SIGTERM,
         // exactly like the real device.
         std::shared_ptr<obd::format::WritableLayer> upper;
+        // D3 shutdown guard + drain gate (created here so the SIGTERM
+        // path below can set/drain them; see make_resize_apply).
+        auto stopping = std::make_shared<std::atomic<bool>>(false);
+        auto resize_gate = std::make_shared<std::mutex>();
         const uint64_t layer_vsize =
             args.virtual_size > 0 ? args.virtual_size : kVsize;
         if (img.writable() && img.upper.type == "lsmt") {
@@ -167,6 +175,9 @@ elio::coro::task<int> fake_main(Args args) {
             // and — for the layer-backed fakes — a shared_ptr to the
             // writable layer so an in-flight grow can never outlive it.
             auto fake_size = std::make_shared<uint64_t>(base_size);
+            // Shutdown guard + drain gate, exactly like the real device:
+            // set/drained before the SIGTERM checkpoint below so a grow
+            // can never rewrite the layer header after the trailer.
             obd::supervisor::DeviceControlHooks hooks;
             if (opened.has_value()) {
                 auto* root = opened->root.get();
@@ -188,26 +199,26 @@ elio::coro::task<int> fake_main(Args args) {
                 };
             }
             // D3 resize executor seam (no kernel): current_size returns
-            // the fake's tracked size; apply grows the writable layer
-            // through the REAL format grow path (so a later checkpoint /
-            // commit seals the grown declared size, mirroring the real
-            // device's data-plane grow) and records the growth.
+            // the fake's tracked size; apply is the SAME
+            // make_resize_apply policy the real obd-device installs —
+            // grow-only ordering (data plane via the REAL format grow
+            // path, so a later checkpoint/commit seals the grown
+            // declared size), plus the shutdown guard and gate that keep
+            // a grow from interleaving with the shutdown checkpoint.
             hooks.resize.current_size = [fake_size]() -> uint64_t {
                 return *fake_size;
             };
-            hooks.resize.apply_resize = [upper,
-                                         fake_size](uint64_t bytes) {
-                if (upper != nullptr) {
-                    const int r = upper->grow(bytes);
-                    if (r != 0) {
-                        throw std::system_error(
-                            -r, std::generic_category(),
-                            "fake resize: data plane grow failed");
-                    }
-                }
-                *fake_size = bytes;
-                return bytes;
-            };
+            hooks.resize.apply_resize = obd::supervisor::make_resize_apply(
+                stopping, resize_gate,
+                upper != nullptr
+                    ? std::function<int(uint64_t)>([upper](uint64_t bytes) {
+                          return upper->grow(bytes);
+                      })
+                    : std::function<int(uint64_t)>(),
+                [fake_size](uint64_t bytes) {
+                    *fake_size = bytes;
+                    return bytes;
+                });
             elio::go([channel, rec = opened.has_value()
                                      ? opened->recorder
                                      : obd::image::TraceRecorderPtr{},
@@ -240,6 +251,15 @@ elio::coro::task<int> fake_main(Args args) {
                 }
             }
             co_await obd::image::park_image_fills(*opened);
+        }
+        // Stop accepting resizes and drain any in-flight grow BEFORE the
+        // checkpoint writes its trailer (the real device's contract;
+        // make_resize_apply re-checks `stopping` under the gate).
+        if (channel) {
+            stopping->store(true, std::memory_order_release);
+            co_await elio::spawn_blocking([&] {
+                std::lock_guard<std::mutex> drain(*resize_gate);
+            });
         }
         if (upper != nullptr) {
             const int crc = co_await upper->checkpoint();

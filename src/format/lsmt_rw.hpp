@@ -61,7 +61,9 @@ public:
     /// (unlike a LocalFileSource, which pins the size at open).
     source::BlobSource& data_source() override;
 
-    bool sealed() const noexcept { return sealed_; }
+    bool sealed() const noexcept {
+        return sealed_.load(std::memory_order_acquire);
+    }
 
     /// D3 grow-only vsize extension (see WritableLayer::grow): also
     /// rewrites the on-disk declared-size header (uuid preserved) so a
@@ -119,8 +121,15 @@ private:
     uint64_t data_end_sector_ = 0;  // append position, sectors
     std::string uuid_;
     std::string path_;
-    bool sealed_ = false;
-    bool checkpointed_ = false;  // terminal: no more pwrite/discard
+    /// Terminal-state flags. ATOMIC on purpose: grow() runs on a
+    /// spawn_blocking pool thread (the device resize executor) while
+    /// checkpoint()/seal() — which set them — run on Elio workers, the
+    /// same cross-thread class the vsize_ atomic covers. Invariant:
+    /// once either is set, no pwrite/discard/grow may mutate the layer
+    /// (they return -EROFS), so the on-disk header can never be
+    /// rewritten after the shutdown checkpoint. (No TSAN in this build.)
+    std::atomic<bool> sealed_{false};
+    std::atomic<bool> checkpointed_{false};  // terminal: no more pwrite/discard
     std::vector<bytes::segment_mapping> segments_;
 };
 

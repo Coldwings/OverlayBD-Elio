@@ -184,8 +184,9 @@ void Ctrl::update_size(uint32_t dev_id, uint64_t sectors) {
     // D3 grow-only online resize (UBLK_U_CMD_UPDATE_SIZE): the new size
     // rides cmd.data[0], in sectors (kernel ABI, ublk_cmd.h). No data
     // buffer, no queue. A kernel without the command (it landed in the
-    // 6.16 development cycle) rejects it with EOPNOTSUPP, reported as a
-    // clean error by the caller.
+    // 6.16 development cycle) rejects it — ENOTSUPP (524) on pre-6.15
+    // kernels, EOPNOTSUPP (95) on 6.15+ — reported as a clean error by
+    // the caller.
     ctrl_cmd(UBLK_U_CMD_UPDATE_SIZE, dev_id, static_cast<uint16_t>(-1),
              nullptr, 0, sectors, "UPDATE_SIZE");
 }

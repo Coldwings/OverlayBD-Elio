@@ -249,14 +249,34 @@ Contract:
   with the single rule `image::device_capacity_bytes` (inside
   `open_image` for writable images, in obd-device otherwise), so a
   create that would shrink the device below its content fails cleanly.
+- **Resize vs commit (no daemon-side lock; documented).** `resize` is
+  NOT serialized against `commit` in the daemon: `commit` stops the
+  device over signals and the entry's `op_mu`, while `resize` rides the
+  device command channel. Every ordering is nevertheless safe because
+  the DEVICE arbitrates: a grow that completes before the device's
+  graceful shutdown is followed by a checkpoint at the grown size
+  (header and trailer agree, so commit seals the grown declared size),
+  and from the moment the shutdown begins the device rejects resizes
+  with `ok:false` "device is shutting down; resize ignored" — so a
+  header rewrite can never land after the checkpoint wrote its trailer
+  (which would make `open_checkpointed` reject the pair and leave the
+  upper uncommittable). The device also DRAINS: the resize executor
+  holds a gate for the whole grow, and the shutdown path sets the
+  stopping flag and then takes/releases that gate once — waiting out a
+  grow that was already in flight — before it stops the device and
+  checkpoints, so no grow can interleave with the checkpoint at all. A
+  resize racing a stop may instead see the channel close ("device
+  control channel unavailable"/timeout), which is also a clean error;
+  the CLI retries after the commit.
 - **Errors**: unknown id, no live device control channel (a stopped/
   dead device: "device control channel unavailable"), a device whose
   executor has no resize seam ("resize unsupported on this device"),
   misaligned/zero size, a grow-only rejection, a failed data-plane
   grow, and a kernel rejection of `UBLK_U_CMD_UPDATE_SIZE` (drivers
-  before the 6.16 cycle answer EOPNOTSUPP — surfaced as the command's
-  error; the data plane is already grown and the retry succeeds once
-  the kernel accepts it).
+  without the command — added in the 6.16 cycle — answer
+  `ENOTSUPP`/524 on pre-6.15 kernels and `EOPNOTSUPP`/95 on 6.15+;
+  surfaced as the command's error. The data plane is already grown and
+  the retry succeeds once the kernel accepts it).
 
 ### Trace recording (ADR-0013)
 

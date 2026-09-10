@@ -140,8 +140,10 @@ A live device can grow through `Ctrl::update_size` (D3):
 `UBLK_U_CMD_UPDATE_SIZE` tells the driver the new capacity — the size
 rides `ublksrv_ctrl_cmd.data[0]`, in 512-byte sectors (kernel ABI,
 ublk_cmd.h) — and the driver updates the gendisk capacity. The command
-landed in the 6.16 development cycle: an older driver rejects it with
-`EOPNOTSUPP`, which the caller surfaces as a clean error. The command is
+landed in the 6.16 development cycle, so a driver without it rejects
+the command: pre-6.15 kernels answer `ENOTSUPP` (524, the control
+dispatch default), 6.15+ kernels answer `EOPNOTSUPP` (95) — either is
+surfaced as a clean error. The command is
 **grow-only by contract**: `Device::resize_blocking` rejects a request
 at or below the current size before any kernel IO, and the supervisor's
 `resize` executor enforces the same rule against the device's tracked
@@ -211,7 +213,8 @@ and remembers the added device for best-effort cleanup. Non-copyable.
 - `void update_size(uint32_t dev_id, uint64_t sectors)` — D3 online
   resize: `UBLK_U_CMD_UPDATE_SIZE` with the new capacity (sectors) in
   `data[0]`. Throws `obd::error` (a kernel without the command returns
-  `EOPNOTSUPP`). Blocking; see the spawn_blocking rule below.
+  `ENOTSUPP`/524 on pre-6.15, `EOPNOTSUPP`/95 on 6.15+). Blocking; see
+  the spawn_blocking rule below.
 - `ublk_params get_params(uint32_t dev_id)` — `UBLK_U_CMD_GET_PARAMS`;
   `basic.dev_sectors` is the kernel's current capacity in sectors
   (which, after an online grow, may exceed the create-time params).

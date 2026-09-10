@@ -17,14 +17,18 @@
 #include <elio/log/macros.hpp>
 #include <elio/runtime/async_main.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
 
 #include <sys/socket.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <unistd.h>
 
@@ -171,32 +175,46 @@ elio::coro::task<int> device_main(Args args) {
         // dereference a destroyed Device). recorder may be null
         // (recorder-less images) — trace commands are answered
         // "unavailable" while resize still works.
+        // D3 shutdown guard, shared with the resize executor seam: set
+        // BEFORE dev->stop() below. Once the graceful shutdown has
+        // begun, the shutdown checkpoint writes (or has written) the
+        // upper's trailer at the CURRENT size — a resize landing in the
+        // window up to the channel EOF would rewrite the on-disk
+        // declared-size header to a different size and leave the
+        // header/trailer pair inconsistent, i.e. the upper
+        // UNCOMMITTABLE. The guard makes every ordering safe: a grow
+        // that completes before this point is followed by a checkpoint
+        // at the grown size (consistent), and everything after it is
+        // rejected cleanly.
+        auto stopping = std::make_shared<std::atomic<bool>>(false);
+        // Serializes an in-flight grow against the shutdown checkpoint:
+        // the shutdown path sets `stopping` and then drains this gate, so
+        // a grow can never rewrite the layer's declared-size header after
+        // the checkpoint wrote its trailer at the old size.
+        auto resize_gate = std::make_shared<std::mutex>();
         if (channel) {
             obd::supervisor::DeviceControlHooks hooks;
-            // D3 resize executor seam: grow-only is enforced by the
-            // command loop against current_size BEFORE any kernel IO;
-            // apply (a) grows the writable DATA PLANE first — so writes
-            // into the headroom land in the upper and commit can seal
-            // them — then (b) issues the blocking ublk UPDATE_SIZE. The
-            // loop runs apply via spawn_blocking, per the ublk
-            // control-plane rule; the layer grows are BLOCKING by design
-            // and run on that same pool thread.
+            // D3 resize executor seam (built by make_resize_apply so the
+            // ordering + shutdown contract are unit-tested without a
+            // device): grow-only is enforced by the command loop against
+            // current_size BEFORE any IO; apply (a) rejects when the
+            // device is shutting down, (b) grows the writable DATA PLANE
+            // — so writes into the headroom land in the upper and commit
+            // can seal them — then (c) issues the blocking ublk
+            // UPDATE_SIZE. The loop runs apply via spawn_blocking, per
+            // the ublk control-plane rule; the layer grows are BLOCKING
+            // by design and run on that same pool thread.
             hooks.resize.current_size =
                 [dev]() -> uint64_t { return dev->size_bytes(); };
-            hooks.resize.apply_resize =
-                [dev, merged_root](uint64_t bytes) -> uint64_t {
-                    if (merged_root != nullptr) {
-                        const int r = merged_root->grow(bytes);
-                        if (r != 0) {
-                            throw obd::error(
-                                -r,
-                                "resize failed: writable data plane grow "
-                                "returned " +
-                                    std::to_string(r));
-                        }
-                    }
-                    return dev->resize_blocking(bytes);
-                };
+            hooks.resize.apply_resize = obd::supervisor::make_resize_apply(
+                stopping, resize_gate,
+                merged_root != nullptr
+                    ? std::function<int(uint64_t)>(
+                          [merged_root](uint64_t bytes) {
+                              return merged_root->grow(bytes);
+                          })
+                    : std::function<int(uint64_t)>(),
+                [dev](uint64_t bytes) { return dev->resize_blocking(bytes); });
             elio::go([channel, rec = opened.recorder, hooks]() mutable
                      -> elio::coro::task<void> {
                 co_await obd::supervisor::run_device_control(channel, rec,
@@ -215,6 +233,20 @@ elio::coro::task<int> device_main(Args args) {
             }
         }
         ELIO_LOG_INFO("device {} shutting down", dev->bdev_path());
+        // Refuse further resizes from here on: the checkpoint below
+        // writes its trailer at the current size, so a grow after this
+        // point would desynchronize the on-disk header (see the guard's
+        // comment where it is created). Set BEFORE stop().
+        stopping->store(true, std::memory_order_release);
+        // Drain the resize gate: taking and releasing it waits for a grow
+        // already IN FLIGHT (which holds it for its whole duration) and,
+        // because every apply re-checks `stopping` while holding it,
+        // guarantees that no grow is running — or can start — from here
+        // through the checkpoint below. Off-worker: the wait is bounded
+        // by one grow's 4K header write + fsync.
+        co_await elio::spawn_blocking([&] {
+            std::lock_guard<std::mutex> drain(*resize_gate);
+        });
         dev->stop();
         // ADR-0013: finalize any active trace recording BEFORE the source
         // chain can go away (the taps feed the recorder; a shutdown

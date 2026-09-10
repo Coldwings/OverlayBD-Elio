@@ -847,6 +847,17 @@ private:
     /// multiple of 512 (ublk sector granularity); anything else is a
     /// clean error without a round-trip. Shrink attempts reach the device
     /// and are rejected there with a clear message.
+    ///
+    /// Deliberately NOT serialized against cmd_commit: commit stops the
+    /// device over signals + the entry's op_mu while resize rides the
+    /// device command channel, but every ordering is safe because the
+    /// DEVICE arbitrates — a grow completing before its shutdown is
+    /// followed by a checkpoint at the grown size (consistent pair), and
+    /// once the shutdown begins the device rejects resizes with
+    /// "device is shutting down; resize ignored" (see make_resize_apply),
+    /// so a header rewrite can never land after the checkpoint trailer.
+    /// A resize racing a stop may instead see the channel close, also a
+    /// clean error (docs/supervisor.md).
     elio::coro::task<std::string> cmd_resize(const nlohmann::json& j) {
         const std::string id = j["id"].get<std::string>();
         // parse_command validated 'size' as a non-negative integer.

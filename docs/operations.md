@@ -323,12 +323,13 @@ Contract and runbook notes:
   `"resize"`); against an older supervisor, `resize` is answered as a
   clean `unknown cmd` protocol error.
 - **Requires a recent kernel driver** for the online grow itself:
-  `UBLK_U_CMD_UPDATE_SIZE` landed in the 6.16 development cycle; an
-  older driver rejects it with `EOPNOTSUPP` (the resize reply reports
-  the failure — the kernel capacity is unchanged; the writable data
-  plane has already grown and the retry succeeds once the kernel accepts
-  the command). Create-time headroom and commit re-baseline need no
-  kernel support.
+  `UBLK_U_CMD_UPDATE_SIZE` landed in the 6.16 development cycle; a
+  driver without it rejects the command with `ENOTSUPP` (524) on
+  pre-6.15 kernels, or `EOPNOTSUPP` (95) on 6.15+ (the resize reply
+  reports the failure — the kernel capacity is unchanged; the writable
+  data plane has already grown and the retry succeeds once the kernel
+  accepts the command). Create-time headroom and commit re-baseline need
+  no kernel support.
 
 ## Logging
 
@@ -351,7 +352,7 @@ correlate by device id and by the supervisor's spawn logs.
 | `commit` fails with "sparse uppers cannot be sealed" | Sparse uppers never seal (upstream parity, ADR-0014). Use `type: "lsmt"` uppers for content you intend to commit. |
 | `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard is supported only on writable devices (ADR-0009). |
 | `resize` fails with a "grow-only" error | The requested size is at or below the device's current capacity; shrink is unsupported (ADR-0014). Grow to a larger size, or create with `--virtual-size` headroom if you need to plan ahead. |
-| `resize` fails with an `UPDATE_SIZE`-related error (EOPNOTSUPP) | The kernel driver predates `UBLK_U_CMD_UPDATE_SIZE` (needs the 6.16 cycle); the kernel capacity is unchanged and a retry succeeds once the driver accepts the command. `create --virtual-size` and `commit --virtual-size` do not need kernel support. |
+| `resize` fails with an `UPDATE_SIZE`-related error (`ENOTSUPP` 524 or `EOPNOTSUPP` 95) | The kernel driver predates `UBLK_U_CMD_UPDATE_SIZE` (needs the 6.16 cycle; pre-6.15 drivers answer `ENOTSUPP` 524, 6.15+ answer `EOPNOTSUPP` 95); the kernel capacity is unchanged and a retry succeeds once the driver accepts the command. `create --virtual-size` and `commit --virtual-size` do not need kernel support. |
 | A grown device crashes and its replacement rejects any resize back down toward the image size | Correct: the kernel kept the grown capacity across USER_RECOVERY, and the replacement seeds its grow-only baseline from that real capacity (GET_PARAMS) — shrinking is unsupported (ADR-0014). The fresh upper starts at the image's declared size (ADR-0008); grow further, or destroy + re-create from a committed layer, to change the size. |
 | `create --virtual-size` fails with a grow-only error | The override is smaller than the image's declared size (that would shrink the device below its content). Use a larger value or drop the option. |
 | `commit --virtual-size` fails with a grow-only error | The override is below the layer's declared size or its content extent; the upper is untouched and still committable at its declared size. |

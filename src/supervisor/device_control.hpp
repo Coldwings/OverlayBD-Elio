@@ -37,6 +37,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -109,6 +110,43 @@ struct DeviceControlHooks {
     /// D3 resize executor (null/empty members = resize unsupported).
     ResizeExecutor resize;
 };
+
+/// Builds the D3 `apply_resize` implementation shared by the real device
+/// (and anything else wiring a resize seam), so its ordering and its
+/// shutdown contract are testable without a device or kernel:
+///
+///   1. If `stopping` is set, throw obd::error(ECANCELED, "device is
+///      shutting down; resize ignored") WITHOUT calling either grow.
+///      This guard is load-bearing: a resize landing after the
+///      graceful-shutdown began would otherwise rewrite the writable
+///      layer's on-disk declared-size header AFTER the shutdown
+///      checkpoint wrote its trailer at the old size — the mismatch
+///      makes open_checkpointed reject the pair and leaves the upper
+///      UNCOMMITTABLE.
+///   2. Grow the writable data plane via `grow_data_plane` (returns
+///      -errno; 0 = ok, including the idempotent equal-size no-op). May
+///      be null for a read-only image (nothing to grow). A failure
+///      throws before any kernel IO.
+///   3. Grow the kernel device via `grow_device` (throws on failure;
+///      returns the new size in bytes).
+///
+/// `gate` (non-null) is held for the whole of 1–3, which makes the
+/// guard airtight for a grow already IN FLIGHT when the shutdown
+/// begins: the shutdown path sets `stopping` and then takes and
+/// releases `gate` once, which waits for that in-flight apply to finish
+/// and blocks every later one — only then may it stop the device and
+/// checkpoint. Without the gate, an apply could pass the flag check
+/// just before it was set and still race the checkpoint's trailer
+/// write.
+///
+/// Both callables run on the caller's thread — the device command loop
+/// invokes apply_resize inside elio::spawn_blocking, and both grows are
+/// BLOCKING by design (docs/supervisor.md, docs/ublk.md).
+std::function<uint64_t(uint64_t)> make_resize_apply(
+    std::shared_ptr<std::atomic<bool>> stopping,
+    std::shared_ptr<std::mutex> gate,
+    std::function<int(uint64_t)> grow_data_plane,
+    std::function<uint64_t(uint64_t)> grow_device);
 
 /// Serves device commands from `channel` until EOF (the supervisor
 /// closed or died — the device keeps serving its block device; any
