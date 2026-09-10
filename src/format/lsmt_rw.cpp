@@ -280,8 +280,8 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
         std::vector<Op> ops;
         uint64_t cur = lo;
         for (const auto& s : segments_) {
-            if (s.zeroed || s.end() <= lo) continue;
             if (s.offset >= hi) break;
+            if (s.zeroed || s.end() <= lo) continue;
             if (s.offset > cur) {
                 ops.push_back({cur, data_end_sector_, s.offset - cur, false});
                 data_end_sector_ += s.offset - cur;
