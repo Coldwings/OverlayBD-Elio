@@ -1,5 +1,6 @@
 // Supervisor daemon. See daemon.hpp and docs/supervisor.md.
 #include "supervisor/daemon.hpp"
+#include "supervisor/daemon_test_hooks.hpp"
 
 #include "common/errors.hpp"
 #include "format/lsmt_rw.hpp"
@@ -32,6 +33,7 @@
 #include <memory>
 #include <optional>
 #include <vector>
+#include <utility>
 
 namespace obd::supervisor {
 
@@ -271,6 +273,10 @@ class Daemon {
     /// fine (no one acquires `op_mu` while holding `mu_`).
     struct DeviceEntry {
         ChildSpec spec;
+        // Initial assignment precedes registry insertion. Replacement holds
+        // op_mu AND mu_; observers retain child/count/trace under mu_.
+        // The sole monitor writer and op_mu-protected stop paths may also
+        // read child directly because they cannot overlap replacement.
         std::shared_ptr<Child> child;
         int dev_id = -1;
         int recoveries = 0;   // completed respawns
@@ -318,7 +324,8 @@ class Daemon {
     };
 
 public:
-    explicit Daemon(DaemonConfig cfg) : cfg_(std::move(cfg)) {
+    explicit Daemon(DaemonConfig cfg, std::shared_ptr<detail::DaemonTestGate> gate = {})
+        : cfg_(std::move(cfg)), test_gate_(std::move(gate)) {
         if (cfg_.device_bin.empty()) {
             cfg_.device_bin = default_device_bin();
         }
@@ -430,10 +437,14 @@ private:
                 ELIO_LOG_WARNING("accept failed: {}", std::strerror(errno));
                 continue;
             }
-            elio::go([this, s = std::move(*stream)]() mutable
-                     -> elio::coro::task<void> {
+            auto handle = [this, s = std::move(*stream)]() mutable
+                          -> elio::coro::task<void> {
                 co_await handle_client(std::move(s));
-            });
+            };
+            // Test placement forces command/monitor overlap on distinct
+            // workers without changing the normal daemon's scheduling.
+            if (test_gate_) elio::go_to(2, std::move(handle));
+            else elio::go(std::move(handle));
         }
         accept_done_.set();
     }
@@ -600,12 +611,22 @@ private:
                                    entry->spec.id, e.what());
                     co_return;
                 }
-                entry->recoveries += 1;
+                // Keep the old owner alive until after mu_ is released:
+                // Child destruction can kill/waitpid and must not block
+                // the registry (nor may spawn or the fd handoff run there).
+                std::shared_ptr<Child> previous;
+                co_await mu_.lock();
+                {
+                    SyncMutexGuard registry_guard{mu_};
+                    previous = std::exchange(entry->child, next);
+                    entry->recoveries += 1;
+                }
+                previous.reset();
                 ELIO_LOG_WARNING(
                     "device {} recovering via ublk USER_RECOVERY "
                     "(attempt {}, dev_id {})",
                     entry->spec.id, entry->recoveries, entry->dev_id);
-                entry->child = next;
+                if (test_gate_) co_await test_gate_->observe("recovery", next);
                 fd = next->release_control_fd();
             }
         }
@@ -811,10 +832,12 @@ private:
             children_[id] = entry;
             mu_.unlock();
         }
-        elio::go([this, entry, fd = entry->child->release_control_fd()]()
-                 -> elio::coro::task<void> {
+        auto monitor = [this, entry, fd = entry->child->release_control_fd()]()
+                       -> elio::coro::task<void> {
             co_await supervise_entry(entry, fd);
-        });
+        };
+        if (test_gate_) elio::go_to(1, std::move(monitor));
+        else elio::go(std::move(monitor));
 
         // Wait for the child to report ready/failed.
         auto outcome = co_await elio::with_timeout(
@@ -1445,48 +1468,73 @@ private:
         co_return reply_ok(fields);
     }
 
-    elio::coro::task<std::string> cmd_list() {
-        nlohmann::json arr = nlohmann::json::array();
-        co_await mu_.lock();
-        for (auto& [id, entry] : children_) {
-            const Child::Status st = entry->child->status();
-            auto dj = nlohmann::json{{"id", id},
-                                     {"pid", entry->child->pid()},
-                                     {"state", st.state},
-                                     {"device", st.device},
-                                     {"error", st.error},
-                                     {"recoveries", entry->recoveries}};
-            if (!entry->trace.is_null()) dj["trace"] = entry->trace;
-            arr.push_back(std::move(dj));
+    // Owning observation of one published generation. Child status can
+    // evolve afterwards, but pid/status always come from this same Child;
+    // recovery count and trace are copied together under the registry lock.
+    struct EntrySnapshot {
+        std::string id;
+        std::shared_ptr<Child> child;
+        int recoveries;
+        nlohmann::json trace;
+    };
+
+    elio::coro::task<nlohmann::json> status_fields(const EntrySnapshot& snapshot,
+                                 bool include_exit_code) {
+        const Child::Status st = snapshot.child->status();
+        if (test_gate_) {
+            co_await test_gate_->observe(
+                include_exit_code ? "status" : "list", snapshot.child);
         }
-        mu_.unlock();
+        nlohmann::json fields = {{"id", snapshot.id},
+                                 {"pid", snapshot.child->pid()},
+                                 {"state", st.state},
+                                 {"device", st.device},
+                                 {"error", st.error},
+                                 {"recoveries", snapshot.recoveries}};
+        if (include_exit_code) fields["exit_code"] = st.exit_code;
+        if (!snapshot.trace.is_null()) fields["trace"] = snapshot.trace;
+        co_return fields;
+    }
+
+    elio::coro::task<std::string> cmd_list() {
+        std::vector<EntrySnapshot> snapshots;
+        co_await mu_.lock();
+        {
+            SyncMutexGuard registry_guard{mu_};
+            snapshots.reserve(children_.size());
+            for (const auto& [id, entry] : children_) {
+                snapshots.push_back(
+                    {id, entry->child, entry->recoveries, entry->trace});
+            }
+        }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& snapshot : snapshots) {
+            auto fields = co_await status_fields(snapshot, false);
+            arr.push_back(std::move(fields));
+        }
         co_return reply_ok({{"devices", arr}});
     }
 
     elio::coro::task<std::string> cmd_status(const nlohmann::json& j) {
         const std::string id = j["id"].get<std::string>();
-        std::shared_ptr<DeviceEntry> entry;
+        std::optional<EntrySnapshot> snapshot;
+        co_await mu_.lock();
         {
-            co_await mu_.lock();
+            SyncMutexGuard registry_guard{mu_};
             auto it = children_.find(id);
-            if (it != children_.end()) entry = it->second;
-            mu_.unlock();
+            if (it != children_.end()) {
+                const auto& entry = it->second;
+                snapshot.emplace(EntrySnapshot{
+                    id, entry->child, entry->recoveries, entry->trace});
+            }
         }
-        if (!entry) co_return reply_error("no such device: " + id);
-        const Child::Status st = entry->child->status();
-        nlohmann::json fields;
-        fields["id"] = id;
-        fields["pid"] = entry->child->pid();
-        fields["state"] = st.state;
-        fields["device"] = st.device;
-        fields["error"] = st.error;
-        fields["exit_code"] = st.exit_code;
-        fields["recoveries"] = entry->recoveries;
-        if (!entry->trace.is_null()) fields["trace"] = entry->trace;
+        if (!snapshot) co_return reply_error("no such device: " + id);
+        auto fields = co_await status_fields(*snapshot, true);
         co_return reply_ok(fields);
     }
 
     DaemonConfig cfg_;
+    std::shared_ptr<detail::DaemonTestGate> test_gate_;
     elio::sync::event accept_done_;
     elio::sync::event reaper_done_;
     elio::sync::mutex mu_;
@@ -1506,6 +1554,12 @@ MkfsRunnerPtr make_default_mkfs_runner(int timeout_sec) {
 
 elio::coro::task<int> run_daemon(const DaemonConfig& cfg) {
     Daemon d(cfg);
+    co_return co_await d.run();
+}
+
+elio::coro::task<int> detail::run_daemon_with_test_gate(
+    const DaemonConfig& cfg, std::shared_ptr<DaemonTestGate> gate) {
+    Daemon d(cfg, std::move(gate));
     co_return co_await d.run();
 }
 

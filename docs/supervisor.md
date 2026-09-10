@@ -670,7 +670,14 @@ pre-parse needed).
 
 - `run_daemon` and all command handlers are **Elio coroutines** — they must
   run on the Elio scheduler. The registry mutex is `elio::sync::mutex`
-  (coroutine-aware); it is never held across child IO.
+  (coroutine-aware); it is never held across child IO. Recovery publishes
+  the replacement child and recovery count together under this mutex,
+  inside the per-device operation lock. Status/list retain the child and
+  copy the count and trace metadata under the registry mutex, then build
+  replies outside it. PID and status come from that retained generation;
+  a reply already in progress may describe the previous generation.
+  The previous child owner is released outside the registry mutex because
+  child destruction can kill and reap the process.
 - `Child::spawn` is a **plain blocking function** containing `fork`; call
   it from the daemon coroutine (as `cmd_create` does) but treat it as a
   cold path. After spawn, all interaction with the child is coroutine-based
@@ -725,6 +732,18 @@ pre-parse needed).
   choice, monitor/reaper coroutine structure.
 
 ## Testing
+
+The controlled recovery tests pause real command/monitor paths on a
+four-worker runtime, while a synchronous client kills the fake child and
+queries its replacement. The internal bounded coroutine gate adds no child
+ownership and invokes no caller callbacks; only this test entry point pins
+commands and monitors to distinct workers. No kernel ublk is required.
+
+| Regression | Evidence |
+| --- | --- |
+| `supervisor: recovery publishes child and count together` | Status/list observed at the publication boundary agree on the replacement PID and recovery count. |
+| `supervisor: status owns its child generation and trace snapshot` | A paused status retains the old child and reports its PID/count/recording trace after concurrent recovery marks the live trace lost. |
+| `supervisor: list owns its child generation and trace snapshot` | A paused list preserves the same owned generation and trace while recovery and other commands proceed on another worker. |
 
 Unit tests live in `tests/unit/test_supervisor.cpp`; they exercise the
 protocol codecs and the child lifecycle with fake device binaries, without
