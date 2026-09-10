@@ -177,6 +177,43 @@ jobs:
             "integration: ublk device survives server death via USER_RECOVERY" -s \
             2>&1 | tee build/ublk-e2e-recovery.log
 
+      - name: "E2E - online grow"
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          log=build/ublk-e2e-grow.log
+          printf 'ublk grow: head=%s kernel=%s\n' "$GITHUB_SHA" "$(uname -r)" | tee "$log"
+          # Capture both statuses before errexit handles the pipeline. Catch2
+          # returns 4 for ANY all-skipped selection, including missing control.
+          set +e
+          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests \
+            "integration: ublk device grows online and serves the new capacity" \
+            -s --colour-mode none 2>&1 | tee -a "$log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'ublk grow: command exit=%s tee exit=%s\n' \
+            "${statuses[0]}" "${statuses[1]}" | tee -a "$log"
+          logging_status=$?
+          set -e
+          # A broken log cannot establish the reason for a skip. Preserve a
+          # failing test status first, otherwise propagate the logging failure.
+          if (( statuses[1] != 0 || logging_status != 0 )); then
+            echo '::error::ublk grow: failed to preserve the test log'
+            if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+            if (( statuses[1] != 0 )); then exit "${statuses[1]}"; fi
+            exit "$logging_status"
+          fi
+          if (( statuses[0] == 4 )) &&
+             grep -Fq 'kernel driver lacks UBLK_U_CMD_UPDATE_SIZE' "$log"; then
+            echo '::warning::ublk grow: SKIP - driver lacks UPDATE_SIZE; supported-grow coverage was not exercised' \
+              | tee -a "$log"
+          elif (( statuses[0] != 0 )); then
+            echo "::error::ublk grow: failed or unexpected skip (exit=${statuses[0]})"
+            exit "${statuses[0]}"
+          else
+            echo 'ublk grow: PASS - capacity, grown-region I/O and original content verified' \
+              | tee -a "$log"
+          fi
+
       - name: Capture available shutdown diagnostics
         if: failure()
         run: |

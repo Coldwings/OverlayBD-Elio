@@ -150,7 +150,8 @@ filters directly:
 **Privileged ublk E2E.** The tests tagged `[ublk]` (currently
 `integration: ublk device serves sector reads from a blob`,
 `integration: ublk writable device serves writes and discard`,
-`integration: ublk device survives server death via USER_RECOVERY`)
+`integration: ublk device survives server death via USER_RECOVERY`,
+`integration: ublk device grows online and serves the new capacity`)
 need `/dev/ublk-control` and root (or `CAP_SYS_ADMIN` in a suitable
 user namespace) with `ublk_drv` loaded. They **self-skip** via Catch2
 `SKIP()` when the kernel facility is absent, and
@@ -159,8 +160,18 @@ all-skipped run is not a failure. **Never make the default test run
 depend on privileged kernel state** — new privileged tests must
 self-skip the same way. The privileged CI job
 (`build-test-ublk-privileged` in `.github/workflows/ci.yml`) loads
-`ublk_drv` and runs exactly these:
-`sudo -E ./build/tests/obd_integration_tests "[ublk]"`.
+`ublk_drv` and runs these tests individually by exact name under `sudo`,
+with a separate bounded step and log for each. The online-grow step has a
+120-second process timeout and records the commit, kernel, command exit status
+and the test-output `tee` exit status in `build/ublk-e2e-grow.log`, included
+in the `ublk-e2e-logs` artifact. On a supported driver it must verify capacity,
+grown-region write/read and original content. Only exit 4 accompanied by
+the test's explicit `kernel driver lacks UBLK_U_CMD_UPDATE_SIZE` reason is
+accepted as an unsupported-driver skip, reported as a workflow warning;
+this is **not supported-grow coverage**. Missing control access, unexplained
+all-skipped results, other test failures, signals, timeouts and log-write
+failures fail the step. Failure diagnostics include available kernel and
+core information. Local unprivileged skips do not prove the privileged path.
 
 ## Test inventory
 
@@ -682,7 +693,8 @@ Every test, grouped by area, with the property it guards.
 - `integration: ublk device grows online and serves the new capacity` —
   the D3 privileged E2E: `Device::resize_blocking` issues
   `UBLK_U_CMD_UPDATE_SIZE`, the kernel gendisk reports the new
-  capacity, and the original content still reads back; shrink attempts
+  capacity, writes in the grown region read back, and the original content
+  still reads back; shrink attempts
   are rejected device-side before any kernel IO. Self-skips without
   `/dev/ublk-control` or on kernels whose driver lacks the command (it
   landed in the 6.16 cycle).
