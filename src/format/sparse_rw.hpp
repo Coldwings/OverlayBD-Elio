@@ -10,6 +10,7 @@
 #include "format/writable.hpp"
 #include "source/local_file.hpp"
 
+#include <atomic>
 #include <string>
 
 namespace obd::format {

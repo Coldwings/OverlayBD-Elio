@@ -58,17 +58,32 @@ std::string uds_rpc(const std::string& path, const std::string& line) {
     if (fd < 0) throw std::system_error(errno, std::generic_category());
     sockaddr_un sa {};
     sa.sun_family = AF_UNIX;
-    std::snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path.c_str());
+    // snprintf truncates silently; reject a path that cannot fit (a
+    // truncated sun_path would connect to a DIFFERENT socket, or none).
+    const int n = std::snprintf(sa.sun_path, sizeof(sa.sun_path), "%s",
+                                path.c_str());
+    if (n < 0 || static_cast<size_t>(n) >= sizeof(sa.sun_path)) {
+        ::close(fd);
+        throw std::system_error(ENAMETOOLONG, std::generic_category());
+    }
     if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
         const int e = errno;
         ::close(fd);
         throw std::system_error(e, std::generic_category());
     }
-    if (::write(fd, line.data(), line.size()) !=
-        static_cast<ssize_t>(line.size())) {
-        const int e = errno;
-        ::close(fd);
-        throw std::system_error(e, std::generic_category());
+    // Loop the write: short writes are legal on SOCK_STREAM. MSG_NOSIGNAL
+    // keeps a peer that closed early from killing the test with SIGPIPE.
+    size_t sent = 0;
+    while (sent < line.size()) {
+        const ssize_t w = ::send(fd, line.data() + sent, line.size() - sent,
+                                 MSG_NOSIGNAL);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            const int e = w < 0 ? errno : EIO;
+            ::close(fd);
+            throw std::system_error(e, std::generic_category());
+        }
+        sent += static_cast<size_t>(w);
     }
     std::string reply;
     char buf[4096];
