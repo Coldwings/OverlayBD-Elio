@@ -776,6 +776,15 @@ commands and monitors to distinct workers. No kernel ublk is required.
 | `supervisor: recovery publishes child and count together` | Status/list observed at the publication boundary agree on the replacement PID and recovery count. |
 | `supervisor: status owns its child generation and trace snapshot` | A paused status retains the old child and reports its PID/count/recording trace after concurrent recovery marks the live trace lost. |
 | `supervisor: list owns its child generation and trace snapshot` | A paused list preserves the same owned generation and trace while recovery and other commands proceed on another worker. |
+| `supervisor: trace start metadata is owned by crashed generation` | A trace_start reply publishes on its retained entry before client completion; recovery marks that generation's live recording lost, and the parked handler cannot restore it. |
+| `supervisor: trace start metadata cannot rewrite a reused id` | A parked trace_start completion from a destroyed entry cannot publish metadata into a newer device that reused the same id. |
+| `supervisor: timed-out trace start reply cannot publish metadata` | A trace_start handler is parked after timeout wins; a later matching success reply is routed but cannot publish recording metadata. |
+| `supervisor: trace start rejects wrong success discriminator` | A matching-sequence success reply with `reply:"resize"` cannot complete trace_start or publish trace metadata. |
+| `supervisor: trace start rejects success without metadata` | A matching-sequence trace_start success without required metadata fields is returned as a clean error and leaves status trace-free. |
+| `supervisor: trace stop metadata cannot rewrite a reused id` | A parked trace_stop completion from a destroyed entry cannot publish stopped metadata into a newer device that reused the same id. |
+| `supervisor: trace stop rejects wrong success discriminator` | A matching-sequence success reply with `reply:"resize"` cannot complete trace_stop or publish stopped trace metadata. |
+| `supervisor: trace stop rejects malformed success metadata` | A matching-sequence trace_stop success with wrong-typed metadata fields is returned as a clean error and keeps the live trace recording. |
+| `supervisor: trace stop history survives child EOF` | A completed trace_stop publishes stopped history that child EOF must preserve instead of overwriting as lost. |
 | `supervisor: shutdown drains a monitor after its entry was erased` | Hold EOF cleanup after a successful destroy; shutdown must retain the daemon until the erased entry's monitor departs. |
 | `supervisor: shutdown drains an admitted create and its late monitor` | Hold an admitted create across shutdown; drain its handler and the monitor it spawns before returning. |
 | `supervisor: shutdown drains an accept racing handler registration` | Hold an accepted socket before handler registration; cancellation and draining include the late handler. |

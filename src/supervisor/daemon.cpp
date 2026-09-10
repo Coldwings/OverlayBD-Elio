@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -78,6 +79,45 @@ uint64_t uint_or(const nlohmann::json& j, const char* key,
 bool bool_or(const nlohmann::json& j, const char* key, bool def = false) {
     const auto it = j.find(key);
     return (it != j.end() && it->is_boolean()) ? it->get<bool>() : def;
+}
+
+bool has_string_field(const nlohmann::json& j, const char* key) {
+    const auto it = j.find(key);
+    return it != j.end() && it->is_string();
+}
+
+bool has_nonnegative_integer_field(const nlohmann::json& j,
+                                   const char* key) {
+    const auto it = j.find(key);
+    if (it == j.end()) return false;
+    if (it->is_number_unsigned()) return true;
+    return it->is_number_integer() && it->get<int64_t>() >= 0;
+}
+
+std::optional<std::string> trace_reply_validation_error(
+    const std::string& command_kind, const nlohmann::json& reply) {
+    if (command_kind != "trace_start" && command_kind != "trace_stop") {
+        return std::nullopt;
+    }
+    const auto rit = reply.find("reply");
+    if (rit == reply.end() || !rit->is_string() ||
+        rit->get<std::string>() != command_kind) {
+        return "malformed " + command_kind + " reply";
+    }
+    if (!bool_or(reply, "ok", false)) return std::nullopt;
+    if (command_kind == "trace_start") {
+        if (!has_string_field(reply, "path") ||
+            !has_nonnegative_integer_field(reply, "duration_sec")) {
+            return "malformed trace_start reply";
+        }
+    } else if (!has_string_field(reply, "path") ||
+               !has_string_field(reply, "sha256") ||
+               !has_nonnegative_integer_field(reply, "size") ||
+               !has_nonnegative_integer_field(reply, "records") ||
+               !has_nonnegative_integer_field(reply, "dropped")) {
+        return "malformed trace_stop reply";
+    }
+    return std::nullopt;
 }
 
 /// Reads a small control-plane text file through the async IO backend
@@ -334,9 +374,14 @@ class Daemon {
     // admission, so later commands cannot replace its result or event.
     struct DeviceCommand {
         uint64_t seq = 0;
+        // The admitted command kind, not the device's reply discriminator.
+        // Trace metadata publication must follow the operation that was sent.
+        std::string kind;
         elio::sync::event waiter;
         bool terminal = false;
         nlohmann::json reply;
+        std::chrono::steady_clock::time_point reply_deadline =
+            std::chrono::steady_clock::time_point::max();
     };
 
     /// Per-device bookkeeping (ADR-0010): the spec is the respawn
@@ -1130,6 +1175,7 @@ private:
         // timed-out command carries an old seq and is dropped, never
         // completing the wrong command.
         co_await mu_.lock();
+        SyncMutexGuard registry_guard{mu_};
         if (entry->active_command) {
             // Protocol input: parse `seq` defensively — a wrong-typed
             // value() would throw type_error and tear down the routing
@@ -1141,7 +1187,54 @@ private:
             }
             auto operation = entry->active_command;
             if (echoed == operation->seq) {
-                operation->reply = std::move(j);
+                if (std::chrono::steady_clock::now() >=
+                    operation->reply_deadline) {
+                    ELIO_LOG_WARNING(
+                        "device {}: dropping command reply after timeout "
+                        "deadline (seq {})",
+                        entry->spec.id, echoed);
+                    operation->terminal = true;
+                    entry->active_command.reset();
+                    co_return;
+                }
+                if (const auto error =
+                        trace_reply_validation_error(operation->kind, j)) {
+                    ELIO_LOG_WARNING(
+                        "device {}: {}", entry->spec.id, *error);
+                    operation->reply = {{"ok", false}, {"error", *error}};
+                } else {
+                    if (bool_or(j, "ok", false)) {
+                        // Publish trace metadata while routing the matching reply
+                        // on the retained entry. A later handler must not look up
+                        // children_[id] after EOF/recovery or destroy/recreate.
+                        if (operation->kind == "trace_start") {
+                            entry->trace = {{"state", "recording"},
+                                            {"path", str_or(j, "path")},
+                                            {"duration_sec",
+                                             uint_or(j, "duration_sec")}};
+                        } else if (operation->kind == "trace_stop") {
+                            // A stop after the duration already finalized the
+                            // recording is a no-op: the expiry event has already
+                            // recorded the true cause, and overwriting it would
+                            // misreport a late trace_stop as the reason.
+                            const bool already_expired =
+                                entry->trace.is_object() &&
+                                entry->trace.value("state", "") == "stopped" &&
+                                entry->trace.value("reason", "") == "expired";
+                            nlohmann::json t;
+                            t["state"] = "stopped";
+                            t["reason"] =
+                                already_expired ? "expired" : "stopped";
+                            t["path"] = str_or(j, "path");
+                            t["sha256"] = str_or(j, "sha256");
+                            t["size"] = uint_or(j, "size");
+                            t["records"] = uint_or(j, "records");
+                            t["dropped"] = uint_or(j, "dropped");
+                            entry->trace = std::move(t);
+                        }
+                    }
+                    operation->reply = std::move(j);
+                }
                 operation->terminal = true;
                 entry->active_command.reset();
                 operation->waiter.set();
@@ -1152,7 +1245,6 @@ private:
                     entry->spec.id, echoed, operation->seq);
             }
         }
-        mu_.unlock();
         co_return;
     }
 
@@ -1170,6 +1262,7 @@ private:
         uint64_t seq = 0;  // captured under mu_: never read the member
                            // unlocked (only this path writes it, but
                            // keep the lock discipline exact)
+        const auto cmd_kind = cmd["cmd"].get<std::string>();
         {
             co_await mu_.lock();
             auto it = children_.find(id);
@@ -1177,6 +1270,7 @@ private:
             command_busy = entry && entry->active_command;
             if (entry && !command_busy && entry->control) {
                 operation->seq = ++entry->cmd_seq;
+                operation->kind = cmd_kind;
                 seq = operation->seq;
                 entry->active_command = operation;
                 channel = entry->control;
@@ -1226,6 +1320,14 @@ private:
             // awaitable; the normal path never dereferences a test gate.
             std::chrono::milliseconds command_timeout{30000};
             if (test_gate_) command_timeout = test_gate_->command_timeout;
+            {
+                co_await mu_.lock();
+                if (entry->active_command == operation) {
+                    operation->reply_deadline =
+                        std::chrono::steady_clock::now() + command_timeout;
+                }
+                mu_.unlock();
+            }
             auto got = co_await elio::with_timeout(
                 command_timeout,
                 [&operation](elio::coro::cancel_token tok)
@@ -1283,14 +1385,6 @@ private:
         std::string r = co_await forward_device_command(id, std::move(cmd));
         auto rj = nlohmann::json::parse(r, nullptr, false);
         if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
-            co_await mu_.lock();
-            auto it = children_.find(id);
-            if (it != children_.end()) {
-                it->second->trace = {{"state", "recording"},
-                                     {"path", str_or(rj, "path")},
-                                     {"duration_sec", uint_or(rj, "duration_sec")}};
-            }
-            mu_.unlock();
             rj.erase("reply");
             rj.erase("seq");  // internal routing token, not client API
             rj["id"] = id;
@@ -1308,28 +1402,6 @@ private:
         std::string r = co_await forward_device_command(id, std::move(cmd));
         auto rj = nlohmann::json::parse(r, nullptr, false);
         if (!rj.is_discarded() && bool_or(rj, "ok", false)) {
-            co_await mu_.lock();
-            auto it = children_.find(id);
-            if (it != children_.end()) {
-                // A stop after the duration already finalized the
-                // recording is a no-op: the expiry event has already
-                // recorded the true cause, and overwriting it would
-                // misreport a late trace_stop as the reason.
-                const bool already_expired =
-                    it->second->trace.is_object() &&
-                    it->second->trace.value("state", "") == "stopped" &&
-                    it->second->trace.value("reason", "") == "expired";
-                nlohmann::json t;
-                t["state"] = "stopped";
-                t["reason"] = already_expired ? "expired" : "stopped";
-                t["path"] = str_or(rj, "path");
-                t["sha256"] = str_or(rj, "sha256");
-                t["size"] = uint_or(rj, "size");
-                t["records"] = uint_or(rj, "records");
-                t["dropped"] = uint_or(rj, "dropped");
-                it->second->trace = std::move(t);
-            }
-            mu_.unlock();
             rj.erase("reply");
             rj.erase("seq");  // internal routing token, not client API
             rj["id"] = id;
