@@ -29,11 +29,14 @@ target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
 target_compile_definitions(obd_unit_tests
     PRIVATE OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>")
 add_dependencies(obd_unit_tests obdctl)
-catch_discover_tests(obd_unit_tests)
+catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]")
 
 if(OBD_ENABLE_UBLK)
-    target_sources(obd_unit_tests PRIVATE unit/test_ublk.cpp)
+    target_sources(obd_unit_tests PRIVATE
+        unit/test_ublk.cpp unit/test_ublk_shutdown.cpp)
     target_link_libraries(obd_unit_tests PRIVATE obd_ublk)
+    catch_discover_tests(obd_unit_tests TEST_SPEC "[shutdown]"
+        PROPERTIES TIMEOUT 30)
     # obd-device is built only with the ublk backend; the flag-validation
     # test executes the real binary.
     target_compile_definitions(obd_unit_tests

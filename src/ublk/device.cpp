@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <exception>
 #include <thread>
 
 namespace obd::ublk {
@@ -25,6 +26,7 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
     dev->params_ = params;
     dev->src_ = std::move(src);
 
+    std::exception_ptr failure;
     try {
         dev->ctrl_ = std::make_unique<Ctrl>();
         // Kernel control calls run off-scheduler (spawn_blocking): they
@@ -66,8 +68,13 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
         // Bridge coroutines on the Elio scheduler, one per queue.
         for (auto& queue : dev->queues_) {
             dev->io_tasks_running_.fetch_add(1, std::memory_order_acq_rel);
-            elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_,
-                     &dev->io_tasks_running_);
+            try {
+                elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_,
+                         &dev->io_tasks_running_);
+            } catch (...) {
+                dev->io_tasks_running_.fetch_sub(1, std::memory_order_acq_rel);
+                throw;
+            }
         }
         ELIO_LOG_INFO("ublk dev {}: bridges started, START_DEV poll",
                       dev->dev_id_);
@@ -103,8 +110,10 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
         ELIO_LOG_INFO("ublk device {} ready ({})", dev->dev_id_,
                       dev->bdev_path());
     } catch (...) {
-        dev->stop();
-        throw;
+        failure = std::current_exception();
+    }
+    if (failure) {
+        co_await cleanup_failed(std::move(dev), failure);
     }
     co_return dev;
 }
@@ -118,6 +127,7 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
     dev->src_ = std::move(src);
     dev->dev_id_ = dev_id;
 
+    std::exception_ptr failure;
     try {
         dev->ctrl_ = std::make_unique<Ctrl>();
         // Announce the replacement server BEFORE parking FETCH commands:
@@ -148,8 +158,13 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         }
         for (auto& queue : dev->queues_) {
             dev->io_tasks_running_.fetch_add(1, std::memory_order_acq_rel);
-            elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_,
-                     &dev->io_tasks_running_);
+            try {
+                elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_,
+                         &dev->io_tasks_running_);
+            } catch (...) {
+                dev->io_tasks_running_.fetch_sub(1, std::memory_order_acq_rel);
+                throw;
+            }
         }
         // END_USER_RECOVERY completes the handshake once every tag has a
         // parked FETCH (same EBUSY polling as START_DEV).
@@ -190,10 +205,19 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         ELIO_LOG_INFO("ublk device {} recovered ({}, {} bytes)",
                       dev_id, dev->bdev_path(), dev->size_bytes());
     } catch (...) {
-        dev->stop();
-        throw;
+        failure = std::current_exception();
+    }
+    if (failure) {
+        co_await cleanup_failed(std::move(dev), failure);
     }
     co_return dev;
+}
+
+elio::coro::task<void> Device::cleanup_failed(
+    std::unique_ptr<Device> dev, std::exception_ptr failure) {
+    co_await dev->stop_async();
+    co_await elio::spawn_blocking([&] { dev.reset(); });
+    std::rethrow_exception(failure);
 }
 
 uint64_t Device::resize_blocking(uint64_t bytes) {
@@ -220,7 +244,7 @@ uint64_t Device::resize_blocking(uint64_t bytes) {
     return bytes;
 }
 
-void Device::stop() noexcept {
+void Device::request_stop() noexcept {
     stop_.store(true, std::memory_order_relaxed);
     for (auto& q : queues_) q->wakeup();
     // Also wake the bridge coroutines: each is parked in an eventfd
@@ -228,18 +252,24 @@ void Device::stop() noexcept {
     // queue threads exit — a parked detached bridge outlives stop()
     // and hangs scheduler teardown.
     for (auto& q : queues_) q->notify_elio();
-    // Wait for bridge/handler coroutines to drain: they dereference
-    // queues_ and src_, so ~Queue must not run while any is alive
-    // (observed as an intermittent SIGSEGV after a passed E2E read).
-    for (int i = 0; i < 5000 &&
-                    io_tasks_running_.load(std::memory_order_acquire) > 0;
-         ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+elio::coro::task<void> Device::stop_async() {
+    request_stop();
+    // A source may itself await spawn_blocking. Do not occupy the pool
+    // while draining: even one worker and one blocking thread must progress.
+    while (io_tasks_running_.load(std::memory_order_acquire) > 0) {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
     }
-    if (io_tasks_running_.load(std::memory_order_acquire) > 0) {
-        ELIO_LOG_ERROR("ublk dev {}: {} IO coroutines still running at stop",
-                       dev_id_,
-                       io_tasks_running_.load(std::memory_order_acquire));
+    co_await elio::spawn_blocking([this] { stop(); });
+}
+
+void Device::stop() noexcept {
+    request_stop();
+    // Blocking callers must leave the scheduler/source executors running.
+    // Elapsed time cannot end the lifetime of an outstanding source IO.
+    while (io_tasks_running_.load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     for (auto& t : threads_) {
         if (t.joinable()) t.join();

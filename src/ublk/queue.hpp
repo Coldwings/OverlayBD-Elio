@@ -97,6 +97,7 @@ public:
     int failure() const noexcept { return failure_.load(); }
 
 private:
+    friend struct DeviceTestAccess;
     /// Creates the queue io_uring. Must be called on the queue thread
     /// (SINGLE_ISSUER binds the creator; DEFER_TASKRUN binds the
     /// waiter). Throws obd::error on failure.

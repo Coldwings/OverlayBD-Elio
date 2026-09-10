@@ -452,3 +452,20 @@ correlate by device id and by the supervisor's spawn logs.
 - **One supervisor per node** is the expected topology; multiple
   supervisors must use distinct `--socket` paths and will compete for ublk
   device ids unless `--dev-id` is managed externally.
+
+## Device shutdown progress
+
+Device shutdown waits for outstanding source I/O to complete before releasing
+queue buffers or the source chain. Coroutine paths use `Device::stop_async()`
+so both scheduler workers and the blocking pool remain available during the
+wait; final thread joins and Device destruction run off-worker. Slow source
+completion can therefore delay shutdown. A time limit is not permission to
+release a live queue or proceed with the writable checkpoint.
+
+For a shutdown failure, retain the exact test name, seed, commit, signal/exit
+status and full log. A passed read followed by a shutdown signal is not a
+failed data comparison. Privileged CI retains per-test output and available
+kernel/core diagnostics; rerunning successfully does not establish a repair.
+The nonprivileged shutdown unit tests cover normal completion with one worker
+and one blocking thread, while privileged E2E still validates actual kernel
+registration and teardown.

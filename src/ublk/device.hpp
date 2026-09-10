@@ -15,6 +15,7 @@
 #include <elio/coro/task.hpp>
 
 #include <atomic>
+#include <exception>
 #include <memory>
 #include <string>
 #include <thread>
@@ -81,12 +82,22 @@ public:
     /// EOPNOTSUPP/95 on 6.15+)).
     uint64_t resize_blocking(uint64_t bytes);
 
-    /// Signals queue threads and bridges to stop, joins the threads, and
-    /// unregisters the device (STOP_DEV/DEL_DEV via ~Ctrl).
+    /// Blocking drain and queue-thread join. Call off an Elio worker,
+    /// with scheduler and any source blocking executor able to progress.
+    /// No resource is released while a bridge/handler still uses it.
     void stop() noexcept;
 
+    /// Scheduler-side drain: leaves both workers and the blocking pool free
+    /// while source IO completes, then joins queue threads off-worker.
+    /// The caller must retain this Device until the await completes.
+    elio::coro::task<void> stop_async();
+
 private:
+    friend struct DeviceTestAccess;
     Device() = default;
+    void request_stop() noexcept;
+    static elio::coro::task<void> cleanup_failed(
+        std::unique_ptr<Device> dev, std::exception_ptr failure);
 
     DeviceParams params_;
     source::BlobSourcePtr src_;

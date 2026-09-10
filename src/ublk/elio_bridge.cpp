@@ -135,7 +135,12 @@ elio::coro::task<void> run_bridge(Queue* q, source::BlobSource* src,
             // The counter is incremented BEFORE the spawn so stop()
             // never observes a zero while a coroutine is still queued.
             running->fetch_add(1, std::memory_order_acq_rel);
-            elio::go(handle_io, q, src, req, running);
+            try {
+                elio::go(handle_io, q, src, req, running);
+            } catch (...) {
+                running->fetch_sub(1, std::memory_order_acq_rel);
+                throw;
+            }
         }
     }
 }
