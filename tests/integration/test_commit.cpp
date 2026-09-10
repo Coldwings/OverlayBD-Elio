@@ -909,3 +909,86 @@ TEST_CASE("supervisor: stale blank-create failure leaves a newer device alone",
         });
     REQUIRE(failures == 0);
 }
+
+TEST_CASE("supervisor: commit is refused while a mode-3 create is still in mkfs",
+          "[supervisor]") {
+    // Review finding: the entry is published in `children_` before the
+    // mkfs step runs, and the unsealable-upper rule used to key on mkfs
+    // having FINISHED — so a commit landing inside that window sealed a
+    // supervisor-formatted (non-deterministic) upper, violating the
+    // ADR-0014 boundary. The rule now keys on the intent recorded when the
+    // entry is created, so no ordering lets that seal through.
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string blank_root = dir / "blank";
+
+    auto mock = std::make_shared<MockMkfs>();
+    mock->release = false;  // hold the create inside its mkfs step
+    auto guard = block_daemon_signals();
+
+    const int failures = run_daemon_case(
+        [&] {
+            supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+            cfg.blank_dir = blank_root;
+            cfg.mkfs_runner = mock;
+            return cfg;
+        }(),
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+
+            // The mode-3 create blocks inside mkfs on its own thread; its
+            // reply only arrives once the mock is released.
+            nlohmann::json create_reply;
+            std::thread blocked([&] {
+                try {
+                    create_reply =
+                        rpc_json({{"cmd", "create"},
+                                  {"id", "h1"},
+                                  {"blank", {{"size", kFakeVsize},
+                                             {"mkfs", "ext4"}}}});
+                } catch (const std::exception&) {
+                    create_reply = nlohmann::json{{"ok", false}};
+                }
+            });
+            for (int i = 0; i < 500 && mock->calls.load() == 0; ++i) {
+                std::this_thread::sleep_for(10ms);
+            }
+            check(mock->calls.load() >= 1, "create never reached mkfs");
+
+            // The window: the device is created, ready and reachable, but
+            // its mkfs has not finished. A commit here must be refused, and
+            // the device must survive it (a commit's first act is a stop).
+            const auto refused = rpc_json({{"cmd", "commit"}, {"id", "h1"}});
+            check(refused.value("ok", true) == false,
+                  "commit inside the mkfs window was not refused");
+            check(refused.contains("error") &&
+                      refused["error"].get<std::string>().find("host mkfs") !=
+                          std::string::npos,
+                  "in-window refusal text mismatch");
+            const auto st = rpc_json({{"cmd", "status"}, {"id", "h1"}});
+            check(st.value("ok", false) && st.value("state", "") == "ready",
+                  "the refused commit stopped the device being formatted");
+
+            // Release mkfs: the create completes normally and the device
+            // stays a mode-3 device (never sealable, by design).
+            mock->release = true;
+            blocked.join();
+            check(create_reply.value("ok", false),
+                  "mode-3 create failed after release");
+            const auto after = rpc_json({{"cmd", "commit"}, {"id", "h1"}});
+            check(after.value("ok", true) == false,
+                  "post-mkfs commit on a mode-3 device was not refused");
+            check(rpc_json({{"cmd", "hello"}}).value("ok", false),
+                  "daemon unusable after the window commit");
+        });
+    REQUIRE(failures == 0);
+}

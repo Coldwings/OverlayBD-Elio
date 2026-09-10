@@ -279,11 +279,16 @@ class Daemon {
         /// old "image_config_ok" name lied for config-less blank devices.
         bool upper_known = false;
         // ADR-0014 blank provenance: no image config (the upper path comes
-        // from the workspace layout); `mkfs_ran` records that the
-        // supervisor itself formatted the blank with host mkfs (create
-        // mode 3) — such uppers are never sealed (commit refuses).
+        // from the workspace layout); `mkfs_requested` records that the
+        // create asked for host mkfs (mode 3) — such uppers are never
+        // sealed (commit refuses). It is set BEFORE the entry is published
+        // to `children_`, i.e. on the CREATE's INTENT, not on mkfs having
+        // finished: the device is already reachable by a concurrent commit
+        // while mkfs runs, and a flag that only flips afterwards would let
+        // that commit seal a supervisor-formatted upper (the ADR-0014
+        // boundary must not depend on a race).
         bool blank = false;
-        bool mkfs_ran = false;
+        bool mkfs_requested = false;
         bool committing = false;      // a commit is in flight
         elio::sync::mutex op_mu;      // commit/destroy vs recovery respawn
 
@@ -720,6 +725,9 @@ private:
             entry->upper_type = "lsmt";
             entry->upper_path = cfg_.blank_dir + "/" + id + "/overlaybd.rw";
             entry->blank = true;
+            // Recorded NOW (before the entry is published and before mkfs
+            // runs) so the unsealable-upper rule holds in every ordering.
+            entry->mkfs_requested = !blank->mkfs.empty();
         } else {
             ChildSpec spec;
             spec.id = id;
@@ -821,14 +829,9 @@ private:
                         (mkfs_err.empty() ? std::to_string(mkrc)
                                           : mkfs_err));
                 }
-                // The supervisor formatted this blank itself (mode 3):
-                // remember it so commit refuses to seal the non-
-                // deterministic upper (ADR-0014).
-                {
-                    co_await mu_.lock();
-                    entry->mkfs_ran = true;
-                    mu_.unlock();
-                }
+                // `mkfs_requested` was already set when the entry was
+                // created (see DeviceEntry): the upper of a mode-3 device
+                // is unsealable from the moment the create is visible.
                 fields["mkfs"] = blank->mkfs;
             }
         }
@@ -1314,15 +1317,19 @@ private:
             co_return reply_error("sparse uppers cannot be sealed: " + id);
         }
         // ADR-0014 mode 3 boundary: a blank device the supervisor itself
-        // formatted with host mkfs is never sealed. Host mkfs output is
-        // non-deterministic (UUIDs, hash seeds, timestamps) and ADR-0014
-        // excludes it from image building — this is where the daemon can
-        // enforce that its own convenience run never becomes an image
-        // layer. Mode-2 blanks (the caller formats) remain committable.
-        if (entry->blank && entry->mkfs_ran) {
+        // was asked to format with host mkfs is never sealed. Host mkfs
+        // output is non-deterministic (UUIDs, hash seeds, timestamps) and
+        // ADR-0014 excludes it from image building — this is where the
+        // daemon can enforce that its own convenience run never becomes an
+        // image layer. The check keys on the create-time INTENT
+        // (`mkfs_requested`), not on mkfs having finished: the entry is
+        // reachable while its mkfs step is still running, and a commit
+        // landing in that window must be refused just the same. Mode-2
+        // blanks (the caller formats) remain committable.
+        if (entry->blank && entry->mkfs_requested) {
             co_return reply_error(
-                "device was formatted with host mkfs (create mode 3); "
-                "its non-deterministic upper cannot be sealed: " + id);
+                "device was created with host mkfs (create mode 3); its "
+                "non-deterministic upper cannot be sealed: " + id);
         }
         const std::string& upper = entry->upper_path;
 

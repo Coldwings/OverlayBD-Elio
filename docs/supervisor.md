@@ -316,10 +316,12 @@ three creation modes of ADR-0014 are:
    docs/operations.md. The daemon runs `mkfs.<type>` only when the create
    explicitly asked for it; a failing mkfs answers with a clean error and
    removes the freshly created device entry. The boundary is enforced:
-   a mode-3 device is marked at create time and `commit` refuses to seal
-   its upper ("host mkfs ... cannot be sealed") — the supervisor never
-   turns its own non-deterministic convenience output into an image
-   layer.
+   a mode-3 device is marked with the create-time INTENT (before the
+   entry is published and before mkfs runs), and `commit` refuses to seal
+   its upper ("host mkfs ... cannot be sealed") in every ordering —
+   including a commit that lands while the mkfs step is still running and
+   the device is already reachable. The supervisor never turns its own
+   non-deterministic convenience output into an image layer.
 
 Two workspace caveats for blank devices (both inherited from the
 writable-upper model, documented in docs/operations.md):

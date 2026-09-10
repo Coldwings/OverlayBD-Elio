@@ -629,6 +629,14 @@ Every test, grouped by area, with the property it guards.
   blank child's real argv is `--blank-size N --blank-dir D --global G
   --control-fd 3` with no `--config`, pinning the spawn contract for both
   creation modes.
+- `supervisor: commit is refused while a mode-3 create is still in mkfs` —
+  the ADR-0014 unsealable-upper rule under concurrency: a mode-3 create is
+  parked inside its mkfs step (the mock runner's release gate) while the
+  device is already created and reachable, then a `commit` for that id
+  must be refused with the "host mkfs" error and must NOT stop the device
+  being formatted — a rule keyed on mkfs having finished would seal the
+  supervisor-formatted upper here; the same create is also refused after
+  mkfs completes.
 - `supervisor: stale blank-create failure leaves a newer device alone` —
   F1/F3-scale concurrency: a create parked inside its (slow) mkfs step,
   the id destroyed and re-created underneath it, then the stale mkfs
