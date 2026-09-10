@@ -640,6 +640,15 @@ Every test, grouped by area, with the property it guards.
   `--blank-dir`, and `--config` combined with blank) is a usage error
   (exit 2) before any device work — obd-device is a standalone entry
   point, not only a supervisor child.
+- `supervisor: fake device rejects malformed blank flags like obd-device` —
+  the same matrix against the test-only fake device binary: its
+  `--blank-size` parsing must accept and reject exactly what the
+  production binary does (a `std::stoull` parse used to turn `-512` into
+  1.8e19 and drive blank-mode integration tests with a size production
+  refuses); a well-formed size paired with an unwritable workspace exits 1
+  (failed device), proving the validator is not merely rejecting
+  everything. The wait is bounded, so a validator regression fails the
+  assertion instead of hanging the job (#11).
 - `supervisor: create blank spec parses and validates size and mkfs` —
   the ADR-0014 blank create grammar end to end: `create` parses with a
   `blank` object (mode 2, and mode 3 with `mkfs`); `config` and `blank`
@@ -718,8 +727,9 @@ Every test, grouped by area, with the property it guards.
   `{"cmd":"create","blank":{"size":...,"mkfs":...},...}` (the supervisor
   has no `create-blank` command), mode 2 omits `mkfs`, image-mode create
   still sends `config`, an `ok:false` reply exits 1, and malformed input
-  (`--size -512` / `100` / missing / bad `--mkfs` / unknown flag) exits 2
-  without connecting.
+  (`--size -512` / `100` / missing / bad `--mkfs` / unknown flag / junk or
+  overflowing `--dev-id` in either create form — `std::stoi` would abort
+  the process instead of exiting 2) exits 2 without connecting.
 
 ### integration
 

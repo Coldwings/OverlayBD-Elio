@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -199,4 +200,17 @@ TEST_CASE("cli: obdctl create-blank sends a create command with the blank object
     REQUIRE(wait_obdctl(spawn_obdctl(
                 absent, {"create-blank", "d9", "--size", "512", "--bogus"})) ==
             2);
+    // `--dev-id` is validated identically in BOTH create forms: `std::stoi`
+    // would abort the CLI (uncaught exception, so WIFEXITED is false) on
+    // junk or overflow instead of exiting 2 — the regression is caught here
+    // because wait_obdctl asserts a normal exit.
+    REQUIRE(wait_obdctl(spawn_obdctl(
+                absent, {"create-blank", "d10", "--size", "512", "--dev-id",
+                         "abc"})) == 2);
+    REQUIRE(wait_obdctl(spawn_obdctl(
+                absent, {"create-blank", "d11", "--size", "512", "--dev-id",
+                         "99999999999"})) == 2);
+    REQUIRE(wait_obdctl(spawn_obdctl(
+                absent, {"create", "d12", "/tmp/config.json", "--dev-id",
+                         "abc"})) == 2);
 }

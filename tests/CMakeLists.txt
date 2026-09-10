@@ -46,6 +46,11 @@ add_executable(obd-test-fake-device fake_device_main.cpp)
 target_include_directories(obd-test-fake-device
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd-test-fake-device PRIVATE obd_core)
+# The unit tests execute the fake binary directly for the CLI-parity
+# checks (its flags must reject exactly what obd-device rejects).
+target_compile_definitions(obd_unit_tests
+    PRIVATE OBD_TEST_FAKE_DEVICE_BIN="$<TARGET_FILE:obd-test-fake-device>")
+add_dependencies(obd_unit_tests obd-test-fake-device)
 
 add_executable(obd_integration_tests
     integration/test_integration.cpp

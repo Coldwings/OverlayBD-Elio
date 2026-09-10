@@ -401,7 +401,34 @@ int main(int argc, char** argv) {
         if (a == "--config") args.config = next("--config");
         else if (a == "--blank-size") {
             args.blank = true;
-            args.blank_size = std::stoull(next("--blank-size"));
+            // Parity with the real obd-device: strict decimal validation
+            // (std::stoull would turn "-512" into 1.8e19 and sail past the
+            // later zero/alignment checks), so a malformed size is the same
+            // usage error here as it is in production.
+            const std::string v = next("--blank-size");
+            bool bad = v.empty() || v[0] == '-' ||
+                       v.find_first_not_of("0123456789") != std::string::npos;
+            uint64_t parsed = 0;
+            if (!bad) {
+                try {
+                    parsed = std::stoull(v);
+                } catch (const std::exception&) {
+                    bad = true;
+                }
+            }
+            if (!bad &&
+                (parsed == 0 || parsed % 512 != 0 ||
+                 parsed > obd::supervisor::kMaxBlankSizeBytes)) {
+                bad = true;
+            }
+            if (bad) {
+                std::fprintf(stderr,
+                             "invalid --blank-size '%s' (want a positive "
+                             "multiple of 512 bytes)\n",
+                             v.c_str());
+                return 2;
+            }
+            args.blank_size = parsed;
         } else if (a == "--blank-dir") args.blank_dir = next("--blank-dir");
         else if (a == "--control-fd")
             args.control_fd = std::stoi(next("--control-fd"));

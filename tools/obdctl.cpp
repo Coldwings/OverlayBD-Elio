@@ -38,6 +38,23 @@ void usage(const char* argv0) {
                  argv0, argv0);
 }
 
+/// Strict `--dev-id N` parse shared by every create form: `std::stoi`
+/// would abort the CLI (uncaught exception) on junk or overflow instead of
+/// the documented usage error, so validate fully and report like every
+/// other malformed argument. Returns false after printing the error.
+bool parse_dev_id(const char* v, nlohmann::json* req) {
+    char* end = nullptr;
+    errno = 0;
+    const long id = std::strtol(v, &end, 10);
+    if (errno != 0 || end == v || *end != '\0' || id < 0 ||
+        id > INT32_MAX) {
+        std::fprintf(stderr, "invalid --dev-id '%s'\n", v);
+        return false;
+    }
+    (*req)["dev_id"] = static_cast<int>(id);
+    return true;
+}
+
 bool send_all(int fd, const std::string& data) {
     size_t done = 0;
     while (done < data.size()) {
@@ -79,18 +96,7 @@ int main(int argc, char** argv) {
             const std::string a = argv[i++];
             if (a == "--global" && i < argc) req["global"] = argv[i++];
             else if (a == "--dev-id" && i < argc) {
-                // std::stoi would abort the CLI on junk; validate fully and
-                // fail like every other malformed argument (exit 2).
-                const char* v = argv[i++];
-                char* end = nullptr;
-                errno = 0;
-                const long id = std::strtol(v, &end, 10);
-                if (errno != 0 || end == v || *end != '\0' || id < 0 ||
-                    id > INT32_MAX) {
-                    std::fprintf(stderr, "invalid --dev-id '%s'\n", v);
-                    return 2;
-                }
-                req["dev_id"] = static_cast<int>(id);
+                if (!parse_dev_id(argv[i++], &req)) return 2;
             } else if (a == "--virtual-size" && i < argc) {
                 // D3 headroom override (bytes): full strtoull validation
                 // for a fast, clear error; the grow-only/alignment
@@ -167,9 +173,9 @@ int main(int argc, char** argv) {
                 }
                 blank["mkfs"] = t;
             } else if (a == "--global" && i < argc) req["global"] = argv[i++];
-            else if (a == "--dev-id" && i < argc)
-                req["dev_id"] = std::stoi(argv[i++]);
-            else {
+            else if (a == "--dev-id" && i < argc) {
+                if (!parse_dev_id(argv[i++], &req)) return 2;
+            } else {
                 usage(argv[0]);
                 return 2;
             }

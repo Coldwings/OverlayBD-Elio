@@ -13,10 +13,15 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+#include <csignal>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace obd;
@@ -613,5 +618,64 @@ TEST_CASE("supervisor: obd-device rejects malformed blank flags",
     REQUIRE(run_device({"--blank-size", "4096"}) == 2);
     REQUIRE(run_device({"--config", "/x.json", "--blank-size", "4096",
                         "--blank-dir", ws}) == 2);
+}
+#endif
+
+#ifdef OBD_TEST_FAKE_DEVICE_BIN
+TEST_CASE("supervisor: fake device rejects malformed blank flags like obd-device",
+          "[supervisor]") {
+    // Review finding: the fake device parsed --blank-size with std::stoull,
+    // so "-512" wrapped to 1.8e19 and sailed past its zero/alignment check
+    // — a test-only binary accepting what the production binary refuses.
+    // The flags now validate identically, so a blank-mode integration test
+    // can never be driven by a size production would have rejected.
+    auto run_fake = [](const std::vector<std::string>& args) {
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(OBD_TEST_FAKE_DEVICE_BIN));
+        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        const pid_t pid = ::fork();
+        REQUIRE(pid >= 0);
+        if (pid == 0) {
+            ::execv(OBD_TEST_FAKE_DEVICE_BIN, argv.data());
+            _exit(127);
+        }
+        // Bounded wait (the repo has no CTest timeouts yet, #11): if the
+        // validator ever regresses, the fake gets past argument parsing and
+        // serves until SIGTERM — kill it and return -1, so the regression
+        // fails the assertion instead of hanging the job.
+        int wstatus = 0;
+        for (int i = 0; i < 50; ++i) {
+            const pid_t r = ::waitpid(pid, &wstatus, WNOHANG);
+            if (r == pid) {
+                return WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+            }
+            if (r < 0 && errno != EINTR) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &wstatus, 0);
+        return -1;
+    };
+    // A workspace on a read-only filesystem: every case that (wrongly)
+    // gets past validation still dies during assembly, so a regression is
+    // an exit-code mismatch rather than a 5 s timeout.
+    const std::string ws = "/proc/obd-never-used";
+    REQUIRE(run_fake({"--blank-size", "-512", "--blank-dir", ws}) == 2);
+    REQUIRE(run_fake({"--blank-size", "0", "--blank-dir", ws}) == 2);
+    REQUIRE(run_fake({"--blank-size", "100", "--blank-dir", ws}) == 2);
+    REQUIRE(run_fake({"--blank-size", "junk", "--blank-dir", ws}) == 2);
+    REQUIRE(run_fake({"--blank-size", "18446744073709551616", "--blank-dir",
+                      ws}) == 2);
+    REQUIRE(run_fake({"--blank-size", "18014398509481984", "--blank-dir",
+                      ws}) == 2);
+    // Blank mode needs its workspace, and the modes are exclusive.
+    REQUIRE(run_fake({"--blank-size", "4096"}) == 2);
+    REQUIRE(run_fake({"--config", "/x.json", "--blank-size", "4096",
+                      "--blank-dir", ws}) == 2);
+    // A well-formed size is NOT a usage error: the read-only workspace
+    // makes the blank assembly fail, so the fake reports a failed device
+    // (exit 1) — but only after validation accepted the size.
+    REQUIRE(run_fake({"--blank-size", "4096", "--blank-dir", ws}) == 1);
 }
 #endif
