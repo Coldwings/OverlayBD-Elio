@@ -454,9 +454,21 @@ elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
     }
     std::error_code ec;
     std::filesystem::create_directories(spec.dir, ec);
-    if (ec && !std::filesystem::exists(spec.dir)) {
+    // ANY error is fatal, and the path must really be a directory: a
+    // workspace path occupied by a regular file sets `ec` while
+    // `exists()` stays true, so the old check fell through and the caller
+    // saw a confusing failure about overlaybd.zero/overlaybd.rw instead of
+    // the workspace it actually has to fix.
+    if (ec) {
         throw error(ec.value() != 0 ? static_cast<int>(ec.value()) : EIO,
-                    "cannot create blank device workspace " + spec.dir);
+                    "cannot create blank device workspace " + spec.dir +
+                        ": " + ec.message());
+    }
+    if (!std::filesystem::is_directory(spec.dir, ec)) {
+        throw error(ENOTDIR,
+                    "blank device workspace is not a directory: " +
+                        spec.dir +
+                        (ec ? " (" + ec.message() + ")" : ""));
     }
 
     // The zero base: a sealed EMPTY LSMT RO layer (ADR-0014). Byte

@@ -465,6 +465,13 @@ Every test, grouped by area, with the property it guards.
 - `image: writable upper assembles and serves writes` — a config with
   `upper.dir` opens a `MergedWritable` root that accepts and serves
   back writes (ADR-0008).
+- `image: blank device rejects an unusable workspace path` — the
+  ADR-0014 workspace preflight: a regular FILE sitting where the
+  per-device workspace must be is reported as a workspace error naming
+  the path (create_directories sets an error_code while `exists()` stays
+  true, so an `ec && !exists` check let it through and the failure
+  surfaced later as a confusing `overlaybd.zero` error), before any layer
+  work happens.
 - `image: blank device assembles a zeroed writable upper` — no config:
   `open_blank_device` opens a writable root of the requested size over a
   sealed empty LSMT zero base; fresh reads are zero, writes land in the

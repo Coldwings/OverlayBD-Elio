@@ -1242,6 +1242,32 @@ TEST_CASE("format: empty lsmt layer bytes are deterministic per virtual size",
     REQUIRE(sealed_header_uuid(c) != want);
 }
 
+TEST_CASE("image: blank device rejects an unusable workspace path", "[image]") {
+    // Review finding: a workspace path occupied by a REGULAR FILE sets
+    // create_directories' error_code while exists() stays true, so the
+    // old check fell through and the failure surfaced later as a confusing
+    // overlaybd.zero error. Every unusable workspace must be reported as
+    // such, before any layer work.
+    TempDir dir;
+    const std::string ws = dir / "not-a-dir";
+    test::write_file(ws, std::vector<uint8_t>{'x'});
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        image::BlankDeviceSpec spec;
+        spec.size = 512 * 64;
+        spec.dir = ws;
+        try {
+            (void)co_await image::open_blank_device(spec);
+            REQUIRE(false);  // a file as the workspace must not succeed
+        } catch (const std::exception& e) {
+            const std::string msg = e.what();
+            REQUIRE(msg.find("workspace") != std::string::npos);
+            REQUIRE(msg.find(ws) != std::string::npos);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("image: blank device assembles a zeroed writable upper", "[image]") {
     // ADR-0014 mode 2: open_blank_device produces a MergedWritable over a
     // sealed EMPTY LSMT zero base + a fresh LSMT-RW upper, both sized to
