@@ -417,6 +417,9 @@ device over channel 2 and relays the reply. Contract:
   ("trace recording already in progress"), an out-of-bounds or
   non-absolute path/duration (device-rejected), a wedged device
   ("device control channel timeout").
+  Busy versus unavailable is captured under the registry mutex when
+  admission is rejected; completion or EOF of the earlier command cannot
+  change the reason returned to that rejected client.
 - **Recording captures REMOTE reads only.** Records fire per
   fully-satisfied pread on a lower's remote source — LayerStore local
   hits produce no record. Structural warm-up, trace replay, and
@@ -753,6 +756,8 @@ commands and monitors to distinct workers. No kernel ublk is required.
 
 | Regression | Evidence |
 | --- | --- |
+| `supervisor: rejected command keeps busy reason after pending reply` | Hold a rejected resize after admission unlock; the real monitor accepts the earlier command's matching reply on another worker before the rejected client receives its original busy reason. |
+| `supervisor: rejected command keeps busy reason after channel EOF` | Hold the same rejection while device EOF fails the earlier request; the admission-time busy reason survives channel closure. |
 | `supervisor: recovery publishes child and count together` | Status/list observed at the publication boundary agree on the replacement PID and recovery count. |
 | `supervisor: status owns its child generation and trace snapshot` | A paused status retains the old child and reports its PID/count/recording trace after concurrent recovery marks the live trace lost. |
 | `supervisor: list owns its child generation and trace snapshot` | A paused list preserves the same owned generation and trace while recovery and other commands proceed on another worker. |

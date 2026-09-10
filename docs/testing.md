@@ -1059,3 +1059,19 @@ and partial-command client sockets open during shutdown. Assertions run only
 after gates are released, fixture peers are closed, and fixture threads have
 joined; the daemon must drain handlers and erased-entry monitors before
 returning. These tests use unprivileged fake device processes.
+
+The `[command-rejection]` cases use real resize RPCs and an unprivileged
+fake device whose reply or exit is controlled through a fixture FIFO:
+
+- `supervisor: rejected command keeps busy reason after pending reply` —
+  pause the second handler after rejection unlock, complete the first
+  request through the real monitor with its matching sequence, then check
+  that the second response retains the admission-time busy reason.
+- `supervisor: rejected command keeps busy reason after channel EOF` —
+  close the device channel while the second handler is paused; the first
+  request receives the channel-closed error and the second remains busy.
+
+Both cases verify that handlers and monitors overlap on distinct workers
+and only the first command reaches the fake. Gates are released, RPC peers
+joined, the independently owned fake child terminated and reaped, daemon
+tasks drained, and the signal mask restored before Catch assertions.

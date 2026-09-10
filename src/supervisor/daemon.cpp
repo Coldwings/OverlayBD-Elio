@@ -616,6 +616,7 @@ private:
                             *line, nullptr, false);
                         if (!j.is_discarded() && is_device_reply_line(j)) {
                             co_await route_device_reply(entry, std::move(j));
+                            if (test_gate_) co_await test_gate_->observe("device_reply", {});
                             continue;
                         }
                     }
@@ -1158,6 +1159,7 @@ private:
         std::shared_ptr<elio::sync::event> waiter =
             std::make_shared<elio::sync::event>();
         std::shared_ptr<elio::net::uds_stream> channel;
+        bool command_busy = false;  // admission-time snapshot, guarded by mu_
         uint64_t seq = 0;  // captured under mu_: never read the member
                            // unlocked (only this path writes it, but
                            // keep the lock discipline exact)
@@ -1165,7 +1167,8 @@ private:
             co_await mu_.lock();
             auto it = children_.find(id);
             if (it != children_.end()) entry = it->second;
-            if (entry && !entry->cmd_pending && entry->control) {
+            command_busy = entry && entry->cmd_pending;
+            if (entry && !command_busy && entry->control) {
                 entry->cmd_pending = true;
                 entry->reply_waiter = waiter;
                 entry->pending_seq = ++entry->cmd_seq;
@@ -1176,8 +1179,9 @@ private:
         }
         if (!entry) co_return reply_error("no such device: " + id);
         if (!channel) {
+            if (test_gate_) co_await test_gate_->observe("command_rejected", {});
             co_return reply_error(
-                entry->cmd_pending
+                command_busy
                     ? "another device command is in flight: " + id
                     : "device control channel unavailable: " + id);
         }
