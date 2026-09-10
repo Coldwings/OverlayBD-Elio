@@ -1,6 +1,9 @@
 // Supervisor wire protocol. See protocol.hpp.
 #include "supervisor/protocol.hpp"
 
+#include <climits>
+#include <cstdint>
+
 namespace obd::supervisor {
 
 std::optional<nlohmann::json> parse_command(std::string_view line,
@@ -75,6 +78,18 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
             error = "create 'global'/'device_bin' must be strings, "
                     "'dev_id' an integer";
             return std::nullopt;
+        }
+        // 'dev_id' is an OPTIONAL kernel device id (-1/absent = auto). The
+        // range check belongs here, with the other type validation: a JSON
+        // integer is 'is_number_integer' even when it cannot fit an int, and
+        // the handler's get<int>() would then throw out of the handler (an
+        // "internal error" reply) instead of a clean parse error.
+        if (j.contains("dev_id")) {
+            const int64_t dev_id = j["dev_id"].get<int64_t>();
+            if (dev_id < -1 || dev_id > INT32_MAX) {
+                error = "create 'dev_id' must be an integer >= -1";
+                return std::nullopt;
+            }
         }
         // D3 create-time headroom: optional 'virtual_size' override in
         // bytes. Semantic rules (positive, 512-aligned, grow-only vs the

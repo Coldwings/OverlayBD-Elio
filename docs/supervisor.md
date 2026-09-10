@@ -72,8 +72,12 @@ object requires an integer `size` and an optional string `mkfs`.
 string `path`, and an integer `duration_sec`; `trace_stop` requires a
 string `id`; `resize` requires a string `id` and a non-negative integer
 `size`; `create` and `commit` accept optional non-negative integer
-`virtual_size` fields; `hello` and `list` take no fields; anything else
-is "unknown cmd". Field TYPES are validated at parse time (value-level
+`virtual_size` fields; `create`'s optional `dev_id` must be an integer
+in `[-1, INT32_MAX]` (an out-of-range JSON integer is rejected here — the
+handler reads it as an `int`, and letting it through would surface as an
+"internal error" instead of a clean parse error); `hello` and `list` take
+no fields; anything else is "unknown cmd". Field TYPES are validated at
+parse time (value-level
 blank rules — positive, 512-aligned, within the sanity bound, safe
 `mkfs` type — are enforced by `parse_blank_spec` when the handler
 runs): a wrong-typed field is answered with a clean protocol error,

@@ -597,7 +597,10 @@ Every test, grouped by area, with the property it guards.
 
 - `supervisor: protocol commands parse and reject garbage` — the
   control-protocol parser accepts the four commands and rejects
-  malformed JSON, missing fields, and unknown commands.
+  malformed JSON, missing fields, unknown commands, and a `create`
+  `dev_id` outside `[-1, INT32_MAX]` (in range: accepted; `4294967296`
+  and `-2`: clean parse errors naming `dev_id`, never a thrown
+  `get<int>()`).
 - `supervisor: hello handshake replies with protocol version and features` —
   the `hello` reply carries an integer `protocol` ≥ 1, a non-empty
   `version` string, and a `features` array; `hello` requires no fields and

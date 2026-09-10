@@ -37,6 +37,23 @@ TEST_CASE("supervisor: protocol commands parse and reject garbage",
                                        err)
                  .has_value());
     REQUIRE(!supervisor::parse_command(R"({"cmd":"bogus"})", err).has_value());
+    // 'dev_id' range: a JSON integer outside int must be a clean parse
+    // error here — the handler's get<int>() would otherwise throw out of
+    // the handler and answer "internal error" instead of a protocol error.
+    REQUIRE(supervisor::parse_command(
+                R"({"cmd":"create","id":"a","config":"/c.json","dev_id":7})",
+                err)
+                .has_value());
+    REQUIRE(!supervisor::parse_command(
+                 R"({"cmd":"create","id":"a","config":"/c.json","dev_id":4294967296})",
+                 err)
+                 .has_value());
+    REQUIRE(err.find("dev_id") != std::string::npos);
+    REQUIRE(!supervisor::parse_command(
+                 R"({"cmd":"create","id":"a","config":"/c.json","dev_id":-2})",
+                 err)
+                 .has_value());
+    REQUIRE(err.find("dev_id") != std::string::npos);
     REQUIRE(!supervisor::parse_command("not json", err).has_value());
     REQUIRE(supervisor::parse_command(R"({"cmd":"list"})", err).has_value());
     REQUIRE(supervisor::parse_command(R"({"cmd":"status","id":"a"})", err)
