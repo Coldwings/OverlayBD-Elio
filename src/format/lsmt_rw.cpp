@@ -269,7 +269,8 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
         const uint64_t lo = (offset + done) / kSector;   // sectors
         const uint64_t hi = lo + piece / kSector;
 
-        // Plan: covered subranges overwrite in place; gaps append.
+        // Only live coverage owns reusable physical blocks. Zeroed segments
+        // have placeholder offsets, so treat them like gaps and append.
         struct Op {
             uint64_t voff;     // virtual start sector
             uint64_t moff;     // target sector in the file
@@ -279,8 +280,8 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
         std::vector<Op> ops;
         uint64_t cur = lo;
         for (const auto& s : segments_) {
-            if (s.end() <= lo) continue;
             if (s.offset >= hi) break;
+            if (s.zeroed || s.end() <= lo) continue;
             if (s.offset > cur) {
                 ops.push_back({cur, data_end_sector_, s.offset - cur, false});
                 data_end_sector_ += s.offset - cur;
@@ -327,7 +328,8 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
             if (s.end() > hi) {
                 auto tail = s;
                 tail.offset = hi;
-                tail.moffset += hi - s.offset;
+                // Zeroed offsets are placeholders, not physical extents.
+                if (!tail.zeroed) tail.moffset += hi - s.offset;
                 tail.length = static_cast<uint32_t>(s.end() - hi);
                 next.push_back(tail);
             }
@@ -422,7 +424,8 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
         if (s.end() > hi) {
             auto tail = s;
             tail.offset = hi;
-            tail.moffset += hi - s.offset;
+            // Zeroed offsets are placeholders, not physical extents.
+            if (!tail.zeroed) tail.moffset += hi - s.offset;
             tail.length = static_cast<uint32_t>(s.end() - hi);
             next.push_back(tail);
         }

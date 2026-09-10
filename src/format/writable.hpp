@@ -3,8 +3,8 @@
 //   * SparseRwLayer (sparse_rw.hpp) — a sparse file with fiemap extent
 //     tracking, identity segment mapping.
 //   * LsmtRwLayer   (lsmt_rw.hpp)   — an unsealed LSMT file with in-place
-//     edit: subranges already covered by the layer overwrite their data
-//     blocks in place; only previously-uncovered subranges are appended.
+//     edit: subranges covered by live segments overwrite their data blocks
+//     in place; uncovered or discarded (zeroed) subranges are appended.
 //     seal() compacts into a standard sealed LSMT RO file.
 #pragma once
 

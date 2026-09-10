@@ -214,6 +214,23 @@ Every test, grouped by area, with the property it guards.
 - `format: lsmt rw discard masks coverage with zeroed segments` —
   discard inserts zeroed segments that read back as zeroes and survive
   `seal()` into a valid standard LSMT file (ADR-0009).
+- `format: lsmt rw pwrite over a discarded range appends fresh data` —
+  rewriting a discarded range appends at the data end instead of
+  in-place-reusing the zeroed segment's placeholder `moffset` (sector 8),
+  so the surviving live neighbor's data is never clobbered and no two live
+  segments share one physical span; the round trip survives `seal()` and
+  seals byte-identically to a plain overwrite of the same content (issue
+  #13).
+- `format: lsmt rw straddling pwrite keeps live and discarded parts apart` —
+  a pwrite whose head lands on live data (in-place edit) and whose tail
+  lands on discarded coverage appends exactly the discarded part, without
+  writing through the placeholder `moffset` into the live head's physical
+  blocks (issue #13).
+- `format: lsmt rw partial zeroed rewrites survive offline sealing` —
+  partial rewrites and repeated discards keep zeroed placeholder offsets
+  valid through checkpoint/offline seal; reopened virtual reads preserve
+  the patch, an unrelated live range and all remaining zeroes. Also covers
+  a rewrite crossing the maximum segment/write-piece length (issue #13).
 - `format: sparse layer discard punches holes and recovers` — discard
   is a real punch-hole; reads stay correct across a reopen even though
   fiemap recovery is filesystem-block granular (ADR-0009).
