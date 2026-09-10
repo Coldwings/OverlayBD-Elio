@@ -717,6 +717,7 @@ void check_command_ownership(const std::string& scenario) {
     auto gate = std::make_shared<supervisor::detail::DaemonTestGate>(std::chrono::seconds(1));
     std::atomic<bool> client_done{false};
     std::atomic<int> daemon_rc{-1};
+    std::atomic<bool> shutdown_signalled{false};
     std::vector<std::string> failures;
     std::string daemon_error;
     nlohmann::json first_reply, second_reply, third_reply;
@@ -800,6 +801,7 @@ void check_command_ownership(const std::string& scenario) {
             } else {
                 const auto seq_a = received(1);
                 if (scenario == "shutdown") {
+                    shutdown_signalled.store(true);
                     ::kill(::getpid(), SIGTERM);
                     if (!wait_until([&] { return gate->count("shutdown") > 0; })) throw std::runtime_error("shutdown did not begin");
                     // The daemon drains handlers before stopping children.
@@ -934,7 +936,7 @@ void check_command_ownership(const std::string& scenario) {
                 }
             });
             while (!client_done.load()) co_await elio::time::sleep_for(std::chrono::milliseconds(10));
-            if (daemon_rc.load() < 0) ::kill(::getpid(), SIGTERM);
+            if (daemon_rc.load() < 0 && !shutdown_signalled.load()) ::kill(::getpid(), SIGTERM);
             while (daemon_rc.load() < 0) co_await elio::time::sleep_for(std::chrono::milliseconds(10));
             co_return 0;
         }, runtime);
