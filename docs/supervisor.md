@@ -650,9 +650,10 @@ pre-parse needed).
 - **Reaping completeness**: every spawned child is reaped exactly once —
   by the SIGCHLD reaper during normal operation, by `~Child` (SIGKILL +
   blocking `waitpid`) on teardown paths. No zombies survive the daemon.
-- **One-shot control channel**: one command line in, one reply line out,
-  connection closed. Malformed commands always receive a `{"ok":false,...}`
-  reply — the socket never hangs silently on bad input.
+- **One-shot control channel**: an admitted command produces at most one
+  reply before the connection closes. Malformed commands map to a
+  `{"ok":false,...}` reply; shutdown or I/O failure can prevent delivery
+  (see "Daemon shutdown").
 - **Bounded waits**: `create` never blocks longer than `ready_timeout_sec`
   waiting for readiness; `destroy` never blocks longer than
   `stop_timeout_sec` + 2 s SIGKILL grace.
@@ -691,8 +692,9 @@ pre-parse needed).
   command handlers concurrently. Event publication happens outside the
   mutex.
 - The control fd passes ownership exactly once via `release_control_fd()`
-  (to the monitor coroutine, which closes it at EOF); double-close is
-  impossible by construction.
+  into a shared stream retained by the monitor and in-flight writers.
+  Monitor EOF removes channel availability from the registry; the fd closes
+  when the last stream owner departs, after its pending I/O completes.
 - The reaper never calls the wildcard `waitpid(-1, …)`: it sweeps the
   registry's device pids plus the pids the mode-3 mkfs runner explicitly
   handed over after abandoning them (`MkfsRunner::take_orphan_pids()`), so
