@@ -335,8 +335,17 @@ writable-upper model, documented in docs/operations.md):
 Size rules (enforced at parse/handler time): positive, multiple of 512
 bytes, at most `kMaxBlankSizeBytes` (16 TiB sanity bound — the zero base
 allocates no data, so this only guards a typo'd size). The `mkfs` type is
-validated to a safe `mkfs.<type>` suffix charset (`valid_mkfs_type`), the
-injection boundary for the fork/exec runner.
+validated to a safe `mkfs.<type>` suffix charset (`valid_mkfs_type`:
+`[a-z0-9_]`, 1..16 chars), the injection boundary for the fork/exec
+runner.
+
+The mode-3 runner is bounded twice over: it polls its helper with
+`waitpid(pid, …, WNOHANG)` for at most `mkfs_timeout_sec`, then SIGKILLs
+it and polls for at most ~2 s more — a create never parks on a helper
+wedged in uninterruptible IO. If the helper is still unreaped by then, a
+detached blocking `waitpid` finishes the job, so it cannot outlive the
+daemon as a zombie (the daemon's SIGCHLD reaper deliberately sweeps only
+its own registered device pids).
 
 ### Trace recording (ADR-0013)
 

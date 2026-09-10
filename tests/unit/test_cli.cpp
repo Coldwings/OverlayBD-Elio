@@ -38,7 +38,17 @@ public:
         REQUIRE(fd_ >= 0);
         sockaddr_un sa {};
         sa.sun_family = AF_UNIX;
-        std::snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path.c_str());
+        // sun_path is a fixed 108-byte field: a truncated path would bind a
+        // DIFFERENT address than the one the CLI is told to connect to, so
+        // assert the fit instead of silently testing the wrong socket.
+        const int wrote = std::snprintf(sa.sun_path, sizeof(sa.sun_path), "%s",
+                                        path.c_str());
+        REQUIRE(wrote > 0);
+        REQUIRE(static_cast<size_t>(wrote) < sizeof(sa.sun_path));
+        // A leftover socket from an aborted earlier run would make bind()
+        // fail with EADDRINUSE; the destructor unlinks, so make the
+        // constructor equally idempotent.
+        ::unlink(path.c_str());
         REQUIRE(::bind(fd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) ==
                 0);
         REQUIRE(::listen(fd_, 1) == 0);

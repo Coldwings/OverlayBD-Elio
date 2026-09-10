@@ -213,8 +213,8 @@ std::optional<BlankSpec> parse_blank_spec(const nlohmann::json& blank,
         const std::string mkfs = blank["mkfs"].get<std::string>();
         if (!valid_mkfs_type(mkfs)) {
             error = "invalid blank 'mkfs' type '" + mkfs +
-                    "' (want mkfs.<type> with a 1..16 char lowercase "
-                    "alphanumeric type)";
+                    "' (want mkfs.<type> with a 1..16 char [a-z0-9_] "
+                    "type)";
             return std::nullopt;
         }
         spec.mkfs = mkfs;

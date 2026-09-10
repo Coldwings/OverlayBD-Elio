@@ -12,6 +12,7 @@
 #include <elio/log/macros.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/sync/mutex.hpp>
@@ -204,15 +205,38 @@ public:
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 ::kill(pid, SIGKILL);
-                // Reap with WNOHANG polling, never a blocking waitpid: a
-                // child slow to die would otherwise pin an Elio worker.
-                // SIGKILL is already delivered, so this terminates.
-                for (;;) {
+                // Bounded reap, then hand the wait off if it is still not
+                // done. SIGKILL normally lands immediately, but a helper
+                // wedged in uninterruptible IO would otherwise stall this
+                // coroutine — and with it the whole create — forever; the
+                // create path must never park on it. WNOHANG polling for at
+                // most ~2 s covers the ordinary case.
+                bool reaped = false;
+                for (int i = 0; i < 200; ++i) {
                     int ws = 0;
                     const pid_t got = ::waitpid(pid, &ws, WNOHANG);
-                    if (got == pid || (got < 0 && errno != EINTR)) break;
+                    if (got == pid || (got < 0 && errno != EINTR)) {
+                        reaped = true;
+                        break;
+                    }
                     co_await elio::time::sleep_for(
                         std::chrono::milliseconds(10));
+                }
+                if (!reaped) {
+                    // Hand-off reap: the daemon's SIGCHLD reaper sweeps
+                    // only REGISTERED device pids, so nothing else would
+                    // collect this helper — a detached blocking waitpid
+                    // keeps it from becoming a zombie that outlives the
+                    // device it was formatting. It costs one blocking-pool
+                    // thread until the helper finally dies.
+                    elio::go([pid]() -> elio::coro::task<void> {
+                        co_await elio::spawn_blocking([pid] {
+                            int ws = 0;
+                            while (::waitpid(pid, &ws, 0) < 0 &&
+                                   errno == EINTR) {
+                            }
+                        });
+                    });
                 }
                 if (error) {
                     *error = prog + " timed out after " +

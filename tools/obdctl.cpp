@@ -167,7 +167,7 @@ int main(int argc, char** argv) {
                     })) {
                     std::fprintf(stderr,
                                  "invalid --mkfs '%s' (want a 1..16 char "
-                                 "lowercase alphanumeric type)\n",
+                                 "[a-z0-9_] type)\n",
                                  v);
                     return 2;
                 }
