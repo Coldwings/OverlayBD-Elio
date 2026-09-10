@@ -644,8 +644,10 @@ Every test, grouped by area, with the property it guards.
   mode-3 mkfs helper that outlives its bounded post-SIGKILL reap is handed
   to the reaper (`MkfsRunner::take_orphan_pids()`) instead of parking a
   detached task on it: the test registers a real forked helper as
-  abandoned and requires the daemon to reap it (the test's own `waitpid`
-  answers `ECHILD`) — a returned pid means the zombie survived.
+  abandoned plus an already-reaped pid (whose wait answers `ECHILD`, which
+  must be terminal for that entry) and requires the daemon to reap the
+  live helper (the test's own `waitpid` then answers `ECHILD`) — a
+  returned pid means the zombie survived.
 - `supervisor: stale blank-create failure leaves a newer device alone` —
   F1/F3-scale concurrency: a create parked inside its (slow) mkfs step,
   the id destroyed and re-created underneath it, then the stale mkfs

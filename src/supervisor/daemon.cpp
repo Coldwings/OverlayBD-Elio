@@ -662,9 +662,21 @@ private:
                 for (auto it = abandoned_helpers_.begin();
                      it != abandoned_helpers_.end();) {
                     int wstatus = 0;
-                    if (::waitpid(*it, &wstatus, WNOHANG) == *it) {
+                    const pid_t r = ::waitpid(*it, &wstatus, WNOHANG);
+                    // Erase on the pid (we reaped it) or on a TERMINAL error
+                    // (ECHILD: it was reaped elsewhere; anything but EINTR
+                    // means this wait will never succeed). Keeping such a pid
+                    // would grow the list forever and re-issue a syscall for
+                    // it on every SIGCHLD wake.
+                    if (r == *it) {
                         ELIO_LOG_INFO(
                             "reaped abandoned mkfs helper (pid {})", *it);
+                        it = abandoned_helpers_.erase(it);
+                    } else if (r < 0 && errno != EINTR) {
+                        ELIO_LOG_WARNING(
+                            "abandoned mkfs helper pid {} is unreapable "
+                            "(waitpid: {}); dropping it",
+                            *it, std::strerror(errno));
                         it = abandoned_helpers_.erase(it);
                     } else {
                         ++it;

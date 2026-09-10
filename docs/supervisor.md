@@ -348,10 +348,13 @@ runner.
 The mode-3 runner is bounded twice over: it polls its helper with
 `waitpid(pid, …, WNOHANG)` for at most `mkfs_timeout_sec`, then SIGKILLs
 it and polls for at most ~2 s more — a create never parks on a helper
-wedged in uninterruptible IO. If the helper is still unreaped by then, a
-detached blocking `waitpid` finishes the job, so it cannot outlive the
-daemon as a zombie (the daemon's SIGCHLD reaper deliberately sweeps only
-its own registered device pids).
+wedged in uninterruptible IO. If the helper is still unreaped by then, its
+pid is handed to the daemon's SIGCHLD reaper
+(`MkfsRunner::take_orphan_pids()`), which collects abandoned helpers with
+`WNOHANG` on every wake — so a wedged helper cannot stay a zombie, and
+nothing detached (no coroutine, no thread) is left for shutdown to join.
+The reaper still never uses the wildcard `waitpid(-1, …)`: it waits on a
+helper pid only once its owner has given up on it.
 
 ### Trace recording (ADR-0013)
 
@@ -501,7 +504,9 @@ the **accept loop** (one coroutine per one-shot client), the **reaper** (a
 `signalfd` on SIGCHLD that reaps its registered device children one pid at
 a time with `waitpid(pid, …, WNOHANG)` — never `waitpid(-1)`, so a helper
 child owned by another component, e.g. the mode-3 mkfs runner, keeps its
-exit status), and one **monitor coroutine per child** (a `LineReader` over
+exit status; the same sweep collects the helper pids that runner
+ABANDONED via `take_orphan_pids()`, see the mkfs bound above), and one
+**monitor coroutine per child** (a `LineReader` over
 the child's status fd feeding `Child::update_status`). The children
 registry (`std::map<id, std::shared_ptr<Child>>`) is guarded by an
 `elio::sync::mutex` — coroutine-aware, never held across heavy work.
@@ -680,9 +685,12 @@ pre-parse needed).
   (to the monitor coroutine, which closes it at EOF); double-close is
   impossible by construction.
 - The reaper never calls the wildcard `waitpid(-1, …)`: it sweeps the
-  registry's device pids only, so it can neither steal a helper child's
-  exit status (the ADR-0014 mode-3 mkfs runner owns its own child) nor
-  wait on a pid it does not manage. Its registry snapshot is taken under
+  registry's device pids plus the pids the mode-3 mkfs runner explicitly
+  handed over after abandoning them (`MkfsRunner::take_orphan_pids()`), so
+  it can neither steal a LIVE helper child's exit status (the runner owns
+  its child until it gives up on it) nor wait on a pid it does not
+  manage. A handled pid is dropped from that list as soon as the wait
+  answers with the pid or a terminal error (`ECHILD`). Its registry snapshot is taken under
   `mu_` and each pid is reaped with `waitpid(pid, …, WNOHANG)`; a child
   replaced meanwhile is simply already reaped and skipped.
 - Inputs are not mutated: `ChildSpec` and `DaemonConfig` are read at

@@ -1027,6 +1027,19 @@ TEST_CASE("supervisor: the reaper collects helpers a runner had to abandon",
     auto mock = std::make_shared<MockMkfs>();
     auto guard = block_daemon_signals();
 
+    // An already-reaped pid lands in the same queue first: the reaper's
+    // waitpid answers ECHILD for it, which must be terminal (drop it) —
+    // otherwise the list would grow forever and re-issue the syscall on
+    // every SIGCHLD wake. Covering both entries in one run pins that the
+    // dead pid neither wedges the sweep nor stops the live one being
+    // reaped.
+    const pid_t dead = ::fork();
+    REQUIRE(dead >= 0);
+    if (dead == 0) _exit(0);
+    int dead_status = 0;
+    REQUIRE(::waitpid(dead, &dead_status, 0) == dead);
+    mock->add_orphan(dead);
+
     const pid_t helper = ::fork();
     REQUIRE(helper >= 0);
     if (helper == 0) {
