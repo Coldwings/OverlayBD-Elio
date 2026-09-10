@@ -41,14 +41,20 @@ void usage(const char* argv0) {
 /// Strict `--dev-id N` parse shared by every create form: `std::stoi`
 /// would abort the CLI (uncaught exception) on junk or overflow instead of
 /// the documented usage error, so validate fully and report like every
-/// other malformed argument. Returns false after printing the error.
+/// other malformed argument. The accepted range is the protocol's, not a
+/// stricter one: `-1` is the documented "auto-assign" spelling that
+/// `parse_command` accepts, so the CLI must forward it rather than refuse
+/// what the supervisor would have taken. Returns false after printing.
 bool parse_dev_id(const char* v, nlohmann::json* req) {
     char* end = nullptr;
     errno = 0;
     const long id = std::strtol(v, &end, 10);
-    if (errno != 0 || end == v || *end != '\0' || id < 0 ||
+    if (errno != 0 || end == v || *end != '\0' || id < -1 ||
         id > INT32_MAX) {
-        std::fprintf(stderr, "invalid --dev-id '%s'\n", v);
+        std::fprintf(stderr,
+                     "invalid --dev-id '%s' (want an integer >= -1; -1 = "
+                     "auto)\n",
+                     v);
         return false;
     }
     (*req)["dev_id"] = static_cast<int>(id);
@@ -146,25 +152,26 @@ int main(int argc, char** argv) {
                 errno = 0;
                 const long long n = std::strtoll(v, &end, 10);
                 if (errno != 0 || end == v || *end != '\0' || n <= 0 ||
-                    n % 512 != 0) {
+                    n % 512 != 0 ||
+                    static_cast<uint64_t>(n) >
+                        obd::supervisor::kMaxBlankSizeBytes) {
                     std::fprintf(stderr,
                                  "invalid --size '%s' (want a positive "
-                                 "multiple of 512 bytes)\n",
-                                 v);
+                                 "multiple of 512 bytes, at most %llu)\n",
+                                 v,
+                                 static_cast<unsigned long long>(
+                                     obd::supervisor::kMaxBlankSizeBytes));
                     return 2;
                 }
                 blank["size"] = static_cast<uint64_t>(n);
                 have_size = true;
             } else if (a == "--mkfs" && i < argc) {
                 const char* v = argv[i++];
-                // Local charset mirror of valid_mkfs_type (supervisor-side
-                // validation is authoritative).
+                // The supervisor's own predicate, not a mirror of it: the
+                // CLI must accept exactly what the daemon accepts (a copy
+                // here had already drifted once, mis-describing `_`).
                 const std::string t(v);
-                if (t.empty() || t.size() > 16 ||
-                    !std::all_of(t.begin(), t.end(), [](char c) {
-                        return (c >= 'a' && c <= 'z') ||
-                               (c >= '0' && c <= '9') || c == '_';
-                    })) {
+                if (!obd::supervisor::valid_mkfs_type(t)) {
                     std::fprintf(stderr,
                                  "invalid --mkfs '%s' (want a 1..16 char "
                                  "[a-z0-9_] type)\n",

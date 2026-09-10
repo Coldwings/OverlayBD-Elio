@@ -738,9 +738,14 @@ Every test, grouped by area, with the property it guards.
   `{"cmd":"create","blank":{"size":...,"mkfs":...},...}` (the supervisor
   has no `create-blank` command), mode 2 omits `mkfs`, image-mode create
   still sends `config`, an `ok:false` reply exits 1, and malformed input
-  (`--size -512` / `100` / missing / bad `--mkfs` / unknown flag / junk or
-  overflowing `--dev-id` in either create form — `std::stoi` would abort
-  the process instead of exiting 2) exits 2 without connecting.
+  (`--size -512` / `100` / missing / above the 16 TiB bound / bad
+  `--mkfs` / unknown flag / junk, overflowing or below `-1` `--dev-id` in
+  either create form — `std::stoi` would abort the process instead of
+  exiting 2) exits 2 without connecting, while `--dev-id -1` (the
+  documented auto-assign spelling) and a `--mkfs` type using `_` are
+  forwarded, not refused. The test server's accept is bounded, so a CLI
+  that wrongly rejects an argument fails the assertion instead of hanging
+  the job (#11).
 
 ### integration
 

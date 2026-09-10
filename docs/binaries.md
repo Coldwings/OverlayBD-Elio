@@ -100,9 +100,14 @@ present, must precede the command word. Commands:
   supervisor's default global config for this device; optional `--dev-id N`
   requests a specific ublk id. The reply blocks until the child reports
   `ready` (carrying the `/dev/ublkb<N>` path) or fails/times out.
+  `--dev-id -1` (or omitting the flag) means auto-assign, exactly as the
+  protocol defines it — the CLI forwards the range the daemon accepts,
+  `[-1, INT32_MAX]`.
 - `create-blank <id> --size BYTES [--mkfs TYPE]` — ADR-0014 modes 2/3:
-  create a blank raw device of `BYTES` (positive, multiple of 512) with
-  no image config — the wire form is `create` with the additive `blank`
+  create a blank raw device of `BYTES` (positive, multiple of 512, at
+  most `kMaxBlankSizeBytes` = 16 TiB — the same bound the supervisor and
+  obd-device enforce, so an absurd size is a local usage error rather
+  than a server round trip) with no image config — the wire form is `create` with the additive `blank`
   object (`{"size":...}` plus optional `"mkfs"`). `--mkfs ext4` (mode 3)
   asks the supervisor to run host `mkfs.<type>` on the new block device
   before replying — a runtime-only convenience whose output is never an

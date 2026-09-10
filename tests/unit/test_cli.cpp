@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -64,6 +65,15 @@ public:
     /// Waits for the client's single request line (returned without the
     /// trailing newline), then answers with `reply` and closes.
     std::string receive_and_reply(const std::string& reply) {
+        // Bounded accept: a CLI that wrongly rejects the arguments never
+        // connects, and an unbounded accept would hang the whole job
+        // instead of failing the assertion (the repo has no CTest timeouts
+        // yet, #11).
+        pollfd pfd {};
+        pfd.fd = fd_;
+        pfd.events = POLLIN;
+        const int ready = ::poll(&pfd, 1, 5000);
+        REQUIRE(ready > 0);
         conn_ = ::accept(fd_, nullptr, nullptr);
         REQUIRE(conn_ >= 0);
         std::string line;
@@ -171,6 +181,23 @@ TEST_CASE("cli: obdctl create-blank sends a create command with the blank object
         REQUIRE(!j["blank"].contains("mkfs"));
     }
 
+    // `--dev-id -1` is the documented "auto-assign" spelling, not a usage
+    // error: the CLI must forward what the supervisor accepts. `--mkfs`
+    // with the `_` the shared charset allows is accepted for the same
+    // reason.
+    {
+        OneShotServer server(sock);
+        const pid_t pid = spawn_obdctl(
+            sock, {"create-blank", "d2b", "--size", "1048576", "--dev-id",
+                   "-1", "--mkfs", "ext4_dev"});
+        const std::string line =
+            server.receive_and_reply("{\"ok\":true,\"id\":\"d2b\"}\n");
+        REQUIRE(wait_obdctl(pid) == 0);
+        const auto j = nlohmann::json::parse(line);
+        REQUIRE(j["dev_id"].get<int>() == -1);
+        REQUIRE(j["blank"]["mkfs"].get<std::string>() == "ext4_dev");
+    }
+
     // A rejected request (ok:false) is exit code 1, not 0.
     {
         OneShotServer server(sock);
@@ -223,4 +250,17 @@ TEST_CASE("cli: obdctl create-blank sends a create command with the blank object
     REQUIRE(wait_obdctl(spawn_obdctl(
                 absent, {"create", "d12", "/tmp/config.json", "--dev-id",
                          "abc"})) == 2);
+    // -1 is the auto-assign spelling (in range), -2 is not.
+    REQUIRE(wait_obdctl(spawn_obdctl(
+                absent, {"create-blank", "d13", "--size", "512", "--dev-id",
+                         "-2"})) == 2);
+    REQUIRE(wait_obdctl(spawn_obdctl(
+                absent, {"create", "d14", "/tmp/config.json", "--dev-id",
+                         "-2"})) == 2);
+    // The supervisor's 16 TiB blank sanity bound is a CLI usage error too
+    // (otherwise an absurd size becomes a server-side protocol error, i.e.
+    // exit 1, and the CLI diverges from its own validation contract).
+    REQUIRE(wait_obdctl(spawn_obdctl(
+                absent, {"create-blank", "d15", "--size",
+                         "18014398509481984"})) == 2);
 }
