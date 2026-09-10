@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <map>
 #include <string_view>
 #include <thread>
 
@@ -20,6 +21,18 @@ namespace obd::supervisor::detail {
 // child reference and runs outside mu_; it cannot repair product ownership.
 class DaemonTestGate {
 public:
+    void mark(std::string point) {
+        std::lock_guard lock(mu);
+        ++observations[std::move(point)];
+    }
+    size_t count(const std::string& point) {
+        std::lock_guard lock(mu);
+        return observations[point];
+    }
+    bool is_armed(std::string_view point) {
+        std::lock_guard lock(mu);
+        return armed == point;
+    }
     void arm(std::string point) {
         std::lock_guard lock(mu);
         armed = std::move(point);
@@ -77,6 +90,7 @@ public:
         return timed_out;
     }
 private:
+    std::map<std::string, size_t> observations;
     std::mutex mu;
     std::condition_variable cv;
     std::string armed;

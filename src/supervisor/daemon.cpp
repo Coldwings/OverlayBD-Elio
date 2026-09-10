@@ -31,6 +31,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 #include <utility>
@@ -103,7 +104,9 @@ elio::coro::task<std::string> read_text_file(const std::string& path) {
 /// Buffered JSON-lines reader over a raw fd (Elio IO backend).
 class LineReader {
 public:
-    explicit LineReader(int fd) : fd_(fd) {}
+    explicit LineReader(elio::net::uds_stream& stream,
+                        elio::coro::cancel_token token = {})
+        : stream_(stream), token_(std::move(token)) {}
 
     /// Next line without the trailing '\n'; std::nullopt on EOF or error.
     elio::coro::task<std::optional<std::string>> next() {
@@ -116,14 +119,15 @@ public:
             if (buf_.size() > kMaxMessageBytes) co_return std::nullopt;
             char tmp[4096];
             const auto r =
-                co_await elio::io::async_read(fd_, tmp, sizeof(tmp), -1);
+                co_await stream_.read(tmp, sizeof(tmp), token_);
             if (r.result <= 0) co_return std::nullopt;
             buf_.append(tmp, static_cast<size_t>(r.result));
         }
     }
 
 private:
-    int fd_;
+    elio::net::uds_stream& stream_;
+    elio::coro::cancel_token token_;
     std::string buf_;
 };
 
@@ -133,6 +137,73 @@ private:
 struct SyncMutexGuard {
     elio::sync::mutex& m;
     ~SyncMutexGuard() { m.unlock(); }
+};
+
+// Own the scheduler wrapper as well as its coroutine result. A join_handle's
+// ready state precedes callable/frame destruction; only is_destroyed proves
+// that its raw-this captures have departed. Admission and closing share a lock.
+// The brief timer is used only when draining, never to block a worker.
+class OwnedTasks {
+public:
+    template<class F>
+    void spawn(F&& function, std::optional<size_t> worker = {}) {
+        std::lock_guard lock(mu_);
+        if (closed_) throw std::logic_error("daemon task admission is closed");
+        for (auto it = tasks_.begin(); it != tasks_.end();) {
+            if (it->is_destroyed()) {
+                report(*it);
+                it = tasks_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Reserve before scheduling: allocation failure must not leave an
+        // already-running coroutine without a retained ownership handle.
+        tasks_.reserve(tasks_.size() + 1);
+        auto* scheduler = elio::runtime::scheduler::current();
+        if (worker) {
+            tasks_.push_back(scheduler->go_joinable_to(
+                *worker, std::forward<F>(function)));
+        } else {
+            tasks_.push_back(scheduler->go_joinable(std::forward<F>(function)));
+        }
+    }
+
+    elio::coro::task<void> join() {
+        std::vector<elio::coro::join_handle<void>> tasks;
+        {
+            std::lock_guard lock(mu_);
+            closed_ = true;
+            tasks.swap(tasks_);
+        }
+        for (auto& task : tasks) {
+            while (!task.is_destroyed()) {
+                bool timer_failed = false;
+                try {
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                } catch (...) {
+                    timer_failed = true;
+                }
+                // Rejected timer setup must not abandon the ownership drain.
+                if (timer_failed) co_await elio::time::yield();
+            }
+            report(task);
+        }
+    }
+
+private:
+    static void report(elio::coro::join_handle<void>& task) {
+        try {
+            task.await_resume();
+        } catch (const std::exception& error) {
+            ELIO_LOG_ERROR("daemon task failed: {}", error.what());
+        } catch (...) {
+            ELIO_LOG_ERROR("daemon task failed with an unknown exception");
+        }
+    }
+    std::mutex mu_;
+    bool closed_ = false;
+    std::vector<elio::coro::join_handle<void>> tasks_;
 };
 
 /// Default MkfsRunner (ADR-0014 mode 3): fork `mkfs.<type> <device>` and
@@ -302,14 +373,15 @@ class Daemon {
         bool committing = false;      // a commit is in flight
         elio::sync::mutex op_mu;      // commit/destroy vs recovery respawn
 
-        // ADR-0013 trace recording (protocol v3). control_fd is the
+        // ADR-0013 trace recording (protocol v3). control owns the
         // supervisor end of the device command channel, published by
-        // supervise_entry under mu_ (-1 when unavailable). One device
+        // supervise_entry under mu_ (null when unavailable). Writers retain
+        // the same stream until their in-flight I/O has completed. One device
         // command is outstanding at a time: cmd_pending is guarded by
         // mu_; the reply waiter is a FRESH event per command (manual-
         // reset events have no reset race this way). `trace` is the
         // additive status/list field: null until the first trace_start.
-        int control_fd = -1;
+        std::shared_ptr<elio::net::uds_stream> control;
         bool cmd_pending = false;
         nlohmann::json pending_reply;
         std::shared_ptr<elio::sync::event> reply_waiter;
@@ -355,105 +427,138 @@ public:
         term_set.add(SIGTERM).add(SIGINT);
         elio::signal::signal_fd term_fd(term_set);
 
-        elio::go([this, &listener]() -> elio::coro::task<void> {
-            co_await accept_loop(*listener);
-        });
-        // go_to pins the reaper to worker 0: its signal_fd caches the
-        // creating worker's io_context, and the reaper also awaits sync
-        // primitives (mu_) whose wakeups could otherwise migrate it onto
-        // a worker where the cached io_context is invalid.
-        elio::go_to(0, [this]() -> elio::coro::task<void> {
-            // signal_fd caches the creating worker's io_context; construct
-            // it inside the coroutine that awaits it.
-            elio::signal::signal_set chld_set;
-            chld_set.add(SIGCHLD);
-            elio::signal::signal_fd chld_fd(chld_set);
-            co_await reaper(chld_fd);
-            reaper_done_.set();
-        });
-
-        // Wait for the shutdown signal.
-        for (;;) {
-            auto info = co_await term_fd.wait();
-            if (info && (info->signo == SIGTERM || info->signo == SIGINT)) {
-                break;
+        // Allocate the drain coroutine frames before any child is admitted.
+        auto accept_join = accept_tasks_.join();
+        auto client_join = client_tasks_.join();
+        auto monitor_join = monitor_tasks_.join();
+        auto reaper_join = reaper_tasks_.join();
+        std::exception_ptr failure;
+        try {
+            accept_tasks_.spawn([this, &listener]() -> elio::coro::task<void> {
+                co_await accept_loop(*listener);
+            });
+            if (test_gate_ && test_gate_->is_armed("startup_failure")) {
+                co_await test_gate_->observe("startup_failure", {});
+                throw std::runtime_error("injected daemon startup failure");
             }
+            // go_to pins the reaper to worker 0: its signal_fd caches the
+            // creating worker's io_context, and the reaper also awaits sync
+            // primitives (mu_) whose wakeups could otherwise migrate it onto
+            // a worker where the cached io_context is invalid.
+            reaper_tasks_.spawn([this]() -> elio::coro::task<void> {
+                // signal_fd caches the creating worker's io_context; construct
+                // it inside the coroutine that awaits it.
+                elio::signal::signal_set chld_set;
+                chld_set.add(SIGCHLD);
+                elio::signal::signal_fd chld_fd(chld_set);
+                co_await reaper(chld_fd);
+            }, 0);
+
+            // Wait for the shutdown signal.
+            for (;;) {
+                auto info = co_await term_fd.wait();
+                if (info && (info->signo == SIGTERM || info->signo == SIGINT)) {
+                    break;
+                }
+            }
+        } catch (...) {
+            failure = std::current_exception();
         }
         ELIO_LOG_INFO("supervisor shutting down");
         stopping_.store(true);
-        // Wake the parked accept: closing the listener does NOT cancel an
-        // in-flight accept SQE, but an incoming connection completes it.
-        // Best-effort; the loop exits on stopping_ either way.
-        {
-            const int wake = ::socket(AF_UNIX, SOCK_STREAM, 0);
-            if (wake >= 0) {
-                sockaddr_un sa {};
-                sa.sun_family = AF_UNIX;
-                std::snprintf(sa.sun_path, sizeof(sa.sun_path), "%s",
-                              cfg_.socket_path.c_str());
-                ::connect(wake, reinterpret_cast<sockaddr*>(&sa),
-                          sizeof(sa));
-                ::close(wake);
+        if (test_gate_) test_gate_->mark("shutdown");
+        auto cancel = [&](elio::coro::cancel_source& source) {
+            try {
+                source.cancel();
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
             }
-        }
-        // Wake the reaper: it is parked in a signal wait with no cancel
-        // path; a synthetic SIGCHLD makes it re-check stopping_ and exit.
-        // Harmless: its per-pid sweep just finds nothing.
-        ::kill(::getpid(), SIGCHLD);
-        // Join both before returning: detached tasks must not outlive the
-        // scheduler (teardown drains forever on parked tasks).
-        co_await accept_done_.wait();
-        co_await reaper_done_.wait();
+        };
+        cancel(accept_cancel_);
+        cancel(client_cancel_);
+        co_await accept_join;
         listener->close();
+        // No accept can now add another handler. Admitted commands may still
+        // create monitors or await child replies/reaping, so drain them first.
+        co_await client_join;
 
-        // Terminate children, then wait briefly for them to exit.
-        std::vector<std::shared_ptr<Child>> snapshot;
+        // Handlers can no longer change registry membership. Mark every
+        // entry, then take op_mu so a recovery already past its stop check
+        // finishes publishing before we choose the child to terminate.
         {
             co_await mu_.lock();
-            for (auto& [id, entry] : children_) {
-                entry->destroying = true;
-                snapshot.push_back(entry->child);
+            SyncMutexGuard registry_guard{mu_};
+            for (auto& [id, entry] : children_) entry->destroying = true;
+        }
+        for (auto& [id, entry] : children_) {
+            co_await entry->op_mu.lock();
+            SyncMutexGuard op_guard{entry->op_mu};
+            entry->child->terminate();
+        }
+        for (auto& [id, entry] : children_) {
+            co_await entry->op_mu.lock();
+            SyncMutexGuard op_guard{entry->op_mu};
+            auto child = entry->child;
+            bool exited = false;
+            try {
+                const auto outcome = co_await elio::with_timeout(
+                    std::chrono::seconds(cfg_.stop_timeout_sec),
+                    [&child](elio::coro::cancel_token tok)
+                        -> elio::coro::task<void> {
+                        co_await child->exit_event().wait(std::move(tok));
+                    });
+                exited = static_cast<bool>(outcome);
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
             }
-            mu_.unlock();
+            if (!exited) child->kill();
         }
-        for (auto& child : snapshot) child->terminate();
-        for (auto& child : snapshot) {
-            co_await elio::with_timeout(
-                std::chrono::seconds(cfg_.stop_timeout_sec),
-                [&child](elio::coro::cancel_token tok)
-                    -> elio::coro::task<void> {
-                    co_await child->exit_event().wait(std::move(tok));
-                });
-        }
-        co_return 0;  // remaining children are SIGKILLed by ~Child
+        // A child (or an inherited socket in its descendants) need not close
+        // the channel to let the monitor depart. Cancellation completes the
+        // read before its shared stream owner can close the descriptor.
+        cancel(monitor_cancel_);
+        co_await monitor_join;
+        reaper_stopping_.store(true);
+        ::kill(::getpid(), SIGCHLD);
+        co_await reaper_join;
+        if (failure) std::rethrow_exception(failure);
+        co_return 0;
     }
 
 private:
+    static std::shared_ptr<elio::net::uds_stream> take_channel(Child& child) {
+        elio::net::uds_stream stream(child.release_control_fd());
+        return std::make_shared<elio::net::uds_stream>(std::move(stream));
+    }
+
     elio::coro::task<void> accept_loop(elio::net::uds_listener& listener) {
         while (!stopping_.load()) {
-            auto stream = co_await listener.accept();
+            auto stream = co_await listener.accept(accept_cancel_.get_token());
             if (!stream) {
                 if (stopping_.load()) break;
                 ELIO_LOG_WARNING("accept failed: {}", std::strerror(errno));
                 continue;
             }
+            if (stopping_.load()) break;
+            if (test_gate_) co_await test_gate_->observe("accepted", {});
             auto handle = [this, s = std::move(*stream)]() mutable
                           -> elio::coro::task<void> {
                 co_await handle_client(std::move(s));
             };
             // Test placement forces command/monitor overlap on distinct
             // workers without changing the normal daemon's scheduling.
-            if (test_gate_) elio::go_to(2, std::move(handle));
-            else elio::go(std::move(handle));
+            client_tasks_.spawn(std::move(handle),
+                test_gate_ ? std::optional<size_t>{2} : std::nullopt);
         }
-        accept_done_.set();
     }
 
     elio::coro::task<void> handle_client(elio::net::uds_stream stream) {
-        LineReader reader(stream.fd());
+        if (test_gate_) test_gate_->mark("client_read");
+        LineReader reader(stream, client_cancel_.get_token());
         std::string reply;
         auto line = co_await reader.next();
-        if (!line) co_return;
+        if (!line || stopping_.load()) co_return;
+        if (test_gate_) co_await test_gate_->observe("command", {});
         std::string error;
         auto cmd = parse_command(*line, error);
         if (!cmd) {
@@ -480,7 +585,7 @@ private:
                                     c + "': " + e.what());
             }
         }
-        co_await stream.write(reply);
+        co_await stream.write(reply, client_cancel_.get_token());
         // One command per connection; the stream closes on destruction.
     }
 
@@ -491,15 +596,15 @@ private:
     /// cfg_.max_recovery_attempts. dev_id is learned here (not in
     /// cmd_create) so the exit path can never observe it unset.
     elio::coro::task<void> supervise_entry(std::shared_ptr<DeviceEntry> entry,
-                                           int fd) {
+                                           std::shared_ptr<elio::net::uds_stream> channel) {
         for (;;) {
             {
                 {
                     co_await mu_.lock();
-                    entry->control_fd = fd;
+                    entry->control = channel;
                     mu_.unlock();
                 }
-                LineReader reader(fd);
+                LineReader reader(*channel, monitor_cancel_.get_token());
                 for (;;) {
                     auto line = co_await reader.next();
                     if (!line) break;
@@ -538,9 +643,10 @@ private:
                     ELIO_LOG_INFO("device {} state: {} {}", entry->spec.id,
                                   st->state, st->device);
                 }
+                if (test_gate_) co_await test_gate_->observe("monitor_eof", entry->child);
                 {
                     co_await mu_.lock();
-                    entry->control_fd = -1;
+                    entry->control.reset();
                     if (entry->cmd_pending) {
                         entry->cmd_pending = false;
                         entry->pending_reply =
@@ -567,7 +673,7 @@ private:
                     cur.state = "exited";
                     entry->child->update_status(cur);
                 }
-                ::close(fd);
+                channel.reset();
             }
             if (stopping_.load()) co_return;
             {
@@ -598,7 +704,7 @@ private:
                 co_await mu_.lock();
                 const bool destroy = entry->destroying;
                 mu_.unlock();
-                if (destroy) co_return;  // op_guard releases
+                if (destroy || stopping_.load()) co_return;  // op_guard releases
                 ChildSpec spec = entry->spec;
                 spec.recover = true;
                 spec.dev_id_request = entry->dev_id;
@@ -627,7 +733,7 @@ private:
                     "(attempt {}, dev_id {})",
                     entry->spec.id, entry->recoveries, entry->dev_id);
                 if (test_gate_) co_await test_gate_->observe("recovery", next);
-                fd = next->release_control_fd();
+                channel = take_channel(*next);
             }
         }
     }
@@ -642,7 +748,7 @@ private:
     /// pids are device children (the registry) and never touches anything
     /// else.
     elio::coro::task<void> reaper(elio::signal::signal_fd& sigfd) {
-        while (!stopping_.load()) {
+        while (!reaper_stopping_.load()) {
             auto info = co_await sigfd.wait();
             if (!info) break;
             // A coalesced SIGCHLD can cover several exits: sweep until a
@@ -832,12 +938,14 @@ private:
             children_[id] = entry;
             mu_.unlock();
         }
-        auto monitor = [this, entry, fd = entry->child->release_control_fd()]()
+        auto monitor = [this, entry, channel = take_channel(*entry->child)]() mutable
                        -> elio::coro::task<void> {
-            co_await supervise_entry(entry, fd);
+            if (test_gate_) test_gate_->mark("monitor_started");
+            co_await supervise_entry(entry, std::move(channel));
+            if (test_gate_) test_gate_->mark("monitor_departed");
         };
-        if (test_gate_) elio::go_to(1, std::move(monitor));
-        else elio::go(std::move(monitor));
+        monitor_tasks_.spawn(std::move(monitor),
+            test_gate_ ? std::optional<size_t>{1} : std::nullopt);
 
         // Wait for the child to report ready/failed.
         auto outcome = co_await elio::with_timeout(
@@ -1049,7 +1157,7 @@ private:
         std::shared_ptr<DeviceEntry> entry;
         std::shared_ptr<elio::sync::event> waiter =
             std::make_shared<elio::sync::event>();
-        int fd;
+        std::shared_ptr<elio::net::uds_stream> channel;
         uint64_t seq = 0;  // captured under mu_: never read the member
                            // unlocked (only this path writes it, but
                            // keep the lock discipline exact)
@@ -1057,19 +1165,17 @@ private:
             co_await mu_.lock();
             auto it = children_.find(id);
             if (it != children_.end()) entry = it->second;
-            if (entry && !entry->cmd_pending && entry->control_fd >= 0) {
+            if (entry && !entry->cmd_pending && entry->control) {
                 entry->cmd_pending = true;
                 entry->reply_waiter = waiter;
                 entry->pending_seq = ++entry->cmd_seq;
                 seq = entry->pending_seq;
-                fd = entry->control_fd;
-            } else {
-                fd = -1;
+                channel = entry->control;
             }
             mu_.unlock();
         }
         if (!entry) co_return reply_error("no such device: " + id);
-        if (fd < 0) {
+        if (!channel) {
             co_return reply_error(
                 entry->cmd_pending
                     ? "another device command is in flight: " + id
@@ -1088,8 +1194,8 @@ private:
         // as the device side's ControlChannelWriter.
         size_t sent = 0;
         while (sent < line.size()) {
-            const auto w = co_await elio::io::async_write(
-                fd, line.data() + sent, line.size() - sent, -1);
+            const auto w = co_await channel->write(
+                line.data() + sent, line.size() - sent, client_cancel_.get_token());
             if (w.result < 0) {
                 co_await fail_pending();
                 co_return reply_error("cannot reach the device control "
@@ -1535,8 +1641,14 @@ private:
 
     DaemonConfig cfg_;
     std::shared_ptr<detail::DaemonTestGate> test_gate_;
-    elio::sync::event accept_done_;
-    elio::sync::event reaper_done_;
+    OwnedTasks accept_tasks_;
+    OwnedTasks client_tasks_;
+    OwnedTasks monitor_tasks_;
+    OwnedTasks reaper_tasks_;
+    elio::coro::cancel_source accept_cancel_;
+    elio::coro::cancel_source client_cancel_;
+    elio::coro::cancel_source monitor_cancel_;
+    std::atomic<bool> reaper_stopping_{false};
     elio::sync::mutex mu_;
     std::map<std::string, std::shared_ptr<DeviceEntry>> children_;
     std::atomic<bool> stopping_{false};

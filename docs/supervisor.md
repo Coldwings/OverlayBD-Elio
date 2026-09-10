@@ -744,6 +744,12 @@ commands and monitors to distinct workers. No kernel ublk is required.
 | `supervisor: recovery publishes child and count together` | Status/list observed at the publication boundary agree on the replacement PID and recovery count. |
 | `supervisor: status owns its child generation and trace snapshot` | A paused status retains the old child and reports its PID/count/recording trace after concurrent recovery marks the live trace lost. |
 | `supervisor: list owns its child generation and trace snapshot` | A paused list preserves the same owned generation and trace while recovery and other commands proceed on another worker. |
+| `supervisor: shutdown drains a monitor after its entry was erased` | Hold EOF cleanup after a successful destroy; shutdown must retain the daemon until the erased entry's monitor departs. |
+| `supervisor: shutdown drains an admitted create and its late monitor` | Hold an admitted create across shutdown; drain its handler and the monitor it spawns before returning. |
+| `supervisor: shutdown drains an accept racing handler registration` | Hold an accepted socket before handler registration; cancellation and draining include the late handler. |
+| `supervisor: shutdown wakes an idle accepted client` | An accepted peer sends no bytes and remains open; shutdown cancels the read and closes its stream after completion. |
+| `supervisor: shutdown wakes a partial accepted command` | A peer sends an incomplete JSON line and remains open; shutdown completes without more peer traffic. |
+| `supervisor: startup failure drains already admitted client work` | An injected failure after accept-loop startup cancels and drains the existing idle client before propagating. |
 
 Unit tests live in `tests/unit/test_supervisor.cpp`; they exercise the
 protocol codecs and the child lifecycle with fake device binaries, without
@@ -878,13 +884,32 @@ flag first and never respawn.
 
 ### Daemon shutdown
 
-`run()` wakes and joins its detached tasks before returning: the accept
-loop (a dummy connection, because `close()` does not cancel an in-flight
-accept SQE) and the reaper (a synthetic SIGCHLD, because a parked signalfd
-wait has no cancel path). The reaper constructs its `signal_fd` itself and
-is pinned with `go_to(0)`: `signal_fd` caches the creating worker's
-`io_context`, and `sync::mutex` wakeups could otherwise migrate the
-coroutine to a worker where that context is invalid.
+Shutdown closes admission and cancels the listener's pending accept and the
+accepted clients' socket reads/writes. An idle peer or a partial JSON line
+therefore needs no additional client traffic to let the daemon stop. The
+listener and each stream retain their descriptors through I/O completion.
+
+The daemon drains accepted handlers first, with device monitors and the
+SIGCHLD reaper still running: an already admitted command may finish a
+create, spawn its monitor, or wait for a device reply or exit. It then stops
+the stable set of registered children, cancels remaining monitor reads, and
+drains **all** admitted monitors, including those whose entry was removed
+by `destroy`. Only after this work departs does it wake and drain the reaper.
+Recovery publication still takes `op_mu` followed by the registry mutex;
+shutdown takes `op_mu` before choosing the generation to terminate.
+
+Each spawned task has an owned join handle. Shutdown waits asynchronously
+for frame and callable destruction, not merely the task's result or a
+child's exit event. Startup/signal-wait exceptions follow the same drain
+before propagating. Completed handles are reclaimed during admission.
+The reaper remains pinned to worker 0 because its `signal_fd` caches its
+creating worker's I/O context.
+
+This is a completion guarantee, not a single global shutdown deadline.
+An admitted command retains its existing readiness, device-reply, stop,
+and host-mkfs bounds; local file/seal operations must complete as usual.
+The daemon does not free shared state when a timeout expires while an
+owned task can still access it.
 
 ## Limitations & TODO
 

@@ -1040,3 +1040,10 @@ Every test, grouped by area, with the property it guards.
   assembly), so a plain commit seals that declared size — the headroom
   reaches the data plane, not just the device size (D3; ADR-0014). Runs
   without privileges.
+
+The `[daemon-lifetime]` supervisor cases hold real EOF, command-admission,
+and accept boundaries with coroutine-friendly gates. They also leave idle
+and partial-command client sockets open during shutdown. Assertions run only
+after gates are released, fixture peers are closed, and fixture threads have
+joined; the daemon must drain handlers and erased-entry monitors before
+returning. These tests use unprivileged fake device processes.
