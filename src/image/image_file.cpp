@@ -16,12 +16,15 @@
 #include "source/tar_offset.hpp"
 
 #include <elio/log/macros.hpp>
+#include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
 
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cctype>
 #include <filesystem>
 #include <memory>
@@ -63,6 +66,28 @@ LocalProbe probe_local_blob(const LowerConfig& lower) {
 /// (24 + 24 × records; the replay record cap of 65536 needs ~1.5 MiB), so
 /// 64 MiB is generous while bounding a hostile layer's memory/IO cost.
 constexpr uint64_t kMaxTraceBlobBytes = uint64_t{64} << 20;
+
+/// Wall-clock budget for opening and reading the trace blob itself. Replay
+/// has its own 30 s budget; this prevents an unhealthy acceleration layer
+/// from extending device bring-up by the registry client's full retry
+/// envelope before replay even starts.
+constexpr std::chrono::milliseconds kTraceBlobLoadBudget{30000};
+constexpr std::chrono::milliseconds kTraceBlobLoadPoll{5};
+
+#ifdef OBD_TEST_HOOKS
+std::atomic<int64_t> g_trace_blob_load_budget_ms{
+    kTraceBlobLoadBudget.count()};
+#endif
+
+std::chrono::milliseconds configured_trace_blob_load_budget() {
+#ifdef OBD_TEST_HOOKS
+    const int64_t ms =
+        g_trace_blob_load_budget_ms.load(std::memory_order_relaxed);
+    return std::chrono::milliseconds(ms);
+#else
+    return kTraceBlobLoadBudget;
+#endif
+}
 
 /// Reads a whole (small) source into memory; empty vector on failure or
 /// when the source exceeds kMaxTraceBlobBytes (callers treat empty as
@@ -123,6 +148,72 @@ elio::coro::task<std::vector<uint8_t>> load_trace_blob(
     } catch (const std::exception& e) {
         ELIO_LOG_WARNING("trace layer load failed ({}); prefetch disabled",
                          e.what());
+        co_return std::vector<uint8_t>{};
+    }
+}
+
+/// Starts the best-effort trace blob load independently, waits only for
+/// the configured wall-clock budget, and drops late results. The loader
+/// captures the config/source owners it needs by value, so abandoning the
+/// join handle never leaves it borrowing open_image's stack.
+elio::coro::task<std::vector<uint8_t>> load_trace_blob_bounded(
+    LowerConfig accel, ImageConfig cfg,
+    std::shared_ptr<source::RegistryClient> client,
+    source::AdmissionFunnelPtr funnel) {
+    const auto budget = configured_trace_blob_load_budget();
+    if (budget <= std::chrono::milliseconds::zero()) {
+        ELIO_LOG_WARNING("trace layer load budget is exhausted before start; "
+                         "prefetch disabled");
+        co_return std::vector<uint8_t>{};
+    }
+
+    auto* scheduler = elio::runtime::scheduler::current();
+    if (scheduler == nullptr) {
+        ELIO_LOG_WARNING("trace layer load has no active scheduler for "
+                         "bounded wait; prefetch disabled");
+        co_return std::vector<uint8_t>{};
+    }
+
+    auto load = [accel = std::move(accel), cfg = std::move(cfg),
+                 client = std::move(client), funnel = std::move(funnel)]()
+        mutable -> elio::coro::task<std::vector<uint8_t>> {
+        co_return co_await load_trace_blob(accel, cfg, client, funnel);
+    };
+
+    auto task = scheduler->go_joinable(std::move(load));
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (!task.is_ready()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            try {
+                task.request_cancel();
+            } catch (const std::exception& e) {
+                ELIO_LOG_WARNING("trace layer load cancel request failed "
+                                 "after timeout ({}); dropping late result",
+                                 e.what());
+            } catch (...) {
+                ELIO_LOG_WARNING("trace layer load cancel request failed "
+                                 "after timeout; dropping late result");
+            }
+            ELIO_LOG_WARNING("trace layer load exceeded {} ms budget; "
+                             "prefetch disabled",
+                             budget.count());
+            co_return std::vector<uint8_t>{};
+        }
+        const auto remaining =
+            std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
+        co_await elio::time::sleep_for(
+            std::min(kTraceBlobLoadPoll, remaining));
+    }
+
+    try {
+        co_return task.await_resume();
+    } catch (const std::exception& e) {
+        ELIO_LOG_WARNING("trace layer load failed ({}); prefetch disabled",
+                         e.what());
+        co_return std::vector<uint8_t>{};
+    } catch (...) {
+        ELIO_LOG_WARNING("trace layer load failed; prefetch disabled");
         co_return std::vector<uint8_t>{};
     }
 }
@@ -197,9 +288,8 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     // merge. Recognition is structural and always applies — but the
     // trace blob itself is loaded only AFTER the structural warm-up
     // below (ADR-0012's floor runs first: a slow or unhealthy trace
-    // layer must not delay it; the load's only time bound is the
-    // registry client's connect/read timeouts and retries, which sits
-    // outside both warm-up budgets).
+    // layer must not delay it). The trace load has its own wall-clock
+    // budget below; a late result is dropped and replay is skipped.
     std::span<const LowerConfig> data_lowers(cfg.lowers);
     if (cfg.acceleration_layer) {
         if (cfg.lowers.size() < 2) {
@@ -415,7 +505,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     // the merge takes ownership of the layer chain.
     TraceReplayStats trace_stats;
     if (cfg.acceleration_layer && global.prefetch_enable) {
-        const std::vector<uint8_t> trace_blob = co_await load_trace_blob(
+        const std::vector<uint8_t> trace_blob = co_await load_trace_blob_bounded(
             cfg.lowers.back(), cfg, client, funnel);
         if (!trace_blob.empty()) {
             trace_stats = co_await replay_trace(trace_blob, warm_targets);
@@ -593,5 +683,21 @@ uint64_t device_capacity_bytes(uint64_t image_bytes, uint64_t override_bytes,
     }
     return override_bytes > 0 ? override_bytes : image_bytes;
 }
+
+#ifdef OBD_TEST_HOOKS
+namespace test_hooks {
+
+std::chrono::milliseconds trace_blob_load_budget_for_test() {
+    return configured_trace_blob_load_budget();
+}
+
+void set_trace_blob_load_budget_for_test(
+    std::chrono::milliseconds budget) {
+    g_trace_blob_load_budget_ms.store(budget.count(),
+                                      std::memory_order_relaxed);
+}
+
+}  // namespace test_hooks
+#endif
 
 }  // namespace obd::image

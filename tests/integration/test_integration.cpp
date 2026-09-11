@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -529,6 +530,26 @@ std::vector<uint8_t> tar_wrap(const std::vector<uint8_t>& payload) {
     out.resize((out.size() + 511) / 512 * 512, 0);
     return out;
 }
+
+#ifdef OBD_TEST_HOOKS
+class TraceBlobLoadBudgetGuard {
+public:
+    explicit TraceBlobLoadBudgetGuard(std::chrono::milliseconds budget)
+        : old_(image::test_hooks::trace_blob_load_budget_for_test()) {
+        image::test_hooks::set_trace_blob_load_budget_for_test(budget);
+    }
+    ~TraceBlobLoadBudgetGuard() {
+        image::test_hooks::set_trace_blob_load_budget_for_test(old_);
+    }
+
+    TraceBlobLoadBudgetGuard(const TraceBlobLoadBudgetGuard&) = delete;
+    TraceBlobLoadBudgetGuard& operator=(const TraceBlobLoadBudgetGuard&) =
+        delete;
+
+private:
+    std::chrono::milliseconds old_;
+};
+#endif
 
 }  // namespace
 
@@ -1427,6 +1448,90 @@ TEST_CASE("integration: structural warm-up runs before the trace blob load",
     });
     REQUIRE(rc == 0);
 }
+
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("integration: trace blob load budget skips slow trace and keeps reads",
+          "[integration]") {
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 32, 96);
+    const std::string layer = dir / "data.lsmt";
+    {
+        const std::string src = test::write_file(dir / "data.raw", raw);
+        const int fd = ::open(src.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        format::write_lsmt_single_layer(fd, raw.size(), layer, {});
+        ::close(fd);
+    }
+
+    format::trace::TraceWriter tw;
+    REQUIRE(tw.append({'R', 0, 4096, 0}));
+    const auto trace_span = tw.finalize();
+    const auto trace_blob =
+        tar_wrap({trace_span.begin(), trace_span.end()});
+    const std::string accel_digest = "sha256:" + sha256_hex_of(trace_blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server({{accel_digest, trace_blob}});
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
+
+        nlohmann::json cfgj;
+        cfgj["repoBlobUrl"] = server.repo_base();
+        cfgj["accelerationLayer"] = true;
+        cfgj["lowers"] = nlohmann::json::array(
+            {nlohmann::json{{"digest", "sha256:data"}, {"file", layer}},
+             nlohmann::json{{"digest", accel_digest},
+                            {"size", trace_blob.size()}}});
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+
+        image::GlobalConfig global;
+        global.prefetch_head_kb = 0;
+        global.prefetch_tail_kb = 0;
+
+        {
+            TraceBlobLoadBudgetGuard budget(std::chrono::milliseconds(500));
+            auto opened = co_await image::open_image(cfg, global);
+            REQUIRE(opened.trace.trace_present);
+            REQUIRE(opened.trace.records_replayed == 1);
+            std::vector<uint8_t> buf(raw.size());
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(raw.size()));
+            REQUIRE(buf == raw);
+        }
+
+        server.set_latency(std::chrono::milliseconds(300));
+        const uint64_t data_gets_before_slow =
+            server.data_gets(accel_digest);
+        {
+            TraceBlobLoadBudgetGuard budget(std::chrono::milliseconds(20));
+            const auto start = std::chrono::steady_clock::now();
+            auto opened = co_await image::open_image(cfg, global);
+            const auto elapsed =
+                std::chrono::steady_clock::now() - start;
+            REQUIRE(elapsed < std::chrono::milliseconds(200));
+            REQUIRE(!opened.trace.trace_present);
+            REQUIRE(opened.trace.records_replayed == 0);
+
+            std::vector<uint8_t> buf(raw.size());
+            const ssize_t r =
+                co_await opened.root->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(raw.size()));
+            REQUIRE(buf == raw);
+        }
+
+        co_await elio::time::sleep_for(std::chrono::milliseconds(650));
+        REQUIRE(server.data_gets(accel_digest) > data_gets_before_slow);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+#endif
 
 TEST_CASE("integration: admission funnel bounds on-demand latency under scavenger load",
           "[integration]") {

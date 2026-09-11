@@ -1208,6 +1208,12 @@ Every test, grouped by area, with the property it guards.
   first data GET — a head→trace→tail regression order fails red on the
   tail check — while replay of a traced middle extent still completes
   and the device reads byte-exactly.
+- `integration: trace blob load budget skips slow trace and keeps reads` —
+  with a local data layer and a latency-injected remote trace layer, a
+  fast trace load still replays; after the test hook tightens the load
+  budget below the injected latency, `open_image` returns before the
+  trace fetch finishes, leaves replay stats empty, and the assembled
+  device still serves byte-exact reads.
 - `image: malformed remote lower digest fails assembly` — a malformed
   `sha256:` lower digest fails assembly with `EINVAL` before any registry
   I/O (ADR-0016 boundary: structural config errors fail loud).

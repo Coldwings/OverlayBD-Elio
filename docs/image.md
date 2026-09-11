@@ -145,10 +145,9 @@ fetch per in-flight extent (a view-space slice spans two extents at an
 unaligned tar base, so the worst case is two of each), and every
 skipped extent is simply served on demand later.
 (The same admit bound also covers trace replay's populates, which share
-the LayerStore populate path.) Combined with replay's
-identical budget, structural warm-up plus trace replay add at most
-**~60 s** to the worst-case device bring-up (plus the trace blob load,
-bounded only by the registry client's timeouts — see "The trace layer");
+the LayerStore populate path.) Combined with the trace blob load and replay
+budgets below, structural warm-up plus trace load plus trace replay add at
+most **~90 s** to the worst-case device bring-up;
 detaching both off the
 bring-up path — now safe, since the funnel yields to on-demand reads —
 is the documented follow-up. Every populate rides
@@ -192,17 +191,18 @@ and is logged and ignored.
 space upstream's `PrefetchFile` wraps, below decompression), executed in
 recorded order. The trace blob load and the replay are **awaited inline
 during device bring-up, after the structural warm-up** (ADR-0012's floor
-runs first — a slow or unhealthy trace layer must not delay it); replay
-is bounded by the 30 s wall-time budget below, and every populate it
-issues passes the device's read admission funnel (ADR-0012) as the
+runs first — a slow or unhealthy trace layer must not delay it). The
+blob load gets its own 30 s wall-clock budget: if opening or reading the
+trace layer is still pending at the deadline, `open_image` drops the late
+result, skips replay, and returns a fully functional device whose later
+reads are served on demand. The underlying fetch may finish in the
+background and its result is discarded; this avoids relying on hard
+cancellation in registry/funnel paths that deliberately do not have it.
+Replay is bounded by the separate 30 s wall-time budget below, and every
+populate it issues passes the device's read admission funnel (ADR-0012) as the
 **Prefetch scavenger class**, outranking background fill. Detaching
 replay off the bring-up path — now safe, since the funnel yields to
-on-demand reads — is a documented follow-up. The blob **load** itself
-carries no wall-clock budget: its only time bound is the registry
-client's connect (10 s) / read (30 s) timeouts with up to 3 attempts per
-request (worst case minutes for a hanging registry — bounding the load
-phase itself is a documented follow-up, needing cancellation the funnel
-paths deliberately lack). The global `prefetch.enable` switch
+on-demand reads — is a documented follow-up. The global `prefetch.enable` switch
 (`docs/config.md`) gates the trace load/replay. Skip rules follow
 upstream replay parity
 (trace-format.md §5/§8): non-READ ops, unknown layer indexes, zero
@@ -565,9 +565,9 @@ Behavior, in order:
    stored-blob-level sources, sequentially awaited under a wall-time
    budget, Prefetch scavenger class. Never fails assembly.
 7. With the floor warmed, loads the acceleration layer's trace blob
-   best-effort (when `accelerationLayer` is set and `prefetch.enable`) —
-   every load failure only disables prefetch (ADR-0013) — and replays it
-   via
+   best-effort under its 30 s wall-clock budget (when `accelerationLayer`
+   is set and `prefetch.enable`) — every load failure or timeout only
+   disables prefetch (ADR-0013) — and replays it via
    `src/image/trace_replay.hpp::replay_trace`: `populate()` on the data
    lowers' stored-blob-level sources, in recorded order, sequentially
    awaited, bounded by `TraceReplayOptions`. Never fails assembly.
@@ -1028,6 +1028,11 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   extent and the tail window's first extent) are served before the
   trace blob's first data GET, and replay of a traced middle extent
   still completes (a slow trace layer must not delay the floor).
+- `integration: trace blob load budget skips slow trace and keeps reads` —
+  with a local data layer and a latency-injected remote trace layer, a
+  fast trace load still replays, while a slow trace load times out inside
+  the trace-load budget, leaves trace stats empty, and the device still
+  serves byte-exact reads.
 - `integration: trace layer replays warm-up through the layer store` —
   end to end against the multi-blob mock: a tar-wrapped trace layer is
   recognized, set aside, and its records warm the data layer through

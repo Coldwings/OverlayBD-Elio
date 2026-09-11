@@ -41,6 +41,10 @@ target_include_directories(obd_core PUBLIC
 target_compile_definitions(obd_core PUBLIC
     OBD_VERSION_STRING="${PROJECT_VERSION}")
 
+if(OBD_BUILD_TESTS)
+    target_compile_definitions(obd_core PUBLIC OBD_TEST_HOOKS=1)
+endif()
+
 target_link_libraries(obd_core PUBLIC
     elio_http
     nlohmann_json::nlohmann_json
