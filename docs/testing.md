@@ -958,7 +958,8 @@ Every test, grouped by area, with the property it guards.
 - `integration: completed layer store commit binds read-only without remote reads` —
   a LayerStore driven to completion renames its staging file to
   `overlaybd.commit`; a reopen binds it via the local probe and serves
-  byte-exact reads with zero remote data reads.
+  byte-exact reads with zero remote data reads while sweeping stale
+  `.download.*`/`.bitmap.*` files beside the committed layer.
 - `integration: background fill completes a layer through image assembly` —
   with `download.enable` set, the first open reads a prefix while the
   background fill warms every remaining extent to `overlaybd.commit`; the

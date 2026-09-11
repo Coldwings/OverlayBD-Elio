@@ -123,21 +123,32 @@ uint64_t parse_nonce_name(const std::string& name, std::string_view prefix) {
 // sweep: once overlaybd.commit exists the probe binds it first, so a
 // leftover pair can never be resumed — it is pure disk leak). Returns the
 // number of files removed. Blocking; cold paths only.
-size_t sweep_stale_pairs(const std::string& dir) {
+size_t sweep_stale_pairs(const std::string& dir) noexcept {
     size_t removed = 0;
-    std::error_code ec;
-    for (const auto& entry :
-         std::filesystem::directory_iterator(dir, ec)) {
-        const std::string name = entry.path().filename().string();
-        if (name.compare(0, 10, ".download.") == 0 ||
-            name.compare(0, 8, ".bitmap.") == 0) {
-            if (::unlink(entry.path().c_str()) == 0) ++removed;
+    try {
+        std::error_code ec;
+        std::filesystem::directory_iterator it(dir, ec);
+        const std::filesystem::directory_iterator end;
+        while (!ec && it != end) {
+            const std::filesystem::path path = it->path();
+            const std::string name = path.filename().string();
+            if (name.compare(0, 10, ".download.") == 0 ||
+                name.compare(0, 8, ".bitmap.") == 0) {
+                if (::unlink(path.c_str()) == 0) ++removed;
+            }
+            it.increment(ec);
         }
+    } catch (...) {
+        // Best-effort hygiene must never make image assembly fail.
     }
     return removed;
 }
 
 }  // namespace
+
+size_t sweep_stale_layer_store_pairs(const std::string& dir) noexcept {
+    return sweep_stale_pairs(dir);
+}
 
 std::string LayerStore::hex_nonce(uint64_t nonce) {
     char buf[17];
@@ -199,7 +210,7 @@ elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
                                std::memory_order_release);
             // Cheap hygiene: a pair left beside the commit can never win
             // the probe — sweep it.
-            const size_t swept = sweep_stale_pairs(self->dir_);
+            const size_t swept = sweep_stale_layer_store_pairs(self->dir_);
             ELIO_LOG_INFO(
                 "layer store {}: bound to commit file ({} stale pair "
                 "files swept)",

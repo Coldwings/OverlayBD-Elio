@@ -1214,7 +1214,8 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   open serves the warmed reads locally (mock remote-read counter flat).
 - `integration: completed layer store commit binds read-only without remote reads` —
   a store driven to completion installs `overlaybd.commit`, which the next
-  assembly binds locally with zero remote data reads.
+  assembly binds locally with zero remote data reads and sweeps stale
+  `.download.*`/`.bitmap.*` files beside the committed layer.
 - `integration: admission funnel bounds on-demand latency under scavenger load` —
   against a serialized, latency-injected mock registry (capacity 1,
   25 ms), with a six-coroutine populate storm plus the background fill

@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -220,6 +221,18 @@ long sidecar_present_count(const std::string& layer_dir) {
         return present;
     }
     return -1;
+}
+
+std::vector<std::string> names_with_prefix(const std::string& dir,
+                                           const std::string& prefix) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, prefix.size(), prefix) == 0) out.push_back(name);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 
@@ -791,10 +804,20 @@ TEST_CASE("integration: completed layer store commit binds read-only without rem
             }
             REQUIRE(committed);
         }
+        server.stop();
+        co_await elio::time::sleep_for(std::chrono::milliseconds(25));
+        test::write_file(layer_dir + "/.download.deadbeefdeadbeef",
+                         std::vector<uint8_t>(1, 0));
+        test::write_file(layer_dir + "/.bitmap.deadbeefdeadbeef",
+                         std::vector<uint8_t>(80, 0));
+        REQUIRE(names_with_prefix(layer_dir, ".download.").size() == 1);
+        REQUIRE(names_with_prefix(layer_dir, ".bitmap.").size() == 1);
         const uint64_t served_gets = server.data_gets();
 
         // Run 2: the commit marker binds the layer locally (the local
-        // probe) — zero remote data reads, byte-exact content.
+        // probe) — zero remote data reads, byte-exact content, and the
+        // stale staging pair beside overlaybd.commit is swept through the
+        // real open_image assembly path.
         {
             auto opened = co_await image::open_image(cfg, global);
             REQUIRE(opened.virtual_size == raw.size());
@@ -805,6 +828,8 @@ TEST_CASE("integration: completed layer store commit binds read-only without rem
             REQUIRE(buf == raw);
         }
         REQUIRE(server.data_gets() == served_gets);
+        REQUIRE(names_with_prefix(layer_dir, ".download.").empty());
+        REQUIRE(names_with_prefix(layer_dir, ".bitmap.").empty());
         co_return 0;
     });
     REQUIRE(rc == 0);
