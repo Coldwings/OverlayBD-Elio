@@ -47,6 +47,14 @@ void apply_download_json(const nlohmann::json& j,
         base.block_size = j["blockSize"].get<uint32_t>();
 }
 
+void validate_download_config(const DownloadConfig& cfg,
+                              const char* scope) {
+    if (cfg.try_count == 0) {
+        throw error(EINVAL, std::string(scope) +
+                                " download.tryCnt must be at least 1");
+    }
+}
+
 /// prefetch.head_kb / prefetch.tail_kb: one structural warm-up window
 /// size in KiB (default 1024 when the key is absent). A negative value
 /// would wrap to ~4 TiB through the uint32 conversion and silently warm
@@ -94,6 +102,7 @@ GlobalConfig GlobalConfig::from_json_text(const std::string& text) {
     if (const auto it = j.find("download"); it != j.end()) {
         apply_download_json(*it, cfg.download);
     }
+    validate_download_config(cfg.download, "global");
     if (const auto it = j.find("ublkConfig"); it != j.end() && it->is_object()) {
         cfg.ublk_recovery = it->value("enableRecovery", true);
     }
@@ -161,6 +170,7 @@ ImageConfig ImageConfig::from_json_text(const std::string& text,
     if (const auto it = j.find("download"); it != j.end()) {
         apply_download_json(*it, cfg.download);
     }
+    validate_download_config(cfg.download, "image");
     return cfg;
 }
 

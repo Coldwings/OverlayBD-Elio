@@ -63,6 +63,62 @@ TEST_CASE("image: per-image download overrides merge over global defaults",
     REQUIRE(image::ImageConfig::digest_sha256_hex("sha512:abc").empty());
 }
 
+TEST_CASE("image: zero download tryCnt is rejected at config boundaries",
+          "[image]") {
+    try {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": 0}})");
+        FAIL("global download.tryCnt=0 should fail");
+    } catch (const error& e) {
+        REQUIRE(e.errno_value() == EINVAL);
+        REQUIRE(std::string(e.what()).find("download.tryCnt") !=
+                std::string::npos);
+    }
+
+    image::DownloadConfig defaults;
+    defaults.try_count = 7;
+    try {
+        (void)image::ImageConfig::from_json_text(
+            R"({
+                "repoBlobUrl": "https://reg.example.com/v2/lib/nginx/blobs",
+                "lowers": [{"digest": "sha256:aaa", "size": 123}],
+                "download": {"tryCnt": 0}
+            })",
+            defaults);
+        FAIL("per-image download.tryCnt=0 should fail");
+    } catch (const error& e) {
+        REQUIRE(e.errno_value() == EINVAL);
+        REQUIRE(std::string(e.what()).find("download.tryCnt") !=
+                std::string::npos);
+    }
+
+    TempDir dir;
+    nlohmann::json cfgj;
+    cfgj["repoBlobUrl"] = "http://127.0.0.1:1/v2";
+    cfgj["lowers"] = nlohmann::json::array({nlohmann::json{
+        {"digest", "sha256:" + std::string(64, 'a')},
+        {"size", 65536},
+        {"dir", dir / "layer"}}});
+    auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+    cfg.download.try_count = 0;
+
+    int thrown_errno = 0;
+    std::string thrown_message;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const image::GlobalConfig global;
+        try {
+            (void)co_await image::open_image(cfg, global);
+        } catch (const error& e) {
+            thrown_errno = e.errno_value();
+            thrown_message = e.what();
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(thrown_errno == EINVAL);
+    REQUIRE(thrown_message.find("download.tryCnt") != std::string::npos);
+}
+
 TEST_CASE("image: upper config parses; unknown type rejected", "[image]") {
     // ADR-0008: a non-empty upper engages the writable mode.
     const std::string text = R"({

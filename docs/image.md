@@ -542,8 +542,9 @@ the calling Elio coroutine during device setup.
 
 Behavior, in order:
 
-1. Rejects an empty `lowers` list with `obd::error(EINVAL)` — an image
-   without layers is a configuration error, not an empty device.
+1. Rejects an empty `lowers` list and `download.tryCnt == 0` with
+   `obd::error(EINVAL)` — these are configuration errors, not an empty
+   device or a persistence-environment failure.
 2. Loads the credential file when configured; an unreadable/missing file is
    **not fatal** — it logs a warning and pulls anonymously.
 3. Resolves DART: when `p2pConfig` is enabled and the address parses, the
@@ -835,6 +836,9 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   image `download` section overrides only the fields it sets and inherits
   the rest; `repoBlobUrl`/`lowers` parse; `digest_sha256_hex` strips the
   `sha256:` prefix and rejects other algorithms.
+- `image: zero download tryCnt is rejected at config boundaries` —
+  `download.tryCnt=0` fails at global parse, per-image parse, and
+  programmatic assembly entry before persistence fallback can swallow it.
 - `image: upper config parses; unknown type rejected` — a non-empty `upper`
   engages `writable()` with `lsmt` as the default type; absent/empty `upper`
   stays read-only; an unknown `upper.type` throws (ADR-0008).
