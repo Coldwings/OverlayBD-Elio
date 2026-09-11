@@ -218,7 +218,7 @@ bring-up without limit:
 | Bound | Default | Rationale |
 |---|---|---|
 | `max_records` | 65536 | Real recorded traces carry thousands of records (one per pread during container start); 64k is far above legitimate sizes yet bounds the loop. |
-| `max_bytes` | 1 GiB | Warm-up beyond ~1 GiB delays the cold start more than it saves; with the 1 MiB per-record cap this also bounds extent-rounding amplification. |
+| `max_bytes` | 1 GiB | Caps requested bytes handed to `populate()`, charged before each issued call even when the warm-up fails; a record that would exceed the remaining allowance is not clamped or submitted. This bounds requested warm-up, not exact network bytes (extent rounding, cache hits, partial progress, and retries are source-layer details). |
 | `max_wall_time` | 30 s | Replay is awaited during bring-up; this caps the worst-case bring-up delay. |
 | `max_record_count` | 1 MiB | The upstream replay buffer cap (trace-format.md §8/§10); larger records come only from non-conforming writers and are skipped, not clamped. |
 
@@ -639,6 +639,7 @@ struct TraceReplayStats {
     size_t records_total = 0;
     size_t records_replayed = 0;
     size_t records_skipped = 0;
+    uint64_t bytes_requested = 0;
     uint64_t bytes_warmed = 0;
     bool budget_exhausted = false;
 };
@@ -656,10 +657,12 @@ entry counts as unknown layer). Records are processed in recorded order,
 each `populate()` sequentially awaited. **Never throws**: a blob the
 codec rejects yields `{trace_present = false}`; non-READ ops, unknown
 layer indexes, zero/oversized counts, and negative offsets are skipped
-silently (upstream parity); a failed populate is logged and skipped.
-Processing stops early on any `TraceReplayOptions` bound
-(`budget_exhausted` set). The bounds and their rationale are tabulated in
-Concepts → "The trace layer".
+silently (upstream parity); a failed populate is logged and skipped after
+charging `bytes_requested`. `max_bytes` is record-atomic: replay stops
+before submitting a record that would exceed the remaining requested-byte
+allowance rather than clamping it. Processing stops early on any
+`TraceReplayOptions` bound (`budget_exhausted` set). The bounds and their
+rationale are tabulated in Concepts → "The trace layer".
 
 ### `trace_record.hpp` — TraceRecorder, TraceRecordSource
 

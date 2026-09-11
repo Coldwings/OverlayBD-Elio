@@ -572,10 +572,13 @@ Every test, grouped by area, with the property it guards.
 - `image: trace replay skips unknown ops, layers and bad records` —
   non-READ ops, unknown/null layer indexes, zero and > 1 MiB counts, and
   negative offsets skip silently; a failing populate and a malformed blob
-  degrade to "no prefetch", never an error.
+  degrade to "no prefetch", never an error, while failed populate requests
+  still count toward `bytes_requested`.
 - `image: trace replay enforces record, byte and time budgets` — the
   `max_records` / `max_bytes` / `max_wall_time` bounds each stop replay
-  early with `budget_exhausted` set.
+  early with `budget_exhausted` set; `max_bytes` charges issued populate
+  requests even on failure and stops before a nondivisible final record
+  would exceed the remaining allowance.
 - `image: trace recording round-trips through the codec reader` — a
   recorded blob parses with the C2 reader (header checksum rewritten on
   finalize) and the finalize stats match the file (ADR-0013).

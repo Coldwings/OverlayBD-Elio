@@ -39,9 +39,11 @@ struct TraceReplayOptions {
     /// bounds the loop.
     size_t max_records = 65536;
 
-    /// Total bytes handed to populate() before replay stops early.
-    /// Warm-up beyond ~1 GiB delays the cold start more than it saves;
-    /// with the per-record 1 MiB cap this also bounds traffic
+    /// Total requested bytes handed to populate() before replay stops early.
+    /// Each issued populate charges this budget even if the warm-up fails; a
+    /// record that would exceed the remaining allowance is not clamped or
+    /// submitted. Warm-up beyond ~1 GiB delays the cold start more than it
+    /// saves; with the per-record 1 MiB cap this also bounds traffic
     /// amplification from extent rounding.
     uint64_t max_bytes = uint64_t{1} << 30;  // 1 GiB
 
@@ -60,9 +62,10 @@ struct TraceReplayOptions {
 struct TraceReplayStats {
     bool trace_present = false;  ///< blob parsed as a valid trace
     size_t records_total = 0;    ///< records in the parsed trace
-    size_t records_replayed = 0; ///< populate() calls issued
-    size_t records_skipped = 0;  ///< non-READ / unknown layer / bad record
-    uint64_t bytes_warmed = 0;   ///< sum of replayed record counts
+    size_t records_replayed = 0; ///< successful populate() calls
+    size_t records_skipped = 0;  ///< non-READ / unknown layer / bad record / failed populate
+    uint64_t bytes_requested = 0; ///< sum of issued populate request lengths
+    uint64_t bytes_warmed = 0;   ///< sum of successful record counts
     bool budget_exhausted = false; ///< stopped early on a replay bound
 };
 
@@ -74,7 +77,11 @@ struct TraceReplayStats {
 /// sequentially awaited. Never throws: parse failure yields
 /// {trace_present=false}; per-record skips follow upstream replay parity
 /// (non-READ ops and unknown layer indexes are silent no-ops,
-/// trace-format.md §5/§8); a failed populate is logged and skipped.
+/// trace-format.md §5/§8); a failed populate is logged and skipped after
+/// charging the requested-byte budget. `max_bytes` is a cap on bytes handed to
+/// populate(), not exact network traffic: extent rounding, cache hits, partial
+/// source progress, and retries are below the source layer. A record that would
+/// exceed the remaining requested-byte budget is not clamped or submitted.
 /// Processing stops early when a TraceReplayOptions bound is hit
 /// (budget_exhausted set).
 elio::coro::task<TraceReplayStats> replay_trace(

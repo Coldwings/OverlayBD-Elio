@@ -105,6 +105,7 @@ TEST_CASE("image: trace replay populates traced extents in recorded order",
         REQUIRE(stats.records_total == 3);
         REQUIRE(stats.records_replayed == 3);
         REQUIRE(stats.records_skipped == 0);
+        REQUIRE(stats.bytes_requested == 4096 + 1024 + 2048);
         REQUIRE(stats.bytes_warmed == 4096 + 1024 + 2048);
         REQUIRE(!stats.budget_exhausted);
         // Layer 1's records in recorded order; layer 0's between them.
@@ -153,6 +154,8 @@ TEST_CASE("image: trace replay skips unknown ops, layers and bad records",
         REQUIRE(s2.trace_present);
         REQUIRE(s2.records_replayed == 0);
         REQUIRE(s2.records_skipped == 2);
+        REQUIRE(s2.bytes_requested == 8192);
+        REQUIRE(s2.bytes_warmed == 0);
 
         // A malformed blob degrades to "no prefetch", never an error.
         const std::vector<uint8_t> garbage{0xDE, 0xAD, 0xBE, 0xEF};
@@ -192,7 +195,50 @@ TEST_CASE("image: trace replay enforces record, byte and time budgets",
             const auto stats = co_await image::replay_trace(
                 writer_blob(recs), targets, opts);
             REQUIRE(stats.records_replayed == 2);
+            REQUIRE(stats.bytes_requested == 1024 * 1024);
             REQUIRE(stats.bytes_warmed == 1024 * 1024);
+            REQUIRE(stats.budget_exhausted);
+        }
+        // Byte cap charges issued populate requests even when they fail.
+        {
+            PopulateRecorder a;
+            a.populate_result = -EIO;
+            const auto blob = writer_blob({
+                {'R', 0, 4096, 0},
+                {'R', 0, 4096, 4096},
+            });
+            image::TraceReplayOptions opts;
+            opts.max_bytes = 4096;
+            std::vector<source::BlobSource*> targets{&a};
+            const auto stats = co_await image::replay_trace(
+                blob, targets, opts);
+            REQUIRE(a.calls.size() == 1);
+            REQUIRE((a.calls[0] == std::pair<uint64_t, size_t>{0, 4096}));
+            REQUIRE(stats.records_replayed == 0);
+            REQUIRE(stats.records_skipped == 1);
+            REQUIRE(stats.bytes_requested == 4096);
+            REQUIRE(stats.bytes_warmed == 0);
+            REQUIRE(stats.budget_exhausted);
+        }
+        // Byte cap is record-atomic: replay does not clamp a final record
+        // that would exceed the remaining allowance.
+        {
+            PopulateRecorder a;
+            const auto blob = writer_blob({
+                {'R', 0, 3072, 0},
+                {'R', 0, 3072, 3072},
+            });
+            image::TraceReplayOptions opts;
+            opts.max_bytes = 4096;
+            std::vector<source::BlobSource*> targets{&a};
+            const auto stats = co_await image::replay_trace(
+                blob, targets, opts);
+            REQUIRE(a.calls.size() == 1);
+            REQUIRE((a.calls[0] == std::pair<uint64_t, size_t>{0, 3072}));
+            REQUIRE(stats.records_replayed == 1);
+            REQUIRE(stats.records_skipped == 0);
+            REQUIRE(stats.bytes_requested == 3072);
+            REQUIRE(stats.bytes_warmed == 3072);
             REQUIRE(stats.budget_exhausted);
         }
         // Wall-time budget: with each populate sleeping ~250 ms and a

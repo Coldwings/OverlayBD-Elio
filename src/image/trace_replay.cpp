@@ -31,7 +31,7 @@ elio::coro::task<TraceReplayStats> replay_trace(
     size_t processed = 0;
     for (const auto& rec : *parsed) {
         if (processed >= opts.max_records ||
-            stats.bytes_warmed >= opts.max_bytes ||
+            stats.bytes_requested >= opts.max_bytes ||
             std::chrono::steady_clock::now() >= deadline) {
             stats.budget_exhausted = true;
             break;
@@ -59,6 +59,13 @@ elio::coro::task<TraceReplayStats> replay_trace(
             continue;
         }
 
+        const uint64_t remaining = opts.max_bytes - stats.bytes_requested;
+        if (rec.count > remaining) {
+            stats.budget_exhausted = true;
+            break;
+        }
+        stats.bytes_requested += rec.count;
+
         const ssize_t r = co_await warm_targets[rec.layer_index]->populate(
             static_cast<uint64_t>(rec.offset),
             static_cast<size_t>(rec.count));
@@ -75,10 +82,11 @@ elio::coro::task<TraceReplayStats> replay_trace(
         stats.bytes_warmed += rec.count;
     }
 
-    ELIO_LOG_INFO("trace replay: {}/{} records replayed ({} bytes warmed, "
-                  "{} skipped{})",
+    ELIO_LOG_INFO("trace replay: {}/{} records replayed ({} bytes requested, "
+                  "{} bytes warmed, {} skipped{})",
                   stats.records_replayed, stats.records_total,
-                  stats.bytes_warmed, stats.records_skipped,
+                  stats.bytes_requested, stats.bytes_warmed,
+                  stats.records_skipped,
                   stats.budget_exhausted ? ", budget exhausted" : "");
     co_return stats;
 }
