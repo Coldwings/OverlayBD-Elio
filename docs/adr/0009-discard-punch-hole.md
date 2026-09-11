@@ -51,11 +51,13 @@ through to lower layers. Implementations:
   because the read-only loader validates the range — `seal()` therefore
   packs zeroed segments with the current data-end position rather than 0.
 - **Sparse** performs a real
-  `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` and drops the
-  range from the extent index. Deallocation follows filesystem-block
-  granularity; reads are unaffected either way (punched blocks read back
-  as zeroes), so the fatter-after-recovery index is a cosmetic
-  difference only.
+  `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` and records the
+  discarded range as zeroed top-layer coverage. The mask is persisted in
+  `<path>.zeroes`, a small sidecar containing encoded zeroed segment
+  mappings, so `MergedWritable` still masks lowers after reopening a
+  sparse upper. Deallocation follows filesystem-block granularity; reads
+  are unaffected either way (punched blocks read back as zeroes), so a
+  fatter fiemap extent after recovery is a cosmetic difference only.
 - **MergedWritable** forwards to the top layer and rebuilds the merged
   index.
 

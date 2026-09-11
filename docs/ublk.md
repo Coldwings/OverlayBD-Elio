@@ -108,7 +108,7 @@ device's op policy:
 | `READ` | `BlobSource::pread` into the tag's IO buffer; short reads at EOF are **zero-filled** so the device always answers the full request; success result = requested length. A miss that reaches a remote source is admitted at the device's read admission funnel as the unconditional OnDemand class (ADR-0012 — the funnel lives in the source chain below, see `docs/source.md`). |
 | `WRITE` | If the root source is a `WritableBlobSource` (writable image, ADR-0008): `pwrite` from the tag's IO buffer; success result = requested length. Otherwise **-EROFS**. |
 | `FLUSH` | If writable root: `WritableBlobSource::flush()` (0 or -errno). Otherwise immediate **0** (read-only device, nothing to persist). |
-| `DISCARD` | If writable root: `WritableBlobSource::discard()`; LSMT-RW uppers provide ADR-0009 mask-with-zeroes semantics, while #85 tracks the sparse-upper lower-mask gap. Success result = 0. Otherwise **-EROFS**. |
+| `DISCARD` | If writable root: `WritableBlobSource::discard()`; writable uppers provide ADR-0009 mask-with-zeroes semantics. LSMT-RW records zeroed segments, while sparse uppers punch holes and persist a sidecar zero map. Success result = 0. Otherwise **-EROFS**. |
 | `WRITE_ZEROES` | If writable root: `discard()` — or, with `UBLK_IO_F_NOUNMAP`, a real write of zeroes (no deallocation). Otherwise **-EROFS**. |
 | `WRITE_SAME` | **-EOPNOTSUPP** (never advertised via params; rejected defensively). |
 | anything else | **-EOPNOTSUPP**. |

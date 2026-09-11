@@ -120,8 +120,8 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
     if (offset + count > cur_vsize) co_return -EINVAL;
     const ssize_t r = co_await top_->pwrite(buf, count, offset);
-    if (r < 0) co_return r;
     rebuild_index();
+    if (r < 0) co_return r;
     co_return r;
 }
 
@@ -131,8 +131,8 @@ elio::coro::task<int> MergedWritable::discard(uint64_t offset,
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
     if (offset + len > cur_vsize) co_return -EINVAL;
     const int r = co_await top_->discard(offset, len);
-    if (r != 0) co_return r;
     rebuild_index();
+    if (r != 0) co_return r;
     co_return 0;
 }
 

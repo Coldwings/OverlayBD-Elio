@@ -28,6 +28,7 @@ public:
     std::string_view label() const noexcept override { return label_; }
 
     int fd() const noexcept { return fd_; }
+    void set_size_for_sparse_writable(uint64_t size) noexcept { size_ = size; }
 
 private:
     LocalFileSource() = default;

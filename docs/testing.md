@@ -383,13 +383,18 @@ Every test, grouped by area, with the property it guards.
   valid through checkpoint/offline seal; reopened virtual reads preserve
   the patch, an unrelated live range and all remaining zeroes. Also covers
   a rewrite crossing the maximum segment/write-piece length (issue #13).
-- `format: sparse layer discard punches holes and recovers` — discard
-  is a real punch-hole; reads stay correct across a reopen even though
-  fiemap recovery is filesystem-block granular (ADR-0009).
+- `format: sparse layer discard keeps a durable zero mask` — discard
+  records sidecar zero-mask coverage so reads stay correct across reopen
+  and lower layers remain masked (ADR-0009).
+- `format: fresh sparse layer ignores stale zero mask sidecar` — a newly
+  created sparse upper removes any stale sidecar instead of inheriting old
+  discard masks from a previous file at the same path.
 - `format: merged writable discard masks the lower layer` — with an
   LSMT-RW top, discarding a range covered only by the lower reads back
-  zeroes, not the lower's data (mask semantics, ADR-0009). Sparse top
-  lower-mask coverage is tracked in #85.
+  zeroes, not the lower's data (mask semantics, ADR-0009).
+- `format: merged writable sparse discard masks the lower layer` — the
+  same lower-mask regression with a sparse top; the zero mask survives
+  flush and reopen.
 - `format: trace crc32c golden vectors match the spec` — the trace blob's
   raw-chaining CRC-32C matches the trace-format.md §4 golden vectors,
   including the chaining property (ADR-0013).
@@ -438,6 +443,9 @@ Every test, grouped by area, with the property it guards.
   then the merged view; pwrite/discard accept the grown range, an
   unwritten headroom gap reads as zeroes, and shrink is rejected
   (ADR-0014).
+- `format: merged writable sparse grow reads new top data` — the same
+  merged grow path with a sparse upper, covering the sparse data-source
+  size refresh needed for reads from newly grown live extents.
 - `image: writable assembly grows to the virtual_size headroom override` —
   `open_image(..., override)` on the real writable assembly path sizes
   the writable top — and hence the merged data plane — at the override:

@@ -434,7 +434,7 @@ correlate by device id and by the supervisor's spawn logs.
 | A device child crashed | Siblings and the supervisor are unaffected (ADR-0004), and the device itself survives: the supervisor respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection (`destroy` + `create`). Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008); offline `commit` only has input if graceful shutdown already wrote a valid checkpoint before the child died. |
 | `commit` fails with "no valid shutdown checkpoint" | No graceful-shutdown checkpoint reached disk before the child died, for example a crash or SIGKILL before `checkpoint()` completed. The unsealed upper is unsealable (ADR-0014); start over from the lowers. |
 | `commit` fails with "sparse uppers cannot be sealed" | Sparse uppers never seal (upstream parity, ADR-0014). Use `type: "lsmt"` uppers for content you intend to commit. |
-| `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard reaches only writable devices; LSMT-RW uppers satisfy ADR-0009 zero-mask semantics, while sparse-upper merged-view masking is tracked by #85. |
+| `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard reaches only writable devices; writable uppers satisfy ADR-0009 zero-mask semantics. LSMT-RW records zeroed segments, while sparse uppers punch holes and persist a sidecar zero map. |
 | `resize` fails with a "grow-only" error | The requested size is at or below the device's current capacity; shrink is unsupported (ADR-0014). Grow to a larger size, or create with `--virtual-size` headroom if you need to plan ahead. |
 | `resize` fails with an `UPDATE_SIZE`-related error (`ENOTSUPP` 524 or `EOPNOTSUPP` 95) | The kernel driver predates `UBLK_U_CMD_UPDATE_SIZE` (needs the 6.16 cycle; pre-6.15 drivers answer `ENOTSUPP` 524, 6.15+ answer `EOPNOTSUPP` 95); the kernel capacity is unchanged and a retry succeeds once the driver accepts the command. `create --virtual-size` and `commit --virtual-size` do not need kernel support. |
 | A grown device crashes and its replacement rejects any resize back down toward the image size | Correct: the kernel kept the grown capacity across USER_RECOVERY, and the replacement seeds its grow-only baseline from that real capacity (GET_PARAMS) — shrinking is unsupported (ADR-0014). The fresh upper starts at the image's declared size (ADR-0008); grow further, or destroy + re-create from a committed layer, to change the size. |
@@ -450,8 +450,8 @@ correlate by device id and by the supervisor's spawn logs.
 - **LSMT-RW discard masks, it does not punch through.** A discarded range
   on an LSMT-RW upper reads back as zeroes even if lower layers have data
   there (ADR-0009); this is the upstream LSMT trim semantics,
-  intentional. Sparse uppers punch holes in the top file; #85 tracks the
-  remaining sparse merged-view lower-mask gap.
+  intentional. Sparse uppers also mask lowers by pairing punch-hole
+  deallocation with sidecar zero-mask metadata.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
   or mutate registry content (ADR-0007). Writable uppers are local-only;
   `commit` (ADR-0014) seals an upper into a local layer file —

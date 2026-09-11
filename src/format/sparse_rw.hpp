@@ -1,10 +1,10 @@
 // Sparse writable layer: a sparse file whose written extents form the
 // layer's segment index with identity mapping (moffset == offset).
-// Extents are rebuilt from the kernel fiemap (SEEK_DATA/SEEK_HOLE) when an
-// existing file is opened, so reopening preserves coverage. Note: fiemap
-// is filesystem-block granular — a sub-block punch-hole zeroes but cannot
-// deallocate, so a recovered index may be fatter than the pre-reopen one;
-// reads are unaffected (punched blocks read back as zeroes).
+// Live extents are rebuilt from the kernel fiemap (SEEK_DATA/SEEK_HOLE)
+// when an existing file is opened, and discard zero masks are recovered
+// from a small sidecar. Note: fiemap is filesystem-block granular, so a
+// sub-block discard may recover as a fatter live extent; reads are
+// unaffected because punched bytes read back as zeroes.
 #pragma once
 
 #include "format/writable.hpp"
@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <string>
+#include <vector>
 
 namespace obd::format {
 
@@ -28,8 +29,9 @@ public:
                                     uint64_t offset) override;
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
-    /// No-op: sparse extents are durable via the fiemap already (sparse
-    /// uppers never seal — ADR-0014 upstream parity).
+    /// No-op: sparse live extents are durable via fiemap and zero masks are
+    /// persisted eagerly in the sidecar (sparse uppers never seal —
+    /// ADR-0014 upstream parity).
     elio::coro::task<int> checkpoint() override;
 
     /// D3 grow-only vsize extension (see WritableLayer::grow): extends
@@ -48,16 +50,21 @@ public:
 
 private:
     SparseRwLayer() = default;
-    /// Inserts [off, off+len) (sectors) merging overlapping/adjacent
-    /// identity segments.
-    void insert_extent(uint64_t off, uint64_t len);
+    bool has_zero_masks() const;
+    void insert_live_extent(uint64_t off, uint64_t len);
+    void insert_zero_extent(uint64_t off, uint64_t len);
+    void insert_zero_gaps(uint64_t off, uint64_t len);
+    void erase_range(uint64_t lo, uint64_t hi);
+    int persist_zero_masks() const;
+    void load_zero_masks();
 
     int fd_ = -1;                    // RW fd (writes + flushes)
-    source::BlobSourcePtr ro_;       // RO view for data_source()
+    std::unique_ptr<source::LocalFileSource> ro_;  // RO view for data_source()
     /// Declared size in bytes. Atomic: the device resize executor (a
     /// spawn_blocking pool thread) grows the layer while bridge
     /// coroutines on Elio workers read/write through it.
     std::atomic<uint64_t> vsize_{0}; // bytes
+    std::string zero_mask_path_;
     std::vector<bytes::segment_mapping> segments_;
 };
 

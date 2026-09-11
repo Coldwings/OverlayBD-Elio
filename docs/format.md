@@ -487,8 +487,8 @@ durability point (ublk FLUSH). `discard` (ADR-0009) is the writable-root
 hook for masking a 512B-aligned range with zeroes in the merged device
 contract. The LSMT-RW
 implementation satisfies that contract by retaining zeroed segments; the
-sparse implementation punches holes in the top file, and #85 tracks its
-current merged-view lower-mask gap. `checkpoint()` (ADR-0014) persists
+sparse implementation punches holes and persists a sidecar zero map so
+reopen preserves the lower-layer mask. `checkpoint()` (ADR-0014) persists
 whatever on-disk state an offline seal needs, without sealing; it
 is called once by the device process on graceful shutdown after IO has
 drained and is terminal (no `pwrite`/`discard` may follow). `segments()` is
@@ -519,26 +519,32 @@ public:
 };
 ```
 
-A sparse file whose written extents form the layer's segment index with
-**identity mapping** (`moffset == offset`). `open` requires `vsize` to be a
-non-zero multiple of 512 (throws `obd::error(EINVAL)` otherwise), opens
-`path` with `O_RDWR | O_CREAT` (existing content is kept — **no
-truncation**), sizes it to `vsize` with `ftruncate`, and, for a pre-existing
-file, rebuilds coverage from the kernel fiemap (`SEEK_DATA`/`SEEK_HOLE`),
-rounding extent boundaries outward to whole sectors (only whole sectors are
-ever written). Filesystem errors throw `obd::error`.
+A sparse file whose live written extents form identity mappings
+(`moffset == offset`) plus zero-mask mappings for discarded ranges. `open`
+requires `vsize` to be a non-zero multiple of 512 (throws
+`obd::error(EINVAL)` otherwise), opens `path` with `O_RDWR | O_CREAT`
+(existing content is kept — **no truncation**), sizes it to `vsize` with
+`ftruncate`, and, for a pre-existing file, rebuilds live coverage from the
+kernel fiemap (`SEEK_DATA`/`SEEK_HOLE`) before loading discard masks from
+`<path>.zeroes`. Fiemap boundaries are rounded outward to whole sectors
+(only whole sectors are ever written). Filesystem or malformed sidecar
+errors throw `obd::error`.
 
 `pwrite`/`pread` return `-EINVAL` on unaligned or out-of-`vsize` requests;
-writes are split at the 14-bit segment-length cap and merged into the
-identity segment set (overlapping and adjacent extents coalesce).
-`flush()` is `fdatasync` and returns 0 or `-errno`.
+writes are split at the 14-bit segment-length cap, replace any overlapping
+zero-mask coverage, and merge into the identity segment set (overlapping
+and adjacent live extents coalesce). `discard` performs a real
+`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`, records zeroed
+segments for the discarded range, and atomically rewrites `<path>.zeroes`
+so a reopened sparse upper still masks lower layers in `MergedWritable`.
+`flush()` is `fdatasync` for the sparse data file and returns 0 or
+`-errno`; zero-mask metadata is fsynced when it is rewritten.
 
-`discard()` (ADR-0009) uses
-`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` and splits/trims
-the identity extent index. Fiemap is filesystem-block granular, so a
-sub-block punch zeroes but may not deallocate; a reopened index may be
-fatter than the pre-restart one, with identical reads because punched
-blocks read back as zeroes.
+On reopen, fiemap live coverage wins wherever the filesystem still reports
+data, and the sidecar fills only uncovered zero-mask gaps. That preserves
+correct reads across filesystem-block granularity differences: a sub-block
+punch may recover as a fatter live extent, while fully deallocated
+lower-only discards still remain top-layer zero masks.
 
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 
@@ -732,8 +738,8 @@ plus a writable top layer, as one block source.
 - `discard()` (ADR-0009) delegates to the top layer and rebuilds the index.
   With an LSMT-RW top, discarded ranges stay covered by zeroed segments and
   mask lower-layer data (matching upstream LSMT trim). With a sparse top,
-  discard punches holes in the top file; #85 tracks the remaining
-  merged-view lower-mask gap.
+  discarded ranges punch holes in the top file and remain covered by a
+  sidecar zero map, preserving the same lower-layer mask semantics.
 - As a `source::WritableBlobSource`, this is the device root the ublk bridge
   dispatches WRITE/FLUSH/DISCARD/WRITE_ZEROES to; a read-only image root
   simply does not implement the interface and writes/discards get `-EROFS`.
