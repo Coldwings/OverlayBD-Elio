@@ -177,7 +177,7 @@ obd-convert --input <rootfs.tar|-> --out-dir <dir> [--name base]
 | `--input PATH|-` | required | Rootfs ustar archive with the standard two-zero-block end marker. `-` reads stdin. |
 | `--out-dir DIR` | required | Output directory; it is created if missing. |
 | `--name STR` | `layer` | Basename of the produced layer. The value must be a plain file stem using letters, digits, `.`, `_`, or `-`. |
-| `--size BYTES` | auto | Raw filesystem size. When omitted, the built-in backend picks the smallest 4 KiB-aligned size with room for the archive, rounded with slack. When provided, it must be a 4 KiB multiple and large enough for the contents. |
+| `--size BYTES` | auto | Raw filesystem size. When omitted, the built-in backend picks a 4 KiB-aligned size with room for the archive, applies a 4 MiB minimum image size, and rounds with slack. When provided, it must be a 4 KiB multiple and large enough for the contents. |
 | `--keep-raw` | off | Keep the intermediate `<out-dir>/.<name>.ext2.tmp` filesystem image for inspection. It is first written in the private staging directory and then atomically renamed to this path. By default it is removed after the LSMT layer is written. |
 
 On success, `obd-convert` writes `<out-dir>/<name>.lsmt` by atomically

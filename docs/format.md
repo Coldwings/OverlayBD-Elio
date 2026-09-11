@@ -24,10 +24,9 @@ images built by upstream `overlaybd-*` tools load identically here:
   single-file LSMT with in-place edit and seal compaction), and
   `MergedWritable` (copy-on-write merged view implementing
   `source::WritableBlobSource`).
-- **Fixture writers** (`writer.hpp`) — synchronous cold-path writers that
-  produce upstream-readable sealed ZFile and LSMT files; used by
-  `obd-mkimage` and the test fixtures. The data plane never writes through
-  these.
+- **Cold-path writers** (`writer.hpp`) — synchronous writers that produce
+  upstream-readable sealed ZFile and LSMT files for `obd-mkimage`,
+  `obd-convert`, and test fixtures. The data plane never writes through these.
 - **Trace codec** (`trace.hpp`) — the upstream OverlayBD prefetch trace
   blob (ADR-0013): an in-memory parser and conforming writer for
   the raw-struct wire format specified in
@@ -779,7 +778,7 @@ plus a writable top layer, as one block source.
   dispatches WRITE/FLUSH/DISCARD/WRITE_ZEROES to; a read-only image root
   simply does not implement the interface and writes/discards get `-EROFS`.
 
-### `src/format/writer.hpp` — fixture writers (`namespace obd::format`)
+### `src/format/writer.hpp` — cold-path writers (`namespace obd::format`)
 
 `src/format/writer.hpp::generate_uuid`
 
