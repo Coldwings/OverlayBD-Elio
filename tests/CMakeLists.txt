@@ -1,5 +1,10 @@
 # Catch2 tests. Names follow the "<area>: <behavior>" convention enforced by
 # scripts/check-docs.sh (docs/testing.md).
+#
+# CTest timeout guardrails (issue #11): a hung test must fail with a bounded
+# timeout, never run unbounded. Each discovered Catch2 TEST_CASE and each
+# auxiliary CTest entry carries a TIMEOUT property below, and the
+# ctest-timeout-coverage audit fails CI if a future entry omits one.
 
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(CTest)
@@ -14,7 +19,13 @@ add_test(NAME test-await-assertions
 add_test(NAME test-await-assertions-selftest
     COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_test_awaits.py)
-set_tests_properties(test-await-assertions test-await-assertions-selftest
+add_test(NAME ctest-timeout-coverage-selftest
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_ctest_timeouts.py)
+set_tests_properties(
+    test-await-assertions
+    test-await-assertions-selftest
+    ctest-timeout-coverage-selftest
     PROPERTIES TIMEOUT 30)
 
 add_executable(obd_unit_tests
@@ -41,7 +52,8 @@ target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
 target_compile_definitions(obd_unit_tests
     PRIVATE OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>")
 add_dependencies(obd_unit_tests obdctl)
-catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]")
+catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
+    PROPERTIES TIMEOUT 60)
 
 if(OBD_ENABLE_UBLK)
     target_sources(obd_unit_tests PRIVATE
@@ -89,7 +101,8 @@ if(OBD_ENABLE_UBLK)
     target_link_libraries(obd_integration_tests PRIVATE obd_ublk)
 endif()
 catch_discover_tests(obd_integration_tests
-    PROPERTIES SKIP_RETURN_CODE 4)  # Catch2 "all selected tests skipped"
+    PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
+               TIMEOUT 300)
 
 # Inspect every first-party translation unit, including binary/test helpers.
 # The check uses the real build commands, so a forgotten target is observable.
@@ -100,4 +113,14 @@ if(CMAKE_GENERATOR MATCHES "Makefiles|Ninja")
             -DPROJECT_SOURCE=${PROJECT_SOURCE_DIR}
             -DWARNINGS_AS_ERRORS=${OBD_WARNINGS_AS_ERRORS}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_warning_flags.cmake)
+    set_tests_properties(build-warning-coverage PROPERTIES TIMEOUT 30)
 endif()
+
+# CI guardrail for issue #11: normal CTest runs include this audit, which
+# rejects any registered test entry that lacks an explicit TIMEOUT property.
+add_test(NAME ctest-timeout-coverage
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/scripts/check_ctest_timeouts.py
+        --build-dir ${CMAKE_BINARY_DIR}
+        --ctest ${CMAKE_CTEST_COMMAND})
+set_tests_properties(ctest-timeout-coverage PROPERTIES TIMEOUT 30)

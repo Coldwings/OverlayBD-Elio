@@ -173,6 +173,93 @@ all-skipped results, other test failures, signals, timeouts and log-write
 failures fail the step. Failure diagnostics include available kernel and
 core information. Local unprivileged skips do not prove the privileged path.
 
+### CTest timeout guardrails
+
+The suite has proven hang-prone under load (supervisor recovery, ublk
+integration), so every registered CTest entry carries an explicit
+`TIMEOUT`: a test that exceeds its budget is killed and reported by
+CTest as a timeout failure (issue #11). The point is a bounded,
+diagnosable failure — not hang prevention or proof that the historical
+recovery hang is fixed.
+
+The remaining #11 recovery investigation has an executable
+repeat-under-load recipe. It is a diagnostic recipe for the historical
+hang, not evidence that this PR fixes its root cause:
+
+```bash
+build_dir=build/issue11-recovery
+repro_dir="$build_dir/repro"
+mkdir -p "$repro_dir"
+cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DOBD_WARNINGS_AS_ERRORS=ON
+cmake --build "$build_dir" --target obd_integration_tests --parallel 2
+ctest --test-dir "$build_dir" -N -V \
+    --no-tests=error \
+    -R '^supervisor: crashed device child is recovered with bounded respawns$' \
+    | tee "$repro_dir/ctest-inventory.log"
+
+cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')
+if command -v stress-ng >/dev/null 2>&1; then
+    stress-ng --cpu "$cpu_count" --timeout 30m --metrics-brief \
+        >"$repro_dir/load.log" 2>&1 &
+    load_pids=$!
+else
+    load_pids=
+    i=0
+    while [ "$i" -lt "$cpu_count" ]; do
+        sh -c 'while :; do :; done' &
+        load_pids="$load_pids $!"
+        i=$((i + 1))
+    done
+fi
+trap 'kill $load_pids 2>/dev/null || true' EXIT
+
+ctest --test-dir "$build_dir" --output-on-failure \
+    --repeat until-fail:200 \
+    --no-tests=error \
+    -R '^supervisor: crashed device child is recovered with bounded respawns$' \
+    2>&1 | tee "$repro_dir/recovery-repeat.log"
+repro_rc=${PIPESTATUS[0]}
+kill $load_pids 2>/dev/null || true
+uname -a >"$repro_dir/kernel.txt"
+git rev-parse HEAD >"$repro_dir/git-head.txt"
+ps -eLf >"$repro_dir/processes-after.txt"
+cp "$build_dir/Testing/Temporary/LastTest.log" \
+    "$repro_dir/LastTest.log" 2>/dev/null || true
+exit "$repro_rc"
+```
+
+Stop at the first nonzero CTest result: timeout, signal, assertion
+failure, sanitizer failure or crash are all useful evidence. If all 200
+iterations pass, keep the same artifacts as a bounded non-reproduction
+record. Preserve the exact seed from Catch2 output, kernel, command log,
+CTest inventory, `LastTest.log`, process snapshot and any core or
+sanitizer output. Historical evidence includes a 12-hour futex hang, a
+later first-respawn SIGSEGV, and a focused sanitizer lifetime finding;
+these may not share one root cause. This PR does not attribute or fix
+those failures. It ensures that if recovery or ublk coverage hangs
+again, CI reports a bounded timeout instead of waiting indefinitely.
+
+Every `TEST_CASE` discovered by `catch_discover_tests` carries a
+`TIMEOUT` property, and the auxiliary script checks do too. Budgets are
+chosen per entry with headroom for slow machines and loaded runs:
+
+| CTest entry | Budget | Rationale |
+|---|---|---|
+| `test-await-assertions`, `test-await-assertions-selftest`, `ctest-timeout-coverage-selftest` | 30 s | small Python source guards that should fail quickly if they regress |
+| `ctest-timeout-coverage` | 30 s | audits the generated CTest registry and fails if any test lacks an explicit timeout |
+| `build-warning-coverage` | 30 s | generator-dependent compile-command audit, registered only for Makefiles/Ninja |
+| `obd_unit_tests` (`~[shutdown]`) | 60 s | unit and supervisor-unit tests are fast even under load; admission-funnel latency samples are synthetic, not wall-clock |
+| `obd_unit_tests` (`[shutdown]`) | 30 s | the ublk shutdown subset is short and is separated so it can keep a tighter bound |
+| `obd_integration_tests` | 300 s | mock-registry E2E take seconds; latency E2E has real-time injected delays; ublk E2E run longer when `/dev/ublk-control` is present and self-skip otherwise |
+
+`ctest-timeout-coverage` runs as part of the normal CTest suite and
+checks the generated `ctest --show-only=json-v1` registry; any future
+`add_test()` or discovered test without a positive explicit `TIMEOUT`
+fails this audit. If a developer invokes `ctest --timeout <seconds>`,
+that value is only a default for unbudgeted tests, not a tighter
+whole-suite cap over the explicit budgets above.
+
 ## Test inventory
 
 Every test, grouped by area, with the property it guards.
