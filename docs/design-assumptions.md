@@ -74,9 +74,11 @@ only at flush level and is not recoverable across restarts until sealed.
 A graceful device shutdown checkpoints the LSMT-RW index into the file so
 the supervisor can seal the upper offline (`commit`, ADR-0014); sparse
 uppers never seal.
-Discard follows mask-with-zeroes semantics (ADR-0009): a discarded range
-reads back as zeroes and never falls through to the lowers — LSMT-RW
-records it as zeroed segments, sparse performs a real punch-hole.
+Discard's intended device contract is mask-with-zeroes semantics
+(ADR-0009): a discarded range should read back as zeroes rather than fall
+through to the lowers. LSMT-RW satisfies this by recording zeroed segments;
+sparse performs a real punch-hole, and #85 tracks its current merged-view
+lower-mask gap.
 
 ## A9. DART is never on the required path
 

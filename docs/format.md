@@ -483,10 +483,13 @@ stack. `pwrite`/`pread` offsets and counts must be 512-byte multiples (the
 same alignment contract as the read side); both return the byte count or a
 negative -errno. `pread` reads through this layer alone — holes read as
 zeroes and fall-through to lower layers is the merger's job. `flush` is the
-durability point (ublk FLUSH). `discard` (ADR-0009) masks a 512B-aligned
-range with zeroes — reads of the range return zeroes from this layer
-onwards and never fall through to lower layers. `checkpoint()` (ADR-0014)
-persists whatever on-disk state an offline seal needs, without sealing; it
+durability point (ublk FLUSH). `discard` (ADR-0009) is the writable-root
+hook for masking a 512B-aligned range with zeroes in the merged device
+contract. The LSMT-RW
+implementation satisfies that contract by retaining zeroed segments; the
+sparse implementation punches holes in the top file, and #85 tracks its
+current merged-view lower-mask gap. `checkpoint()` (ADR-0014) persists
+whatever on-disk state an offline seal needs, without sealing; it
 is called once by the device process on graceful shutdown after IO has
 drained and is terminal (no `pwrite`/`discard` may follow). `segments()` is
 the current index: sorted, disjoint, 512B sector units, tag 0.
