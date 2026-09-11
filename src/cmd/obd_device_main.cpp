@@ -71,6 +71,8 @@ void report(const obd::supervisor::ControlChannelWriterPtr& channel,
     channel->write_line(obd::supervisor::make_device_status(st));
 }
 
+struct ReportedDeviceFailure {};
+
 elio::coro::task<int> device_main(Args args) {
     using obd::supervisor::DeviceStatus;
     // ONE serialized writer for every channel writer (status reports,
@@ -104,6 +106,12 @@ elio::coro::task<int> device_main(Args args) {
                            tres.error);
         }
     };
+    bool fills_parked = false;
+    auto park_opened_fills = [&]() -> elio::coro::task<void> {
+        if (fills_parked) co_return;
+        fills_parked = true;
+        co_await obd::image::park_image_fills(opened);
+    };
     try {
         obd::image::GlobalConfig global =
             args.global.empty()
@@ -115,7 +123,7 @@ elio::coro::task<int> device_main(Args args) {
                                args.blank_size);
                 report(channel, DeviceStatus{"failed", "",
                                           "blank size not sector aligned"});
-                co_return 1;
+                throw ReportedDeviceFailure{};
             }
             obd::image::BlankDeviceSpec spec;
             spec.size = args.blank_size;
@@ -143,7 +151,7 @@ elio::coro::task<int> device_main(Args args) {
                            opened.virtual_size);
             report(channel, DeviceStatus{"failed", "",
                                       "virtual size not sector aligned"});
-            co_return 1;
+            throw ReportedDeviceFailure{};
         }
         uint64_t dev_bytes = opened.virtual_size;
         if (args.virtual_size > 0) {
@@ -153,7 +161,7 @@ elio::coro::task<int> device_main(Args args) {
                     args.virtual_size);
                 report(channel, DeviceStatus{"failed", "",
                                           "virtual_size not sector aligned"});
-                co_return 1;
+                throw ReportedDeviceFailure{};
             }
             if (!opened.writable) {
                 std::string cap_error;
@@ -163,7 +171,7 @@ elio::coro::task<int> device_main(Args args) {
                     ELIO_LOG_ERROR("virtual-size override rejected: {}",
                                    cap_error);
                     report(channel, DeviceStatus{"failed", "", cap_error});
-                    co_return 1;
+                    throw ReportedDeviceFailure{};
                 }
             }
             // Writable: opened.virtual_size already reflects the override
@@ -202,14 +210,15 @@ elio::coro::task<int> device_main(Args args) {
             if (args.dev_id < 0) {
                 report(channel, DeviceStatus{"failed", "",
                                           "--recover requires --dev-id"});
-                co_return 1;
+                throw ReportedDeviceFailure{};
             }
             dev = co_await obd::ublk::Device::attach(
                 static_cast<uint32_t>(args.dev_id), params,
-                std::move(opened.root));
+                std::move(opened.root), park_opened_fills);
         } else {
             dev = co_await obd::ublk::Device::create(params,
-                                                     std::move(opened.root));
+                                                     std::move(opened.root),
+                                                     park_opened_fills);
         }
         report(channel, DeviceStatus{"ready", dev->bdev_path(), ""});
 
@@ -314,7 +323,7 @@ elio::coro::task<int> device_main(Args args) {
         }
         // Park background fills before the source chain is destroyed
         // (the LayerStore lifetime contract; no-op when fill is off).
-        co_await obd::image::park_image_fills(opened);
+        co_await park_opened_fills();
         // Keep our owning reference until the control task's captures have
         // been destroyed; its last reference must not destroy Device on a worker.
         report(channel, DeviceStatus{"stopped", "", ""});
@@ -328,6 +337,8 @@ elio::coro::task<int> device_main(Args args) {
         if (args.control_fd >= 0) {
             ::shutdown(args.control_fd, SHUT_RDWR);
         }
+    } catch (const ReportedDeviceFailure&) {
+        result = 1;
     } catch (const std::system_error& e) {
         ELIO_LOG_ERROR("device failed: {}", e.what());
         report(channel, DeviceStatus{"failed", "", e.what()});
@@ -369,8 +380,10 @@ elio::coro::task<int> device_main(Args args) {
         co_await finish_trace_recording();
         // The normal path already parks fills before reporting stopped.
         // Retain the same owners during exceptional cleanup as well.
-        if (result != 0) co_await obd::image::park_image_fills(opened);
+        if (result != 0) co_await park_opened_fills();
         co_await elio::spawn_blocking([&] { dev.reset(); });
+    } else if (result != 0) {
+        co_await park_opened_fills();
     }
     co_return result;
 }

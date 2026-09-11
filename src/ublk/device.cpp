@@ -17,7 +17,8 @@
 namespace obd::ublk {
 
 elio::coro::task<std::unique_ptr<Device>> Device::create(
-    const DeviceParams& params, source::BlobSourcePtr src) {
+    const DeviceParams& params, source::BlobSourcePtr src,
+    FailureCleanup failure_cleanup) {
     if (!src) throw error(EINVAL, "ublk device with null block source");
     if (params.dev_sectors == 0) {
         throw error(EINVAL, "ublk device with zero size");
@@ -113,14 +114,15 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
         failure = std::current_exception();
     }
     if (failure) {
-        co_await cleanup_failed(std::move(dev), failure);
+        co_await cleanup_failed(std::move(dev), failure,
+                                std::move(failure_cleanup));
     }
     co_return dev;
 }
 
 elio::coro::task<std::unique_ptr<Device>> Device::attach(
-    uint32_t dev_id, const DeviceParams& params,
-    source::BlobSourcePtr src) {
+    uint32_t dev_id, const DeviceParams& params, source::BlobSourcePtr src,
+    FailureCleanup failure_cleanup) {
     if (!src) throw error(EINVAL, "ublk recovery with null block source");
     auto dev = std::unique_ptr<Device>(new Device());
     dev->params_ = params;
@@ -208,14 +210,17 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
         failure = std::current_exception();
     }
     if (failure) {
-        co_await cleanup_failed(std::move(dev), failure);
+        co_await cleanup_failed(std::move(dev), failure,
+                                std::move(failure_cleanup));
     }
     co_return dev;
 }
 
 elio::coro::task<void> Device::cleanup_failed(
-    std::unique_ptr<Device> dev, std::exception_ptr failure) {
+    std::unique_ptr<Device> dev, std::exception_ptr failure,
+    FailureCleanup failure_cleanup) {
     co_await dev->stop_async();
+    if (failure_cleanup) co_await failure_cleanup();
     co_await elio::spawn_blocking([&] { dev.reset(); });
     std::rethrow_exception(failure);
 }

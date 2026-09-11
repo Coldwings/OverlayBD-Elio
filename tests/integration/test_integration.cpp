@@ -4,6 +4,7 @@
 // optional-accelerator fallback, and background fill through image
 // assembly. No kernel dependencies (ublk E2E lives in test_ublk_e2e.cpp
 // and self-skips). See docs/testing.md.
+#include "common/errors.hpp"
 #include "common/sha256.hpp"
 #include "format/lsmt.hpp"
 #include "format/trace.hpp"
@@ -771,6 +772,61 @@ TEST_CASE("integration: background fill completes a layer through image assembly
             REQUIRE(buf == raw);
         }
         REQUIRE(server.data_gets() == served_gets);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: open_image parks fills when later lower fails assembly",
+          "[integration]") {
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 256, 113);
+    const auto blob = make_zfile_blob(dir, raw);
+    const std::string good_digest = "sha256:" + sha256_hex_of(blob);
+    const std::string layer_dir = dir / "layer_partial_unwind";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server({{good_digest, blob}});
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
+
+        nlohmann::json cfgj;
+        cfgj["repoBlobUrl"] = server.repo_base();
+        cfgj["lowers"] = nlohmann::json::array({
+            nlohmann::json{{"digest", good_digest},
+                           {"size", blob.size()},
+                           {"dir", layer_dir}},
+            nlohmann::json{{"digest", "sha256:abcd"},
+                           {"size", 64 * 1024},
+                           {"dir", dir / "bad_lower"}},
+        });
+        cfgj["download"] = nlohmann::json{
+            {"enable", true}, {"delay", 60}, {"delayExtra", 0}};
+        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+
+        source::test_hooks::reset_unparked_layer_store_destructions_for_test();
+        bool threw = false;
+        int thrown_errno = 0;
+        std::optional<image::OpenedImage> opened;
+        try {
+            opened.emplace(co_await image::open_image(cfg, global));
+        } catch (const obd::error& e) {
+            threw = true;
+            thrown_errno = e.errno_value();
+        }
+        if (opened) co_await image::park_image_fills(*opened);
+
+        REQUIRE(threw);
+        REQUIRE(thrown_errno == EINVAL);
+        REQUIRE(source::test_hooks::
+                    unparked_layer_store_destructions_for_test() == 0);
         co_return 0;
     });
     REQUIRE(rc == 0);

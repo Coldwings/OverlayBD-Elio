@@ -1523,16 +1523,7 @@ TEST_CASE("image: trace recording captures only remote fetches through the layer
 
         // Park/destroy inside this scheduler (LayerStore lifetime).
         auto park = [&]() -> elio::coro::task<void> {
-            store->stop_fill();
-            using FillStatus = source::LayerStore::FillStatus;
-            for (int i = 0; i < 5000; ++i) {
-                const FillStatus s = store->fill_status();
-                if (s == FillStatus::kDisabled || s == FillStatus::kDone ||
-                    s == FillStatus::kStopped) {
-                    break;
-                }
-                co_await elio::time::sleep_for(1ms);
-            }
+            co_await store->park_fill(std::chrono::milliseconds(5000));
             store.reset();
         };
         std::exception_ptr err;
@@ -1614,16 +1605,7 @@ TEST_CASE("image: trace recording filters fill and prefetch layer-store reads",
 
         auto park = [&]() -> elio::coro::task<void> {
             remote_raw->release();
-            store->stop_fill();
-            using FillStatus = source::LayerStore::FillStatus;
-            for (int i = 0; i < 5000; ++i) {
-                const FillStatus s = store->fill_status();
-                if (s == FillStatus::kDisabled || s == FillStatus::kDone ||
-                    s == FillStatus::kStopped) {
-                    break;
-                }
-                co_await elio::time::sleep_for(1ms);
-            }
+            co_await store->park_fill(std::chrono::milliseconds(5000));
             remote_reads = remote_raw->reads();
             store.reset();
         };

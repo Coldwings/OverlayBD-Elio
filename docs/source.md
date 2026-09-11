@@ -181,7 +181,8 @@ onto the ADR-0011 machinery):
   traffic.
 - transient remote errors back off (2 s doubling, capped at 64 s) and the
   walk resumes — persisted extents survive in the sidecar, so progress is
-  never lost;
+  never lost; the backoff sleep is sliced so `stop_fill()` can still park
+  the task promptly;
 - completion rides the same sha256-verify + atomic rename as read-through
   warming; an all-present bitmap is only a pending verification state, so
   fill waits for the writer's verification outcome and resumes automatically
@@ -765,6 +766,7 @@ public:
     uint64_t coalesced_joins() const noexcept;
     FillStatus fill_status() const noexcept;
     void stop_fill() noexcept;
+    elio::coro::task<void> park_fill(std::chrono::milliseconds timeout);
     void set_test_write_hook(std::function<int(uint64_t)> hook);  // test-only
 };
 ```
@@ -835,10 +837,12 @@ remote bytes into a sparse local staging file with a sidecar extent map
   just re-fetch it). Start delay `delay_sec + random(0, delay_extra_sec)`,
   a per-second `max_mbps` MiB/s budget, transient-error backoff, and
   completion through the same sha256 + rename path as read-through
-  warming. `stop_fill()` asks the walk to exit (prompt once past the start
-  delay); `fill_status()` reports `kDisabled`/`kWaiting`/`kFilling`/
-  `kDone`/`kStopped`. Fill shares the lifetime contract below: park it
-  (`stop_fill` + a terminal `fill_status`) before destroying the store.
+  warming. `stop_fill()` asks the walk to exit; start delay, transient
+  error backoff, and throttle waits are sliced so stop is observed
+  promptly. `fill_status()` reports `kDisabled`/`kWaiting`/`kFilling`/
+  `kDone`/`kStopped`, but it is observability only. Fill shares the
+  lifetime contract below: call `park_fill()` before destroying the store
+  so the fill coroutine has released its frame.
 - Write-behind: fetched extents queue (bounded by `queue_max_bytes`) for a
   dedicated writer thread that `pwrite`s data, then the 8-byte sidecar
   record, then sets the in-memory bit. A full queue drops the entry and
@@ -955,8 +959,10 @@ Callers may rely on:
   the io_uring backend). A `LayerStore` must not be destroyed while
   `pread`/`populate` coroutines or a background fill are in flight on it
   (a suspended fetch, joiner, or fill step touches members on resume) —
-  park an active fill first: `stop_fill()` + `fill_status()` reaching
-  `kDone`/`kStopped`.
+  park an active fill first: `park_fill()` stops the walk and waits for
+  the joinable fill task to release its coroutine frame. A terminal
+  `fill_status()` is useful for observation, but it is not a destruction
+  barrier by itself.
 - **Writable sources** — `WritableBlobSource::pwrite`/`flush` are called only
   from the ublk data plane on the image root, after the bridge has confirmed
   the root implements the interface; writers and readers may race on
@@ -1102,6 +1108,9 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: layer store fill honors the throughput throttle` — a 1 MiB/s
   budget makes a 3 MiB fill take measurable seconds instead of
   milliseconds.
+- `source: layer store fill stop interrupts error backoff` — a transient
+  remote read failure enters the exponential fill backoff; `stop_fill()`
+  interrupts that sleep promptly and `park_fill()` releases the task.
 - `source: layer store fill stays off in bypass` — an injected `ENOSPC`
   flips the store to `Bypass` mid-fill: fill stops (`kStopped`), reads
   continue remotely, nothing persists, no commit appears.
@@ -1233,6 +1242,10 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   with `download.enable` set, a first open reads a prefix while the
   background fill warms every remaining extent to `overlaybd.commit`; a
   second open binds the commit with zero additional remote reads.
+- `integration: open_image parks fills when later lower fails assembly` —
+  a first remote lower opens with background fill enabled, then a later
+  malformed lower fails assembly; `open_image` stops and parks the partial
+  chain before unwinding it.
 - `integration: unwritable layer dir degrades to remote-only reads` — a
   layer dir that can never be created (a file blocks its parent path) does
   not fail `open_image`: the image boots and serves byte-exact reads
@@ -1310,9 +1323,10 @@ directly.
 - **Fill teardown goes through `park_image_fills`** — destroying a store
   with a fill in flight is a use-after-free (the fill coroutine touches
   members on resume), so assembled chains are parked before destruction
-  (the device server calls `park_image_fills` during shutdown; stores
-  composed by hand use `stop_fill()` + a terminal `fill_status()`; the
-  start delay is slept in 100 ms slices so parking is prompt).
+  (the device server calls `park_image_fills` during shutdown and
+  post-open boot-failure cleanup; stores composed by hand use
+  `park_fill()`; start delay, transient-error backoff, and throttle waits
+  are slept in bounded slices so parking is prompt).
   `delay_extra_sec` uses `std::random_device` per store, so delays are
   not reproducible run-to-run.
 - **Redirect caching trusts `Location` for 300 s** — a CDN URL that expires

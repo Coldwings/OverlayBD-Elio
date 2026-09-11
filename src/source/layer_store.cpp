@@ -31,6 +31,10 @@ constexpr char kSidecarMagic[8] = {'O', 'B', 'D', 'S', 'I', 'D', 'E', '1'};
 constexpr uint32_t kSidecarVersion = 1;
 constexpr size_t kHeaderSize = 80;  // fixed, little-endian field layout below
 
+#ifdef OBD_TEST_HOOKS
+std::atomic<uint64_t> g_unparked_layer_store_destructions{0};
+#endif
+
 // Blocking write loop — writer-thread / cold-path use only, never on an
 // Elio worker. Returns 0 or an errno.
 int pwrite_all(int fd, const void* buf, size_t count, uint64_t offset) {
@@ -146,6 +150,18 @@ size_t sweep_stale_pairs(const std::string& dir) noexcept {
 
 }  // namespace
 
+#ifdef OBD_TEST_HOOKS
+namespace test_hooks {
+void reset_unparked_layer_store_destructions_for_test() {
+    g_unparked_layer_store_destructions.store(0, std::memory_order_relaxed);
+}
+
+uint64_t unparked_layer_store_destructions_for_test() {
+    return g_unparked_layer_store_destructions.load(std::memory_order_relaxed);
+}
+}  // namespace test_hooks
+#endif
+
 size_t sweep_stale_layer_store_pairs(const std::string& dir) noexcept {
     return sweep_stale_pairs(dir);
 }
@@ -245,14 +261,22 @@ elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
     LayerStore* self = ls.get();
     ls->writer_ = std::thread([self] { self->writer_main(); });
     if (ls->cfg_.fill.enable && ls->extent_count_ > 0) {
-        elio::go([self]() -> elio::coro::task<void> {
+        ls->fill_status_.store(static_cast<int>(FillStatus::kWaiting),
+                               std::memory_order_release);
+        ls->fill_task_.emplace(elio::spawn([self]() -> elio::coro::task<void> {
             co_await self->run_fill();
-        });
+        }));
     }
     co_return ls;
 }
 
 LayerStore::~LayerStore() {
+#ifdef OBD_TEST_HOOKS
+    if (fill_task_ && !fill_task_->is_ready()) {
+        g_unparked_layer_store_destructions.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+#endif
     if (writer_.joinable()) {
         {
             std::lock_guard lk(qmu_);
@@ -772,6 +796,56 @@ elio::coro::task<bool> LayerStore::wait_queue_room(size_t len) {
     }
 }
 
+elio::coro::task<void> LayerStore::park_fill(
+    std::chrono::milliseconds timeout) {
+    stop_fill();
+    if (!fill_task_) co_return;
+
+    auto waited = std::chrono::milliseconds(0);
+    bool warned = false;
+    while (!fill_task_->is_ready()) {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        waited += std::chrono::milliseconds(1);
+        if (!warned && waited >= timeout) {
+            warned = true;
+            ELIO_LOG_WARNING(
+                "layer store {}: fill still running after {}ms; waiting for "
+                "the task to release before destroying the store",
+                dir_, timeout.count());
+        }
+    }
+
+    auto task = std::move(*fill_task_);
+    fill_task_.reset();
+    try {
+        co_await task;
+    } catch (const std::exception& e) {
+        ELIO_LOG_ERROR("layer store {}: fill task failed during parking: {}",
+                       dir_, e.what());
+    } catch (...) {
+        ELIO_LOG_ERROR("layer store {}: fill task failed during parking",
+                       dir_);
+    }
+    co_return;
+}
+
+elio::coro::task<bool> LayerStore::sleep_fill_stop_aware(
+    std::chrono::milliseconds duration) {
+    auto slept = std::chrono::milliseconds(0);
+    constexpr auto kStep = std::chrono::milliseconds(100);
+    while (slept < duration) {
+        if (fill_stop_.load(std::memory_order_acquire) ||
+            state() != State::Filling) {
+            co_return false;
+        }
+        const auto step = std::min(kStep, duration - slept);
+        co_await elio::time::sleep_for(step);
+        slept += step;
+    }
+    co_return !fill_stop_.load(std::memory_order_acquire) &&
+              state() == State::Filling;
+}
+
 elio::coro::task<void> LayerStore::run_fill() {
     // Fill is the ADR-0012 `Fill` scavenger class: conservative
     // concurrency 1 (this single walk), admitted at the device's funnel
@@ -787,14 +861,9 @@ elio::coro::task<void> LayerStore::run_fill() {
     }
     // Slept in 100 ms slices so stop_fill() (park_image_fills, teardown)
     // takes effect promptly even inside a long start delay.
-    for (uint64_t slept_ms = 0;
-         slept_ms < static_cast<uint64_t>(delay) * 1000 &&
-         !fill_stop_.load(std::memory_order_acquire);
-         slept_ms += 100) {
-        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
-    }
-    if (fill_stop_.load(std::memory_order_acquire) ||
-        state() != State::Filling) {
+    if (!co_await sleep_fill_stop_aware(std::chrono::duration_cast<
+                                        std::chrono::milliseconds>(
+            std::chrono::seconds(delay)))) {
         fill_status_.store(static_cast<int>(FillStatus::kStopped),
                            std::memory_order_release);
         co_return;
@@ -894,7 +963,14 @@ elio::coro::task<void> LayerStore::run_fill() {
                 dir_, e,
                 r < 0 ? strerror(static_cast<int>(-r)) : "short read",
                 1u << shift);
-            co_await elio::time::sleep_for(std::chrono::seconds(1u << shift));
+            if (!co_await sleep_fill_stop_aware(std::chrono::duration_cast<
+                                                std::chrono::milliseconds>(
+                    std::chrono::seconds(1u << shift)))) {
+                fill_status_.store(
+                    static_cast<int>(FillStatus::kStopped),
+                    std::memory_order_release);
+                co_return;
+            }
             continue;
         }
         consecutive_errors = 0;
@@ -923,19 +999,25 @@ elio::coro::task<void> LayerStore::run_fill() {
             const auto elapsed =
                 std::chrono::steady_clock::now() - window_start;
             if (elapsed < std::chrono::seconds(1)) {
-                co_await elio::time::sleep_for(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::seconds(1) - elapsed));
+                if (!co_await sleep_fill_stop_aware(
+                        std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                            std::chrono::seconds(1) - elapsed))) {
+                    fill_status_.store(
+                        static_cast<int>(FillStatus::kStopped),
+                        std::memory_order_release);
+                    co_return;
+                }
             }
             window_start = std::chrono::steady_clock::now();
             window_used = 0;
         }
     }
+    ELIO_LOG_INFO("layer store {}: background fill {}",
+                  dir_, done ? "finished" : "stopped");
     fill_status_.store(static_cast<int>(done ? FillStatus::kDone
                                              : FillStatus::kStopped),
                        std::memory_order_release);
-    ELIO_LOG_INFO("layer store {}: background fill {}",
-                  dir_, done ? "finished" : "stopped");
 }
 
 // ---------------------------------------------------------------------------

@@ -703,13 +703,10 @@ TEST_CASE("source: layer store fill frees the funnel window before throttling",
         REQUIRE(done);
         REQUIRE(funnel->scavenger_admissions() == 2);
 
-        store->stop_fill();
-        const bool parked = co_await poll_until([&] {
-            const auto s = store->fill_status();
-            return s == source::LayerStore::FillStatus::kDone ||
-                   s == source::LayerStore::FillStatus::kStopped;
-        });
-        REQUIRE(parked);
+        co_await store->park_fill(std::chrono::milliseconds(500));
+        const auto fill_status = store->fill_status();
+        REQUIRE((fill_status == source::LayerStore::FillStatus::kDone ||
+                 fill_status == source::LayerStore::FillStatus::kStopped));
         co_return 0;
     });
     REQUIRE(rc == 0);
