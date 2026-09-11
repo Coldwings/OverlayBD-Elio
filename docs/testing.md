@@ -1158,7 +1158,7 @@ Every test, grouped by area, with the property it guards.
   a tar entry outside the built-in backend's feature set, a checksum-valid
   non-ustar header, an empty stream, a malformed two-zero-block end marker, a
   regular file beyond the single-indirect backend limit, a too-small explicit
-  `--size`, aggregate payloads beyond the image budget, a directory requiring
+  `--size`, tar contents plus ext2 metadata beyond the image budget, a directory requiring
   more than 12 data blocks, or a tree requiring more than 32768 inodes exits 1
   with a clear error and leaves no published LSMT layer behind.
 

@@ -43,10 +43,6 @@ constexpr uint64_t kMaxBuiltInFileBlocks = 12 + kBlockSize / 4;
 constexpr uint64_t kMaxBuiltInFileBytes = kMaxBuiltInFileBlocks * kBlockSize;
 constexpr uint32_t kMinBuiltInInodes = 128;
 constexpr uint32_t kInodeTableBlock = 4;
-constexpr uint64_t kMinDataStartBlock =
-    kInodeTableBlock +
-    (static_cast<uint64_t>(kMinBuiltInInodes) * kInodeSize + kBlockSize - 1) /
-        kBlockSize;
 
 constexpr uint16_t kExt2SIfReg = 0100000;
 constexpr uint16_t kExt2SIfDir = 0040000;
@@ -284,10 +280,9 @@ uint64_t validate_explicit_image_blocks(uint64_t requested_size) {
     return blocks;
 }
 
-uint64_t payload_block_budget_for(uint64_t requested_size) {
+uint64_t image_block_budget_for(uint64_t requested_size) {
     const uint64_t explicit_blocks = validate_explicit_image_blocks(requested_size);
-    const uint64_t image_blocks = explicit_blocks == 0 ? kMaxBlocks : explicit_blocks;
-    return image_blocks > kMinDataStartBlock ? image_blocks - kMinDataStartBlock : 0;
+    return explicit_blocks == 0 ? kMaxBlocks : explicit_blocks;
 }
 
 void validate_output_name(const std::string& name) {
@@ -305,7 +300,7 @@ enum class NodeKind { Dir, File, Symlink };
 
 struct Node {
     explicit Node(std::string n, NodeKind k, Node* p = nullptr)
-        : name(std::move(n)), kind(k), parent(p) {}
+        : name(std::move(n)), kind(k), parent(p), dir_blocks(k == NodeKind::Dir ? 1 : 0) {}
 
     std::string name;
     NodeKind kind;
@@ -320,6 +315,7 @@ struct Node {
     uint32_t inode = 0;
     std::vector<uint32_t> blocks;
     uint32_t indirect_block = 0;
+    uint64_t dir_blocks = 0;
     std::vector<uint8_t> dir_data;
 };
 
@@ -358,29 +354,10 @@ std::vector<std::string> split_tar_path(std::string path, NodeKind kind) {
     return parts;
 }
 
+size_t min_dirent_len(size_t name_len) { return static_cast<size_t>(round_up(8 + name_len, 4)); }
+
 void throw_too_many_inodes() {
     throw std::runtime_error("built-in ext2 backend supports at most 32768 inodes");
-}
-
-Node& ensure_dir(Node& root, const std::vector<std::string>& parts,
-                 uint32_t* node_count = nullptr) {
-    Node* cur = &root;
-    for (const auto& part : parts) {
-        auto it = cur->children.find(part);
-        if (it == cur->children.end()) {
-            if (node_count != nullptr) {
-                if (*node_count >= kMaxBuiltInNodes) throw_too_many_inodes();
-                ++*node_count;
-            }
-            auto dir = std::make_unique<Node>(part, NodeKind::Dir, cur);
-            it = cur->children.emplace(part, std::move(dir)).first;
-        }
-        if (it->second->kind != NodeKind::Dir) {
-            throw std::runtime_error("tar path parent is not a directory: " + part);
-        }
-        cur = it->second.get();
-    }
-    return *cur;
 }
 
 uint64_t parse_octal_field(const uint8_t* data, size_t size, const char* name) {
@@ -434,22 +411,60 @@ uint64_t regular_file_payload_blocks(uint64_t size) {
     return data_blocks + (data_blocks > 12 ? 1 : 0);
 }
 
+uint64_t metadata_blocks_for_nodes(uint32_t nodes) {
+    const uint32_t used_inodes = 10 + (nodes - 1);
+    uint32_t desired_inodes = std::max<uint32_t>(used_inodes + 32, kMinBuiltInInodes);
+    desired_inodes = std::min<uint32_t>(desired_inodes, kMaxBuiltInInodes);
+    const uint32_t inode_count =
+        static_cast<uint32_t>(round_up(desired_inodes, 128));
+    const uint64_t inode_table_blocks =
+        div_ceil(static_cast<uint64_t>(inode_count) * kInodeSize, kBlockSize);
+    return kInodeTableBlock + inode_table_blocks;
+}
+
+uint64_t directory_blocks_with_pending_child(const Node& dir,
+                                             std::string_view pending_name) {
+    uint64_t blocks = 1;
+    size_t used = 0;
+    auto add_entry = [&](size_t name_len) {
+        const size_t need = min_dirent_len(name_len);
+        if (used != 0 && used + need > kBlockSize) {
+            ++blocks;
+            used = 0;
+        }
+        used += need;
+    };
+    add_entry(1);  // "."
+    add_entry(2);  // ".."
+    bool inserted_pending = false;
+    for (const auto& [name, _] : dir.children) {
+        if (!inserted_pending && pending_name < std::string_view(name)) {
+            add_entry(pending_name.size());
+            inserted_pending = true;
+        }
+        add_entry(name.size());
+    }
+    if (!inserted_pending) add_entry(pending_name.size());
+    return blocks;
+}
+
 struct TarReader {
     int fd;
     std::string work_dir;
     std::string stem;
-    uint64_t max_payload_blocks = kMaxBlocks;
+    uint64_t max_image_blocks = kMaxBlocks;
     std::vector<std::string> spool_paths;
     uint64_t next_spool = 0;
     uint64_t reserved_payload_blocks = 0;
+    uint64_t reserved_directory_blocks = 1;
     uint32_t node_count = 1;
 
     TarReader(int input_fd, std::string workspace_dir, std::string output_stem,
-              uint64_t payload_block_budget)
+              uint64_t image_block_budget)
         : fd(input_fd),
           work_dir(std::move(workspace_dir)),
           stem(std::move(output_stem)),
-          max_payload_blocks(payload_block_budget) {}
+          max_image_blocks(image_block_budget) {}
 
     ~TarReader() {
         for (const auto& path : spool_paths) ::unlink(path.c_str());
@@ -482,14 +497,67 @@ struct TarReader {
         return path;
     }
 
+    std::runtime_error image_budget_error(const std::string& name) const {
+        return std::runtime_error(
+            "built-in ext2 backend tar contents and ext2 metadata exceed image budget: " +
+            name);
+    }
+
+    uint64_t required_image_blocks(uint64_t payload_blocks) const {
+        return metadata_blocks_for_nodes(node_count) + reserved_directory_blocks +
+               payload_blocks;
+    }
+
+    void ensure_image_budget(const std::string& name) const {
+        if (required_image_blocks(reserved_payload_blocks) > max_image_blocks) {
+            throw image_budget_error(name);
+        }
+    }
+
+    void reserve_directory_child(Node& parent, const std::string& leaf) {
+        const uint64_t next_blocks = directory_blocks_with_pending_child(parent, leaf);
+        if (next_blocks > kMaxBuiltInDirectoryBlocks) {
+            throw std::runtime_error(
+                "built-in ext2 backend supports directories up to 12 data blocks: " +
+                (parent.name.empty() ? std::string("/") : parent.name));
+        }
+        reserved_directory_blocks += next_blocks - parent.dir_blocks;
+        parent.dir_blocks = next_blocks;
+    }
+
+    Node& ensure_dir(Node& root, const std::vector<std::string>& parts) {
+        Node* cur = &root;
+        for (const auto& part : parts) {
+            auto it = cur->children.find(part);
+            if (it == cur->children.end()) {
+                if (node_count >= kMaxBuiltInNodes) throw_too_many_inodes();
+                ++node_count;
+                reserve_directory_child(*cur, part);
+                auto dir = std::make_unique<Node>(part, NodeKind::Dir, cur);
+                reserved_directory_blocks += dir->dir_blocks;
+                ensure_image_budget(part);
+                it = cur->children.emplace(part, std::move(dir)).first;
+            }
+            if (it->second->kind != NodeKind::Dir) {
+                throw std::runtime_error("tar path parent is not a directory: " + part);
+            }
+            cur = it->second.get();
+        }
+        return *cur;
+    }
+
     void reserve_regular_file_payload(uint64_t size, const std::string& name) {
         const uint64_t blocks = regular_file_payload_blocks(size);
-        if (blocks > max_payload_blocks ||
-            reserved_payload_blocks > max_payload_blocks - blocks) {
-            throw std::runtime_error(
-                "built-in ext2 backend payloads exceed image budget: " + name);
+        if (blocks > max_image_blocks ||
+            reserved_payload_blocks > max_image_blocks - blocks) {
+            throw image_budget_error(name);
         }
-        reserved_payload_blocks += blocks;
+        const uint64_t reserved_after = reserved_payload_blocks + blocks;
+        const uint64_t required_blocks = required_image_blocks(reserved_after);
+        if (required_blocks > max_image_blocks) {
+            throw image_budget_error(name);
+        }
+        reserved_payload_blocks = reserved_after;
     }
 
     void load_into(Node& root) {
@@ -530,7 +598,7 @@ struct TarReader {
             if (typeflag == '5') {
                 if (size != 0) throw std::runtime_error("directory tar entry has a payload");
                 auto parts = split_tar_path(name, NodeKind::Dir);
-                Node& dir = ensure_dir(root, parts, &node_count);
+                Node& dir = ensure_dir(root, parts);
                 dir.perm = perm;
                 dir.uid = static_cast<uint32_t>(uid);
                 dir.gid = static_cast<uint32_t>(gid);
@@ -544,13 +612,15 @@ struct TarReader {
             auto parts = split_tar_path(name, kind);
             if (parts.empty()) throw std::runtime_error("tar entry names the root directory as a file");
             std::vector<std::string> parent_parts(parts.begin(), parts.end() - 1);
-            Node& parent = ensure_dir(root, parent_parts, &node_count);
+            Node& parent = ensure_dir(root, parent_parts);
             const std::string leaf = parts.back();
             if (parent.children.count(leaf) != 0) {
                 throw std::runtime_error("duplicate tar entry: " + name);
             }
             if (node_count >= kMaxBuiltInNodes) throw_too_many_inodes();
             ++node_count;
+            reserve_directory_child(parent, leaf);
+            ensure_image_budget(name);
             auto node = std::make_unique<Node>(leaf, kind, &parent);
             node->perm = perm;
             node->uid = static_cast<uint32_t>(uid);
@@ -559,9 +629,10 @@ struct TarReader {
                 if (size > kMaxBuiltInFileBytes) {
                     throw std::runtime_error("built-in ext2 backend file is too large: " + name);
                 }
-                // Reserve declared ext2 payload blocks before reading bytes so an
-                // oversized archive cannot fill the temporary workspace and fail
-                // only after final image sizing.
+                // Reserve declared ext2 payload blocks, directory blocks, and
+                // inode metadata before reading bytes so an oversized archive
+                // cannot fill the temporary workspace and fail only after
+                // final image sizing.
                 reserve_regular_file_payload(size, name);
                 node->size = size;
                 if (size != 0) node->spool_path = spool_payload(size);
@@ -614,8 +685,6 @@ void put_dirent(std::vector<uint8_t>& block, size_t offset, uint32_t ino,
     block[offset + 7] = file_type;
     std::memcpy(block.data() + offset + 8, name.data(), name.size());
 }
-
-size_t min_dirent_len(size_t name_len) { return static_cast<size_t>(round_up(8 + name_len, 4)); }
 
 std::vector<uint8_t> build_dir_data(const Node& dir) {
     struct Entry { uint32_t ino; uint8_t type; std::string name; };
@@ -941,9 +1010,9 @@ int main(int argc, char** argv) {
 
         Node root("", NodeKind::Dir, nullptr);
         TempWorkspace workspace(opts.out_dir, opts.name);
-        const uint64_t payload_block_budget = payload_block_budget_for(opts.size);
+        const uint64_t image_block_budget = image_block_budget_for(opts.size);
         TarReader reader{input.fd, workspace.path(), opts.name,
-                         payload_block_budget};
+                         image_block_budget};
         reader.load_into(root);
         if (opts.input == "-") input.release();
 

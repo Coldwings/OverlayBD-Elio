@@ -127,7 +127,7 @@ LSMT layer:
 obd-convert --input rootfs.tar --out-dir /var/lib/overlaybd-elio/blobs \
             --name base
 # or stream input:
-tar -C rootfs -cf - . | obd-convert --input - \
+tar --format=ustar -C rootfs -cf - . | obd-convert --input - \
     --out-dir /var/lib/overlaybd-elio/blobs --name base
 ```
 
