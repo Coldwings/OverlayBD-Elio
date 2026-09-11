@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -25,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -33,7 +35,10 @@ namespace {
 constexpr uint32_t kBlockSize = 4096;
 constexpr uint32_t kInodeSize = 128;
 constexpr uint32_t kMaxBlocks = kBlockSize * 8;
+constexpr uint32_t kMaxBuiltInInodes = kBlockSize * 8;
+constexpr uint32_t kMaxBuiltInNodes = kMaxBuiltInInodes - 9;
 constexpr uint32_t kFirstDynamicInode = 11;
+constexpr uint64_t kMaxBuiltInDirectoryBlocks = 12;
 constexpr uint64_t kMaxBuiltInFileBlocks = 12 + kBlockSize / 4;
 constexpr uint64_t kMaxBuiltInFileBytes = kMaxBuiltInFileBlocks * kBlockSize;
 
@@ -71,6 +76,35 @@ struct FdGuard {
         fd = -1;
         return out;
     }
+};
+
+class TempWorkspace {
+public:
+    TempWorkspace(const std::string& out_dir, const std::string& stem) {
+        std::string pattern = out_dir + "/." + stem + ".work.XXXXXX";
+        std::vector<char> buf(pattern.begin(), pattern.end());
+        buf.push_back('\0');
+        char* created = ::mkdtemp(buf.data());
+        if (created == nullptr) {
+            obd::throw_errno(errno, "cannot create temporary workspace in " + out_dir);
+        }
+        path_ = created;
+    }
+
+    TempWorkspace(const TempWorkspace&) = delete;
+    TempWorkspace& operator=(const TempWorkspace&) = delete;
+
+    ~TempWorkspace() {
+        if (!path_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(path_, ec);
+        }
+    }
+
+    const std::string& path() const { return path_; }
+
+private:
+    std::string path_;
 };
 
 uint64_t round_up(uint64_t value, uint64_t alignment) {
@@ -167,6 +201,26 @@ uint64_t file_size(const std::string& path) {
     struct stat st {};
     if (::stat(path.c_str(), &st) != 0) obd::throw_errno(errno, "cannot stat " + path);
     return static_cast<uint64_t>(st.st_size);
+}
+
+void fsync_file(const std::string& path, const char* what) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) obd::throw_errno(errno, std::string("cannot open ") + what + " " + path);
+    FdGuard guard(fd);
+    if (::fsync(fd) != 0) obd::throw_errno(errno, std::string("fsync failed for ") + what);
+}
+
+void fsync_directory(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) obd::throw_errno(errno, "cannot open output directory " + path);
+    FdGuard guard(fd);
+    if (::fsync(fd) != 0) obd::throw_errno(errno, "fsync failed for output directory");
+}
+
+void replace_file_atomically(const std::string& src, const std::string& dst) {
+    if (::rename(src.c_str(), dst.c_str()) != 0) {
+        obd::throw_errno(errno, "cannot publish " + dst);
+    }
 }
 
 std::string uuid_from_digest(const std::string& digest_hex) {
@@ -277,11 +331,20 @@ std::vector<std::string> split_tar_path(std::string path, NodeKind kind) {
     return parts;
 }
 
-Node& ensure_dir(Node& root, const std::vector<std::string>& parts) {
+void throw_too_many_inodes() {
+    throw std::runtime_error("built-in ext2 backend supports at most 32768 inodes");
+}
+
+Node& ensure_dir(Node& root, const std::vector<std::string>& parts,
+                 uint32_t* node_count = nullptr) {
     Node* cur = &root;
     for (const auto& part : parts) {
         auto it = cur->children.find(part);
         if (it == cur->children.end()) {
+            if (node_count != nullptr) {
+                if (*node_count >= kMaxBuiltInNodes) throw_too_many_inodes();
+                ++*node_count;
+            }
             auto dir = std::make_unique<Node>(part, NodeKind::Dir, cur);
             it = cur->children.emplace(part, std::move(dir)).first;
         }
@@ -333,20 +396,21 @@ void verify_tar_checksum(const std::array<uint8_t, 512>& header) {
 
 struct TarReader {
     int fd;
-    std::string out_dir;
+    std::string work_dir;
     std::string stem;
     std::vector<std::string> spool_paths;
     uint64_t next_spool = 0;
+    uint32_t node_count = 1;
 
-    TarReader(int input_fd, std::string output_dir, std::string output_stem)
-        : fd(input_fd), out_dir(std::move(output_dir)), stem(std::move(output_stem)) {}
+    TarReader(int input_fd, std::string workspace_dir, std::string output_stem)
+        : fd(input_fd), work_dir(std::move(workspace_dir)), stem(std::move(output_stem)) {}
 
     ~TarReader() {
         for (const auto& path : spool_paths) ::unlink(path.c_str());
     }
 
     std::string make_spool_path() {
-        return out_dir + "/." + stem + ".entry-" + std::to_string(next_spool++) + ".tmp";
+        return work_dir + "/" + stem + ".entry-" + std::to_string(next_spool++) + ".tmp";
     }
 
     void skip_padding(uint64_t payload_size) {
@@ -357,7 +421,8 @@ struct TarReader {
 
     std::string spool_payload(uint64_t payload_size) {
         const std::string path = make_spool_path();
-        const int out = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        const int out =
+            ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
         if (out < 0) obd::throw_errno(errno, "cannot create payload spool " + path);
         FdGuard guard(out);
         spool_paths.push_back(path);
@@ -395,8 +460,8 @@ struct TarReader {
             if (typeflag == '5') {
                 if (size != 0) throw std::runtime_error("directory tar entry has a payload");
                 auto parts = split_tar_path(name, NodeKind::Dir);
-                Node& dir = ensure_dir(root, parts);
-                dir.perm = perm == 0 ? 0755 : perm;
+                Node& dir = ensure_dir(root, parts, &node_count);
+                dir.perm = perm;
                 dir.uid = static_cast<uint32_t>(uid);
                 dir.gid = static_cast<uint32_t>(gid);
                 continue;
@@ -409,13 +474,15 @@ struct TarReader {
             auto parts = split_tar_path(name, kind);
             if (parts.empty()) throw std::runtime_error("tar entry names the root directory as a file");
             std::vector<std::string> parent_parts(parts.begin(), parts.end() - 1);
-            Node& parent = ensure_dir(root, parent_parts);
+            Node& parent = ensure_dir(root, parent_parts, &node_count);
             const std::string leaf = parts.back();
             if (parent.children.count(leaf) != 0) {
                 throw std::runtime_error("duplicate tar entry: " + name);
             }
+            if (node_count >= kMaxBuiltInNodes) throw_too_many_inodes();
+            ++node_count;
             auto node = std::make_unique<Node>(leaf, kind, &parent);
-            node->perm = perm == 0 ? (kind == NodeKind::File ? 0644 : 0777) : perm;
+            node->perm = perm;
             node->uid = static_cast<uint32_t>(uid);
             node->gid = static_cast<uint32_t>(gid);
             if (kind == NodeKind::File) {
@@ -423,7 +490,7 @@ struct TarReader {
                     throw std::runtime_error("built-in ext2 backend file is too large: " + name);
                 }
                 node->size = size;
-                node->spool_path = spool_payload(size);
+                if (size != 0) node->spool_path = spool_payload(size);
                 skip_padding(size);
             } else {
                 if (size != 0) throw std::runtime_error("symlink tar entry has a payload");
@@ -514,6 +581,12 @@ std::vector<uint8_t> build_dir_data(const Node& dir) {
 void build_directory_payloads(Node& node) {
     if (node.kind == NodeKind::Dir) {
         node.dir_data = build_dir_data(node);
+        const uint64_t blocks = node.dir_data.size() / kBlockSize;
+        if (blocks > kMaxBuiltInDirectoryBlocks) {
+            throw std::runtime_error(
+                "built-in ext2 backend supports directories up to 12 data blocks: " +
+                (node.name.empty() ? std::string("/") : node.name));
+        }
         node.size = node.dir_data.size();
         for (auto& [_, child] : node.children) build_directory_payloads(*child);
     }
@@ -583,6 +656,9 @@ void store_inode(std::vector<uint8_t>& inode, const Node& node) {
 }
 
 void set_bitmap_bit(std::vector<uint8_t>& bitmap, uint32_t index) {
+    if (index / 8 >= bitmap.size()) {
+        throw std::runtime_error("internal ext2 bitmap index is out of range");
+    }
     bitmap[index / 8] |= static_cast<uint8_t>(1u << (index % 8));
 }
 
@@ -610,17 +686,20 @@ void write_file_payload(int out_fd, const Node& node) {
             full_pwrite(out_fd, indirect.data(), indirect.size(),
                         static_cast<uint64_t>(node.indirect_block) * kBlockSize);
         }
-        const int in = ::open(node.spool_path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (in < 0) obd::throw_errno(errno, "cannot open payload spool " + node.spool_path);
-        FdGuard guard(in);
-        std::vector<uint8_t> block(kBlockSize, 0);
-        uint64_t remaining = node.size;
-        for (uint32_t b : node.blocks) {
-            std::fill(block.begin(), block.end(), 0);
-            const size_t chunk = static_cast<size_t>(std::min<uint64_t>(kBlockSize, remaining));
-            if (chunk > 0) read_exact(in, block.data(), chunk, false);
-            full_pwrite(out_fd, block.data(), block.size(), static_cast<uint64_t>(b) * kBlockSize);
-            remaining -= chunk;
+        if (node.size != 0) {
+            const int in = ::open(node.spool_path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (in < 0) obd::throw_errno(errno, "cannot open payload spool " + node.spool_path);
+            FdGuard guard(in);
+            std::vector<uint8_t> block(kBlockSize, 0);
+            uint64_t remaining = node.size;
+            for (uint32_t b : node.blocks) {
+                std::fill(block.begin(), block.end(), 0);
+                const size_t chunk = static_cast<size_t>(std::min<uint64_t>(kBlockSize, remaining));
+                if (chunk > 0) read_exact(in, block.data(), chunk, false);
+                full_pwrite(out_fd, block.data(), block.size(),
+                            static_cast<uint64_t>(b) * kBlockSize);
+                remaining -= chunk;
+            }
         }
     }
     for (const auto& [_, child] : node.children) write_file_payload(out_fd, *child);
@@ -632,7 +711,13 @@ void write_ext2_image(Node& root, const std::string& path, uint64_t requested_si
 
     const uint32_t nodes = count_nodes(root);
     const uint32_t used_inodes = 10 + (nodes - 1);
-    const uint32_t inode_count = static_cast<uint32_t>(round_up(std::max<uint32_t>(used_inodes + 32, 128), 128));
+    if (used_inodes > kMaxBuiltInInodes) {
+        throw_too_many_inodes();
+    }
+    uint32_t desired_inodes = std::max<uint32_t>(used_inodes + 32, 128);
+    desired_inodes = std::min<uint32_t>(desired_inodes, kMaxBuiltInInodes);
+    const uint32_t inode_count =
+        static_cast<uint32_t>(round_up(desired_inodes, 128));
     const uint32_t inode_table_blocks = static_cast<uint32_t>(div_ceil(
         static_cast<uint64_t>(inode_count) * kInodeSize, kBlockSize));
     const uint32_t inode_table_block = 4;
@@ -663,7 +748,8 @@ void write_ext2_image(Node& root, const std::string& path, uint64_t requested_si
     const uint32_t free_blocks = static_cast<uint32_t>(total_blocks - used_blocks);
     const uint32_t free_inodes = inode_count - used_inodes;
 
-    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    const int fd =
+        ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (fd < 0) obd::throw_errno(errno, "cannot create raw filesystem " + path);
     FdGuard guard(fd);
     if (::ftruncate(fd, static_cast<off_t>(total_blocks * kBlockSize)) != 0) {
@@ -778,12 +864,15 @@ int main(int argc, char** argv) {
         }
 
         Node root("", NodeKind::Dir, nullptr);
-        TarReader reader{input.fd, opts.out_dir, opts.name};
+        TempWorkspace workspace(opts.out_dir, opts.name);
+        TarReader reader{input.fd, workspace.path(), opts.name};
         reader.load_into(root);
         if (opts.input == "-") input.release();
 
-        const std::string raw_path = opts.out_dir + "/." + opts.name + ".ext2.tmp";
+        const std::string raw_path = workspace.path() + "/rootfs.ext2";
+        const std::string lsmt_tmp_path = workspace.path() + "/layer.lsmt";
         const std::string lsmt_path = opts.out_dir + "/" + opts.name + ".lsmt";
+        const std::string keep_raw_path = opts.out_dir + "/." + opts.name + ".ext2.tmp";
         write_ext2_image(root, raw_path, opts.size);
 
         const int raw_fd = ::open(raw_path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -794,13 +883,21 @@ int main(int argc, char** argv) {
         obd::format::LsmtWriteOptions lopts;
         lopts.uuid = uuid_from_digest(raw_digest);
         lopts.user_tag = "obd-convert builtin-ext2";
-        obd::format::write_lsmt_single_layer(raw_fd, raw_size, lsmt_path, lopts);
+        obd::format::write_lsmt_single_layer(raw_fd, raw_size, lsmt_tmp_path, lopts);
         raw.reset();
-        if (!opts.keep_raw) ::unlink(raw_path.c_str());
+        fsync_file(lsmt_tmp_path, "LSMT layer");
+        const std::string lsmt_digest = sha256_of_file(lsmt_tmp_path);
+        const uint64_t lsmt_size = file_size(lsmt_tmp_path);
+        if (opts.keep_raw) {
+            fsync_file(raw_path, "raw filesystem");
+            replace_file_atomically(raw_path, keep_raw_path);
+        }
+        replace_file_atomically(lsmt_tmp_path, lsmt_path);
+        fsync_directory(opts.out_dir);
 
         nlohmann::json lower;
-        lower["digest"] = "sha256:" + sha256_of_file(lsmt_path);
-        lower["size"] = file_size(lsmt_path);
+        lower["digest"] = "sha256:" + lsmt_digest;
+        lower["size"] = lsmt_size;
         lower["file"] = lsmt_path;
         nlohmann::json snippet;
         snippet["repoBlobUrl"] = "";
@@ -813,6 +910,9 @@ int main(int argc, char** argv) {
         };
         std::puts(snippet.dump(2).c_str());
         return 0;
+    } catch (const UsageError& e) {
+        std::fprintf(stderr, "obd-convert: %s\n", e.what());
+        return 2;
     } catch (const std::system_error& e) {
         std::fprintf(stderr, "obd-convert: %s\n", e.what());
         return 1;

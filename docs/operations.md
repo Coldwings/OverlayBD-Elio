@@ -133,7 +133,9 @@ tar -C rootfs -cf - . | obd-convert --input - \
 
 Paste the printed `lowers[]` entry into the image config. The `converter`
 metadata records the backend (`builtin-ext2`), raw filesystem digest and raw
-virtual size for build logs; it is not required by `config.json`.
+virtual size for build logs; it is not required by `config.json`. Output files
+are assembled in a private temporary workspace below `--out-dir` and atomically
+renamed into place after they are complete.
 
 ## Creating devices: three modes (ADR-0014)
 
@@ -475,12 +477,15 @@ correlate by device id and by the supervisor's spawn logs.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
   or mutate registry content (ADR-0007). Writable uppers are local-only;
   `commit` (ADR-0014) and `obd-convert` (ADR-0019) produce local layer files —
-  publishing them as OCI artifacts is the external CLI's job.
+  publishing them as OCI artifacts is the external CLI's job. `obd-convert`
+  stages artifacts privately and atomically renames the completed LSMT into
+  place, so failed conversions do not truncate an existing layer path.
 - **Built-in converter bounds.** The default `obd-convert` backend is
   deterministic and unprivileged, but intentionally small: ext2-compatible
-  output only, images up to 128 MiB, regular files, directories and short
-  symlinks. PAX/xattrs/devices/hardlinks/sparse tar entries require a future
-  backend.
+  output only, 4 KiB blocks, images up to 128 MiB, uid/gid values up to 65535,
+  at most 32768 inodes, regular files, directories up to 12 data blocks and
+  short symlinks. PAX/xattrs/devices/hardlinks/sparse tar entries require a
+  future backend.
 - **Credentials**: only `credentialConfig` `mode=file` is honored; other
   modes are ignored with a warning (see [config.md](./config.md)).
 - **One supervisor per node** is the expected topology; multiple

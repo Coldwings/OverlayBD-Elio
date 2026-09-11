@@ -1144,10 +1144,19 @@ Every test, grouped by area, with the property it guards.
   converter binary consumes the same rootfs tar from a file and from stdin,
   emits byte-identical sealed LSMT layers, reports the correct digest and
   metadata, and the test reads the layer back as an ext2 image to verify file
-  content, mode, uid/gid and short symlink target (ADR-0019).
+  content including a single-indirect regular file, explicit `0000` modes,
+  uid/gid and short symlink target (ADR-0019).
+- `cli: obd-convert atomically replaces existing output symlinks` — pre-creates
+  symlinks at the final LSMT and kept-raw output paths, then verifies
+  `obd-convert` replaces those paths with regular files without truncating the
+  symlink target.
+- `cli: obd-convert reports usage errors with exit 2` — unknown options,
+  missing option values, and non-numeric `--size` values are classified as
+  usage errors rather than runtime conversion failures.
 - `cli: obd-convert rejects unsupported tar entries before writing a layer` —
-  a tar entry outside the built-in backend's feature set exits 1 with a clear
-  error and leaves no published LSMT layer behind.
+  a tar entry outside the built-in backend's feature set, a directory requiring
+  more than 12 data blocks, or a tree requiring more than 32768 inodes exits 1
+  with a clear error and leaves no published LSMT layer behind.
 
 ### integration
 

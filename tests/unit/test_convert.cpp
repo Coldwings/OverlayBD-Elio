@@ -34,6 +34,9 @@ using obd::test::TempDir;
 
 namespace {
 
+constexpr size_t kExt2BlockSize = 4096;
+constexpr size_t kIndirectToolSize = 13 * kExt2BlockSize + 123;
+
 struct CommandResult {
     int exit_code = -1;
     std::string out;
@@ -161,9 +164,39 @@ std::vector<uint8_t> make_rootfs_tar() {
     append_tar_entry(tar, "etc/", '5', 0750, 5, 6);
     const std::vector<uint8_t> hello = {'h', 'e', 'l', 'l', 'o', '\n'};
     append_tar_entry(tar, "etc/hello.txt", '0', 0640, 1000, 1001, hello);
-    const std::vector<uint8_t> tool = test::pattern_bytes(7000, 77);
+    const std::vector<uint8_t> tool = test::pattern_bytes(kIndirectToolSize, 77);
     append_tar_entry(tar, "bin/tool", '0', 0755, 0, 0, tool);
     append_tar_entry(tar, "link-to-hello", '2', 0777, 7, 8, {}, "etc/hello.txt");
+    append_tar_entry(tar, "zero-dir/", '5', 0000, 9, 10);
+    append_tar_entry(tar, "zero-file", '0', 0000, 11, 12,
+                     std::vector<uint8_t>{'z'});
+    append_tar_entry(tar, "zero-link", '2', 0000, 13, 14, {}, "etc/hello.txt");
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
+std::vector<uint8_t> make_many_root_files_tar(size_t count) {
+    std::vector<uint8_t> tar;
+    tar.reserve((count + 2) * 512);
+    for (size_t i = 0; i < count; ++i) {
+        append_tar_entry(tar, "f" + std::to_string(i), '0', 0644, 0, 0);
+    }
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
+std::vector<uint8_t> make_many_inode_tar() {
+    std::vector<uint8_t> tar;
+    constexpr size_t kDirs = 11;
+    constexpr size_t kFilesPerDir = 3000;
+    tar.reserve((kDirs + kDirs * kFilesPerDir + 2) * 512);
+    for (size_t d = 0; d < kDirs; ++d) {
+        const std::string dir = "d" + std::to_string(d);
+        append_tar_entry(tar, dir + "/", '5', 0755, 0, 0);
+        for (size_t f = 0; f < kFilesPerDir; ++f) {
+            append_tar_entry(tar, dir + "/f" + std::to_string(f), '0', 0644, 0, 0);
+        }
+    }
     tar.resize(tar.size() + 1024, 0);
     return tar;
 }
@@ -261,12 +294,24 @@ public:
         const Ext2Inode file = inode(ino);
         std::vector<uint8_t> out;
         out.reserve(file.size);
-        for (size_t i = 0; i < 12 && out.size() < file.size; ++i) {
-            REQUIRE(file.blocks[i] != 0);
-            const uint64_t base = static_cast<uint64_t>(file.blocks[i]) * block_size_;
+        auto append_block = [&](uint32_t block) {
+            REQUIRE(block != 0);
+            const uint64_t base = static_cast<uint64_t>(block) * block_size_;
             REQUIRE(base + block_size_ <= raw_.size());
             const size_t want = std::min<size_t>(block_size_, file.size - out.size());
             out.insert(out.end(), raw_.begin() + base, raw_.begin() + base + want);
+        };
+        for (size_t i = 0; i < 12 && out.size() < file.size; ++i) {
+            append_block(file.blocks[i]);
+        }
+        if (out.size() < file.size) {
+            REQUIRE(file.blocks[12] != 0);
+            const uint64_t indirect_base =
+                static_cast<uint64_t>(file.blocks[12]) * block_size_;
+            REQUIRE(indirect_base + block_size_ <= raw_.size());
+            for (size_t off = 0; off < block_size_ && out.size() < file.size; off += 4) {
+                append_block(bytes::load_u32_le(raw_.data() + indirect_base + off));
+            }
         }
         REQUIRE(out.size() == file.size);
         return out;
@@ -347,7 +392,7 @@ TEST_CASE("cli: obd-convert builds a deterministic ext2 layer from tar", "[cli]"
     REQUIRE(std::string(hello_bytes.begin(), hello_bytes.end()) == "hello\n");
 
     const uint32_t tool_ino = fs.lookup({"bin", "tool"});
-    REQUIRE(fs.read_file(tool_ino) == test::pattern_bytes(7000, 77));
+    REQUIRE(fs.read_file(tool_ino) == test::pattern_bytes(kIndirectToolSize, 77));
 
     const uint32_t link_ino = fs.lookup({"link-to-hello"});
     const auto link = fs.inode(link_ino);
@@ -355,6 +400,71 @@ TEST_CASE("cli: obd-convert builds a deterministic ext2 layer from tar", "[cli]"
     REQUIRE(link.uid == 7);
     REQUIRE(link.gid == 8);
     REQUIRE(fs.inline_symlink(link_ino) == "etc/hello.txt");
+
+    const auto zero_dir = fs.inode(fs.lookup({"zero-dir"}));
+    REQUIRE((zero_dir.mode & 0170000) == 0040000);
+    REQUIRE((zero_dir.mode & 07777) == 0000);
+    REQUIRE(zero_dir.uid == 9);
+    REQUIRE(zero_dir.gid == 10);
+
+    const uint32_t zero_file_ino = fs.lookup({"zero-file"});
+    const auto zero_file = fs.inode(zero_file_ino);
+    REQUIRE((zero_file.mode & 0170000) == 0100000);
+    REQUIRE((zero_file.mode & 07777) == 0000);
+    REQUIRE(zero_file.uid == 11);
+    REQUIRE(zero_file.gid == 12);
+    REQUIRE(fs.read_file(zero_file_ino) == std::vector<uint8_t>{'z'});
+
+    const uint32_t zero_link_ino = fs.lookup({"zero-link"});
+    const auto zero_link = fs.inode(zero_link_ino);
+    REQUIRE((zero_link.mode & 0170000) == 0120000);
+    REQUIRE((zero_link.mode & 07777) == 0000);
+    REQUIRE(zero_link.uid == 13);
+    REQUIRE(zero_link.gid == 14);
+    REQUIRE(fs.inline_symlink(zero_link_ino) == "etc/hello.txt");
+}
+
+// NOTE: name on one source line (check-docs extracts names line-wise).
+TEST_CASE("cli: obd-convert atomically replaces existing output symlinks", "[cli]") {
+    TempDir dir;
+    const auto tar = make_rootfs_tar();
+    const std::string out_dir = dir / "out";
+    REQUIRE(::mkdir(out_dir.c_str(), 0755) == 0);
+    const std::vector<uint8_t> victim_bytes = {'k', 'e', 'e', 'p'};
+    const std::string victim = test::write_file(dir / "victim", victim_bytes);
+    const std::string victim_sha = file_sha256(victim);
+    const std::string lsmt_path = out_dir + "/rootfs.lsmt";
+    const std::string raw_path = out_dir + "/.rootfs.ext2.tmp";
+    REQUIRE(::symlink(victim.c_str(), lsmt_path.c_str()) == 0);
+    REQUIRE(::symlink(victim.c_str(), raw_path.c_str()) == 0);
+
+    const auto result = run_convert({"--input", "-", "--out-dir", out_dir,
+                                     "--name", "rootfs", "--keep-raw"}, &tar);
+    REQUIRE(result.exit_code == 0);
+    REQUIRE(file_sha256(victim) == victim_sha);
+
+    struct stat st {};
+    REQUIRE(::lstat(lsmt_path.c_str(), &st) == 0);
+    REQUIRE(S_ISREG(st.st_mode));
+    REQUIRE(::lstat(raw_path.c_str(), &st) == 0);
+    REQUIRE(S_ISREG(st.st_mode));
+}
+
+// NOTE: name on one source line (check-docs extracts names line-wise).
+TEST_CASE("cli: obd-convert reports usage errors with exit 2", "[cli]") {
+    const auto unknown = run_convert({"--unknown"});
+    REQUIRE(unknown.exit_code == 2);
+    REQUIRE(unknown.err.find("unknown argument") != std::string::npos);
+
+    const auto missing = run_convert({"--input"});
+    REQUIRE(missing.exit_code == 2);
+    REQUIRE(missing.err.find("missing value for --input") != std::string::npos);
+
+    const auto bad_size =
+        run_convert({"--input", "rootfs.tar", "--out-dir", "out", "--size", "abc"});
+    REQUIRE(bad_size.exit_code == 2);
+    REQUIRE(bad_size.err.find("--size must be a positive integer") !=
+            std::string::npos);
 }
 
 // NOTE: name on one source line (check-docs extracts names line-wise).
@@ -372,4 +482,23 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
     REQUIRE(result.err.find("unsupported tar entry type") != std::string::npos);
     struct stat st {};
     REQUIRE(::stat((out_dir + "/bad.lsmt").c_str(), &st) != 0);
+
+    const std::string many_dir = dir / "many-dir";
+    const auto many = make_many_root_files_tar(4100);
+    const auto dir_result = run_convert({"--input", "-", "--out-dir", many_dir,
+                                         "--name", "many"}, &many);
+    REQUIRE(dir_result.exit_code == 1);
+    REQUIRE(dir_result.err.find("directories up to 12 data blocks") !=
+            std::string::npos);
+    REQUIRE(::stat((many_dir + "/many.lsmt").c_str(), &st) != 0);
+
+    const std::string many_inode_dir = dir / "many-inodes";
+    const auto many_inodes = make_many_inode_tar();
+    const std::string many_inode_tar = test::write_file(dir / "many-inodes.tar",
+                                                        many_inodes);
+    const auto inode_result = run_convert({"--input", many_inode_tar, "--out-dir",
+                                           many_inode_dir, "--name", "many"});
+    REQUIRE(inode_result.exit_code == 1);
+    REQUIRE(inode_result.err.find("at most 32768 inodes") != std::string::npos);
+    REQUIRE(::stat((many_inode_dir + "/many.lsmt").c_str(), &st) != 0);
 }

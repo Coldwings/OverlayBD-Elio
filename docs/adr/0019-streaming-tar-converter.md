@@ -34,9 +34,9 @@ fields that would otherwise vary by host or time are pinned: timestamps are
 zero, filesystem identity is deterministic/static, directory order is stable,
 and the LSMT UUID is derived from the raw filesystem digest rather than
 randomness. The supported filesystem feature set is deliberately small:
-regular files, directories, and short inline symlinks; 4 KiB ext2 blocks; uid
-and gid values up to 65535; single-indirect regular file data; and images up to
-128 MiB.
+regular files, directories up to 12 data blocks, and short inline symlinks; 4
+KiB ext2 blocks; uid and gid values up to 65535; at most 32768 inodes;
+single-indirect regular file data; and images up to 128 MiB.
 
 A future pinned libe2fs backend may be added behind the same binary when it is
 needed for broader ext4 features, but it remains converter-local. The data
@@ -52,6 +52,8 @@ and keep the built-in backend available for default CI.
   rootfs-tar image authoring.
 - Converter-produced layers are ordinary sealed LSMT lowers and can be pasted
   into `config.json` just like committed layers.
+- Output assembly happens in a private temporary workspace below `--out-dir`;
+  only completed files are atomically renamed to the documented output paths.
 - The first implementation is intentionally bounded. Tar entries outside the
   documented subset fail clearly before an LSMT layer is published.
 - Broader ext4 feature coverage, PAX/xattrs, devices, hardlinks, sparse tar

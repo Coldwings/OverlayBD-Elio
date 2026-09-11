@@ -960,8 +960,9 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
 - **Converter determinism (ADR-0019).** `obd-convert` writes a deterministic
   raw filesystem image first, then calls `write_lsmt_single_layer` with an
   explicit UUID derived from that raw image's SHA-256 digest and a fixed
-  converter tag. The resulting LSMT file is a standard sealed lower; pinned by
-  `cli: obd-convert builds a deterministic ext2 layer from tar`.
+  converter tag, using a private temporary workspace before atomically
+  publishing the final path. The resulting LSMT file is a standard sealed lower;
+  pinned by `cli: obd-convert builds a deterministic ext2 layer from tar`.
 - **Error channels.** Cold paths (`open`, `parse`, writers) throw
   `obd::format_error` / `obd::error`; hot paths (`pread`/`pwrite`/`flush`)
   return negative -errno and never throw (the `source::BlobSource`
