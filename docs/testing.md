@@ -603,6 +603,10 @@ Every test, grouped by area, with the property it guards.
 - `image: trace recording stop drains an awakened duration timer` —
   explicit shutdown stop waits for a timer that already woke before it
   touched recorder state.
+- `image: trace recording expiry callback is skipped when explicit stop wins` —
+  a timer that already captured the expiry callback but loses finalization
+  to an explicit shutdown stop returns that shutdown result without
+  emitting an expiry callback.
 - `image: trace recording shutdown joins expiry finalization` —
   shutdown stop joins an expiry-owned finalize while `recording()` is
   already false and returns the expiry result.

@@ -228,8 +228,8 @@ private:
         uint64_t generation, uint32_t duration_sec,
         std::shared_ptr<elio::coro::cancel_source> cancel);
 
-    elio::coro::task<FinalizeResult> stop_impl(std::string reason,
-                                               bool from_timer);
+    elio::coro::task<FinalizeResult> stop_impl(
+        std::string reason, bool from_timer, bool* owns_finalize = nullptr);
     elio::coro::task<void> drain_timer_task(
         std::shared_ptr<TimerDrain> drain);
 

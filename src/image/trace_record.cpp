@@ -311,8 +311,10 @@ elio::coro::task<void> TraceRecorder::run_timer(
     // Duration expired: finalize exactly like an explicit stop; the
     // CLI's fate is irrelevant (ADR-0013 server-side bound). This is
     // the timer itself, so it must not try to join its own handle.
-    FinalizeResult res = co_await stop_impl("expired", /*from_timer=*/true);
-    if (cb) {
+    bool owns_expiry_finalize = false;
+    FinalizeResult res = co_await stop_impl(
+        "expired", /*from_timer=*/true, &owns_expiry_finalize);
+    if (owns_expiry_finalize && cb) {
         TimerCallbackScope callback_scope(this, res);
         cb(res);
     }
@@ -389,7 +391,7 @@ elio::coro::task<void> TraceRecorder::drain_timer_task(
 }
 
 elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
-    std::string reason, bool from_timer) {
+    std::string reason, bool from_timer, bool* owns_finalize_out) {
     // A concurrent stop while another caller is finalizing (an explicit
     // stop racing the duration expiry) captures that finalization's
     // completion object and waits for exactly that result. It must not
@@ -475,6 +477,9 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
     }
     if (!have_result) {
         res.error = "no trace recording in progress";
+    }
+    if (owns_finalize_out != nullptr) {
+        *owns_finalize_out = owns_finalize;
     }
     if (!from_timer && drain_to_join) {
         co_await drain_timer_task(std::move(drain_to_join));
