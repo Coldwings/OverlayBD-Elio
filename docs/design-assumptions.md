@@ -147,6 +147,8 @@ keep flowing through P2P). The rules:
   already-issued scavenger request.
 - **Extent-granular dedup happens below the funnel** (A11's in-flight
   map): a request for an extent already being fetched joins that fetch,
-  whatever class started it.
+  whatever class started it. Queued scavenger admission is not published
+  as in-flight work, so a later on-demand miss never inherits prefetch's
+  wait or local skip result.
 - **Source clients stay class-agnostic** — the funnel governs admission,
   never source selection (A9's fallback semantics are untouched).

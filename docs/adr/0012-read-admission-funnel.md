@@ -58,7 +58,9 @@ through a single admission funnel before reaching the source client
 - **All classes deduplicate at extent granularity.** The funnel consults
   the LayerStore's in-flight map (ADR-0011): a request for an extent
   already being fetched joins the in-flight fetch instead of issuing a
-  duplicate, whatever class issued the first one.
+  duplicate, whatever class issued the first one. A scavenger still
+  queued for admission is not yet in-flight work and cannot make a later
+  on-demand miss wait or inherit a local skip result.
 - The source chain grows a **populate(offset, len) verb** — "fetch into
   the local store without delivering data to the caller" — with a default
   no-op implementation; the LayerStore-backed layer implements it, and
