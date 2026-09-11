@@ -621,6 +621,13 @@ Every test, grouped by area, with the property it guards.
   a stop task created re-entrantly from the expiry callback returns the
   captured expiry result without joining its own timer or stopping a
   restarted recording, and a callback-created start is rejected.
+- `image: trace recording external stop during expiry callback drains timer` —
+  a stop task created by another thread while the expiry callback is
+  running still waits for the timer frame to finish before returning.
+- `image: trace recording external start during expiry callback drains timer` —
+  a start task created by another thread while the expiry callback is
+  running waits for the stale timer drain instead of being rejected as
+  callback-reentrant.
 - `image: trace recording stale stop never drains a restarted timer` —
   a late stop waiting on an old timer drain stays bound to that old
   timer after a new recording starts.

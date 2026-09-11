@@ -15,6 +15,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace obd::image {
@@ -35,11 +36,18 @@ TraceRecorder::TimerCallbackScope::TimerCallbackScope(
     : recorder_(recorder) {
     std::lock_guard<std::mutex> lk(recorder_.mu_);
     recorder_.timer_callback_result_ = std::move(result);
+    recorder_.timer_callback_thread_ = std::this_thread::get_id();
 }
 
 TraceRecorder::TimerCallbackScope::~TimerCallbackScope() {
     std::lock_guard<std::mutex> lk(recorder_.mu_);
     recorder_.timer_callback_result_.reset();
+    recorder_.timer_callback_thread_ = std::thread::id{};
+}
+
+bool TraceRecorder::in_timer_callback_locked() const {
+    return timer_callback_result_.has_value() &&
+           timer_callback_thread_ == std::this_thread::get_id();
 }
 
 void TraceRecorder::record(uint32_t layer_index, uint64_t offset,
@@ -102,7 +110,7 @@ elio::coro::task<bool> TraceRecorder::start(
     bool from_timer_callback = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        from_timer_callback = timer_callback_result_.has_value();
+        from_timer_callback = in_timer_callback_locked();
     }
     return start_impl(std::move(path), duration_sec, std::move(on_expire),
                       error, from_timer_callback);
@@ -294,7 +302,7 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
     FinalizeResult result;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (timer_callback_result_.has_value()) {
+        if (in_timer_callback_locked()) {
             result = *timer_callback_result_;
             return ready_finalize_result(std::move(result));
         }

@@ -274,9 +274,12 @@ docs/operations.md. Design:
   that run after an expiry-owned finalize. Device shutdown therefore
   calls `stop()` for any recorder, even when `recording()` is already
   false. `stop()` is idempotent: a stop racing the expiry waits for the
-  in-flight finalize and returns its stats. A stop task created from the
-  expiry callback captures and returns that expiry result without trying
-  to join the callback's own timer.
+  in-flight finalize and returns its stats. A stop task created on the
+  expiry callback's execution thread captures and returns that expiry
+  result without trying to join the callback's own timer. Calls created
+  by other threads while the callback is still running remain external
+  calls: they wait for the timer drain instead of using the callback's
+  reentrant fast path.
 
 ### The writable mode (ADR-0008)
 
@@ -928,6 +931,13 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   a stop task created re-entrantly from the expiry callback returns the
   captured expiry result without joining its own timer or stopping a
   restarted recording, and a callback-created start is rejected;
+  `image: trace recording external stop during expiry callback drains timer` —
+  a stop task created by another thread while the expiry callback is
+  running still waits for the timer frame to finish before returning;
+  `image: trace recording external start during expiry callback drains timer` —
+  a start task created by another thread while the expiry callback is
+  running waits for the stale timer drain instead of being rejected as
+  callback-reentrant;
   `image: trace recording stale stop never drains a restarted timer` —
   a late stop waiting on an old timer drain stays bound to that old
   timer after a new recording starts;

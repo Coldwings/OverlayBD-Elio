@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace obd;
@@ -1008,6 +1009,172 @@ TEST_CASE("image: trace recording expiry callback stop never joins itself",
     REQUIRE_FALSE(callback_start_ok);
     REQUIRE(callback_start_error.find("expiry callback") !=
             std::string::npos);
+    REQUIRE(cleanup_stop.has_value());
+    REQUIRE(cleanup_stop->ok);
+    REQUIRE(cleanup_stop->reason == "cleanup");
+    REQUIRE(parse_file(out).size() == 1);
+    REQUIRE(parse_file(next_out).empty());
+}
+
+TEST_CASE("image: trace recording external stop during expiry callback drains timer",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 82);
+    const std::string out = dir / "out.trace";
+    std::atomic<bool> timer_exit_entered{false};
+    std::atomic<bool> timer_exit_release{false};
+    std::atomic<bool> external_task_created{false};
+    std::optional<elio::coro::task<image::TraceRecorder::FinalizeResult>>
+        external_stop_task;
+    std::optional<image::TraceRecorder::FinalizeResult> external_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> cleanup_stop;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_exit_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_exit_entered.store(true, std::memory_order_release);
+                while (!timer_exit_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult&) {
+                std::thread external([&] {
+                    external_stop_task.emplace(rec->stop("external"));
+                    external_task_created.store(true,
+                                                std::memory_order_release);
+                });
+                external.join();
+            },
+            error);
+        if (!started) co_return 1;
+        const ssize_t r = co_await read_at(tap, 0, 4096);
+        if (r != 4096) {
+            timer_exit_release.store(true, std::memory_order_release);
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool exit_held = co_await wait_until([&] {
+            return timer_exit_entered.load(std::memory_order_acquire) &&
+                   external_task_created.load(std::memory_order_acquire);
+        });
+        if (!exit_held || !external_stop_task) {
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto external_stop_handle =
+            elio::spawn(std::move(*external_stop_task));
+        co_await elio::time::sleep_for(20ms);
+        if (external_stop_handle.is_ready() ||
+            external_stop_handle.is_destroyed()) {
+            external_stop = co_await await_stop_handle(external_stop_handle);
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 4;
+        }
+        timer_exit_release.store(true, std::memory_order_release);
+        external_stop = co_await await_stop_handle(external_stop_handle);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(external_stop.has_value());
+    REQUIRE(external_stop->ok);
+    REQUIRE(external_stop->reason == "expired");
+    REQUIRE(external_stop->records == 1);
+    REQUIRE_FALSE(cleanup_stop.has_value());
+    REQUIRE(parse_file(out).size() == 1);
+}
+
+TEST_CASE("image: trace recording external start during expiry callback drains timer",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 83);
+    const std::string out = dir / "out.trace";
+    const std::string next_out = dir / "next.trace";
+    std::atomic<bool> timer_exit_entered{false};
+    std::atomic<bool> timer_exit_release{false};
+    std::atomic<bool> external_task_created{false};
+    std::optional<elio::coro::task<bool>> external_start_task;
+    std::optional<image::TraceRecorder::FinalizeResult> cleanup_stop;
+    bool external_start_ok = false;
+    std::string external_start_error;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_exit_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_exit_entered.store(true, std::memory_order_release);
+                while (!timer_exit_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult&) {
+                std::thread external([&] {
+                    external_start_task.emplace(rec->start(
+                        next_out, 300,
+                        [](const image::TraceRecorder::FinalizeResult&) {},
+                        external_start_error));
+                    external_task_created.store(true,
+                                                std::memory_order_release);
+                });
+                external.join();
+            },
+            error);
+        if (!started) co_return 1;
+        const ssize_t r = co_await read_at(tap, 0, 4096);
+        if (r != 4096) {
+            timer_exit_release.store(true, std::memory_order_release);
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool exit_held = co_await wait_until([&] {
+            return timer_exit_entered.load(std::memory_order_acquire) &&
+                   external_task_created.load(std::memory_order_acquire);
+        });
+        if (!exit_held || !external_start_task) {
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto external_start_handle =
+            elio::spawn(std::move(*external_start_task));
+        co_await elio::time::sleep_for(20ms);
+        if (external_start_handle.is_ready() ||
+            external_start_handle.is_destroyed()) {
+            external_start_ok = co_await await_bool_handle(
+                external_start_handle);
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 4;
+        }
+        timer_exit_release.store(true, std::memory_order_release);
+        external_start_ok = co_await await_bool_handle(external_start_handle);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        if (!external_start_ok) co_return 5;
+        cleanup_stop = co_await rec->stop("cleanup");
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(external_start_ok);
+    REQUIRE(external_start_error.empty());
     REQUIRE(cleanup_stop.has_value());
     REQUIRE(cleanup_stop->ok);
     REQUIRE(cleanup_stop->reason == "cleanup");

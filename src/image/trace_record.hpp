@@ -51,6 +51,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 namespace obd::image {
 
@@ -244,6 +245,7 @@ private:
         std::string reason, bool from_timer, bool* owns_finalize = nullptr);
     elio::coro::task<void> drain_timer_task(
         std::shared_ptr<TimerDrain> drain);
+    bool in_timer_callback_locked() const;
 
     /// Shared finalize: drain + write + fsync + digest. Caller holds
     /// state transition; returns the filled result (reason set by caller).
@@ -268,6 +270,7 @@ private:
     std::optional<elio::coro::join_handle<void>> timer_task_;
     std::shared_ptr<TimerDrain> timer_drain_;
     std::optional<FinalizeResult> timer_callback_result_;
+    std::thread::id timer_callback_thread_;
     std::function<elio::coro::task<void>()> finalize_hook_;      // test-only
     std::function<elio::coro::task<void>()> start_hook_;         // test-only
     std::function<elio::coro::task<void>()> stop_claim_hook_;    // test-only

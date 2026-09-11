@@ -26,6 +26,7 @@
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
 #include <elio/sync/mutex.hpp>
+#include <elio/time/timer.hpp>
 
 #include <sys/socket.h>
 
@@ -40,6 +41,7 @@
 #include <mutex>
 #include <string>
 #include <system_error>
+#include <vector>
 #include <unistd.h>
 
 namespace {
@@ -49,6 +51,54 @@ namespace {
 constexpr uint64_t kVsize = 512 * 64;
 constexpr uint32_t kPayloadSeed = 4242;
 constexpr size_t kPayloadBytes = 512 * 16;
+
+class TraceWorkloads {
+public:
+    void spawn(obd::source::BlobSource* root) {
+        std::lock_guard<std::mutex> lock(mu_);
+        tasks_.reserve(tasks_.size() + 1);
+        tasks_.push_back(elio::spawn(
+            [root]() -> elio::coro::task<void> {
+                char buf[4096];
+                for (const uint64_t off : {uint64_t{65536},
+                                           uint64_t{131072},
+                                           uint64_t{196608}}) {
+                    const ssize_t r =
+                        co_await root->pread(buf, sizeof(buf), off);
+                    if (r < 0) {
+                        ELIO_LOG_WARNING(
+                            "fake workload read at {} failed: {}",
+                            off, (int)-r);
+                    }
+                }
+            }));
+    }
+
+    elio::coro::task<void> join() {
+        std::vector<elio::coro::join_handle<void>> tasks;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            tasks.swap(tasks_);
+        }
+        for (auto& task : tasks) {
+            while (!task.is_destroyed()) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            try {
+                task.await_resume();
+            } catch (const std::exception& e) {
+                ELIO_LOG_WARNING("fake workload failed: {}", e.what());
+            } catch (...) {
+                ELIO_LOG_WARNING("fake workload failed: unknown exception");
+            }
+        }
+        co_return;
+    }
+
+private:
+    std::mutex mu_;
+    std::vector<elio::coro::join_handle<void>> tasks_;
+};
 
 struct Args {
     std::string config;
@@ -93,6 +143,7 @@ elio::coro::task<int> fake_main(Args args) {
         auto trace_start_stopping =
             std::make_shared<std::atomic<bool>>(false);
         auto trace_start_gate = std::make_shared<elio::sync::mutex>();
+        auto trace_workloads = std::make_shared<TraceWorkloads>();
         auto close_trace_start_admission = [&]() -> elio::coro::task<void> {
             trace_start_stopping->store(true, std::memory_order_release);
             co_await trace_start_gate->lock();
@@ -267,21 +318,8 @@ elio::coro::task<int> fake_main(Args args) {
             obd::supervisor::DeviceControlHooks hooks;
             if (opened.has_value()) {
                 auto* root = opened->root.get();
-                hooks.on_start = [root]() {
-                    elio::go([root]() -> elio::coro::task<void> {
-                        char buf[4096];
-                        for (const uint64_t off : {uint64_t{65536},
-                                                   uint64_t{131072},
-                                                   uint64_t{196608}}) {
-                            const ssize_t r =
-                                co_await root->pread(buf, sizeof(buf), off);
-                            if (r < 0) {
-                                ELIO_LOG_WARNING(
-                                    "fake workload read at {} failed: {}",
-                                    off, (int)-r);
-                            }
-                        }
-                    });
+                hooks.on_start = [root, trace_workloads]() {
+                    trace_workloads->spawn(root);
                 };
             }
             // D3 resize executor seam (no kernel): current_size returns
@@ -343,6 +381,10 @@ elio::coro::task<int> fake_main(Args args) {
         // flag while the timer coroutine may still be alive.
         if (opened.has_value()) {
             co_await close_trace_start_admission();
+            // `opened` owns the raw root captured by the synthetic trace
+            // workload. Keep the image chain alive until every retained
+            // workload coroutine has left its read path.
+            co_await trace_workloads->join();
             if (opened->recorder) {
                 const auto tres = co_await opened->recorder->stop("shutdown");
                 if (!tres.ok &&
