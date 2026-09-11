@@ -321,8 +321,9 @@ contracts above:
   a crashed child in recovery mode up to `max_recovery_attempts`
   (ADR-0010). Older kernels that reject the recovery flags degrade to a
   non-recoverable device at create time. Recovery reassembles the image
-  from durable inputs: unsealed LSMT-RW writes that never reached a
-  graceful shutdown checkpoint are lost.
+  from restart-recoverable inputs: sealed lowers and sparse writable
+  extents can be reopened, but an unsealed LSMT-RW upper is not reopened
+  by recovery even if graceful shutdown wrote a checkpoint.
 - **Prefetch** covers the structural head/tail warm-up (ADR-0012) and
   trace replay (the upstream trace blob IS replayed through `populate`
   when the image config marks an `accelerationLayer`, ADR-0013 — see
