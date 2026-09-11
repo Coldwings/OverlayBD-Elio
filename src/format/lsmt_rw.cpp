@@ -13,14 +13,32 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
+#include <utility>
 
 namespace obd::format {
+
+class LsmtRwLayer::FdHandle final {
+public:
+    explicit FdHandle(int value) : fd_(value) {}
+    FdHandle(const FdHandle&) = delete;
+    FdHandle& operator=(const FdHandle&) = delete;
+    ~FdHandle() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+
+    int get() const noexcept { return fd_; }
+
+private:
+    int fd_;
+};
 
 /// BlobSource view over the RW fd with a dynamically tracked size
 /// (a LocalFileSource pins st_size at open and would hide appended data).
 class LsmtRwLayer::View final : public source::BlobSource {
 public:
-    View(int fd, const std::atomic<uint64_t>* data_bytes, std::string label)
+    View(const std::atomic<std::shared_ptr<FdHandle>>* fd,
+         const std::atomic<uint64_t>* data_bytes, std::string label)
         : fd_(fd), data_bytes_(data_bytes), label_(std::move(label)) {}
 
     elio::coro::task<ssize_t> pread(void* buf, size_t count,
@@ -31,8 +49,10 @@ public:
             count = static_cast<size_t>(bound - offset);
         }
         if (count == 0) co_return 0;
+        auto handle = fd_->load(std::memory_order_acquire);
+        if (!handle) co_return -EBADF;
         const auto r = co_await elio::io::async_read(
-            fd_, buf, count, static_cast<off_t>(offset));
+            handle->get(), buf, count, static_cast<off_t>(offset));
         co_return r.result;
     }
 
@@ -42,19 +62,37 @@ public:
     std::string_view label() const noexcept override { return label_; }
 
 private:
-    int fd_;
+    const std::atomic<std::shared_ptr<FdHandle>>* fd_;
     const std::atomic<uint64_t>* data_bytes_;
     std::string label_;
 };
 
-LsmtRwLayer::~LsmtRwLayer() {
-    // View borrows fd_ and data_bytes_; callers must drain IO before destruction.
-    if (fd_ >= 0) ::close(fd_);
-}
+LsmtRwLayer::~LsmtRwLayer() = default;
 
 source::BlobSource& LsmtRwLayer::data_source() { return *view_; }
 
 namespace {
+
+template<class F>
+class ScopeExit {
+public:
+    explicit ScopeExit(F fn) : fn_(std::move(fn)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() {
+        if (active_) fn_();
+    }
+    void dismiss() noexcept { active_ = false; }
+
+private:
+    F fn_;
+    bool active_ = true;
+};
+
+template<class F>
+ScopeExit<F> make_scope_exit(F fn) {
+    return ScopeExit<F>(std::move(fn));
+}
 
 // Cold-path descriptors must also close when allocation/serialization throws.
 // For compaction output, unlink the unpublished file during unwinding too.
@@ -66,8 +104,14 @@ struct FdGuard {
         : fd(value), unlink_path(path) {}
     FdGuard(const FdGuard&) = delete;
     FdGuard& operator=(const FdGuard&) = delete;
+    int release() {
+        unlink_path = nullptr;
+        const int value = fd;
+        fd = -1;
+        return value;
+    }
     ~FdGuard() {
-        ::close(fd);
+        if (fd >= 0) ::close(fd);
         if (unlink_path != nullptr) ::unlink(unlink_path->c_str());
     }
 };
@@ -164,16 +208,51 @@ std::string uuid_from_content_digest(const std::string& digest_hex) {
 
 }  // namespace
 
+int LsmtRwLayer::begin_grow_op() {
+    std::lock_guard<std::mutex> lock(state_gate_mu_);
+    if (terminal_op_in_progress_ || grow_op_in_progress_) return -EBUSY;
+    if (sealed_.load(std::memory_order_acquire) ||
+        checkpointed_.load(std::memory_order_acquire)) {
+        return -EROFS;
+    }
+    grow_op_in_progress_ = true;
+    return 0;
+}
+
+void LsmtRwLayer::end_grow_op() {
+    std::lock_guard<std::mutex> lock(state_gate_mu_);
+    grow_op_in_progress_ = false;
+}
+
+int LsmtRwLayer::begin_terminal_op(bool allow_checkpointed) {
+    std::lock_guard<std::mutex> lock(state_gate_mu_);
+    if (terminal_op_in_progress_ || grow_op_in_progress_) return -EBUSY;
+    if (sealed_.load(std::memory_order_acquire)) {
+        return -EROFS;
+    }
+    if (!allow_checkpointed &&
+        checkpointed_.load(std::memory_order_acquire)) {
+        return -EROFS;
+    }
+    terminal_op_in_progress_ = true;
+    return 0;
+}
+
+void LsmtRwLayer::end_terminal_op() {
+    std::lock_guard<std::mutex> lock(state_gate_mu_);
+    terminal_op_in_progress_ = false;
+}
+
 elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
     const std::string& path, uint64_t vsize) {
     if (vsize == 0 || vsize % kSector != 0) {
         throw error(EINVAL, "lsmt rw vsize must be sector aligned");
     }
     auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer);
-    layer->fd_ =
+    const int fd =
         ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    const int fd = layer->fd_;
     if (fd < 0) throw_errno(errno, "cannot create lsmt rw layer " + path);
+    FdGuard opened(fd);
     layer->vsize_.store(vsize, std::memory_order_release);
     layer->data_end_sector_ = kHeaderSectors;
     layer->uuid_ = generate_uuid();
@@ -189,9 +268,12 @@ elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
         rc != 0) {
         throw_errno(-rc, "cannot write lsmt rw header " + path);
     }
+    auto handle = std::make_shared<FdHandle>(fd);
+    opened.release();
+    layer->fd_.store(std::move(handle), std::memory_order_release);
     layer->data_bytes_.store(4096, std::memory_order_release);
-    layer->view_ = std::make_unique<LsmtRwLayer::View>(fd, &layer->data_bytes_,
-                                                       "lsmt-rw:" + path);
+    layer->view_ = std::make_unique<LsmtRwLayer::View>(
+        &layer->fd_, &layer->data_bytes_, "lsmt-rw:" + path);
     co_return layer;
 }
 
@@ -202,14 +284,16 @@ int LsmtRwLayer::grow(uint64_t vsize) {
     // an equal request is an idempotent no-op (retried grows after a
     // partial kernel failure land here); smaller is a shrink and is
     // rejected.
-    if (sealed_.load(std::memory_order_acquire) ||
-        checkpointed_.load(std::memory_order_acquire)) {
-        return -EROFS;
-    }
+    const int gate = begin_grow_op();
+    if (gate != 0) return gate;
+    auto gate_guard = make_scope_exit([this] { end_grow_op(); });
     if (vsize == 0 || vsize % kSector != 0) return -EINVAL;
     const uint64_t cur = vsize_.load(std::memory_order_acquire);
     if (vsize < cur) return -EINVAL;  // grow-only (equal = no-op)
     if (vsize == cur) return 0;
+    auto handle = fd_.load(std::memory_order_acquire);
+    if (!handle) return -EBADF;
+    const int fd = handle->get();
     // Rebuild the on-disk header (the 4096B region at offset 0) with the
     // new declared size, preserving the uuid/flags exactly as create()
     // wrote them. This keeps the checkpoint-vs-header cross-check and the
@@ -224,7 +308,7 @@ int LsmtRwLayer::grow(uint64_t vsize) {
     // would make the upper UNCOMMITTABLE. Therefore: back the header up
     // first, and on ANY failure restore it and leave vsize_ untouched.
     uint8_t backup[4096];
-    if (::pread(fd_, backup, sizeof(backup), 0) !=
+    if (::pread(fd, backup, sizeof(backup), 0) !=
         static_cast<ssize_t>(sizeof(backup))) {
         return -EIO;  // cannot guarantee rollback: do not touch anything
     }
@@ -235,29 +319,29 @@ int LsmtRwLayer::grow(uint64_t vsize) {
     ht.serialize(region);
     // A SHORT write is a hard error: errno may be stale (or 0) after a
     // partial ::pwrite, so it is never trusted here.
-    if (::pwrite(fd_, region, sizeof(region), 0) !=
+    if (::pwrite(fd, region, sizeof(region), 0) !=
         static_cast<ssize_t>(sizeof(region))) {
-        if (::pwrite(fd_, backup, sizeof(backup), 0) !=
+        if (::pwrite(fd, backup, sizeof(backup), 0) !=
             static_cast<ssize_t>(sizeof(backup))) {
             ELIO_LOG_ERROR(
                 "lsmt rw grow: header restore FAILED after a short write; "
                 "{} may no longer be committable (header inconsistent)",
                 path_);
         } else {
-            ::fsync(fd_);
+            ::fsync(fd);
         }
         return -EIO;
     }
-    if (::fsync(fd_) != 0) {
+    if (::fsync(fd) != 0) {
         const int e = errno;
-        if (::pwrite(fd_, backup, sizeof(backup), 0) !=
+        if (::pwrite(fd, backup, sizeof(backup), 0) !=
             static_cast<ssize_t>(sizeof(backup))) {
             ELIO_LOG_ERROR(
                 "lsmt rw grow: header restore FAILED after fsync error; "
                 "{} may no longer be committable (header inconsistent)",
                 path_);
         } else {
-            ::fsync(fd_);
+            ::fsync(fd);
         }
         return -e;
     }
@@ -278,6 +362,9 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
     }
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
     if (offset + count > cur_vsize) co_return -EINVAL;
+    auto handle = fd_.load(std::memory_order_acquire);
+    if (!handle) co_return -EBADF;
+    const int fd = handle->get();
 
     const uint8_t* src = static_cast<const uint8_t*>(buf);
     size_t done = 0;
@@ -322,7 +409,7 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
             const size_t src_off =
                 static_cast<size_t>(op.voff * kSector - offset);
             if (const int rc = co_await write_all(
-                    fd_, src + src_off, nbytes, op.moff * kSector);
+                    fd, src + src_off, nbytes, op.moff * kSector);
                 rc != 0) {
                 co_return rc;
             }
@@ -373,7 +460,12 @@ elio::coro::task<ssize_t> LsmtRwLayer::pread(void* buf, size_t count,
     if (offset % kSector != 0 || count % kSector != 0) co_return -EINVAL;
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
     if (offset >= cur_vsize) co_return 0;
-    if (count > cur_vsize - offset) count = static_cast<size_t>(cur_vsize - offset);
+    if (count > cur_vsize - offset) {
+        count = static_cast<size_t>(cur_vsize - offset);
+    }
+    auto handle = fd_.load(std::memory_order_acquire);
+    if (!handle) co_return -EBADF;
+    const int fd = handle->get();
     uint8_t* out = static_cast<uint8_t*>(buf);
     size_t done = 0;
     while (done < count) {
@@ -393,7 +485,7 @@ elio::coro::task<ssize_t> LsmtRwLayer::pread(void* buf, size_t count,
                 (hit->moffset + (sector - hit->offset)) * kSector;
             const size_t n = static_cast<size_t>(
                 std::min<uint64_t>(hit->end() * kSector - pos, count - done));
-            if (const int rc = co_await read_all(fd_, out + done, n, mbyte);
+            if (const int rc = co_await read_all(fd, out + done, n, mbyte);
                 rc != 0) {
                 co_return rc;
             }
@@ -468,15 +560,19 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
 }
 
 elio::coro::task<int> LsmtRwLayer::flush() {
-    if (::fdatasync(fd_) != 0) co_return -errno;
+    auto handle = fd_.load(std::memory_order_acquire);
+    if (!handle) co_return -EBADF;
+    if (::fdatasync(handle->get()) != 0) co_return -errno;
     co_return 0;
 }
 
 elio::coro::task<int> LsmtRwLayer::checkpoint() {
-    if (sealed_.load(std::memory_order_acquire) ||
-        checkpointed_.load(std::memory_order_acquire)) {
-        co_return -EROFS;
-    }
+    const int gate = begin_terminal_op(false);
+    if (gate != 0) co_return gate;
+    auto gate_guard = make_scope_exit([this] { end_terminal_op(); });
+    auto handle = fd_.load(std::memory_order_acquire);
+    if (!handle) co_return -EBADF;
+    const int fd = handle->get();
 
     // Appended at the data end: index (SegmentMapping array, padded to
     // 4096B) | unsealed trailer (4096B). The trailer sits in the file's
@@ -496,7 +592,7 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
             idx.data() + i * bytes::segment_mapping::kEncodedSize,
             segments_[i]);
     }
-    int rc = co_await write_all(fd_, idx.data(), idx.size(), index_offset);
+    int rc = co_await write_all(fd, idx.data(), idx.size(), index_offset);
     if (rc != 0) co_return rc;
 
     uint8_t region[4096];
@@ -506,10 +602,10 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
                                  vsize_.load(std::memory_order_acquire),
                                  uuid_, "");
     trailer.serialize(region);
-    rc = co_await write_all(fd_, region, sizeof(region),
+    rc = co_await write_all(fd, region, sizeof(region),
                             index_offset + index_region);
     if (rc != 0) co_return rc;
-    if (::fdatasync(fd_) != 0) co_return -errno;
+    if (::fdatasync(fd) != 0) co_return -errno;
     data_bytes_.store(index_offset + index_region + sizeof(region),
                       std::memory_order_release);
     checkpointed_.store(true, std::memory_order_release);
@@ -517,7 +613,12 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
 }
 
 elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
-    if (sealed_.load(std::memory_order_acquire)) co_return -EROFS;
+    const int gate = begin_terminal_op(true);
+    if (gate != 0) co_return gate;
+    auto gate_guard = make_scope_exit([this] { end_terminal_op(); });
+    auto input = fd_.load(std::memory_order_acquire);
+    if (!input) co_return -EBADF;
+    const int input_fd = input->get();
 
     // Compaction: live segments are copied out packed sequentially; the
     // garbage left behind by in-place edits is dropped. The tmp name is
@@ -533,6 +634,9 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     int rc = 0;
     std::vector<bytes::segment_mapping> packed;
     uint64_t out_sector = kHeaderSectors;
+    uint64_t sealed_bytes = 0;
+    std::string sealed_uuid;
+    std::shared_ptr<FdHandle> sealed_handle;
     std::vector<uint8_t> copy_buf(1 << 20);
     // ADR-0014 seal determinism: the sealed uuid is derived from the
     // content digest sha256(vsize as LE u64 || packed data bytes in
@@ -558,7 +662,7 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
             while (remaining > 0) {
                 const size_t n = static_cast<size_t>(
                     std::min<uint64_t>(remaining, copy_buf.size()));
-                rc = co_await read_all(fd_, copy_buf.data(), n, from);
+                rc = co_await read_all(input_fd, copy_buf.data(), n, from);
                 if (rc != 0) goto out;
                 content_hash.update(copy_buf.data(), n);
                 rc = co_await write_all(out_fd, copy_buf.data(), n, to);
@@ -592,13 +696,14 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
         }
         // With data and index fixed, the content digest — and therefore
         // the sealed uuid — is determined (ADR-0014). Derive it before the
-        // header is written.
+        // header is written, but do not mutate the live layer until the
+        // compacted inode is successfully published.
         content_hash.update(idx.data(), index_bytes);
-        uuid_ = uuid_from_content_digest(content_hash.final_hex());
+        sealed_uuid = uuid_from_content_digest(content_hash.final_hex());
 
         std::memset(region, 0, sizeof(region));
         const auto header = make_ht(true, true, index_offset, index_size,
-                                    seal_vsize, uuid_, user_tag);
+                                    seal_vsize, sealed_uuid, user_tag);
         header.serialize(region);
         rc = co_await write_all(out_fd, region, sizeof(region), 0);
         if (rc != 0) goto out;
@@ -609,15 +714,28 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
 
         std::memset(region, 0, sizeof(region));
         const auto trailer = make_ht(false, true, index_offset, index_size,
-                                     seal_vsize, uuid_, user_tag);
+                                     seal_vsize, sealed_uuid, user_tag);
         trailer.serialize(region);
+        const uint64_t trailer_offset = index_offset + index_region;
         rc = co_await write_all(out_fd, region, sizeof(region),
-                                index_offset + index_region);
+                                trailer_offset);
         if (rc != 0) goto out;
+        sealed_bytes = trailer_offset + sizeof(region);
 
         if (::fdatasync(out_fd) != 0) {
             rc = -errno;
             goto out;
+        }
+        const int live_fd = ::fcntl(out_fd, F_DUPFD_CLOEXEC, 0);
+        if (live_fd < 0) {
+            rc = -errno;
+            goto out;
+        }
+        try {
+            sealed_handle = std::make_shared<FdHandle>(live_fd);
+        } catch (...) {
+            ::close(live_fd);
+            throw;
         }
     }
 
@@ -625,16 +743,12 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
         rc = -errno;
         goto out;
     }
-    output.unlink_path = nullptr;  // rename published the output
+    uuid_ = std::move(sealed_uuid);
     segments_ = std::move(packed);
+    data_bytes_.store(sealed_bytes, std::memory_order_release);
+    fd_.store(std::move(sealed_handle), std::memory_order_release);
+    output.unlink_path = nullptr;  // rename published the output
     sealed_.store(true, std::memory_order_release);
-    {
-        struct stat st {};
-        if (::fstat(fd_, &st) == 0) {
-            data_bytes_.store(static_cast<uint64_t>(st.st_size),
-                              std::memory_order_release);
-        }
-    }
 
 out:
     co_return rc;
@@ -643,12 +757,12 @@ out:
 elio::coro::task<std::unique_ptr<LsmtRwLayer>>
 LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
     auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer);
-    layer->fd_ = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
-    const int fd = layer->fd_;
+    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         *error = -errno;
         co_return nullptr;
     }
+    FdGuard opened(fd);
 
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
@@ -777,8 +891,11 @@ LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
     layer->segments_ = std::move(segments);
     layer->data_bytes_.store(static_cast<uint64_t>(st.st_size),
                              std::memory_order_release);
+    auto handle = std::make_shared<FdHandle>(fd);
+    opened.release();
+    layer->fd_.store(std::move(handle), std::memory_order_release);
     layer->view_ = std::make_unique<LsmtRwLayer::View>(
-        fd, &layer->data_bytes_, "lsmt-rw:" + path);
+        &layer->fd_, &layer->data_bytes_, "lsmt-rw:" + path);
     co_return layer;
 }
 

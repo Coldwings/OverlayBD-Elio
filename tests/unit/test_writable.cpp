@@ -26,6 +26,23 @@
 using namespace obd;
 using obd::test::TempDir;
 
+namespace obd::format {
+
+struct LsmtRwLayerTestAccess {
+    static int begin_grow(LsmtRwLayer& layer) {
+        return layer.begin_grow_op();
+    }
+    static void end_grow(LsmtRwLayer& layer) { layer.end_grow_op(); }
+    static int begin_terminal(LsmtRwLayer& layer, bool allow_checkpointed) {
+        return layer.begin_terminal_op(allow_checkpointed);
+    }
+    static void end_terminal(LsmtRwLayer& layer) {
+        layer.end_terminal_op();
+    }
+};
+
+}  // namespace obd::format
+
 namespace {
 
 uint64_t file_bytes(const std::string& path) {
@@ -257,6 +274,232 @@ TEST_CASE("format: lsmt rw seal compacts into a standard sealed layer",
         REQUIRE(r == 16 * 512);
         REQUIRE(std::memcmp(buf.data(), a.data(), 4 * 512) == 0);
         REQUIRE(std::memcmp(buf.data() + 4 * 512, b.data(), 4 * 512) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: lsmt rw seal rebinds live reads to the compacted inode",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto low = sectors_pattern(0, 1, 720);
+    const auto high = sectors_pattern(16, 1, 721);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        const BackingInode original(path);
+
+        // Allocate the old inode in the reverse physical order: high, then low.
+        ssize_t r = co_await layer->pwrite(high.data(), high.size(), 16 * 512);
+        REQUIRE(r == static_cast<ssize_t>(high.size()));
+        r = co_await layer->pwrite(low.data(), low.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(low.size()));
+        const int drc = co_await layer->discard(32 * 512, 512);
+        REQUIRE(drc == 0);
+
+        std::vector<uint8_t> buf(512);
+        r = co_await layer->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == low);
+        r = co_await layer->pread(buf.data(), buf.size(), 16 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == high);
+
+        const auto& before = layer->segments();
+        REQUIRE(before.size() == 3);
+        REQUIRE(before[0].offset == 0);
+        REQUIRE(before[1].offset == 16);
+        REQUIRE(before[2].zeroed);
+        source::BlobSource& live_before = layer->data_source();
+        r = co_await live_before.pread(buf.data(), buf.size(),
+                                       before[0].moffset * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == low);
+        r = co_await live_before.pread(buf.data(), buf.size(),
+                                       before[1].moffset * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == high);
+        const uint64_t old_size = live_before.size();
+
+        const int src = co_await layer->seal("live-rebind");
+        REQUIRE(src == 0);
+        REQUIRE(layer->sealed());
+        const BackingInode published(path);
+        REQUIRE(original.descriptors() == 0);
+        REQUIRE(published.descriptors() == 1);
+
+        r = co_await layer->pwrite(low.data(), low.size(), 0);
+        REQUIRE(r == -EROFS);
+        r = co_await layer->discard(32 * 512, 512);
+        REQUIRE(r == -EROFS);
+        REQUIRE(layer->grow(512 * 128) == -EROFS);
+        const int repeat_seal = co_await layer->seal("again");
+        REQUIRE(repeat_seal == -EROFS);
+
+        r = co_await layer->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == low);
+        r = co_await layer->pread(buf.data(), buf.size(), 16 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == high);
+        r = co_await layer->pread(buf.data(), buf.size(), 32 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::all_of(buf.begin(), buf.end(),
+                            [](uint8_t v) { return v == 0; }));
+
+        const auto& after = layer->segments();
+        REQUIRE(after.size() == 3);
+        REQUIRE(after[0].offset == 0);
+        REQUIRE(after[1].offset == 16);
+        REQUIRE(after[2].zeroed);
+        r = co_await live_before.pread(buf.data(), buf.size(),
+                                       after[0].moffset * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == low);
+        r = co_await live_before.pread(buf.data(), buf.size(),
+                                       after[1].moffset * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == high);
+        source::BlobSource& live_after = layer->data_source();
+        r = co_await live_after.pread(buf.data(), buf.size(),
+                                      after[0].moffset * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == low);
+        r = co_await live_after.pread(buf.data(), buf.size(),
+                                      after[1].moffset * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == high);
+        REQUIRE(live_after.size() == file_bytes(path));
+        REQUIRE(live_after.size() > old_size);
+
+        auto ro_source = co_await source::LocalFileSource::open(path);
+        auto reopened =
+            co_await format::LsmtLayer::open(std::move(ro_source));
+        REQUIRE(reopened->segments().size() == 3);
+        source::BlobSource& reopened_data = reopened->data_source();
+        r = co_await reopened_data.pread(buf.data(), buf.size(),
+                                         reopened->segments()[0].moffset * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == low);
+        r = co_await reopened_data.pread(buf.data(), buf.size(),
+                                         reopened->segments()[1].moffset * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == high);
+        REQUIRE(reopened->segments()[2].zeroed);
+        reopened.reset();
+        layer.reset();
+        REQUIRE(published.descriptors() == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: lsmt rw failed live seal keeps original backing",
+          "[format][lsmt-fd]") {
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto payload = sectors_pattern(0, 2, 722);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        const BackingInode original(path);
+        const ssize_t wrote =
+            co_await layer->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(wrote == static_cast<ssize_t>(payload.size()));
+        const std::string before = file_sha256(path);
+        const std::string tmp = path + ".sealing." + std::to_string(::getpid());
+
+        bool threw = false;
+        try {
+            const int unexpected =
+                co_await layer->seal(std::string(257, 'x'));
+            (void)unexpected;
+        } catch (const std::system_error& e) {
+            REQUIRE(e.code().value() == EINVAL);
+            threw = true;
+        }
+        REQUIRE(threw);
+        REQUIRE_FALSE(std::filesystem::exists(tmp));
+        REQUIRE_FALSE(layer->sealed());
+        REQUIRE(file_sha256(path) == before);
+        REQUIRE(original.descriptors() == 1);
+
+        std::vector<uint8_t> buf(payload.size());
+        const ssize_t got = co_await layer->pread(buf.data(), buf.size(), 0);
+        REQUIRE(got == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == payload);
+        const int checkpointed = co_await layer->checkpoint();
+        REQUIRE(checkpointed == 0);
+        layer.reset();
+        REQUIRE(original.descriptors() == 0);
+
+        std::string sha;
+        uint64_t size = 0;
+        const int sealed = co_await format::LsmtRwLayer::seal_file(
+            path, "after-failed-live-seal", &sha, &size);
+        REQUIRE(sealed == 0);
+        REQUIRE(sha == file_sha256(path));
+        REQUIRE(size == file_bytes(path));
+
+        auto ro_source = co_await source::LocalFileSource::open(path);
+        auto reopened =
+            co_await format::LsmtLayer::open(std::move(ro_source));
+        source::BlobSource& reopened_data = reopened->data_source();
+        const ssize_t reopened_got =
+            co_await reopened_data.pread(buf.data(), buf.size(),
+                                         reopened->segments()[0].moffset * 512);
+        REQUIRE(reopened_got == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == payload);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: lsmt rw direct terminal and grow gates reject overlaps",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const std::string path2 = dir / "upper2.rw";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+
+        int gate = format::LsmtRwLayerTestAccess::begin_terminal(*layer,
+                                                                 false);
+        REQUIRE(gate == 0);
+        int grow_busy = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 128); });
+        REQUIRE(grow_busy == -EBUSY);
+        const int checkpoint_busy = co_await layer->checkpoint();
+        REQUIRE(checkpoint_busy == -EBUSY);
+        const int seal_busy = co_await layer->seal("busy");
+        REQUIRE(seal_busy == -EBUSY);
+        format::LsmtRwLayerTestAccess::end_terminal(*layer);
+
+        int grow_retry = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 128); });
+        REQUIRE(grow_retry == 0);
+        const int checkpoint_retry = co_await layer->checkpoint();
+        REQUIRE(checkpoint_retry == 0);
+
+        auto layer2 = co_await format::LsmtRwLayer::create(path2, 512 * 64);
+        gate = format::LsmtRwLayerTestAccess::begin_grow(*layer2);
+        REQUIRE(gate == 0);
+        const int checkpoint_while_grow = co_await layer2->checkpoint();
+        REQUIRE(checkpoint_while_grow == -EBUSY);
+        const int seal_while_grow = co_await layer2->seal("busy");
+        REQUIRE(seal_while_grow == -EBUSY);
+        grow_busy = co_await elio::spawn_blocking(
+            [&] { return layer2->grow(512 * 128); });
+        REQUIRE(grow_busy == -EBUSY);
+        format::LsmtRwLayerTestAccess::end_grow(*layer2);
+
+        const int seal_retry = co_await layer2->seal("after-busy");
+        REQUIRE(seal_retry == 0);
+        grow_busy = co_await elio::spawn_blocking(
+            [&] { return layer2->grow(512 * 256); });
+        REQUIRE(grow_busy == -EROFS);
         co_return 0;
     });
     REQUIRE(rc == 0);
