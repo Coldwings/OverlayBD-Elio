@@ -22,6 +22,12 @@ The ublk tests (`tests/unit/test_ublk.cpp`,
 
 - **`run_coro`** — runs a coroutine to completion on a fresh Elio
   scheduler and returns its value; every async test body goes through it.
+- **`ReservedTcpPort`** — asks the kernel for a free loopback TCP
+  port by binding port 0 and reading the OS-assigned port back. Mock
+  server fixtures hold that reservation until immediately before their
+  real listener binds the same port, so test listeners never hard-code
+  ports (issue #15: the fixed 1919x/1920x range collided across sibling
+  worktrees on a shared machine).
 - **`VectorSource`** — an in-memory `BlobSource` with a read counter and
   failure injection (`fail_with(errno)`); the workhorse stub for the
   whole source/format stack.
@@ -45,7 +51,16 @@ multi-blob variant (`BlobMapServer` in
 `tests/integration/test_integration.cpp`) adds per-blob GET/extent
 counters, per-request latency injection, and an optional serialized
 service mode (source capacity 1) for the ADR-0012 admission-funnel
-tests.
+tests. All of these mocks bind an **OS-assigned ephemeral loopback port**
+(reserved via `ReservedTcpPort`, issue #15): no fixed
+1919x/1920x listener remains, so sibling worktrees no longer collide on
+repository-chosen ports. If another process wins the short close-to-bind
+window, the fixture reserves a fresh ephemeral port and tests wait until
+the server is running before publishing URLs or configuration. The
+DART-fallback tests instead need an address that is **guaranteed to have
+nothing listening**; they hold a bound-but-never-listening probe socket
+(`UnusedPort` in `test_integration.cpp`) for the duration of the test, so
+connect probes are refused deterministically.
 
 ## Naming convention
 
@@ -536,6 +551,10 @@ Every test, grouped by area, with the property it guards.
 - `source: DART address parsing and prefixed URL` — `host:port[/prefix]`
   parsing, scheme stripping, `/dart` default prefix, and the
   prefix-passthrough URL shape (ADR-0005).
+- `source: mock registry refreshes port after bind collision` — forces a
+  deterministic close-to-bind `EADDRINUSE` collision on the first reserved
+  mock-registry port, then verifies the fixture publishes a fresh port and
+  serves bytes from the refreshed URL (issue #15).
 - `source: registry range reads and size probe` — HTTP `Range` reads
   return exactly the requested window against the mock registry.
 - `source: registry bearer auth flow via token endpoint` — a 401 with
@@ -1090,6 +1109,12 @@ Every test, grouped by area, with the property it guards.
 - `integration: layered stack stages over a mock registry` — the full
   registry→layer store→tar→zfile→lsmt→merge chain serves correct bytes
   for a multi-layer image.
+- `integration: concurrent mock servers bind distinct ephemeral ports` —
+  issue #15 tripwire: two mock blob servers live at once on one host,
+  each on its own OS-assigned port (never a fixed 1919x/1920x port), and
+  one server first hits a deterministic close-to-bind `EADDRINUSE` collision
+  before publishing a refreshed port; both serve their own bytes, which is
+  impossible with the old fixed-port fixtures.
 - `integration: cancelled connect probe does not break later io` — a
   cancelled reachability/connect probe leaves the HTTP stack usable for
   subsequent reads.
@@ -1237,7 +1262,9 @@ Every test, grouped by area, with the property it guards.
   workload → stop returns `{path,sha256,size,records,dropped}`, the
   additive `trace` status field reports recording then stopped, and the
   blob parses with the codec reader to exactly the workload's coalesced
-  record (ADR-0013). Runs without privileges.
+  record; the trace mock also proves an initial close-to-bind
+  `EADDRINUSE` collision refreshes the published config URL (ADR-0013,
+  issue #15). Runs without privileges.
 - `integration: trace recording duration expiry finalizes without a client call` —
   the device-side timer finalizes on its own; `status` reports
   `"state":"stopped","reason":"expired"` and a late stop returns the

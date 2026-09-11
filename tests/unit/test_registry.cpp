@@ -13,8 +13,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <cerrno>
+#include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
+#include <system_error>
+#include <utility>
 
 using namespace obd;
 namespace http = elio::http;
@@ -33,8 +38,9 @@ namespace {
 ///   /dart/<upstream>  — DART-style prefix passthrough echo endpoint
 class MockRegistry {
 public:
-    MockRegistry(std::vector<uint8_t> blob, uint16_t port)
-        : blob_(std::move(blob)), port_(port) {
+    explicit MockRegistry(std::vector<uint8_t> blob)
+        : blob_(std::move(blob)),
+          port_lease_(), port_(port_lease_.port()) {
         http::router r;
         r.add_route(http::method::GET, "/v2/*",
                     [this](http::context& ctx) { return blob_handler(ctx); });
@@ -48,12 +54,48 @@ public:
     }
 
     elio::coro::task<void> run() {
-        co_await server_->listen(
-            elio::net::socket_address(
-                elio::net::ipv4_address("127.0.0.1", port_)));
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            port_lease_.reset();
+            port_ = port_lease_.port();
+            port_lease_.release();
+            if (before_listen_) before_listen_(port_);
+            try {
+                errno = 0;
+                co_await server_->listen(
+                    elio::net::socket_address(
+                        elio::net::ipv4_address("127.0.0.1", port_)));
+                const int listen_errno = errno;
+                if (!stop_requested_.load(std::memory_order_acquire) &&
+                    !server_->is_running()) {
+                    test::require_retryable_http_listen_return(
+                        "MockRegistry listen", listen_errno);
+                }
+            } catch (const std::system_error& e) {
+                if (e.code().value() != EADDRINUSE) throw;
+            }
+            if (!stop_requested_.load(std::memory_order_acquire)) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
     }
-    void stop() { server_->stop(); }
+    void stop() {
+        stop_requested_.store(true, std::memory_order_release);
+        server_->stop();
+    }
+    bool is_running() const noexcept { return server_->is_running(); }
+    void set_before_listen_hook(std::function<void(uint16_t)> hook) {
+        before_listen_ = std::move(hook);
+    }
     bool drained() const { return server_->active_connections() == 0; }
+    /// The OS-assigned loopback port this mock listens on (ephemeral:
+    /// picked at construction via port 0, issue #15).
+    uint16_t port() const noexcept { return port_; }
+    /// Origin for building test URLs ("http://127.0.0.1:<port>").
+    std::string origin() const {
+        return "http://127.0.0.1:" + std::to_string(port_);
+    }
+    /// Registry base ("http://127.0.0.1:<port>/v2").
+    std::string repo_base() const { return origin() + "/v2"; }
 
 private:
     static std::optional<std::pair<uint64_t, uint64_t>> parse_range(
@@ -204,8 +246,11 @@ private:
     }
 
     std::vector<uint8_t> blob_;
+    test::ReservedTcpPort port_lease_;
     uint16_t port_;
     std::unique_ptr<http::server> server_;
+    std::function<void(uint16_t)> before_listen_;
+    std::atomic<bool> stop_requested_{false};
     std::mutex body_mu_;
     std::string token_body_override_;  // under body_mu_
 public:
@@ -254,20 +299,60 @@ source::CredentialStorePtr test_creds() {
 
 }  // namespace
 
-TEST_CASE("source: registry range reads and size probe", "[source]") {
+TEST_CASE("source: mock registry refreshes port after bind collision",
+          "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
-        auto blob = test::pattern_bytes(300 * 1024, 21);
-        MockRegistry mock(blob, 19191);
+        auto blob = test::pattern_bytes(64 * 1024, 20);
+        MockRegistry mock(blob);
+        std::optional<test::TcpPortBlocker> blocker;
+        std::atomic<bool> armed{true};
+        std::atomic<uint16_t> blocked_port{0};
+        mock.set_before_listen_hook([&](uint16_t port) {
+            if (!armed.exchange(false)) return;
+            blocker.emplace(port);
+            blocked_port.store(port, std::memory_order_release);
+        });
         elio::go([&mock]() -> elio::coro::task<void> {
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
+        REQUIRE(blocked_port.load(std::memory_order_acquire) != 0);
+        REQUIRE(mock.port() != blocked_port.load(std::memory_order_acquire));
+
+        auto client =
+            std::make_shared<source::RegistryClient>(
+                nullptr, source::RegistryClientConfig{});
+        const std::string url = mock.repo_base() + "/blobs/x";
+        auto src = co_await source::RegistrySource::open(client, url);
+        std::vector<uint8_t> buf(4096);
+        const ssize_t r = co_await src->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == std::vector<uint8_t>(blob.begin(),
+                                            blob.begin() + buf.size()));
+        blocker.reset();
+        co_await wait_drained(mock);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry range reads and size probe", "[source]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto blob = test::pattern_bytes(300 * 1024, 21);
+        MockRegistry mock(blob);
+        elio::go([&mock]() -> elio::coro::task<void> {
+            co_await mock.run();
+        });
+        MockGuard guard{mock};
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client =
             std::make_shared<source::RegistryClient>(nullptr,
                                                      source::RegistryClientConfig{});
-        const std::string url = "http://127.0.0.1:19191/v2/blobs/x";
+        const std::string url = mock.repo_base() + "/blobs/x";
         auto src = co_await source::RegistrySource::open(client, url);
         REQUIRE(src->size() == blob.size());
         std::vector<uint8_t> buf(100 * 1024);
@@ -286,16 +371,17 @@ TEST_CASE("source: registry bearer auth flow via token endpoint",
           "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 22);
-        MockRegistry mock(blob, 19192);
+        MockRegistry mock(blob);
         elio::go([&mock]() -> elio::coro::task<void> {
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client = std::make_shared<source::RegistryClient>(
             test_creds(), source::RegistryClientConfig{});
-        const std::string url = "http://127.0.0.1:19192/v2/auth/x";
+        const std::string url = mock.repo_base() + "/auth/x";
         auto src = co_await source::RegistrySource::open(client, url);
         REQUIRE(src->size() == blob.size());
         std::vector<uint8_t> buf(4096);
@@ -313,14 +399,15 @@ TEST_CASE("source: registry redirect mode drops auth on the CDN URL",
           "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 23);
-        MockRegistry mock(blob, 19193);
+        MockRegistry mock(blob);
         elio::go([&mock]() -> elio::coro::task<void> {
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
-        const std::string url = "http://127.0.0.1:19193/v2/redir/x";
+        const std::string url = mock.repo_base() + "/redir/x";
         auto client = std::make_shared<source::RegistryClient>(
             nullptr, source::RegistryClientConfig{});
         auto src = co_await source::RegistrySource::open(client, url);
@@ -337,18 +424,19 @@ TEST_CASE("source: DART prefix passthrough preserves the embedded URL",
           "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 24);
-        MockRegistry mock(blob, 19194);
+        MockRegistry mock(blob);
         elio::go([&mock]() -> elio::coro::task<void> {
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         source::RegistryClientConfig cfg;
-        cfg.accelerate_base = "http://127.0.0.1:19194/dart";
+        cfg.accelerate_base = mock.origin() + "/dart";
         auto client =
             std::make_shared<source::RegistryClient>(nullptr, cfg);
-        const std::string url = "http://127.0.0.1:19194/v2/blobs/x";
+        const std::string url = mock.repo_base() + "/blobs/x";
         auto src = co_await source::RegistrySource::open(client, url);
         std::vector<uint8_t> buf(2048);
         const ssize_t r = co_await src->pread(buf.data(), buf.size(), 100);
@@ -367,7 +455,7 @@ TEST_CASE("source: registry concurrent 401s share one token refresh",
           "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(256 * 1024, 25);
-        MockRegistry mock(blob, 19195);
+        MockRegistry mock(blob);
         mock.serial_tokens_ = true;
         mock.expires_in_ = 100;      // refreshed tokens live 80 s: no re-auth
         mock.token_delay_ms_ = 30;   // make the concurrent 401s overlap
@@ -375,11 +463,12 @@ TEST_CASE("source: registry concurrent 401s share one token refresh",
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client = std::make_shared<source::RegistryClient>(
             test_creds(), source::RegistryClientConfig{});
-        const std::string url = "http://127.0.0.1:19195/v2/auth/x";
+        const std::string url = mock.repo_base() + "/auth/x";
         auto src = co_await source::RegistrySource::open(client, url);
         REQUIRE(mock.token_hits_.load() == 1);
 
@@ -421,7 +510,7 @@ TEST_CASE("source: registry concurrent 401s share one token refresh",
 TEST_CASE("source: registry 401 retry budget is bounded when re-auth keeps failing", "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 26);
-        MockRegistry mock(blob, 19196);
+        MockRegistry mock(blob);
         // The mock accepts every fresh token on the 0-0 probes but rejects
         // it on data GETs: re-auth never helps, so the request must fail
         // within its retry budget instead of looping on token exchanges.
@@ -430,11 +519,12 @@ TEST_CASE("source: registry 401 retry budget is bounded when re-auth keeps faili
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client = std::make_shared<source::RegistryClient>(
             test_creds(), source::RegistryClientConfig{});
-        const std::string url = "http://127.0.0.1:19196/v2/auth/x";
+        const std::string url = mock.repo_base() + "/auth/x";
         auto src = co_await source::RegistrySource::open(client, url);
         REQUIRE(mock.token_hits_.load() == 1);
 
@@ -455,17 +545,18 @@ TEST_CASE("source: registry re-auths after expires_in lifetime elapses",
           "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 27);
-        MockRegistry mock(blob, 19197);
+        MockRegistry mock(blob);
         mock.expires_in_ = 1;  // cache lifetime: 80% of 1 s = 800 ms
         elio::go([&mock]() -> elio::coro::task<void> {
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client = std::make_shared<source::RegistryClient>(
             test_creds(), source::RegistryClientConfig{});
-        const std::string base = "http://127.0.0.1:19197/v2/auth/";
+        const std::string base = mock.repo_base() + "/auth/";
         auto src_a = co_await source::RegistrySource::open(client,
                                                            base + "a");
         REQUIRE(mock.token_hits_.load() == 1);
@@ -499,17 +590,18 @@ TEST_CASE("source: registry self-mode URL cache follows bearer expiry",
           "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 29);
-        MockRegistry mock(blob, 19201);
+        MockRegistry mock(blob);
         mock.expires_in_ = 1;  // cache lifetime: 80% of 1 s = 800 ms
         elio::go([&mock]() -> elio::coro::task<void> {
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client = std::make_shared<source::RegistryClient>(
             test_creds(), source::RegistryClientConfig{});
-        const std::string url = "http://127.0.0.1:19201/v2/auth/x";
+        const std::string url = mock.repo_base() + "/auth/x";
         auto src = co_await source::RegistrySource::open(client, url);
         REQUIRE(mock.token_hits_.load() == 1);
 
@@ -537,17 +629,18 @@ TEST_CASE("source: registry self-mode URL cache follows bearer expiry",
 TEST_CASE("source: registry keeps the cached token within expires_in lifetime", "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 28);
-        MockRegistry mock(blob, 19198);
+        MockRegistry mock(blob);
         mock.expires_in_ = 100;  // cache lifetime: 80 s
         elio::go([&mock]() -> elio::coro::task<void> {
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client = std::make_shared<source::RegistryClient>(
             test_creds(), source::RegistryClientConfig{});
-        const std::string base = "http://127.0.0.1:19198/v2/auth/";
+        const std::string base = mock.repo_base() + "/auth/";
         auto src_a = co_await source::RegistrySource::open(client,
                                                            base + "a");
         co_await elio::time::sleep_for(std::chrono::milliseconds(300));
@@ -570,7 +663,7 @@ TEST_CASE("source: registry keeps the cached token within expires_in lifetime", 
 TEST_CASE("source: registry failed token refresh reaches all concurrent waiters", "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(128 * 1024, 29);
-        MockRegistry mock(blob, 19199);
+        MockRegistry mock(blob);
         mock.serial_tokens_ = true;
         mock.expires_in_ = 0;      // every resolution needs a fresh exchange
         mock.token_delay_ms_ = 30; // make the concurrent 401s overlap
@@ -578,11 +671,12 @@ TEST_CASE("source: registry failed token refresh reaches all concurrent waiters"
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client = std::make_shared<source::RegistryClient>(
             test_creds(), source::RegistryClientConfig{});
-        const std::string url = "http://127.0.0.1:19199/v2/auth/x";
+        const std::string url = mock.repo_base() + "/auth/x";
         auto src = co_await source::RegistrySource::open(client, url);
         REQUIRE(mock.token_hits_.load() == 1);
 
@@ -632,16 +726,17 @@ TEST_CASE("source: registry failed token refresh reaches all concurrent waiters"
 TEST_CASE("source: registry survives hostile token endpoint fields", "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 30);
-        MockRegistry mock(blob, 19200);
+        MockRegistry mock(blob);
         elio::go([&mock]() -> elio::coro::task<void> {
             co_await mock.run();
         });
         MockGuard guard{mock};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool mock_running = co_await test::wait_server_running(mock);
+        REQUIRE(mock_running);
 
         auto client = std::make_shared<source::RegistryClient>(
             test_creds(), source::RegistryClientConfig{});
-        const std::string base = "http://127.0.0.1:19200/v2/auth/";
+        const std::string base = mock.repo_base() + "/auth/";
 
         // A float expires_in far outside int64 range (1e100): converting
         // it would be undefined behavior; it must be ignored and the

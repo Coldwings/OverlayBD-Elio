@@ -31,11 +31,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <system_error>
+#include <utility>
 
 using namespace obd;
 using obd::test::TempDir;
@@ -44,21 +48,53 @@ namespace http = elio::http;
 namespace {
 
 /// Minimal Range-capable blob server: every GET under /v2/* serves the one
-/// hosted blob.
+/// hosted blob. The listener port is OS-assigned (ephemeral, issue #15):
+/// never a fixed port, so concurrent suite runs on one machine cannot
+/// collide.
 class BlobServer {
 public:
-    BlobServer(std::vector<uint8_t> blob, uint16_t port)
-        : blob_(std::move(blob)), port_(port) {
+    explicit BlobServer(std::vector<uint8_t> blob)
+        : blob_(std::move(blob)),
+          port_lease_(), port_(port_lease_.port()) {
         http::router r;
         r.add_route(http::method::GET, "/v2/*",
                     [this](http::context& ctx) { return handler(ctx); });
         server_ = std::make_unique<http::server>(std::move(r));
     }
     elio::coro::task<void> run() {
-        co_await server_->listen(elio::net::socket_address(
-            elio::net::ipv4_address("127.0.0.1", port_)));
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            port_lease_.reset();
+            port_ = port_lease_.port();
+            port_lease_.release();
+            if (before_listen_) before_listen_(port_);
+            try {
+                errno = 0;
+                co_await server_->listen(elio::net::socket_address(
+                    elio::net::ipv4_address("127.0.0.1", port_)));
+                const int listen_errno = errno;
+                if (!stop_requested_.load(std::memory_order_acquire) &&
+                    !server_->is_running()) {
+                    test::require_retryable_http_listen_return(
+                        "BlobServer listen", listen_errno);
+                }
+            } catch (const std::system_error& e) {
+                if (e.code().value() != EADDRINUSE) throw;
+            }
+            if (!stop_requested_.load(std::memory_order_acquire)) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
     }
-    void stop() { server_->stop(); }
+    void stop() {
+        stop_requested_.store(true, std::memory_order_release);
+        server_->stop();
+    }
+    bool is_running() const noexcept { return server_->is_running(); }
+    void set_before_listen_hook(std::function<void(uint16_t)> hook) {
+        before_listen_ = std::move(hook);
+    }
+    /// The OS-assigned loopback port this server listens on.
+    uint16_t port() const noexcept { return port_; }
     /// GETs serving more than the 1-byte size probe (Range bytes=0-0):
     /// the observable "went to the remote" counter for cache assertions.
     uint64_t data_gets() const {
@@ -119,8 +155,11 @@ private:
         co_return resp;
     }
     std::vector<uint8_t> blob_;
+    test::ReservedTcpPort port_lease_;
     uint16_t port_;
     std::unique_ptr<http::server> server_;
+    std::function<void(uint16_t)> before_listen_;
+    std::atomic<bool> stop_requested_{false};
     std::atomic<uint64_t> data_gets_{0};
     mutable std::mutex extents_mu_;
     std::set<uint64_t> served_extents_;
@@ -134,6 +173,56 @@ struct BlobGuard {
     explicit BlobGuard(Server& server) : stop_([&server] { server.stop(); }) {}
     ~BlobGuard() { stop_(); }
     std::function<void()> stop_;
+};
+
+/// A loopback address on which NOTHING listens for the whole lifetime of
+/// this object: the probe socket stays bound (never listening), so no
+/// other process can bind the port and every connect() to it is answered
+/// with ECONNREFUSED. This is the "unreachable proxy" fixture for the DART
+/// fallback tests — a fixed port (previously 19999) was itself a
+/// cross-machine collision source, since any unrelated process could be
+/// legitimately listening there.
+class UnusedPort {
+public:
+    UnusedPort() {
+        fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd_ < 0) {
+            throw std::system_error(errno, std::system_category(), "socket");
+        }
+        sockaddr_in sa {};
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port = 0;
+        if (::bind(fd_, reinterpret_cast<const sockaddr*>(&sa), sizeof(sa)) !=
+            0) {
+            const int e = errno;
+            ::close(fd_);
+            fd_ = -1;
+            throw std::system_error(e, std::system_category(), "bind");
+        }
+        socklen_t len = sizeof(sa);
+        if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&sa), &len) != 0) {
+            const int e = errno;
+            ::close(fd_);
+            fd_ = -1;
+            throw std::system_error(e, std::system_category(), "getsockname");
+        }
+        port_ = ntohs(sa.sin_port);
+    }
+    ~UnusedPort() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    UnusedPort(const UnusedPort&) = delete;
+    UnusedPort& operator=(const UnusedPort&) = delete;
+    uint16_t port() const noexcept { return port_; }
+    /// "host:port" form for the DART address ("...:port/dart").
+    std::string address() const {
+        return "127.0.0.1:" + std::to_string(port_);
+    }
+
+private:
+    int fd_ = -1;
+    uint16_t port_ = 0;
 };
 
 std::string sha256_hex_of(const std::vector<uint8_t>& data) {
@@ -246,9 +335,9 @@ std::vector<std::string> names_with_prefix(const std::string& dir,
 /// with capacity 1 (queued requests wait one service time each).
 class BlobMapServer {
 public:
-    BlobMapServer(std::map<std::string, std::vector<uint8_t>> blobs,
-                  uint16_t port)
-        : blobs_(std::move(blobs)), port_(port) {
+    explicit BlobMapServer(std::map<std::string, std::vector<uint8_t>> blobs)
+        : blobs_(std::move(blobs)),
+          port_lease_(), port_(port_lease_.port()) {
         for (const auto& [name, blob] : blobs_) {
             stats_[name] = std::make_unique<Stats>();
         }
@@ -258,10 +347,39 @@ public:
         server_ = std::make_unique<http::server>(std::move(r));
     }
     elio::coro::task<void> run() {
-        co_await server_->listen(elio::net::socket_address(
-            elio::net::ipv4_address("127.0.0.1", port_)));
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            port_lease_.reset();
+            port_ = port_lease_.port();
+            port_lease_.release();
+            if (before_listen_) before_listen_(port_);
+            try {
+                errno = 0;
+                co_await server_->listen(elio::net::socket_address(
+                    elio::net::ipv4_address("127.0.0.1", port_)));
+                const int listen_errno = errno;
+                if (!stop_requested_.load(std::memory_order_acquire) &&
+                    !server_->is_running()) {
+                    test::require_retryable_http_listen_return(
+                        "BlobMapServer listen", listen_errno);
+                }
+            } catch (const std::system_error& e) {
+                if (e.code().value() != EADDRINUSE) throw;
+            }
+            if (!stop_requested_.load(std::memory_order_acquire)) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
     }
-    void stop() { server_->stop(); }
+    void stop() {
+        stop_requested_.store(true, std::memory_order_release);
+        server_->stop();
+    }
+    bool is_running() const noexcept { return server_->is_running(); }
+    void set_before_listen_hook(std::function<void(uint16_t)> hook) {
+        before_listen_ = std::move(hook);
+    }
+    /// The OS-assigned loopback port this server listens on.
+    uint16_t port() const noexcept { return port_; }
     std::string repo_base() const {
         return "http://127.0.0.1:" + std::to_string(port_) + "/v2";
     }
@@ -365,8 +483,11 @@ private:
     }
 
     std::map<std::string, std::vector<uint8_t>> blobs_;
+    test::ReservedTcpPort port_lease_;
     uint16_t port_;
     std::unique_ptr<http::server> server_;
+    std::function<void(uint16_t)> before_listen_;
+    std::atomic<bool> stop_requested_{false};
     std::map<std::string, std::unique_ptr<Stats>> stats_;
     mutable std::mutex log_mu_;
     std::vector<std::pair<std::string, uint64_t>> log_;
@@ -395,12 +516,14 @@ TEST_CASE("integration: layered stack stages over a mock registry",
     const std::string layer_dir = dir / "layer_staging";
     std::filesystem::create_directories(layer_dir);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19190);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
         auto client = std::make_shared<source::RegistryClient>(
             nullptr, source::RegistryClientConfig{});
         auto reg =
@@ -435,14 +558,20 @@ TEST_CASE("integration: cancelled connect probe does not break later io",
           "[integration]") {
     auto blob = test::pattern_bytes(32 * 1024, 95);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19199);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
-        // Unreachable probe (nothing on 19999): must time out fast.
-        const auto addr = source::parse_dart_address("127.0.0.1:19999/dart");
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
+        // Unreachable probe (nothing listening): must time out fast. The
+        // port is held by a bound-but-never-listening socket for the whole
+        // test, so no unrelated process can occupy it (issue #15).
+        UnusedPort dead_end;
+        const auto addr =
+            source::parse_dart_address(dead_end.address() + "/dart");
         REQUIRE(addr.has_value());
         const bool reachable = co_await source::dart_proxy_reachable(*addr);
         REQUIRE(!reachable);
@@ -467,19 +596,25 @@ TEST_CASE("integration: enabled-but-unreachable DART falls back to direct reads"
     const auto raw = test::pattern_bytes(512 * 32, 91);
     const auto blob = make_zfile_blob(dir, raw);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19198);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         const auto cfgj = remote_image_config(
             server.repo_base(), sha256_hex_of(blob), blob.size());
         const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+        // p2pConfig points at a port that nothing can listen on for this
+        // whole test (bound, never listening — issue #15), so the proxy is
+        // deterministically unreachable and reads must fall back direct.
+        UnusedPort dead_end;
         image::GlobalConfig global;
         global.p2p_enable = true;
-        global.p2p_address = "127.0.0.1:19999/dart";  // nothing listening
+        global.p2p_address = dead_end.address() + "/dart";
         auto opened = co_await image::open_image(cfg, global);
         std::vector<uint8_t> buf(raw.size());
         const ssize_t r = co_await opened.root->pread(buf.data(), buf.size(), 0);
@@ -497,12 +632,14 @@ TEST_CASE("integration: registry pipeline serves a zfile-compressed image",
     const auto blob = make_zfile_blob(dir, raw);
     const std::string digest_hex = sha256_hex_of(blob);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19195);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         const auto cfgj =
             remote_image_config(server.repo_base(), digest_hex, blob.size());
@@ -531,12 +668,14 @@ TEST_CASE("integration: background fill completes a layer through image assembly
     const std::string layer_dir = dir / "layer_fill";
     constexpr size_t kPrefix = 8192;
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19194);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         auto cfgj = remote_image_config_with_dir(server.repo_base(),
                                                  digest_hex, blob.size(),
@@ -605,12 +744,14 @@ TEST_CASE("integration: unwritable layer dir degrades to remote-only reads",
     const std::string layer_dir =
         std::string(dir / "blocker") + "/layer";
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19189);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         const auto cfgj = remote_image_config_with_dir(
             server.repo_base(), digest_hex, blob.size(), layer_dir);
@@ -647,12 +788,14 @@ TEST_CASE("integration: image assembly serves remote reads through the layer sto
     // Deliberately NOT pre-created: assembly creates a missing layer dir.
     const std::string layer_dir = dir / "layer_cold";
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19191);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         const auto cfgj = remote_image_config_with_dir(
             server.repo_base(), digest_hex, blob.size(), layer_dir);
@@ -695,12 +838,14 @@ TEST_CASE("integration: layer store restart serves warmed extents without remote
     std::filesystem::create_directories(layer_dir);
     constexpr size_t kPrefix = 8192;
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19192);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         const auto cfgj = remote_image_config_with_dir(
             server.repo_base(), digest_hex, blob.size(), layer_dir);
@@ -772,12 +917,14 @@ TEST_CASE("integration: completed layer store commit binds read-only without rem
     const std::string layer_dir = dir / "layer_commit";
     std::filesystem::create_directories(layer_dir);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(blob, 19193);
+        BlobServer server(blob);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         const auto cfgj = remote_image_config_with_dir(
             server.repo_base(), digest_hex, blob.size(), layer_dir);
@@ -873,12 +1020,14 @@ TEST_CASE("integration: trace layer replays warm-up through the layer store",
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         BlobMapServer server(
-            {{data_digest, data_blob}, {accel_digest, trace_blob}}, 19201);
+            {{data_digest, data_blob}, {accel_digest, trace_blob}});
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         nlohmann::json cfgj;
         cfgj["repoBlobUrl"] = server.repo_base();
@@ -961,13 +1110,14 @@ TEST_CASE("integration: trace replay warms the lower addressed by layer index",
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         BlobMapServer server(
-            {{digest0, blob0}, {digest1, blob1}, {accel_digest, trace_blob}},
-            19202);
+            {{digest0, blob0}, {digest1, blob1}, {accel_digest, trace_blob}});
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         nlohmann::json cfgj;
         cfgj["repoBlobUrl"] = server.repo_base();
@@ -1064,12 +1214,14 @@ TEST_CASE("integration: structural warm-up fetches head and tail extents at brin
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         BlobMapServer server(
-            {{digest_off, blob_off}, {digest_on, blob_on}}, 19205);
+            {{digest_off, blob_off}, {digest_on, blob_on}});
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         auto make_cfg = [&](const std::string& digest, uint64_t size,
                             const std::string& layer_dir) {
@@ -1186,12 +1338,14 @@ TEST_CASE("integration: structural warm-up runs before the trace blob load",
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         BlobMapServer server(
-            {{data_digest, data_blob}, {accel_digest, trace_blob}}, 19206);
+            {{data_digest, data_blob}, {accel_digest, trace_blob}});
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         nlohmann::json cfgj;
         cfgj["repoBlobUrl"] = server.repo_base();
@@ -1268,14 +1422,16 @@ TEST_CASE("integration: admission funnel bounds on-demand latency under scavenge
     std::filesystem::create_directories(layer_dir);
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobMapServer server({{digest, blob}}, 19203);
+        BlobMapServer server({{digest, blob}});
         server.set_latency(std::chrono::milliseconds(25));
         server.set_serialized(true);
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         auto cfgj = remote_image_config_with_dir(
             server.repo_base(), sha256_hex_of(blob), blob.size(), layer_dir);
@@ -1377,13 +1533,15 @@ TEST_CASE("integration: admission funnel collapses scavenger traffic under on-de
     std::filesystem::create_directories(layer_dir1);
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobMapServer server({{digest0, blob0}, {digest1, blob1}}, 19204);
+        BlobMapServer server({{digest0, blob0}, {digest1, blob1}});
         server.set_latency(std::chrono::milliseconds(20));
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
         BlobGuard guard{server};
-        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+        const bool server_running =
+            co_await test::wait_server_running(server);
+        REQUIRE(server_running);
 
         nlohmann::json cfgj;
         cfgj["repoBlobUrl"] = server.repo_base();
@@ -1456,6 +1614,73 @@ TEST_CASE("integration: admission funnel collapses scavenger traffic under on-de
         REQUIRE(recovered);
 
         co_await image::park_image_fills(opened);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: concurrent mock servers bind distinct ephemeral ports",
+          "[integration]") {
+    // Issue #15 regression tripwire: mock blob servers must never
+    // hard-code listener ports (the fixed 1919x/1920x range collided
+    // across sibling worktrees/CI runs on one machine). Two servers live
+    // at once on this host; each must get its own OS-assigned ephemeral
+    // port and serve its own bytes — impossible with a fixed port, which
+    // would make the second listen fail with EADDRINUSE.
+    const auto blob_a = test::pattern_bytes(64 * 1024, 111);
+    const auto blob_b = test::pattern_bytes(64 * 1024, 222);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobServer server_a(blob_a);
+        BlobServer server_b(blob_b);
+        std::optional<test::TcpPortBlocker> blocker;
+        std::atomic<bool> armed{true};
+        std::atomic<uint16_t> blocked_port{0};
+        server_a.set_before_listen_hook([&](uint16_t port) {
+            if (!armed.exchange(false)) return;
+            blocker.emplace(port);
+            blocked_port.store(port, std::memory_order_release);
+        });
+        elio::go([&server_a]() -> elio::coro::task<void> {
+            co_await server_a.run();
+        });
+        elio::go([&server_b]() -> elio::coro::task<void> {
+            co_await server_b.run();
+        });
+        BlobGuard guard_a{server_a};
+        BlobGuard guard_b{server_b};
+        const bool server_a_running =
+            co_await test::wait_server_running(server_a);
+        REQUIRE(server_a_running);
+        const bool server_b_running =
+            co_await test::wait_server_running(server_b);
+        REQUIRE(server_b_running);
+        REQUIRE(blocked_port.load(std::memory_order_acquire) != 0);
+        REQUIRE(server_a.port() != 0);
+        REQUIRE(server_b.port() != 0);
+        REQUIRE(server_a.port() !=
+                blocked_port.load(std::memory_order_acquire));
+        REQUIRE(server_a.port() != server_b.port());
+
+        auto client = std::make_shared<source::RegistryClient>(
+            nullptr, source::RegistryClientConfig{});
+        auto src_a =
+            co_await source::RegistrySource::open(client, server_a.url("b"));
+        auto src_b =
+            co_await source::RegistrySource::open(client, server_b.url("b"));
+        REQUIRE(src_a->size() == blob_a.size());
+        REQUIRE(src_b->size() == blob_b.size());
+        std::vector<uint8_t> buf(4096);
+        const ssize_t got_a =
+            co_await src_a->pread(buf.data(), buf.size(), 0);
+        REQUIRE(got_a == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == std::vector<uint8_t>(blob_a.begin(),
+                                            blob_a.begin() + buf.size()));
+        const ssize_t got_b =
+            co_await src_b->pread(buf.data(), buf.size(), 0);
+        REQUIRE(got_b == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == std::vector<uint8_t>(blob_b.begin(),
+                                            blob_b.begin() + buf.size()));
+        blocker.reset();
         co_return 0;
     });
     REQUIRE(rc == 0);
