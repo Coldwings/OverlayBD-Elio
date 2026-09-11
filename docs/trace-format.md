@@ -371,8 +371,14 @@ disable trace replay; they do not retry dynamic parsing.
   valid 24-byte blob: passes all §7 checks, loads zero records, replay is
   a no-op (`PrefetcherImpl::replay` returns 0 on an empty queue). This is
   what a recording with no full reads produces.
-- **Truncated blob / trailing garbage after matching magic.** Rejected by
-  the exact-size rule (§7 rule 3); prefetch silently disabled without
+- **Shorter than a full 24-byte header.** `new_prefetcher` cannot match a
+  static trace header, so non-empty content shorter than 24 bytes selects
+  the dynamic-prefetch file-list path (§3), even if its first few bytes
+  happen to match the magic prefix.
+- **Header-readable trace with truncated data or trailing garbage.** Once
+  `new_prefetcher` read 24 bytes and matched the magic, the blob is routed
+  to static replay. A later total-size mismatch is rejected by the
+  exact-size rule (§7 rule 3); prefetch is silently disabled without
   dynamic fallback.
 - **Checksum mismatch.** Record queue cleared; prefetch silently
   disabled (§7 rule 5).
