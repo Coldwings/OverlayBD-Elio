@@ -172,8 +172,10 @@ is being sealed. Contract:
   memory-only (docs/format.md); a graceful obd-device shutdown therefore
   **checkpoints** the index into the file (unsealed trailer) before
   exiting, which is what the supervisor's offline seal consumes. A device
-  that crashed or was SIGKILLed has no checkpoint and its upper is lost —
-  commit then fails with a precise error.
+  that crashes or is SIGKILLed before that checkpoint completes has no
+  checkpoint and its upper is lost; if the kill races after the checkpoint
+  has already been written, offline `commit` can still consume it. Missing
+  checkpoints fail with a precise error.
 - **Sealing** runs in the supervisor process via
   `src/format/lsmt_rw.hpp::LsmtRwLayer::seal_file` over the async IO
   backend (no blocking work on the Elio workers). The sealed uuid is

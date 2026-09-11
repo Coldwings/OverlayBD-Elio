@@ -322,8 +322,9 @@ contracts above:
   created with ublk `USER_RECOVERY` when `ublkConfig.enableRecovery` is
   true (the default) and the kernel supports it; the supervisor respawns
   a crashed child in recovery mode up to `max_recovery_attempts`
-  (ADR-0010). Older kernels that reject the recovery flags degrade to a
-  non-recoverable device at create time. Recovery reassembles the image
+  (ADR-0010). Older kernels whose `ADD_DEV` call rejects the
+  recovery flags with `EINVAL` degrade to a non-recoverable device at
+  create time. Recovery reassembles the image
   from restart-recoverable inputs: sealed lowers and sparse writable
   extents can be reopened, but an unsealed LSMT-RW upper is not reopened
   by recovery even if graceful shutdown wrote a checkpoint.
