@@ -88,6 +88,14 @@ TEST_CASE("image: invalid download tryCnt is rejected at config boundaries",
         (void)image::GlobalConfig::from_json_text(
             R"({"download": {"tryCnt": 4294967296}})");
     });
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": 1.5}})");
+    });
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": "2"}})");
+    });
 
     image::DownloadConfig defaults;
     defaults.try_count = 7;

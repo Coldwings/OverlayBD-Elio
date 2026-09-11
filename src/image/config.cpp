@@ -44,6 +44,11 @@ void apply_download_json(const nlohmann::json& j,
     if (j.contains("maxMBps")) base.max_mbps = j["maxMBps"].get<uint32_t>();
     if (j.contains("tryCnt")) {
         const auto& v = j["tryCnt"];
+        if (!v.is_number_integer()) {
+            throw error(EINVAL,
+                        "download.tryCnt must be an integer in range 1.." +
+                            std::to_string(std::numeric_limits<uint32_t>::max()));
+        }
         uint64_t raw = 0;
         if (v.is_number_unsigned()) {
             raw = v.get<uint64_t>();
