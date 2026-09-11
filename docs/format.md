@@ -530,6 +530,13 @@ writes are split at the 14-bit segment-length cap and merged into the
 identity segment set (overlapping and adjacent extents coalesce).
 `flush()` is `fdatasync` and returns 0 or `-errno`.
 
+`discard()` (ADR-0009) uses
+`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` and splits/trims
+the identity extent index. Fiemap is filesystem-block granular, so a
+sub-block punch zeroes but may not deallocate; a reopened index may be
+fatter than the pre-restart one, with identical reads because punched
+blocks read back as zeroes.
+
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 
 `src/format/lsmt_rw.hpp::LsmtRwLayer`
@@ -593,12 +600,6 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
 - `pread`: sector-aligned; holes and zeroed segments read as zeroes; clamped
   at `virtual_size()`.
 - `flush()`: `fdatasync`; 0 or `-errno`.
-- `discard` (ADR-0009): a real
-  `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` plus a
-  split/trim of the extent index. Note the granularity caveat: fiemap is
-  filesystem-block granular, so a sub-block punch zeroes but cannot
-  deallocate — a reopened index may be fatter than the pre-restart one,
-  with identical reads (punched blocks read back as zeroes).
 - `discard` (ADR-0009): inserts **zeroed segments** covering the range
   (split/trimming overlapped segments exactly like `pwrite`); no data is
   written and superseded blocks become garbage that `seal()` drops. Zeroed
@@ -799,7 +800,7 @@ the data plane never writes.
 ### `src/format/trace.hpp` — `namespace obd::format::trace`
 
 Dependency-free codec for the upstream prefetch trace blob (ADR-0013,
-proposed; wire authority: [trace-format.md](./trace-format.md)). Pure
+accepted; wire authority: [trace-format.md](./trace-format.md)). Pure
 in-memory: no IO, no coroutines. Expected failure modes (corrupt input,
 contract-violating appends) are reported by result value, never by
 exception; the only exceptional way out is allocation failure

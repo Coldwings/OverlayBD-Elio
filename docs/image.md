@@ -1073,21 +1073,24 @@ single Range-capable blob. No external golden files.
   `enable`, `head_kb`, and `tail_kb` are honored (see `docs/config.md`
   for the full compatibility matrix). The trace layer IS recognized and
   replayed (ADR-0013; see Concepts → "The trace layer"), with
-  these gaps: trace **recording** is not implemented; the
-  dynamic-prefetch file-list fallback is rejected by design; the tar
-  member name (`trace`) is not checked — recognition is the config flag
-  plus the blob magic; remote lowers without `dir` are not warmed
-  (populate is a no-op on the bare `RegistrySource`); and both replay
-  and the structural warm-up are still awaited inline during bring-up —
-  detaching them into background scavenger warm-up is a follow-up the
-  ADR-0012 funnel now makes safe.
+  these gaps: the dynamic-prefetch file-list fallback is rejected by
+  design; the tar member name (`trace`) is not checked — recognition is
+  the config flag plus the blob magic; remote lowers without `dir` are
+  not warmed (populate is a no-op on the bare `RegistrySource`); both
+  replay and the structural warm-up are still awaited inline during
+  bring-up; and supervisor-driven trace recording currently observes all
+  remote reads below the LayerStore until issue #33 narrows the default
+  recording set to OnDemand traffic.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
-- **Writable uppers are per-device and not sealed automatically** — the
-  ADR-0008 mode persists writes in the upper file across reopen, but
-  committing/sealing an upper into a new lower is an explicit, offline
-  operation (the supervisor's `commit` command, ADR-0014); TurboOCI and
-  registry write-back remain out of scope (ADR-0007).
+- **Writable uppers are per-device and not sealed automatically** — a
+  sparse upper can recover written extents from the file/fiemap across
+  reopen, while an unsealed LSMT-RW upper is not recoverable after a
+  crash or restart until graceful shutdown writes its checkpoint (fresh
+  create truncates the file). Committing/sealing an upper into a new
+  lower is an explicit, offline operation (the supervisor's `commit`
+  command, ADR-0014); TurboOCI and registry write-back remain out of
+  scope (ADR-0007).
 - **Sparse uppers depend on filesystem fiemap support** for extent recovery
   after reopen (see `docs/format.md`); exotic filesystems without
   `SEEK_HOLE`/fiemap semantics are unsupported for `upper.type = "sparse"`.
