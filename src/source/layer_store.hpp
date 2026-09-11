@@ -116,7 +116,7 @@ public:
         kDisabled = 0,  // fill not enabled
         kWaiting = 1,   // in the start delay
         kFilling = 2,   // walking and persisting
-        kDone = 3,      // walk finished: no missing extent remained
+        kDone = 3,      // walk reached verified completion
         kStopped = 4,   // left early: bypass, completion, or stop_fill()
     };
 
@@ -191,6 +191,11 @@ public:
     /// API.
     void set_test_fetch_done_hook(std::function<void()> hook);
 
+    /// Test-only hook: invoked by the writer thread after all extents are
+    /// present and just before completion verification begins. Not part
+    /// of the module API.
+    void set_test_completion_hook(std::function<void(uint32_t attempt)> hook);
+
 private:
     LayerStore() = default;
 
@@ -201,10 +206,12 @@ private:
         elio::sync::event done;
         std::shared_ptr<const std::vector<uint8_t>> data;  // set on success
         int error = 0;  // positive errno on failure
+        uint64_t generation = 0;
     };
     struct FetchResult {
         std::shared_ptr<const std::vector<uint8_t>> data;
         int error = 0;  // positive errno
+        uint64_t generation = 0;
     };
 
     struct WriteJob {
@@ -242,7 +249,7 @@ private:
                                                 ReadClass cls);
     void enqueue_write(uint64_t extent_id,
                        std::shared_ptr<const std::vector<uint8_t>> data,
-                       size_t data_offset = 0);
+                       uint64_t generation, size_t data_offset = 0);
     void enqueue_clear(uint64_t extent_id);
 
     // Background fill (one coroutine, spawned by open when fill.enable).
@@ -294,6 +301,11 @@ private:
 
     std::atomic<int> state_{static_cast<int>(State::Filling)};
     std::atomic<uint64_t> present_{0};
+    // Incremented by the writer before a checksum retry publishes a fresh
+    // staging pair. Coroutine-side remote reads capture it before fetching and
+    // may cache-fill only when it still matches at enqueue time; stale reads
+    // from a failed attempt must not populate the retry pair.
+    std::atomic<uint64_t> generation_{1};
     std::atomic<uint64_t> dropped_writes_{0};
     std::atomic<uint64_t> crc_failures_{0};
     std::atomic<uint64_t> remote_fetches_{0};
@@ -311,6 +323,7 @@ private:
     uint64_t queued_bytes_ = 0;
     bool stopping_ = false;
     std::function<int(uint64_t)> write_hook_;  // test-only, under qmu_
+    std::function<void(uint32_t)> completion_hook_;  // test-only, under qmu_
     std::function<void()> fetch_done_hook_;    // test-only, coroutine-side
     uint32_t attempts_ = 0;        // completion-verify attempts (writer only)
     bool kick_completion_check_ = false;  // set before the writer starts

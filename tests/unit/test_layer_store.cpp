@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <thread>
 
@@ -125,6 +126,118 @@ public:
 
 private:
     VectorSource inner_;
+};
+
+/// Returns `initial` until switch_to_replacement(), then returns
+/// `replacement` for later reads. The first fill attempt can therefore
+/// reach whole-file verification with checksum-bad bytes, and the retry
+/// attempt can fetch checksum-good bytes without foreground traffic.
+class SwitchAfterCompletionSource final : public source::BlobSource {
+public:
+    SwitchAfterCompletionSource(std::vector<uint8_t> initial,
+                                std::vector<uint8_t> replacement)
+        : initial_(std::move(initial)),
+          replacement_(std::move(replacement)) {}
+
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                    uint64_t offset) override {
+        co_await gate.wait();
+        const auto& src =
+            use_replacement_.load(std::memory_order_acquire) ? replacement_
+                                                             : initial_;
+        if (offset >= src.size()) co_return 0;
+        const size_t n = static_cast<size_t>(
+            std::min<uint64_t>(count, src.size() - offset));
+        std::memcpy(buf, src.data() + offset, n);
+        reads_completed_.fetch_add(1, std::memory_order_relaxed);
+        co_return static_cast<ssize_t>(n);
+    }
+
+    uint64_t size() const noexcept override { return replacement_.size(); }
+    std::string_view label() const noexcept override {
+        return "switch-after-completion";
+    }
+    uint64_t reads_completed() const noexcept {
+        return reads_completed_.load(std::memory_order_relaxed);
+    }
+    void switch_to_replacement() {
+        use_replacement_.store(true, std::memory_order_release);
+    }
+
+    elio::sync::event gate;
+
+private:
+    std::vector<uint8_t> initial_;
+    std::vector<uint8_t> replacement_;
+    std::atomic<uint64_t> reads_completed_{0};
+    std::atomic<bool> use_replacement_{false};
+};
+
+
+/// Blocks the first read at one offset and makes that blocked read return
+/// the old bytes even if later reads have switched to replacement bytes.
+/// This models a fill fetch that started in a checksum-bad attempt and
+/// completes only after the writer has restarted with a fresh staging pair.
+class BlockFirstOffsetSource final : public source::BlobSource {
+public:
+    BlockFirstOffsetSource(std::vector<uint8_t> initial,
+                           std::vector<uint8_t> replacement,
+                           uint64_t block_offset)
+        : initial_(std::move(initial)),
+          replacement_(std::move(replacement)),
+          block_offset_(block_offset) {}
+
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                    uint64_t offset) override {
+        co_await gate.wait();
+        const bool stale_blocked =
+            offset == block_offset_ && !blocked_.exchange(
+                                            true, std::memory_order_acq_rel);
+        const auto& src =
+            (!stale_blocked &&
+             use_replacement_.load(std::memory_order_acquire))
+                ? replacement_
+                : initial_;
+        if (stale_blocked) {
+            while (!release_blocked_.load(std::memory_order_acquire)) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        if (offset >= src.size()) co_return 0;
+        const size_t n = static_cast<size_t>(
+            std::min<uint64_t>(count, src.size() - offset));
+        std::memcpy(buf, src.data() + offset, n);
+        reads_completed_.fetch_add(1, std::memory_order_relaxed);
+        co_return static_cast<ssize_t>(n);
+    }
+
+    uint64_t size() const noexcept override { return replacement_.size(); }
+    std::string_view label() const noexcept override {
+        return "block-first-offset";
+    }
+    bool blocked() const {
+        return blocked_.load(std::memory_order_acquire);
+    }
+    void release_blocked() {
+        release_blocked_.store(true, std::memory_order_release);
+    }
+    void switch_to_replacement() {
+        use_replacement_.store(true, std::memory_order_release);
+    }
+    uint64_t reads_completed() const noexcept {
+        return reads_completed_.load(std::memory_order_relaxed);
+    }
+
+    elio::sync::event gate;
+
+private:
+    std::vector<uint8_t> initial_;
+    std::vector<uint8_t> replacement_;
+    uint64_t block_offset_ = 0;
+    std::atomic<bool> blocked_{false};
+    std::atomic<bool> release_blocked_{false};
+    std::atomic<bool> use_replacement_{false};
+    std::atomic<uint64_t> reads_completed_{0};
 };
 
 }  // namespace
@@ -974,10 +1087,175 @@ TEST_CASE("source: layer store fill resumes from the sidecar across a restart",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("source: layer store fill resumes after checksum retry",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(3 * kExtent, 24);
+    auto corrupt = blob;
+    corrupt[kExtent + 17] ^= 0x7f;
+    const std::string digest = digest_of(blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* src = new SwitchAfterCompletionSource(corrupt, blob);
+        source::LayerStore::Config cfg;
+        cfg.try_count = 2;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.queue_max_bytes = kExtent;
+        std::atomic<uint32_t> verify_attempt{0};
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(src), dir.str(), digest, cfg);
+        store->set_test_completion_hook(
+            [src, &verify_attempt](uint32_t attempt) {
+                verify_attempt.store(attempt, std::memory_order_release);
+                if (attempt == 1) {
+                    src->switch_to_replacement();
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(100));
+                }
+            });
+        src->gate.set();
+
+        const bool done = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        const bool fill_done = co_await poll_until([&] {
+            return store->fill_status() ==
+                   source::LayerStore::FillStatus::kDone;
+        });
+        REQUIRE(fill_done);
+        REQUIRE(verify_attempt.load(std::memory_order_acquire) == 2);
+        REQUIRE(src->reads_completed() >= 2);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(std::filesystem::exists(dir.str() + "/overlaybd.commit"));
+    REQUIRE(names_with_prefix(dir.str(), ".download.").empty());
+    REQUIRE(names_with_prefix(dir.str(), ".bitmap.").empty());
+}
+
+
+TEST_CASE("source: layer store drops stale fill writes after checksum retry",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(3 * kExtent, 28);
+    auto corrupt = blob;
+    corrupt[33] ^= 0x5a;
+    const std::string digest = digest_of(blob);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* src = new BlockFirstOffsetSource(corrupt, blob, 0);
+        source::LayerStore::Config cfg;
+        cfg.try_count = 2;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.fill.block_size = static_cast<uint32_t>(kExtent);
+        cfg.queue_max_bytes = 4 * kExtent;
+        std::atomic<uint32_t> verify_attempt{0};
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(src), dir.str(), digest, cfg);
+        store->set_test_completion_hook(
+            [src, &verify_attempt](uint32_t attempt) {
+                verify_attempt.store(attempt, std::memory_order_release);
+                if (attempt == 1) src->switch_to_replacement();
+            });
+        src->gate.set();
+
+        const bool fill_blocked = co_await poll_until([&] {
+            return src->blocked();
+        });
+        REQUIRE(fill_blocked);
+        const auto first_stagings = names_with_prefix(dir.str(), ".download.");
+        REQUIRE(first_stagings.size() == 1);
+
+        std::vector<uint8_t> guest_buf(blob.size());
+        const ssize_t guest =
+            co_await store->pread(guest_buf.data(), guest_buf.size(), 0);
+        REQUIRE(guest == static_cast<ssize_t>(guest_buf.size()));
+        REQUIRE(guest_buf == corrupt);
+
+        const bool attempted = co_await poll_until([&] {
+            return verify_attempt.load(std::memory_order_acquire) == 1;
+        });
+        REQUIRE(attempted);
+        const bool restarted = co_await poll_until([&] {
+            const auto current = names_with_prefix(dir.str(), ".download.");
+            return current.size() == 1 && current[0] != first_stagings[0];
+        });
+        REQUIRE(restarted);
+        src->release_blocked();
+
+        const bool done = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        });
+        REQUIRE(done);
+        const bool fill_done = co_await poll_until([&] {
+            return store->fill_status() ==
+                   source::LayerStore::FillStatus::kDone;
+        });
+        REQUIRE(fill_done);
+        REQUIRE(verify_attempt.load(std::memory_order_acquire) == 2);
+        REQUIRE(src->reads_completed() >= 5);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(std::filesystem::exists(dir.str() + "/overlaybd.commit"));
+    REQUIRE(names_with_prefix(dir.str(), ".download.").empty());
+    REQUIRE(names_with_prefix(dir.str(), ".bitmap.").empty());
+}
+
+TEST_CASE("source: layer store fill exhausts checksum retries",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(3 * kExtent, 25);
+    const std::string digest =
+        digest_of(test::pattern_bytes(3 * kExtent, 26));
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* src = new GatedSource(blob);
+        source::LayerStore::Config cfg;
+        cfg.try_count = 2;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.queue_max_bytes = kExtent;
+        std::atomic<uint32_t> verify_attempt{0};
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(src), dir.str(), digest, cfg);
+        store->set_test_completion_hook(
+            [&verify_attempt](uint32_t attempt) {
+                verify_attempt.store(attempt, std::memory_order_release);
+                if (attempt == 1) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(100));
+                }
+            });
+        src->gate.set();
+
+        const bool bypassed = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Bypass;
+        });
+        REQUIRE(bypassed);
+        const bool fill_stopped = co_await poll_until([&] {
+            return store->fill_status() ==
+                   source::LayerStore::FillStatus::kStopped;
+        });
+        REQUIRE(fill_stopped);
+        REQUIRE(verify_attempt.load(std::memory_order_acquire) == 2);
+        REQUIRE(src->reads() >= 2);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(!std::filesystem::exists(dir.str() + "/overlaybd.commit"));
+}
+
 TEST_CASE("source: layer store fill honors the throughput throttle",
           "[source]") {
     test::TempDir dir;
-    auto blob = test::pattern_bytes(3 * 1024 * 1024, 24);
+    auto blob = test::pattern_bytes(3 * 1024 * 1024, 27);
     const std::string digest = digest_of(blob);
 
     const auto t0 = std::chrono::steady_clock::now();

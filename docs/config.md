@@ -82,6 +82,10 @@ throttled by `maxMBps`, delayed by `delay`+`delayExtra`, runs at
 concurrency 1 per layer, and back-pressures itself — readers are never
 queued behind it. Locality grows with reads regardless of
 `download.enable`; the knob only controls the proactive whole-layer warm.
+If whole-file verification fails while retry attempts remain, the fill
+walk follows the fresh staging pair automatically; `tryCnt` bounds those
+automatic fill-driven verification attempts just as it bounds read-through
+warming attempts.
 
 ### `prefetch` (ADR-0012/0013)
 

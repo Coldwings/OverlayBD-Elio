@@ -630,6 +630,17 @@ Every test, grouped by area, with the property it guards.
   a fill stopped mid-walk leaves persisted extents in the sidecar; a
   reopen resumes them without refetching and the restarted fill
   completes the layer.
+- `source: layer store fill resumes after checksum retry` — background
+  fill reaches a fully present but checksum-bad first attempt, then keeps
+  running across the fresh retry and completes without any foreground
+  read or populate driving the second attempt.
+- `source: layer store drops stale fill writes after checksum retry` — an
+  old fill read that completes after checksum retry restart is not cached
+  into the fresh staging pair; the new fill attempt rereads and commits
+  the checksum-good bytes.
+- `source: layer store fill exhausts checksum retries` — background fill
+  keeps retrying checksum-bad attempts until `try_count` is exhausted,
+  then parks in `Bypass` with fill stopped and no commit file.
 - `source: layer store fill honors the throughput throttle` — a 1 MiB/s
   budget makes a 3 MiB fill take measurable seconds instead of
   milliseconds.

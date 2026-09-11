@@ -282,6 +282,12 @@ void LayerStore::set_test_fetch_done_hook(std::function<void()> hook) {
     fetch_done_hook_ = std::move(hook);
 }
 
+void LayerStore::set_test_completion_hook(
+    std::function<void(uint32_t attempt)> hook) {
+    std::lock_guard lk(qmu_);
+    completion_hook_ = std::move(hook);
+}
+
 // ---------------------------------------------------------------------------
 // Setup / recovery (cold paths)
 // ---------------------------------------------------------------------------
@@ -487,6 +493,7 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
         // before acquiring its permit so concurrent same-extent readers
         // still coalesce behind one remote fetch.
         f = std::make_shared<InFlight>();
+        f->generation = generation_.load(std::memory_order_acquire);
         inflight_.emplace(extent_id, f);
         starter = true;
     }
@@ -495,7 +502,7 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
     if (f && !starter) {
         coalesced_joins_.fetch_add(1, std::memory_order_relaxed);
         co_await f->done.wait();
-        co_return FetchResult{f->data, f->error};
+        co_return FetchResult{f->data, f->error, f->generation};
     }
 
     AdmissionFunnel::Permit permit;
@@ -509,7 +516,9 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
             auto bounded = co_await cfg_.funnel->acquire_scavenger_bounded(
                 cls, cfg_.populate_admit_timeout);
             if (!bounded) {
-                co_return FetchResult{nullptr, EAGAIN};
+                co_return FetchResult{nullptr, EAGAIN,
+                                      generation_.load(
+                                          std::memory_order_acquire)};
             }
             permit = std::move(*bounded);
         } else if (cfg_.funnel) {
@@ -523,7 +532,9 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
         if (state() != State::Filling ||
             (records_[extent_id].load(std::memory_order_acquire) &
              kFlagPresent)) {
-            co_return FetchResult{nullptr, 0};
+            co_return FetchResult{nullptr, 0,
+                                  generation_.load(
+                                      std::memory_order_acquire)};
         }
 
         // Another class may have issued this extent while Prefetch waited but
@@ -535,6 +546,7 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
             f = it->second;
         } else {
             f = std::make_shared<InFlight>();
+            f->generation = generation_.load(std::memory_order_acquire);
             inflight_.emplace(extent_id, f);
             starter = true;
         }
@@ -544,7 +556,7 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
             permit.reset();
             coalesced_joins_.fetch_add(1, std::memory_order_relaxed);
             co_await f->done.wait();
-            co_return FetchResult{f->data, f->error};
+            co_return FetchResult{f->data, f->error, f->generation};
         }
     } else if (cfg_.funnel) {
         permit = co_await cfg_.funnel->acquire(cls);
@@ -553,6 +565,7 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
     const uint64_t ebase = extent_id * cfg_.extent_size;
     const size_t elen = static_cast<size_t>(
         std::min<uint64_t>(cfg_.extent_size, size_ - ebase));
+    const uint64_t generation = f->generation;
     auto buf = std::make_shared<std::vector<uint8_t>>(elen);
     // ADR-0012: the starter's remote fetch enters the source only
     // through the device's admission funnel (the permit's lifetime is
@@ -596,18 +609,21 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
     f->done.set();
     inflight_.erase(extent_id);
     inflight_mu_.unlock();
-    co_return FetchResult{f->data, f->error};
+    co_return FetchResult{f->data, f->error, generation};
 }
 
 void LayerStore::enqueue_write(
     uint64_t extent_id, std::shared_ptr<const std::vector<uint8_t>> data,
-    size_t data_offset) {
+    uint64_t generation, size_t data_offset) {
     const uint64_t ebase = extent_id * cfg_.extent_size;
     const size_t elen = static_cast<size_t>(
         std::min<uint64_t>(cfg_.extent_size, size_ - ebase));
     const uint32_t crc = crc32_of(data->data() + data_offset, elen);
     std::lock_guard lk(qmu_);
-    if (stopping_ || state() != State::Filling) return;
+    if (stopping_ || state() != State::Filling ||
+        generation != generation_.load(std::memory_order_acquire)) {
+        return;
+    }
     if (queued_bytes_ + elen > cfg_.queue_max_bytes) {
         dropped_writes_.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -704,7 +720,7 @@ elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
             if (state() == State::Filling &&
                 !(records_[eid].load(std::memory_order_acquire) &
                   kFlagPresent)) {
-                enqueue_write(eid, fr.data);
+                enqueue_write(eid, fr.data, fr.generation);
             }
         }
         done += need;
@@ -730,7 +746,7 @@ elio::coro::task<ssize_t> LayerStore::populate(uint64_t offset, size_t len) {
         if (state() == State::Filling &&
             !(records_[eid].load(std::memory_order_acquire) &
               kFlagPresent)) {
-            enqueue_write(eid, fr.data);
+            enqueue_write(eid, fr.data, fr.generation);
         }
     }
     co_return 0;
@@ -817,8 +833,26 @@ elio::coro::task<void> LayerStore::run_fill() {
             }
         }
         if (e == extent_count_) {
-            done = true;  // nothing missing: completion is the writer's job
-            break;
+            // Every extent is present, but that is not yet a successful
+            // completion: the writer may still fail sha256 verification and
+            // restart with a fresh empty pair. Keep the fill alive across
+            // that decision so it can resume the new attempt without
+            // foreground reads.
+            while (!fill_stop_.load(std::memory_order_acquire) &&
+                   state() == State::Filling &&
+                   present_.load(std::memory_order_acquire) ==
+                       extent_count_) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (state() == State::Complete) {
+                done = true;
+                break;
+            }
+            if (fill_stop_.load(std::memory_order_acquire) ||
+                state() != State::Filling) {
+                break;
+            }
+            continue;
         }
         uint64_t run_end = e;
         while (run_end < extent_count_ &&
@@ -829,6 +863,8 @@ elio::coro::task<void> LayerStore::run_fill() {
         }
         const uint64_t run_len =
             std::min((run_end - e) * es, size_ - e * es);
+        const uint64_t generation =
+            generation_.load(std::memory_order_acquire);
         auto buf = std::make_shared<std::vector<uint8_t>>(
             static_cast<size_t>(run_len));
         // ADR-0012: fill's range read is one Fill-class scavenger
@@ -878,7 +914,8 @@ elio::coro::task<void> LayerStore::run_fill() {
                     std::memory_order_release);
                 co_return;
             }
-            enqueue_write(x, buf, static_cast<size_t>(xbase - e * es));
+            enqueue_write(x, buf, generation,
+                          static_cast<size_t>(xbase - e * es));
         }
         // Throughput throttle (the download contract's per-second budget window).
         window_used += run_len;
@@ -1011,6 +1048,12 @@ void LayerStore::complete_layer() {
     // Runs on the writer thread — the mandated blocking context for the
     // whole-file read-back and sha256.
     ++attempts_;
+    std::function<void(uint32_t)> hook;
+    {
+        std::lock_guard lk(qmu_);
+        hook = completion_hook_;
+    }
+    if (hook) hook(attempts_);
     bool verified = true;
     if (!expected_hex_.empty()) {
         try {
@@ -1077,15 +1120,21 @@ void LayerStore::complete_layer() {
 }
 
 void LayerStore::restart_fresh() {
-    // Ordering contract: demote everything FIRST. Readers either see a
-    // cleared record (treated as a miss, re-fetched remotely — any write
-    // they enqueue lands in the new pair, because process_job resolves the
-    // fds after the publish below) or the old fd with a stale record (old
-    // bytes, CRC-verified). Only then build and publish the replacement
-    // pair, so a watcher that observes the new pair's files already sees
-    // cleared records.
+    // Ordering contract: invalidate the current caching generation and
+    // demote everything FIRST. Readers either see a cleared record (treated
+    // as a miss, re-fetched remotely; stale in-flight reads from the failed
+    // generation are not allowed to enqueue into the retry pair) or the old
+    // fd with a stale record (old bytes, CRC-verified). Only then build and
+    // publish the replacement pair, so a watcher that observes the new
+    // pair's files already sees cleared records.
+    generation_.fetch_add(1, std::memory_order_acq_rel);
     for (auto& rec : records_) rec.store(0, std::memory_order_relaxed);
     present_.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard lk(qmu_);
+        queue_.clear();
+        queued_bytes_ = 0;
+    }
     const std::string old_staging = staging_path();
     const std::string old_sidecar = sidecar_path();
     // Build the replacement pair into locals: readers keep using the old
