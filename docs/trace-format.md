@@ -45,8 +45,10 @@ image** and inherits the host C++ ABI:
   image and would need its own verification.
 - **Alignment/padding: the platform ABI's natural struct layout**
   (verified empirically with GCC on x86-64: `sizeof` = 24 for both
-  structs, offsets as tabulated below). Padding bytes are part of the
-  byte stream and are **covered by the checksum** (§4).
+  structs, offsets as tabulated below). Header padding bytes are part of
+  the 24-byte header and are not covered by the checksum; record padding
+  bytes are part of the record stream and are covered by the checksum
+  (§4).
 
 The struct definitions that define the wire format (overlaybd
 `src/prefetch.cpp`, `PrefetcherImpl::TraceHeader` /
@@ -94,10 +96,10 @@ Total blob size = `24 + data_size` bytes; the reader enforces this
 | Offset | Size | Type | LE bytes | Meaning |
 |---|---|---|---|---|
 | 0 | 4 | u32 | `20 18 EF C2` | `magic` = 3270449184 (0xC2EF1820). |
-| 4 | 4 | padding | any | Struct alignment padding; **not** read as a field. |
+| 4 | 4 | padding | any | Struct alignment padding; **not** read as a field and not checksummed. |
 | 8 | 8 | u64 | — | `data_size` = number of record bytes = `24 × record_count`. |
 | 16 | 4 | u32 | — | `checksum` = CRC-32C over the whole record stream (§4). |
-| 20 | 4 | padding | any | Struct tail padding; **not** read as a field. |
+| 20 | 4 | padding | any | Struct tail padding; **not** read as a field and not checksummed. |
 
 - `magic`: constant `TRACE_MAGIC = 3270449184` with the upstream comment
   "CRC32 of `Container Image Trace Format`" (overlaybd `src/prefetch.cpp`,
@@ -163,9 +165,13 @@ consumers check it, with different consequences (§7):
   bytes; a size-0 file selects **Record** mode, a matching magic selects
   the static trace **Replay** path, and *any other non-empty content*
   silently selects the **dynamic prefetcher** (a line-based text file
-  list — `DynamicPrefetcher`). A trace blob whose first 4 bytes are
-  corrupted is therefore not rejected; it is reinterpreted as a (usually
-  garbage) file list.
+  list — `DynamicPrefetcher`). This routing decision checks only the
+  header read and magic, not `data_size` or checksum. A trace blob whose
+  first 4 bytes are corrupted is therefore not rejected; it is
+  reinterpreted as a (usually garbage) file list. A blob with matching
+  magic but a bad declared size is routed to static replay and then
+  rejected by `PrefetcherImpl::reload`; it does not fall back to dynamic
+  parsing.
 - `PrefetcherImpl::reload` hard-rejects a magic mismatch
   (`LOG_ERROR_RETURN`, "trace magic mismatch") — but this path is only
   reached after `new_prefetcher` already matched the magic.
@@ -350,9 +356,12 @@ never to a device-bring-up failure):
 No record field (`op`, `layer_index`, `count`, `offset`, padding) is
 validated at parse time; all semantics are deferred to replay, where
 non-READ ops and unknown layer indexes are silently skipped. Unknown
-"versions" do not exist: any blob that fails rules 1–3 at the
-`new_prefetcher` routing stage is not an error at all — it is
-reinterpreted as a dynamic-prefetch text file list (§3).
+"versions" do not exist. A non-empty blob that fails the
+`new_prefetcher` magic check is not a static-trace parse error at all —
+it is reinterpreted as a dynamic-prefetch text file list (§3). Once the
+magic matched and `new_prefetcher` selected static replay, later
+`reload` failures such as exact-size mismatch or checksum mismatch only
+disable trace replay; they do not retry dynamic parsing.
 
 ## 8. Edge cases
 
@@ -362,8 +371,15 @@ reinterpreted as a dynamic-prefetch text file list (§3).
   valid 24-byte blob: passes all §7 checks, loads zero records, replay is
   a no-op (`PrefetcherImpl::replay` returns 0 on an empty queue). This is
   what a recording with no full reads produces.
-- **Truncated blob / trailing garbage.** Rejected by the exact-size rule
-  (§7 rule 3); prefetch silently disabled.
+- **Shorter than a full 24-byte header.** `new_prefetcher` cannot match a
+  static trace header, so non-empty content shorter than 24 bytes selects
+  the dynamic-prefetch file-list path (§3), even if its first few bytes
+  happen to match the magic prefix.
+- **Header-readable trace with truncated data or trailing garbage.** Once
+  `new_prefetcher` read 24 bytes and matched the magic, the blob is routed
+  to static replay. A later total-size mismatch is rejected by the
+  exact-size rule (§7 rule 3); prefetch is silently disabled without
+  dynamic fallback.
 - **Checksum mismatch.** Record queue cleared; prefetch silently
   disabled (§7 rule 5).
 - **Short read mid-stream** (file shrinks between `stat` and read — the
@@ -391,11 +407,12 @@ reinterpreted as a dynamic-prefetch text file list (§3).
   (`TraceFormat trace = {op, layer_index, count, offset};`), whose
   padding-byte values are **not guaranteed by C++** — empirically zero at
   GCC `-O2`, but observed non-zero (0x02 in byte 1) at `-O0`. Upstream
-  trace files may therefore contain arbitrary padding bytes; the
-  checksum keeps them self-consistent because the reader recomputes the
-  CRC over the bytes as stored. Readers MUST include padding bytes in
-  the checksum and MUST NOT require them to be zero; writers SHOULD emit
-  zero padding (see §10).
+  trace records may therefore contain arbitrary padding bytes; the
+  checksum keeps record padding self-consistent because the reader
+  recomputes the CRC over the record bytes as stored. Header padding is
+  ignored and unchecksummed. Readers MUST include record padding bytes in
+  the checksum and MUST NOT require header or record padding to be zero;
+  writers SHOULD emit zero padding (see §10).
 - **Corrupt magic.** Not a parse error: the blob is reinterpreted as a
   dynamic-prefetch file list (§3), normally a harmless no-op.
 
@@ -413,7 +430,8 @@ layer blobs". Nothing in the blob gates device bring-up.
 | `layer_index` | **Load-bearing** | Selects the target layer blob; wrong indexes silently drop records (replay skips misses). |
 | `count`, `offset` | **Load-bearing** | The actual prefetch ranges; also the 1 MiB safety cap (§8). |
 | Record order | **Ignorable for correctness** | Upstream replays concurrently without order guarantees; chronological order is an optimization hint only. |
-| Header/record padding bytes | **Ignorable values, but checksummed** | Any values accepted; must be included in the CRC. |
+| Header padding bytes | **Ignorable and unchecksummed** | Any values accepted; never read as fields and outside the record-stream CRC. |
+| Record padding bytes | **Ignorable values, but checksummed** | Any values accepted; must be included in the record-stream CRC. |
 | `.lock` / `.ok` side files | **Operational only** | Recording handshake; never part of the blob or the image layer. |
 
 ## 10. Minimal writer checklist
@@ -436,16 +454,17 @@ upstream replayers:
    little-endian.
 2. `magic` = 3270449184 (`20 18 EF C2` little-endian).
 3. `checksum` = CRC-32C raw-chaining (seed 0, no complements) over **all
-   record bytes as written, padding included**, u64/u32 fields
-   little-endian.
+   record bytes as written, record padding included**, u64/u32 fields
+   little-endian. Header bytes and header padding are outside this CRC.
 4. Each record: `op = 0x52` (`'R'`); `layer_index` within the target
    image's lower count; `1 ≤ count ≤ 1048576` (split larger ranges —
    larger counts are parse-accepted but overflow the upstream replay
    buffer, §8); `offset ≥ 0` and `offset + count` within the layer
    blob's size (out-of-range records replay as logged failures, not
    errors).
-5. Emit zero padding bytes (upstream accepts any values, but zeros make
-   produced blobs deterministic and match optimized upstream builds).
+5. Emit zero header and record padding bytes (upstream accepts any
+   values, but zeros make produced blobs deterministic and match
+   optimized upstream builds).
 6. Image packaging, if the blob ships as a layer: single tar member
    named `trace`; layer media type
    `application/vnd.oci.image.layer.v1.tar`; annotation

@@ -3,10 +3,11 @@
 //
 // The blob is a raw LP64 little-endian struct image: a 24-byte header
 // (magic, data_size, checksum) followed by a stream of fixed 24-byte
-// records, all padding bytes included in the running CRC-32C. This codec
-// is a pure in-memory parser/serializer — no IO, no coroutines. The wire
-// authority is docs/trace-format.md; this header only restates the API
-// contract.
+// records. The running CRC-32C covers record bytes, including record
+// padding; header bytes and header padding are outside that CRC. This
+// codec is a pure in-memory parser/serializer — no IO, no coroutines.
+// The wire authority is docs/trace-format.md; this header only restates
+// the API contract.
 #pragma once
 
 #include <cstddef>
