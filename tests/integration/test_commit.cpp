@@ -16,6 +16,7 @@
 #include "format/lsmt.hpp"
 #include "format/lsmt_rw.hpp"
 #include "supervisor/daemon.hpp"
+#include "supervisor/daemon_test_hooks.hpp"
 #include "supervisor/protocol.hpp"
 
 #include <elio/runtime/spawn.hpp>
@@ -131,7 +132,9 @@ struct SigMaskGuard {
 using CheckFn = std::function<void(bool, const char*)>;
 
 template <typename F>
-int run_daemon_case(supervisor::DaemonConfig cfg, F&& client_body) {
+int run_daemon_case(
+    supervisor::DaemonConfig cfg, F&& client_body,
+    std::shared_ptr<supervisor::detail::DaemonTestGate> gate = nullptr) {
     std::atomic<bool> client_done{false};
     std::atomic<int> failures{0};
     std::string fail_msg;
@@ -158,7 +161,13 @@ int run_daemon_case(supervisor::DaemonConfig cfg, F&& client_body) {
     std::atomic<int> daemon_rc{-1};
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         elio::go([&]() -> elio::coro::task<void> {
-            daemon_rc.store(co_await supervisor::run_daemon(cfg));
+            if (gate) {
+                daemon_rc.store(
+                    co_await supervisor::detail::run_daemon_with_test_gate(
+                        cfg, gate));
+            } else {
+                daemon_rc.store(co_await supervisor::run_daemon(cfg));
+            }
         });
         while (!client_done.load()) {
             co_await elio::time::sleep_for(20ms);
@@ -197,6 +206,21 @@ std::string write_config(const test::TempDir& dir, const std::string& name,
     const std::string text = j.dump();
     return test::write_file(dir / name,
                             std::vector<uint8_t>(text.begin(), text.end()));
+}
+
+std::string write_slow_ready_device(const test::TempDir& dir,
+                                    const std::string& name) {
+    const std::string script = dir / name;
+    const std::string content =
+        "#!/usr/bin/env python3\n"
+        "import os, time\n"
+        "os.write(3, b'{\"state\":\"ready\",\"device\":\"/dev/ublkb70\"}\\n')\n"
+        "while True:\n"
+        "    time.sleep(1)\n";
+    test::write_file(script,
+                     std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    return script;
 }
 
 /// The sealed output must re-open as a valid standard LSMT RO layer with
@@ -379,6 +403,87 @@ TEST_CASE("supervisor: commit stops the device and seals its upper offline",
     require_sealed_payload(upper, "v1");
 }
 
+TEST_CASE("supervisor: successful commit disables recovery respawn",
+          "[supervisor]") {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string upper_dir = dir / "upper";
+    const std::string upper = upper_dir + "/overlaybd.rw";
+    const std::string cfg_lsmt = write_config(
+        dir, "config-lsmt.json",
+        {{"upper", {{"dir", upper_dir}, {"type", "lsmt"}}}});
+
+    auto guard = block_daemon_signals();
+
+    supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+    cfg.max_recovery_attempts = 1;
+
+    const int failures = run_daemon_case(
+        cfg,
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "d1"},
+                            {"config", cfg_lsmt}})
+                      .value("ok", false),
+                  "create d1 failed");
+            const auto before =
+                rpc_json({{"cmd", "status"}, {"id", "d1"}});
+            check(before.value("ok", false),
+                  "status before successful commit failed");
+            const int old_pid = before.value("pid", -1);
+            check(old_pid > 0,
+                  "status before successful commit lacks pid");
+            if (old_pid <= 0) return;
+
+            const auto commit = rpc_json({{"cmd", "commit"}, {"id", "d1"}});
+            check(commit.value("ok", false), "commit d1 failed");
+            if (!commit.value("ok", false)) {
+                std::fprintf(stderr, "[commit d1 reply] %s\n",
+                             commit.dump().c_str());
+                return;
+            }
+
+            nlohmann::json last_status;
+            bool replacement_published = false;
+            for (int i = 0; i < 100; ++i) {
+                last_status = rpc_json({{"cmd", "status"}, {"id", "d1"}});
+                if (!last_status.value("ok", false)) {
+                    check(false, "status after successful commit failed");
+                    return;
+                }
+                if (last_status.value("pid", old_pid) != old_pid ||
+                    last_status.value("recoveries", -1) != 0 ||
+                    last_status.value("state", "") == "ready") {
+                    replacement_published = true;
+                    break;
+                }
+                std::this_thread::sleep_for(20ms);
+            }
+            check(!replacement_published,
+                  "successful commit published a recovery child");
+            check(last_status.value("pid", -1) == old_pid,
+                  "successful commit changed the child pid");
+            check(last_status.value("recoveries", -1) == 0,
+                  "successful commit incremented recoveries");
+            check(last_status.value("state", "") == "exited",
+                  "successful commit did not leave the child exited");
+        });
+    REQUIRE(failures == 0);
+
+    require_sealed_payload(upper, "");
+}
+
 TEST_CASE("supervisor: concurrent commits are serialized and reject the loser",
           "[supervisor]") {
     // Two barrier-synchronized commits of the same device: exactly one
@@ -450,6 +555,183 @@ TEST_CASE("supervisor: concurrent commits are serialized and reject the loser",
     // Whichever commit won, the file is a valid sealed layer with the
     // payload — never a half-written interleaving.
     require_sealed_payload(upper, "");
+}
+
+TEST_CASE("supervisor: destroy is rejected while commit is admitted",
+          "[supervisor]") {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string upper_dir = dir / "upper";
+    const std::string cfg_lsmt = write_config(
+        dir, "config-lsmt.json",
+        {{"upper", {{"dir", upper_dir}, {"type", "lsmt"}}}});
+    const std::string script = write_slow_ready_device(dir, "slow-device.py");
+
+    auto gate =
+        std::make_shared<supervisor::detail::DaemonTestGate>(5s);
+    gate->arm("commit_admitted");
+    auto guard = block_daemon_signals();
+
+    supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+    cfg.device_bin = script;
+    cfg.stop_timeout_sec = 1;
+
+    const int failures = run_daemon_case(
+        cfg,
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "d1"},
+                            {"config", cfg_lsmt}})
+                      .value("ok", false),
+                  "create d1 failed");
+
+            nlohmann::json commit_reply;
+            std::string commit_error;
+            std::thread commit_thread([&] {
+                try {
+                    commit_reply =
+                        rpc_json({{"cmd", "commit"}, {"id", "d1"}});
+                } catch (const std::exception& e) {
+                    commit_error = e.what();
+                }
+            });
+            bool released = false;
+            auto release_and_join = [&] {
+                if (!released) {
+                    gate->release();
+                    released = true;
+                }
+                if (commit_thread.joinable()) commit_thread.join();
+            };
+
+            try {
+                check(gate->wait(), "commit admission gate was not hit");
+                const auto destroy =
+                    rpc_json({{"cmd", "destroy"}, {"id", "d1"}});
+                check(destroy.value("ok", true) == false,
+                      "destroy during commit unexpectedly succeeded");
+                check(destroy.contains("error") &&
+                          destroy["error"].get<std::string>().find(
+                              "commit already in progress") !=
+                              std::string::npos,
+                      "destroy during commit error text mismatch");
+
+                release_and_join();
+                check(commit_error.empty(), "commit RPC threw");
+                check(commit_reply.value("ok", true) == false,
+                      "commit with missing upper unexpectedly succeeded");
+                check(commit_reply.contains("error") &&
+                          commit_reply["error"].get<std::string>().find(
+                              "upper file not found") != std::string::npos,
+                      "commit failure text mismatch");
+                const auto cleanup =
+                    rpc_json({{"cmd", "destroy"}, {"id", "d1"}});
+                check(cleanup.value("ok", false),
+                      "destroy after commit failure failed");
+            } catch (...) {
+                release_and_join();
+                throw;
+            }
+        },
+        gate);
+    REQUIRE(failures == 0);
+}
+
+TEST_CASE("supervisor: commit is rejected while destroy is admitted",
+          "[supervisor]") {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string upper_dir = dir / "upper";
+    const std::string cfg_lsmt = write_config(
+        dir, "config-lsmt.json",
+        {{"upper", {{"dir", upper_dir}, {"type", "lsmt"}}}});
+    const std::string script = write_slow_ready_device(dir, "slow-device.py");
+
+    auto gate =
+        std::make_shared<supervisor::detail::DaemonTestGate>(5s);
+    gate->arm("destroy_admitted");
+    auto guard = block_daemon_signals();
+
+    supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+    cfg.device_bin = script;
+    cfg.stop_timeout_sec = 1;
+
+    const int failures = run_daemon_case(
+        cfg,
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "d1"},
+                            {"config", cfg_lsmt}})
+                      .value("ok", false),
+                  "create d1 failed");
+
+            nlohmann::json destroy_reply;
+            std::string destroy_error;
+            std::thread destroy_thread([&] {
+                try {
+                    destroy_reply =
+                        rpc_json({{"cmd", "destroy"}, {"id", "d1"}});
+                } catch (const std::exception& e) {
+                    destroy_error = e.what();
+                }
+            });
+            bool released = false;
+            auto release_and_join = [&] {
+                if (!released) {
+                    gate->release();
+                    released = true;
+                }
+                if (destroy_thread.joinable()) destroy_thread.join();
+            };
+
+            try {
+                check(gate->wait(), "destroy admission gate was not hit");
+                const auto commit =
+                    rpc_json({{"cmd", "commit"}, {"id", "d1"}});
+                check(commit.value("ok", true) == false,
+                      "commit during destroy unexpectedly succeeded");
+                check(commit.contains("error") &&
+                          commit["error"].get<std::string>().find(
+                              "being destroyed") != std::string::npos,
+                      "commit during destroy error text mismatch");
+
+                release_and_join();
+                check(destroy_error.empty(), "destroy RPC threw");
+                check(destroy_reply.value("ok", false),
+                      "destroy after release failed");
+                const auto status =
+                    rpc_json({{"cmd", "status"}, {"id", "d1"}});
+                check(status.value("ok", true) == false,
+                      "destroyed device still has a status entry");
+            } catch (...) {
+                release_and_join();
+                throw;
+            }
+        },
+        gate);
+    REQUIRE(failures == 0);
 }
 
 namespace {
@@ -834,6 +1116,135 @@ TEST_CASE("supervisor: mode-3 mkfs runs only when the blank spec requests it",
             const auto ghost = rpc_json({{"cmd", "status"}, {"id", "g1"}});
             check(ghost.value("ok", true) == false,
                   "failed-mkfs device entry still present");
+        });
+    REQUIRE(failures == 0);
+}
+
+TEST_CASE("supervisor: rejected commits preserve crash recovery",
+          "[supervisor]") {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string sparse_dir = dir / "sparse";
+    const std::string blank_root = dir / "blank";
+    const std::string cfg_sparse = write_config(
+        dir, "config-sparse.json",
+        {{"upper", {{"dir", sparse_dir}, {"type", "sparse"}}}});
+    const std::string cfg_plain = test::write_file(
+        dir / "config-plain.json", std::vector<uint8_t>{'{', '}'});
+
+    auto mock = std::make_shared<MockMkfs>();
+    auto guard = block_daemon_signals();
+
+    supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+    cfg.max_recovery_attempts = 1;
+    cfg.blank_dir = blank_root;
+    cfg.mkfs_runner = mock;
+
+    const int failures = run_daemon_case(
+        cfg, [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc_json = [&](const nlohmann::json& cmd) {
+                return nlohmann::json::parse(uds_rpc(s, cmd.dump() + "\n"));
+            };
+
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "sparse"},
+                            {"config", cfg_sparse}})
+                      .value("ok", false),
+                  "create sparse failed");
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "plain"},
+                            {"config", cfg_plain}})
+                      .value("ok", false),
+                  "create plain failed");
+            check(rpc_json({{"cmd", "create"},
+                            {"id", "mode3"},
+                            {"blank", {{"size", kFakeVsize},
+                                       {"mkfs", "ext4"}}}})
+                      .value("ok", false),
+                  "create mode3 failed");
+            check(mock->calls.load() == 1, "mode3 mkfs count mismatch");
+
+            auto expect_refusal_keeps_recovery =
+                [&](const char* id, const char* expected_error) {
+                    const auto before =
+                        rpc_json({{"cmd", "status"}, {"id", id}});
+                    check(before.value("ok", false),
+                          "status before refused commit failed");
+                    const int old_pid = before.value("pid", -1);
+                    check(old_pid > 0, "status before refused commit lacks pid");
+                    if (old_pid <= 0) return;
+                    check(before.value("state", "") == "ready",
+                          "device not ready before refused commit");
+                    check(before.value("recoveries", -1) == 0,
+                          "device already recovered before refused commit");
+
+                    const auto refused =
+                        rpc_json({{"cmd", "commit"}, {"id", id}});
+                    check(refused.value("ok", true) == false,
+                          "unsupported commit unexpectedly succeeded");
+                    check(refused.contains("error") &&
+                              refused["error"].get<std::string>().find(
+                                  expected_error) != std::string::npos,
+                          "unsupported commit error text mismatch");
+
+                    const auto after_refusal =
+                        rpc_json({{"cmd", "status"}, {"id", id}});
+                    const bool status_after_ok =
+                        after_refusal.value("ok", false);
+                    const bool same_child_after_refusal =
+                        after_refusal.value("pid", -1) == old_pid;
+                    const bool ready_after_refusal =
+                        after_refusal.value("state", "") == "ready";
+                    const bool no_recovery_after_refusal =
+                        after_refusal.value("recoveries", -1) == 0;
+                    check(status_after_ok,
+                          "status after refused commit failed");
+                    check(same_child_after_refusal,
+                          "refused commit replaced the child");
+                    check(ready_after_refusal,
+                          "refused commit stopped the child");
+                    check(no_recovery_after_refusal,
+                          "refused commit triggered recovery");
+                    if (!status_after_ok || !same_child_after_refusal ||
+                        !ready_after_refusal || !no_recovery_after_refusal) {
+                        return;
+                    }
+
+                    if (::kill(old_pid, SIGKILL) != 0) {
+                        check(false, "cannot kill old child");
+                        return;
+                    }
+                    bool recovered = false;
+                    for (int i = 0; i < 250; ++i) {
+                        const auto st =
+                            rpc_json({{"cmd", "status"}, {"id", id}});
+                        if (st.value("ok", false) &&
+                            st.value("recoveries", 0) == 1 &&
+                            st.value("pid", old_pid) != old_pid &&
+                            st.value("state", "") == "ready") {
+                            recovered = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(20ms);
+                    }
+                    check(recovered,
+                          "device did not recover after refused commit");
+                    const auto destroy =
+                        rpc_json({{"cmd", "destroy"}, {"id", id}});
+                    check(destroy.value("ok", false),
+                          "destroy after recovery failed");
+                };
+
+            expect_refusal_keeps_recovery("sparse", "sparse");
+            expect_refusal_keeps_recovery("plain", "no writable upper");
+            expect_refusal_keeps_recovery("mode3", "host mkfs");
         });
     REQUIRE(failures == 0);
 }
