@@ -19,6 +19,7 @@
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
+#include <elio/sync/mutex.hpp>
 
 #include <sys/socket.h>
 
@@ -86,8 +87,23 @@ elio::coro::task<int> device_main(Args args) {
     obd::image::OpenedImage opened;
     auto stopping = std::make_shared<std::atomic<bool>>(false);
     auto resize_gate = std::make_shared<std::mutex>();
+    auto trace_start_stopping = std::make_shared<std::atomic<bool>>(false);
+    auto trace_start_gate = std::make_shared<elio::sync::mutex>();
     std::optional<elio::coro::join_handle<void>> control;
     int result = 0;
+    auto close_trace_start_admission = [&]() -> elio::coro::task<void> {
+        trace_start_stopping->store(true, std::memory_order_release);
+        co_await trace_start_gate->lock();
+        trace_start_gate->unlock();
+    };
+    auto finish_trace_recording = [&]() -> elio::coro::task<void> {
+        if (!opened.recorder) co_return;
+        const auto tres = co_await opened.recorder->stop("shutdown");
+        if (!tres.ok && tres.error != "no trace recording in progress") {
+            ELIO_LOG_ERROR("trace finalize on shutdown failed: {}",
+                           tres.error);
+        }
+    };
     try {
         obd::image::GlobalConfig global =
             args.global.empty()
@@ -246,6 +262,8 @@ elio::coro::task<int> device_main(Args args) {
                           })
                     : std::function<int(uint64_t)>(),
                 [dev](uint64_t bytes) { return dev->resize_blocking(bytes); });
+            hooks.trace_start_stopping = trace_start_stopping;
+            hooks.trace_start_gate = trace_start_gate;
             control.emplace(elio::spawn(obd::supervisor::run_device_control,
                                         channel, opened.recorder,
                                         std::move(hooks)));
@@ -276,17 +294,13 @@ elio::coro::task<int> device_main(Args args) {
         co_await elio::spawn_blocking([&] {
             std::lock_guard<std::mutex> drain(*resize_gate);
         });
+        co_await close_trace_start_admission();
         co_await dev->stop_async();
-        // ADR-0013: finalize any active trace recording BEFORE the source
-        // chain can go away (the taps feed the recorder; a shutdown
-        // finalize keeps the produced blob valid).
-        if (opened.recorder && opened.recorder->recording()) {
-            const auto tres = co_await opened.recorder->stop("shutdown");
-            if (!tres.ok) {
-                ELIO_LOG_ERROR("trace finalize on shutdown failed: {}",
-                               tres.error);
-            }
-        }
+        // ADR-0013: finalize and drain any trace recording BEFORE the source
+        // chain can go away. Do not gate this on recording(): an expiry-owned
+        // finalize has already lowered the hot-path flag while its timer
+        // coroutine may still be writing the file or sending the callback.
+        co_await finish_trace_recording();
         // ADR-0014: with the queues drained, persist the writable top's
         // index so the supervisor can seal the upper offline (commit). A
         // checkpoint failure is logged, not fatal: shutdown continues and
@@ -334,6 +348,7 @@ elio::coro::task<int> device_main(Args args) {
     co_await elio::spawn_blocking([&] {
         std::lock_guard<std::mutex> drain(*resize_gate);
     });
+    co_await close_trace_start_admission();
     if (control) {
         ::shutdown(args.control_fd, SHUT_RDWR);
         auto& control_task = *control;
@@ -351,6 +366,7 @@ elio::coro::task<int> device_main(Args args) {
     }
     if (dev) {
         co_await dev->stop_async();
+        co_await finish_trace_recording();
         // The normal path already parks fills before reporting stopped.
         // Retain the same owners during exceptional cleanup as well.
         if (result != 0) co_await obd::image::park_image_fills(opened);

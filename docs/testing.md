@@ -600,6 +600,37 @@ Every test, grouped by area, with the property it guards.
 - `image: trace recording stop is idempotent and reports expiry stats` —
   the device-side timer finalizes with no client call; a late stop
   returns the same stats.
+- `image: trace recording stop drains an awakened duration timer` —
+  explicit shutdown stop waits for a timer that already woke before it
+  touched recorder state.
+- `image: trace recording expiry callback is skipped when explicit stop wins` —
+  a timer that already captured the expiry callback but loses finalization
+  to an explicit shutdown stop returns that shutdown result without
+  emitting an expiry callback.
+- `image: trace recording shutdown joins expiry finalization` —
+  shutdown stop joins an expiry-owned finalize while `recording()` is
+  already false and returns the expiry result.
+- `image: trace recording late stop waits for expiry callback completion` —
+  a cached late stop waits for the timer's expiry callback tail to
+  finish before returning.
+- `image: trace recording timer losing stop race skips expiry callback` —
+  if an external stop wins after the timer copied its callback but before
+  it owns finalization, no expiry callback is emitted for the external
+  stop result.
+- `image: trace recording expiry callback stop never joins itself` —
+  a stop task created re-entrantly from the expiry callback returns the
+  captured expiry result without joining its own timer or stopping a
+  restarted recording, and a callback-created start is rejected.
+- `image: trace recording external stop during expiry callback drains timer` —
+  a stop task created by another thread while the expiry callback is
+  running still waits for the timer frame to finish before returning.
+- `image: trace recording external start during expiry callback drains timer` —
+  a start task created by another thread while the expiry callback is
+  running waits for the stale timer drain instead of being rejected as
+  callback-reentrant.
+- `image: trace recording stale stop never drains a restarted timer` —
+  a late stop waiting on an old timer drain stays bound to that old
+  timer after a new recording starts.
 - `image: concurrent trace stops join the winning finalize` — an
   expiry stop and explicit stop are held after both observe Recording;
   the losing stop waits for and returns the winner's finalized path,
@@ -809,6 +840,10 @@ Every test, grouped by area, with the property it guards.
   gets a clean error reply (with the `seq` correlation echoed) instead
   of an escaping `type_error` killing the loop, and a valid start/stop
   cycle afterwards proves the loop stayed alive (ADR-0013).
+- `supervisor: trace start is rejected after shutdown admission closes` —
+  a queued `trace_start` behind the device shutdown admission gate is
+  rejected with a clean shutting-down error and never arms a recorder
+  timer after shutdown has begun (ADR-0013).
 - `supervisor: device trace control skips an oversized line and stays alive` —
   the same loop over a real socketpair: a command line larger than the
   64 KiB cap (no newline inside) is discarded rather than mistaken for

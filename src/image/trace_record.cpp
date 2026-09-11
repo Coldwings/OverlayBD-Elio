@@ -13,13 +13,42 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 namespace obd::image {
 
+namespace {
+
+elio::coro::task<TraceRecorder::FinalizeResult> ready_finalize_result(
+    TraceRecorder::FinalizeResult result) {
+    co_return result;
+}
+
+}  // namespace
+
 TraceRecorder::TraceRecorder(size_t max_pending) : max_pending_(max_pending) {}
+
+TraceRecorder::TimerCallbackScope::TimerCallbackScope(
+    TraceRecorder& recorder, FinalizeResult result)
+    : recorder_(recorder) {
+    std::lock_guard<std::mutex> lk(recorder_.mu_);
+    recorder_.timer_callback_result_ = std::move(result);
+    recorder_.timer_callback_thread_ = std::this_thread::get_id();
+}
+
+TraceRecorder::TimerCallbackScope::~TimerCallbackScope() {
+    std::lock_guard<std::mutex> lk(recorder_.mu_);
+    recorder_.timer_callback_result_.reset();
+    recorder_.timer_callback_thread_ = std::thread::id{};
+}
+
+bool TraceRecorder::in_timer_callback_locked() const {
+    return timer_callback_result_.has_value() &&
+           timer_callback_thread_ == std::this_thread::get_id();
+}
 
 void TraceRecorder::record(uint32_t layer_index, uint64_t offset,
                            uint64_t count) noexcept {
@@ -78,6 +107,23 @@ elio::coro::task<bool> TraceRecorder::start(
     std::string path, uint32_t duration_sec,
     std::function<void(const FinalizeResult&)> on_expire,
     std::string& error) {
+    bool from_timer_callback = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        from_timer_callback = in_timer_callback_locked();
+    }
+    return start_impl(std::move(path), duration_sec, std::move(on_expire),
+                      error, from_timer_callback);
+}
+
+elio::coro::task<bool> TraceRecorder::start_impl(
+    std::string path, uint32_t duration_sec,
+    std::function<void(const FinalizeResult&)> on_expire,
+    std::string& error, bool from_timer_callback) {
+    if (from_timer_callback) {
+        error = "trace recorder expiry callback cannot start recording";
+        co_return false;
+    }
     if (duration_sec < kMinDurationSec || duration_sec > kMaxDurationSec) {
         error = "duration_sec out of bounds [" +
                 std::to_string(kMinDurationSec) + ", " +
@@ -88,15 +134,29 @@ elio::coro::task<bool> TraceRecorder::start(
         error = "trace output path must be absolute";
         co_return false;
     }
+
+    // A previous duration-owned expiry can publish Idle before its timer
+    // coroutine has finished the expiry callback. Reuse must not overwrite
+    // that timer handle, so a start from Idle first drains any stale timer.
+    auto drain_stale_idle_timer = [&]() -> elio::coro::task<bool> {
+        for (;;) {
+            std::shared_ptr<TimerDrain> drain;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (state_ != State::Idle) co_return false;
+                drain = timer_drain_;
+                if (!drain || drain->drained) co_return true;
+            }
+            co_await drain_timer_task(std::move(drain));
+        }
+    };
+
     // Gate BEFORE touching the filesystem: a rejected start must not
     // O_TRUNC anything — least of all a previous recording's valid,
     // already-finalized blob whose path the operator reused.
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (state_ != State::Idle) {
-            error = "trace recording already in progress";
-            co_return false;
-        }
+    if (!co_await drain_stale_idle_timer()) {
+        error = "trace recording already in progress";
+        co_return false;
     }
     // Fail fast on the output path before arming any tap — but open
     // WITHOUT O_TRUNC: two concurrent starts on the SAME path both get
@@ -138,6 +198,11 @@ elio::coro::task<bool> TraceRecorder::start(
         }
         if (hook) co_await hook();
     }
+    if (!co_await drain_stale_idle_timer()) {
+        ::close(fd);
+        error = "trace recording already in progress";
+        co_return false;
+    }
     uint64_t generation;
     std::shared_ptr<elio::coro::cancel_source> cancel;
     {
@@ -175,6 +240,9 @@ elio::coro::task<bool> TraceRecorder::start(
         last_.reset();
         cancel = std::make_shared<elio::coro::cancel_source>();
         timer_cancel_ = cancel;
+        timer_drain_ = std::make_shared<TimerDrain>();
+        timer_task_.emplace(elio::spawn(
+            run_timer(generation, duration_sec, cancel)));
         // Enable the hot-path gate INSIDE the lock, as the last step
         // after every field the gate's fast path reads is consistent:
         // a record() arriving between this store and the unlock must not
@@ -183,10 +251,6 @@ elio::coro::task<bool> TraceRecorder::start(
         active_.store(true, std::memory_order_release);
     }
     ELIO_LOG_INFO("trace recording to {} for {}s", path_, duration_sec);
-    elio::go([this, generation, duration_sec,
-              cancel = std::move(cancel)]() -> elio::coro::task<void> {
-        co_await run_timer(generation, duration_sec, std::move(cancel));
-    });
     co_return true;
 }
 
@@ -200,7 +264,13 @@ elio::coro::task<void> TraceRecorder::run_timer(
     if (slept != elio::coro::cancel_result::completed) {
         co_return;  // stopped or superseded
     }
+    std::function<elio::coro::task<void>()> awake_hook;
     std::function<void(const FinalizeResult&)> cb;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        awake_hook = timer_awake_hook_;
+    }
+    if (awake_hook) co_await awake_hook();
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (state_ != State::Recording || generation != generation_) {
@@ -209,24 +279,107 @@ elio::coro::task<void> TraceRecorder::run_timer(
         cb = on_expire_;
     }
     // Duration expired: finalize exactly like an explicit stop; the
-    // CLI's fate is irrelevant (ADR-0013 server-side bound).
-    FinalizeResult res = co_await stop("expired");
-    if (cb) cb(res);
+    // CLI's fate is irrelevant (ADR-0013 server-side bound). This is
+    // the timer itself, so it must not try to join its own handle.
+    bool owns_expiry_finalize = false;
+    FinalizeResult res = co_await stop_impl(
+        "expired", /*from_timer=*/true, &owns_expiry_finalize);
+    if (owns_expiry_finalize && cb) {
+        TimerCallbackScope callback_scope(*this, res);
+        cb(res);
+    }
+    std::function<elio::coro::task<void>()> exit_hook;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        exit_hook = timer_exit_hook_;
+    }
+    if (exit_hook) co_await exit_hook();
     co_return;
 }
 
 elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
     std::string reason) {
+    FinalizeResult result;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (in_timer_callback_locked()) {
+            result = *timer_callback_result_;
+            return ready_finalize_result(std::move(result));
+        }
+    }
+    return stop_impl(std::move(reason), /*from_timer=*/false);
+}
+
+elio::coro::task<void> TraceRecorder::drain_timer_task(
+    std::shared_ptr<TimerDrain> drain) {
+    std::optional<elio::coro::join_handle<void>> timer_task;
+    for (;;) {
+        bool wait_for_other_drain = false;
+        std::function<elio::coro::task<void>()> claim_hook;
+        std::function<elio::coro::task<void>()> wait_hook;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!drain || drain->drained) co_return;
+            if (drain->draining) {
+                wait_for_other_drain = true;
+                wait_hook = timer_drain_wait_hook_;
+            } else {
+                drain->draining = true;
+                if (timer_drain_ == drain && timer_task_) {
+                    timer_task.emplace(std::move(*timer_task_));
+                    timer_task_.reset();
+                    claim_hook = timer_drain_claim_hook_;
+                } else {
+                    drain->drained = true;
+                    if (timer_drain_ == drain) timer_drain_.reset();
+                    co_return;
+                }
+            }
+        }
+        if (!wait_for_other_drain) {
+            if (claim_hook) co_await claim_hook();
+            break;
+        }
+        if (wait_hook) co_await wait_hook();
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    while (!timer_task->is_destroyed()) {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+    }
+    try {
+        timer_task->await_resume();
+    } catch (const std::exception& e) {
+        ELIO_LOG_ERROR("trace duration timer failed: {}", e.what());
+    } catch (...) {
+        ELIO_LOG_ERROR("trace duration timer failed: unknown exception");
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (drain) {
+            drain->drained = true;
+            if (timer_drain_ == drain) timer_drain_.reset();
+        }
+    }
+}
+
+elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
+    std::string reason, bool from_timer, bool* owns_finalize_out) {
     // A concurrent stop while another caller is finalizing (an explicit
     // stop racing the duration expiry) captures that finalization's
     // completion object and waits for exactly that result. It must not
     // poll the global state alone: the owner can publish Idle and a new
     // start can enter Recording before a waiter wakes.
-    int fd;
+    int fd = -1;
     std::string path;
     std::shared_ptr<FinalizeCompletion> joined_finalize;
     std::shared_ptr<FinalizeCompletion> owned_finalize;
     bool stop_claim_hook_ran = false;
+    std::shared_ptr<TimerDrain> drain_to_join;
+    FinalizeResult res;
+    bool have_result = false;
+    bool owns_finalize = false;
     for (;;) {
         std::function<elio::coro::task<void>()> stop_claim_hook;
         bool wait_for_finalizer = false;
@@ -234,23 +387,31 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
             std::lock_guard<std::mutex> lk(mu_);
             if (joined_finalize) {
                 if (joined_finalize->result.has_value()) {
-                    co_return *joined_finalize->result;
+                    res = *joined_finalize->result;
+                    have_result = true;
+                    break;
                 }
                 wait_for_finalizer = true;
             } else if (state_ == State::Finalizing) {
                 joined_finalize = finalizing_;
+                drain_to_join = timer_drain_;
                 wait_for_finalizer = true;
             } else if (state_ != State::Recording) {
+                drain_to_join = timer_drain_;
                 // Idempotent stop: report the cached finalize when there was
                 // one (a stop racing the expiry gets the expiry's stats).
-                if (last_.has_value()) co_return *last_;
-                FinalizeResult res;
-                res.error = "no trace recording in progress";
-                co_return res;
+                if (last_.has_value()) {
+                    res = *last_;
+                } else {
+                    res.error = "no trace recording in progress";
+                }
+                have_result = true;
+                break;
             } else if (!stop_claim_hook_ran && stop_claim_hook_) {
                 stop_claim_hook = stop_claim_hook_;
                 stop_claim_hook_ran = true;
             } else {
+                drain_to_join = timer_drain_;
                 state_ = State::Finalizing;
                 ++generation_;  // invalidate the duration timer
                 owned_finalize = std::make_shared<FinalizeCompletion>();
@@ -266,6 +427,7 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
                 // where a late record() appended into the drained queue and was
                 // silently lost).
                 active_.store(false, std::memory_order_release);
+                owns_finalize = true;
                 break;
             }
         }
@@ -275,15 +437,26 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
             co_await elio::time::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    FinalizeResult res =
-        co_await finalize_locked_state(fd, std::move(path), reason);
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        last_ = res;
-        if (owned_finalize) owned_finalize->result = res;
-        if (finalizing_ == owned_finalize) finalizing_.reset();
-        state_ = State::Idle;
-        on_expire_ = nullptr;
+    if (owns_finalize) {
+        res = co_await finalize_locked_state(fd, std::move(path), reason);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            last_ = res;
+            if (owned_finalize) owned_finalize->result = res;
+            if (finalizing_ == owned_finalize) finalizing_.reset();
+            state_ = State::Idle;
+            on_expire_ = nullptr;
+        }
+        have_result = true;
+    }
+    if (!have_result) {
+        res.error = "no trace recording in progress";
+    }
+    if (owns_finalize_out != nullptr) {
+        *owns_finalize_out = owns_finalize;
+    }
+    if (!from_timer && drain_to_join) {
+        co_await drain_timer_task(std::move(drain_to_join));
     }
     co_return res;
 }

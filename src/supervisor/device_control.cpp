@@ -88,6 +88,19 @@ private:
     std::string buf_;
 };
 
+struct SyncMutexGuard {
+    elio::sync::mutex* mu = nullptr;
+
+    SyncMutexGuard() = default;
+    explicit SyncMutexGuard(elio::sync::mutex& m) : mu(&m) {}
+    ~SyncMutexGuard() {
+        if (mu != nullptr) mu->unlock();
+    }
+
+    SyncMutexGuard(const SyncMutexGuard&) = delete;
+    SyncMutexGuard& operator=(const SyncMutexGuard&) = delete;
+};
+
 }  // namespace
 
 bool ControlChannelWriter::write_line(const nlohmann::json& j) {
@@ -310,6 +323,23 @@ elio::coro::task<void> run_device_control(
                 nlohmann::json rj = {{"reply", "trace_start"},
                                      {"ok", false},
                                      {"error", bound_msg}};
+                echo_seq(j, rj);
+                channel->write_line(rj);
+                continue;
+            }
+            std::optional<SyncMutexGuard> trace_start_guard;
+            if (hooks.trace_start_gate) {
+                co_await hooks.trace_start_gate->lock();
+                trace_start_guard.emplace(*hooks.trace_start_gate);
+            }
+            if (hooks.trace_start_stopping &&
+                hooks.trace_start_stopping->load(
+                    std::memory_order_acquire)) {
+                nlohmann::json rj = {
+                    {"reply", "trace_start"},
+                    {"ok", false},
+                    {"error",
+                     "device is shutting down; trace_start ignored"}};
                 echo_seq(j, rj);
                 channel->write_line(rj);
                 continue;

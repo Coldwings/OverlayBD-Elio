@@ -5,12 +5,11 @@
 // conforming-writer MUSTs of docs/trace-format.md §10.
 //
 // STYLE NOTE: each test runs its whole recording lifecycle (start, reads,
-// stop) inside ONE run_coro: the recorder's duration timer is a detached
-// coroutine on the starting scheduler, and a stop cancels it — a parked
-// timer across schedulers would stall teardown (see trace_record.hpp).
-// No Catch2 macros between start and stop: a REQUIRE throw would skip
-// the stop and leak the timer; read results are collected and asserted
-// after the stop.
+// stop) inside ONE run_coro: stop is the recorder's timer completion
+// barrier, so the coroutine that starts the duration timer also drains it
+// before the scheduler exits (see trace_record.hpp). No Catch2 macros
+// between start and stop: a REQUIRE throw would skip cleanup; read
+// results are collected and asserted after the stop.
 #include "common/sha256.hpp"
 #include "image/trace_record.hpp"
 #include "source/layer_store.hpp"
@@ -31,6 +30,7 @@
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace obd;
@@ -60,6 +60,24 @@ elio::coro::task<image::TraceRecorder::FinalizeResult> await_stop_handle(
         co_await elio::time::sleep_for(1ms);
     }
     co_return result;
+}
+
+elio::coro::task<bool> await_bool_handle(
+    elio::coro::join_handle<bool>& handle) {
+    const bool result = co_await handle;
+    while (!handle.is_destroyed()) {
+        co_await elio::time::sleep_for(1ms);
+    }
+    co_return result;
+}
+
+template <typename Pred>
+elio::coro::task<bool> wait_until(Pred pred, int attempts = 5000) {
+    for (int i = 0; i < attempts; ++i) {
+        if (pred()) co_return true;
+        co_await elio::time::sleep_for(1ms);
+    }
+    co_return pred();
 }
 
 /// Starts the recorder, runs `body` (a coroutine lambda), and ALWAYS
@@ -418,6 +436,897 @@ TEST_CASE("image: trace recording stop is idempotent and reports expiry stats",
     REQUIRE(again.sha256 == expired->sha256);
     const auto records = parse_file(out);
     REQUIRE(records.size() == 1);
+}
+
+TEST_CASE("image: trace recording stop drains an awakened duration timer",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 74);
+    const std::string out = dir / "out.trace";
+    std::atomic<bool> timer_awake{false};
+    std::atomic<bool> timer_release{false};
+    std::atomic<bool> stop_entered{false};
+    std::optional<image::TraceRecorder::FinalizeResult> stopped;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_awake_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_awake.store(true, std::memory_order_release);
+                while (!timer_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!started) co_return 1;
+        const ssize_t r1 = co_await read_at(tap, 0, 4096);
+        if (r1 != 4096) {
+            timer_release.store(true, std::memory_order_release);
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool awake = co_await wait_until([&] {
+            return timer_awake.load(std::memory_order_acquire);
+        });
+        if (!awake) {
+            timer_release.store(true, std::memory_order_release);
+            stopped = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto stop_task = elio::spawn(marked_stop, rec, &stop_entered,
+                                    std::string("shutdown"));
+        const bool entered = co_await wait_until([&] {
+            return stop_entered.load(std::memory_order_acquire);
+        });
+        if (!entered) {
+            timer_release.store(true, std::memory_order_release);
+            stopped = co_await await_stop_handle(stop_task);
+            co_return 4;
+        }
+        const bool finalized = co_await wait_until([&] {
+            return rec->last_result().has_value() || stop_task.is_ready();
+        });
+        if (!finalized) {
+            timer_release.store(true, std::memory_order_release);
+            stopped = co_await await_stop_handle(stop_task);
+            co_return 5;
+        }
+        if (stop_task.is_ready() || stop_task.is_destroyed()) {
+            timer_release.store(true, std::memory_order_release);
+            stopped = co_await await_stop_handle(stop_task);
+            co_return 6;
+        }
+        timer_release.store(true, std::memory_order_release);
+        stopped = co_await await_stop_handle(stop_task);
+        rec->set_timer_awake_hook_for_test(nullptr);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(stopped.has_value());
+    REQUIRE(stopped->ok);
+    REQUIRE(stopped->reason == "shutdown");
+    REQUIRE(stopped->records == 1);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+}
+
+TEST_CASE("image: trace recording expiry callback is skipped when explicit stop wins",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 75);
+    const std::string out = dir / "out.trace";
+    std::atomic<int> stop_claim_entries{0};
+    std::atomic<bool> timer_stop_claim_entered{false};
+    std::atomic<bool> timer_stop_claim_release{false};
+    std::atomic<bool> explicit_stop_claim_release{false};
+    std::atomic<bool> finalize_entered{false};
+    std::atomic<bool> finalize_release{false};
+    std::atomic<bool> explicit_stop_entered{false};
+    std::atomic<int> callback_calls{0};
+    std::optional<image::TraceRecorder::FinalizeResult> explicit_stop;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        auto release_all = [&] {
+            timer_stop_claim_release.store(true, std::memory_order_release);
+            explicit_stop_claim_release.store(true,
+                                             std::memory_order_release);
+            finalize_release.store(true, std::memory_order_release);
+            rec->set_stop_claim_hook_for_test(nullptr);
+            rec->set_finalize_hook_for_test(nullptr);
+        };
+        rec->set_stop_claim_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                const int entry = stop_claim_entries.fetch_add(
+                                      1, std::memory_order_acq_rel) +
+                                  1;
+                if (entry == 1) {
+                    timer_stop_claim_entered.store(
+                        true, std::memory_order_release);
+                    while (!timer_stop_claim_release.load(
+                        std::memory_order_acquire)) {
+                        co_await elio::time::sleep_for(1ms);
+                    }
+                } else {
+                    while (!explicit_stop_claim_release.load(
+                        std::memory_order_acquire)) {
+                        co_await elio::time::sleep_for(1ms);
+                    }
+                }
+            });
+        rec->set_finalize_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                finalize_entered.store(true, std::memory_order_release);
+                while (!finalize_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult&) {
+                callback_calls.fetch_add(1, std::memory_order_acq_rel);
+            },
+            error);
+        if (!started) {
+            release_all();
+            co_return 1;
+        }
+        const ssize_t r1 = co_await read_at(tap, 0, 4096);
+        if (r1 != 4096) {
+            release_all();
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool timer_claimed = co_await wait_until([&] {
+            return timer_stop_claim_entered.load(std::memory_order_acquire);
+        });
+        if (!timer_claimed) {
+            release_all();
+            explicit_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto stop_task = elio::spawn(marked_stop, rec,
+                                    &explicit_stop_entered,
+                                    std::string("shutdown"));
+        const bool explicit_claimed = co_await wait_until([&] {
+            return explicit_stop_entered.load(std::memory_order_acquire) &&
+                   stop_claim_entries.load(std::memory_order_acquire) >= 2;
+        });
+        if (!explicit_claimed) {
+            release_all();
+            explicit_stop = co_await await_stop_handle(stop_task);
+            co_return 4;
+        }
+        explicit_stop_claim_release.store(true, std::memory_order_release);
+        const bool finalizing = co_await wait_until([&] {
+            return finalize_entered.load(std::memory_order_acquire);
+        });
+        if (!finalizing) {
+            release_all();
+            explicit_stop = co_await await_stop_handle(stop_task);
+            co_return 5;
+        }
+        finalize_release.store(true, std::memory_order_release);
+        timer_stop_claim_release.store(true, std::memory_order_release);
+        explicit_stop = co_await await_stop_handle(stop_task);
+        rec->set_stop_claim_hook_for_test(nullptr);
+        rec->set_finalize_hook_for_test(nullptr);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(explicit_stop.has_value());
+    REQUIRE(explicit_stop->ok);
+    REQUIRE(explicit_stop->reason == "shutdown");
+    REQUIRE(callback_calls.load(std::memory_order_acquire) == 0);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+}
+
+TEST_CASE("image: trace recording shutdown joins expiry finalization",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 76);
+    const std::string out = dir / "out.trace";
+    std::atomic<bool> finalize_entered{false};
+    std::atomic<bool> finalize_release{false};
+    std::atomic<bool> shutdown_entered{false};
+    bool recording_during_finalize = true;
+    std::optional<image::TraceRecorder::FinalizeResult> shutdown_stop;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_finalize_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                finalize_entered.store(true, std::memory_order_release);
+                while (!finalize_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!started) co_return 1;
+        const ssize_t r1 = co_await read_at(tap, 0, 4096);
+        if (r1 != 4096) {
+            finalize_release.store(true, std::memory_order_release);
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool entered = co_await wait_until([&] {
+            return finalize_entered.load(std::memory_order_acquire);
+        });
+        if (!entered) {
+            finalize_release.store(true, std::memory_order_release);
+            shutdown_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+        recording_during_finalize = rec->recording();
+
+        auto stop_task = elio::spawn(marked_stop, rec, &shutdown_entered,
+                                    std::string("shutdown"));
+        const bool stop_entered = co_await wait_until([&] {
+            return shutdown_entered.load(std::memory_order_acquire);
+        });
+        if (!stop_entered) {
+            finalize_release.store(true, std::memory_order_release);
+            shutdown_stop = co_await await_stop_handle(stop_task);
+            co_return 4;
+        }
+        co_await elio::time::sleep_for(20ms);
+        if (stop_task.is_ready() || stop_task.is_destroyed()) {
+            finalize_release.store(true, std::memory_order_release);
+            shutdown_stop = co_await await_stop_handle(stop_task);
+            co_return 5;
+        }
+        finalize_release.store(true, std::memory_order_release);
+        shutdown_stop = co_await await_stop_handle(stop_task);
+        rec->set_finalize_hook_for_test(nullptr);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE_FALSE(recording_during_finalize);
+    REQUIRE(shutdown_stop.has_value());
+    REQUIRE(shutdown_stop->ok);
+    REQUIRE(shutdown_stop->reason == "expired");
+    REQUIRE(shutdown_stop->records == 1);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+}
+
+TEST_CASE("image: trace recording late stop waits for expiry callback completion",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 78);
+    const std::string out = dir / "out.trace";
+    std::atomic<bool> callback_seen{false};
+    std::atomic<bool> timer_exit_entered{false};
+    std::atomic<bool> timer_exit_release{false};
+    std::atomic<bool> shutdown_entered{false};
+    std::optional<image::TraceRecorder::FinalizeResult> shutdown_stop;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_exit_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_exit_entered.store(true, std::memory_order_release);
+                while (!timer_exit_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult&) {
+                callback_seen.store(true, std::memory_order_release);
+            },
+            error);
+        if (!started) co_return 1;
+        const ssize_t r1 = co_await read_at(tap, 0, 4096);
+        if (r1 != 4096) {
+            timer_exit_release.store(true, std::memory_order_release);
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool exit_held = co_await wait_until([&] {
+            return timer_exit_entered.load(std::memory_order_acquire);
+        });
+        if (!exit_held) {
+            timer_exit_release.store(true, std::memory_order_release);
+            shutdown_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto stop_task = elio::spawn(marked_stop, rec, &shutdown_entered,
+                                    std::string("shutdown"));
+        const bool stop_entered = co_await wait_until([&] {
+            return shutdown_entered.load(std::memory_order_acquire);
+        });
+        if (!stop_entered) {
+            timer_exit_release.store(true, std::memory_order_release);
+            shutdown_stop = co_await await_stop_handle(stop_task);
+            co_return 4;
+        }
+        co_await elio::time::sleep_for(20ms);
+        if (stop_task.is_ready() || stop_task.is_destroyed()) {
+            timer_exit_release.store(true, std::memory_order_release);
+            shutdown_stop = co_await await_stop_handle(stop_task);
+            co_return 5;
+        }
+        timer_exit_release.store(true, std::memory_order_release);
+        shutdown_stop = co_await await_stop_handle(stop_task);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(callback_seen.load(std::memory_order_acquire));
+    REQUIRE(shutdown_stop.has_value());
+    REQUIRE(shutdown_stop->ok);
+    REQUIRE(shutdown_stop->reason == "expired");
+    REQUIRE(shutdown_stop->records == 1);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+}
+
+TEST_CASE("image: trace recording timer losing stop race skips expiry callback",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 81);
+    const std::string out = dir / "out.trace";
+    std::atomic<int> claim_calls{0};
+    std::atomic<bool> timer_claim_entered{false};
+    std::atomic<bool> external_claim_seen{false};
+    std::atomic<bool> release_timer_claim{false};
+    std::atomic<bool> finalize_entered{false};
+    std::atomic<bool> release_finalize{false};
+    std::atomic<int> callback_count{0};
+    std::optional<image::TraceRecorder::FinalizeResult> manual_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> last;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_stop_claim_hook_for_test([&]() -> elio::coro::task<void> {
+            const int call = claim_calls.fetch_add(
+                                 1, std::memory_order_acq_rel) +
+                             1;
+            if (call == 1) {
+                timer_claim_entered.store(true, std::memory_order_release);
+                while (!release_timer_claim.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            } else {
+                external_claim_seen.store(true, std::memory_order_release);
+            }
+        });
+        rec->set_finalize_hook_for_test([&]() -> elio::coro::task<void> {
+            finalize_entered.store(true, std::memory_order_release);
+            while (!release_finalize.load(std::memory_order_acquire)) {
+                co_await elio::time::sleep_for(1ms);
+            }
+        });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult&) {
+                callback_count.fetch_add(1, std::memory_order_acq_rel);
+            },
+            error);
+        if (!started) co_return 1;
+        const ssize_t r = co_await read_at(tap, 0, 4096);
+        if (r != 4096) co_return 2;
+        const bool timer_waiting = co_await wait_until([&] {
+            return timer_claim_entered.load(std::memory_order_acquire);
+        }, 1500);
+        if (!timer_waiting) co_return 3;
+
+        auto manual_stop_task = elio::spawn(rec->stop("manual"));
+        const bool external_waiting = co_await wait_until([&] {
+            return external_claim_seen.load(std::memory_order_acquire);
+        });
+        if (!external_waiting) {
+            release_timer_claim.store(true, std::memory_order_release);
+            release_finalize.store(true, std::memory_order_release);
+            manual_stop = co_await await_stop_handle(manual_stop_task);
+            co_return 4;
+        }
+        const bool external_finalizing = co_await wait_until([&] {
+            return finalize_entered.load(std::memory_order_acquire);
+        });
+        if (!external_finalizing) {
+            release_timer_claim.store(true, std::memory_order_release);
+            release_finalize.store(true, std::memory_order_release);
+            manual_stop = co_await await_stop_handle(manual_stop_task);
+            co_return 5;
+        }
+        release_timer_claim.store(true, std::memory_order_release);
+        release_finalize.store(true, std::memory_order_release);
+        manual_stop = co_await await_stop_handle(manual_stop_task);
+        rec->set_stop_claim_hook_for_test(nullptr);
+        rec->set_finalize_hook_for_test(nullptr);
+        last = rec->last_result();
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(manual_stop.has_value());
+    REQUIRE(manual_stop->ok);
+    REQUIRE(manual_stop->reason == "manual");
+    REQUIRE(last.has_value());
+    REQUIRE(last->ok);
+    REQUIRE(last->reason == "manual");
+    REQUIRE(callback_count.load(std::memory_order_acquire) == 0);
+    REQUIRE(parse_file(out).size() == 1);
+}
+
+TEST_CASE("image: trace recording expiry callback stop never joins itself",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 80);
+    const std::string out = dir / "out.trace";
+    const std::string next_out = dir / "next.trace";
+    std::atomic<bool> timer_exit_entered{false};
+    std::atomic<bool> timer_exit_release{false};
+    bool callback_made_stop_task = false;
+    std::optional<elio::coro::task<image::TraceRecorder::FinalizeResult>>
+        callback_stop_task;
+    std::optional<elio::coro::task<image::TraceRecorder::FinalizeResult>>
+        self_join_stop_task;
+    std::optional<elio::coro::task<bool>> callback_start_task;
+    std::optional<image::TraceRecorder::FinalizeResult> callback_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> self_join_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> cleanup_stop;
+    bool callback_start_ok = true;
+    std::string callback_start_error;
+    bool restarted = false;
+    std::string restart_error;
+    bool recording_after_callback_stop = false;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_exit_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_exit_entered.store(true, std::memory_order_release);
+                while (!timer_exit_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult&) {
+                self_join_stop_task.emplace(rec->stop("self-join"));
+                callback_stop_task.emplace(rec->stop("callback"));
+                callback_start_task.emplace(rec->start(
+                    next_out, 300,
+                    [](const image::TraceRecorder::FinalizeResult&) {},
+                    callback_start_error));
+                callback_made_stop_task = true;
+            },
+            error);
+        if (!started) co_return 1;
+        const ssize_t r1 = co_await read_at(tap, 0, 4096);
+        if (r1 != 4096) {
+            timer_exit_release.store(true, std::memory_order_release);
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool exit_held = co_await wait_until([&] {
+            return timer_exit_entered.load(std::memory_order_acquire);
+        });
+        if (!exit_held || !callback_made_stop_task || !self_join_stop_task ||
+            !callback_stop_task || !callback_start_task) {
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto self_join_stop_handle =
+            elio::spawn(std::move(*self_join_stop_task));
+        const bool self_join_ready = co_await wait_until([&] {
+            return self_join_stop_handle.is_ready() ||
+                   self_join_stop_handle.is_destroyed();
+        }, 200);
+        if (!self_join_ready) {
+            timer_exit_release.store(true, std::memory_order_release);
+            self_join_stop = co_await await_stop_handle(self_join_stop_handle);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 4;
+        }
+        self_join_stop = co_await await_stop_handle(self_join_stop_handle);
+
+        timer_exit_release.store(true, std::memory_order_release);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        restarted = co_await rec->start(
+            next_out, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {},
+            restart_error);
+        if (!restarted) {
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 5;
+        }
+
+        auto reentrant_stop = elio::spawn(std::move(*callback_stop_task));
+        const bool reentrant_ready = co_await wait_until([&] {
+            return reentrant_stop.is_ready() || reentrant_stop.is_destroyed();
+        }, 200);
+        if (!reentrant_ready) {
+            callback_stop = co_await await_stop_handle(reentrant_stop);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 6;
+        }
+        callback_stop = co_await await_stop_handle(reentrant_stop);
+        recording_after_callback_stop = rec->recording();
+
+        auto reentrant_start = elio::spawn(std::move(*callback_start_task));
+        const bool start_ready = co_await wait_until([&] {
+            return reentrant_start.is_ready() || reentrant_start.is_destroyed();
+        }, 200);
+        if (!start_ready) {
+            callback_start_ok = co_await await_bool_handle(reentrant_start);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 7;
+        }
+        callback_start_ok = co_await await_bool_handle(reentrant_start);
+        cleanup_stop = co_await rec->stop("cleanup");
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(restarted);
+    REQUIRE(recording_after_callback_stop);
+    REQUIRE(self_join_stop.has_value());
+    REQUIRE(self_join_stop->ok);
+    REQUIRE(self_join_stop->reason == "expired");
+    REQUIRE(callback_stop.has_value());
+    REQUIRE(callback_stop->ok);
+    REQUIRE(callback_stop->reason == "expired");
+    REQUIRE_FALSE(callback_start_ok);
+    REQUIRE(callback_start_error.find("expiry callback") !=
+            std::string::npos);
+    REQUIRE(cleanup_stop.has_value());
+    REQUIRE(cleanup_stop->ok);
+    REQUIRE(cleanup_stop->reason == "cleanup");
+    REQUIRE(parse_file(out).size() == 1);
+    REQUIRE(parse_file(next_out).empty());
+}
+
+TEST_CASE("image: trace recording external stop during expiry callback drains timer",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 82);
+    const std::string out = dir / "out.trace";
+    std::atomic<bool> timer_exit_entered{false};
+    std::atomic<bool> timer_exit_release{false};
+    std::atomic<bool> external_task_created{false};
+    std::optional<elio::coro::task<image::TraceRecorder::FinalizeResult>>
+        external_stop_task;
+    std::optional<image::TraceRecorder::FinalizeResult> external_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> cleanup_stop;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_exit_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_exit_entered.store(true, std::memory_order_release);
+                while (!timer_exit_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult&) {
+                std::thread external([&] {
+                    external_stop_task.emplace(rec->stop("external"));
+                    external_task_created.store(true,
+                                                std::memory_order_release);
+                });
+                external.join();
+            },
+            error);
+        if (!started) co_return 1;
+        const ssize_t r = co_await read_at(tap, 0, 4096);
+        if (r != 4096) {
+            timer_exit_release.store(true, std::memory_order_release);
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool exit_held = co_await wait_until([&] {
+            return timer_exit_entered.load(std::memory_order_acquire) &&
+                   external_task_created.load(std::memory_order_acquire);
+        });
+        if (!exit_held || !external_stop_task) {
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto external_stop_handle =
+            elio::spawn(std::move(*external_stop_task));
+        co_await elio::time::sleep_for(20ms);
+        if (external_stop_handle.is_ready() ||
+            external_stop_handle.is_destroyed()) {
+            external_stop = co_await await_stop_handle(external_stop_handle);
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 4;
+        }
+        timer_exit_release.store(true, std::memory_order_release);
+        external_stop = co_await await_stop_handle(external_stop_handle);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(external_stop.has_value());
+    REQUIRE(external_stop->ok);
+    REQUIRE(external_stop->reason == "expired");
+    REQUIRE(external_stop->records == 1);
+    REQUIRE_FALSE(cleanup_stop.has_value());
+    REQUIRE(parse_file(out).size() == 1);
+}
+
+TEST_CASE("image: trace recording external start during expiry callback drains timer",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 83);
+    const std::string out = dir / "out.trace";
+    const std::string next_out = dir / "next.trace";
+    std::atomic<bool> timer_exit_entered{false};
+    std::atomic<bool> timer_exit_release{false};
+    std::atomic<bool> external_task_created{false};
+    std::optional<elio::coro::task<bool>> external_start_task;
+    std::optional<image::TraceRecorder::FinalizeResult> cleanup_stop;
+    bool external_start_ok = false;
+    std::string external_start_error;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_exit_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_exit_entered.store(true, std::memory_order_release);
+                while (!timer_exit_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 1,
+            [&](const image::TraceRecorder::FinalizeResult&) {
+                std::thread external([&] {
+                    external_start_task.emplace(rec->start(
+                        next_out, 300,
+                        [](const image::TraceRecorder::FinalizeResult&) {},
+                        external_start_error));
+                    external_task_created.store(true,
+                                                std::memory_order_release);
+                });
+                external.join();
+            },
+            error);
+        if (!started) co_return 1;
+        const ssize_t r = co_await read_at(tap, 0, 4096);
+        if (r != 4096) {
+            timer_exit_release.store(true, std::memory_order_release);
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool exit_held = co_await wait_until([&] {
+            return timer_exit_entered.load(std::memory_order_acquire) &&
+                   external_task_created.load(std::memory_order_acquire);
+        });
+        if (!exit_held || !external_start_task) {
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto external_start_handle =
+            elio::spawn(std::move(*external_start_task));
+        co_await elio::time::sleep_for(20ms);
+        if (external_start_handle.is_ready() ||
+            external_start_handle.is_destroyed()) {
+            external_start_ok = co_await await_bool_handle(
+                external_start_handle);
+            timer_exit_release.store(true, std::memory_order_release);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 4;
+        }
+        timer_exit_release.store(true, std::memory_order_release);
+        external_start_ok = co_await await_bool_handle(external_start_handle);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        if (!external_start_ok) co_return 5;
+        cleanup_stop = co_await rec->stop("cleanup");
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(external_start_ok);
+    REQUIRE(external_start_error.empty());
+    REQUIRE(cleanup_stop.has_value());
+    REQUIRE(cleanup_stop->ok);
+    REQUIRE(cleanup_stop->reason == "cleanup");
+    REQUIRE(parse_file(out).size() == 1);
+    REQUIRE(parse_file(next_out).empty());
+}
+
+TEST_CASE("image: trace recording stale stop never drains a restarted timer",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 79);
+    const std::string first_out = dir / "first.trace";
+    const std::string second_out = dir / "second.trace";
+    std::atomic<bool> timer_exit_entered{false};
+    std::atomic<bool> timer_exit_release{false};
+    std::atomic<bool> drain_claimed{false};
+    std::atomic<bool> drain_claim_release{false};
+    std::atomic<bool> drain_waiting{false};
+    std::atomic<bool> drain_wait_release{false};
+    std::atomic<bool> first_stop_entered{false};
+    std::atomic<bool> stale_stop_entered{false};
+    std::optional<image::TraceRecorder::FinalizeResult> first_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> stale_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> cleanup_stop;
+    bool second_started = false;
+    bool recording_after_stale_stop = false;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_exit_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_exit_entered.store(true, std::memory_order_release);
+                while (!timer_exit_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        rec->set_timer_drain_claim_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                drain_claimed.store(true, std::memory_order_release);
+                while (!drain_claim_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        rec->set_timer_drain_wait_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                drain_waiting.store(true, std::memory_order_release);
+                while (!drain_wait_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        auto release_all = [&] {
+            timer_exit_release.store(true, std::memory_order_release);
+            drain_claim_release.store(true, std::memory_order_release);
+            drain_wait_release.store(true, std::memory_order_release);
+        };
+
+        image::TraceRecordSource first_tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            first_out, 1,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!started) co_return 1;
+        const ssize_t r1 = co_await read_at(first_tap, 0, 4096);
+        if (r1 != 4096) {
+            release_all();
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool exit_held = co_await wait_until([&] {
+            return timer_exit_entered.load(std::memory_order_acquire);
+        });
+        if (!exit_held) {
+            release_all();
+            stale_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto first_task = elio::spawn(marked_stop, rec, &first_stop_entered,
+                                     std::string("shutdown"));
+        const bool claimed = co_await wait_until([&] {
+            return first_stop_entered.load(std::memory_order_acquire) &&
+                   drain_claimed.load(std::memory_order_acquire);
+        });
+        if (!claimed) {
+            release_all();
+            first_stop = co_await await_stop_handle(first_task);
+            co_return 4;
+        }
+
+        auto stale_task = elio::spawn(marked_stop, rec, &stale_stop_entered,
+                                     std::string("shutdown"));
+        const bool waiting = co_await wait_until([&] {
+            return stale_stop_entered.load(std::memory_order_acquire) &&
+                   drain_waiting.load(std::memory_order_acquire);
+        });
+        if (!waiting) {
+            release_all();
+            first_stop = co_await await_stop_handle(first_task);
+            stale_stop = co_await await_stop_handle(stale_task);
+            co_return 5;
+        }
+
+        timer_exit_release.store(true, std::memory_order_release);
+        drain_claim_release.store(true, std::memory_order_release);
+        first_stop = co_await await_stop_handle(first_task);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        rec->set_timer_drain_claim_hook_for_test(nullptr);
+
+        image::TraceRecordSource second_tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        second_started = co_await rec->start(
+            second_out, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!second_started) {
+            release_all();
+            stale_stop = co_await await_stop_handle(stale_task);
+            co_return 6;
+        }
+
+        drain_wait_release.store(true, std::memory_order_release);
+        const bool stale_ready = co_await wait_until([&] {
+            return stale_task.is_ready() || stale_task.is_destroyed();
+        }, 200);
+        if (!stale_ready) {
+            cleanup_stop = co_await rec->stop("cleanup");
+            stale_stop = co_await await_stop_handle(stale_task);
+            rec->set_timer_drain_wait_hook_for_test(nullptr);
+            co_return 7;
+        }
+        stale_stop = co_await await_stop_handle(stale_task);
+        recording_after_stale_stop = rec->recording();
+        cleanup_stop = co_await rec->stop("cleanup");
+        rec->set_timer_drain_wait_hook_for_test(nullptr);
+        co_return recording_after_stale_stop ? 0 : 8;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(second_started);
+    REQUIRE(recording_after_stale_stop);
+    REQUIRE(first_stop.has_value());
+    REQUIRE(first_stop->ok);
+    REQUIRE(first_stop->reason == "expired");
+    REQUIRE(stale_stop.has_value());
+    REQUIRE(stale_stop->ok);
+    REQUIRE(stale_stop->reason == "expired");
+    REQUIRE(cleanup_stop.has_value());
+    REQUIRE(cleanup_stop->ok);
+    REQUIRE(cleanup_stop->reason == "cleanup");
+    REQUIRE(parse_file(first_out).size() == 1);
+    REQUIRE(parse_file(second_out).empty());
 }
 
 TEST_CASE("image: concurrent trace stops join the winning finalize",

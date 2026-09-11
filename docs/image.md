@@ -268,11 +268,18 @@ docs/operations.md. Design:
   `format::trace::TraceWriter` — 24×N framing, raw-chaining CRC-32C,
   header checksum rewritten on `finalize()` — then writes + fsyncs the
   blob and reports `{path, sha256, size, records, dropped}`. The
-  duration timer is a cancellable sleep owned by the recorder; a stop
-  cancels it for an immediate exit, and a recorder must be stopped
-  before its scheduler shuts down (a parked timer coroutine would stall
-  the teardown drain). `stop()` is idempotent: a stop racing the expiry
-  waits for the in-flight finalize and returns its stats.
+  duration timer is a joinable recorder task; an external,
+  non-reentrant `stop()` cancels a sleeping timer and waits until the
+  timer coroutine has destroyed its frame, including expiry callbacks
+  that run after an expiry-owned finalize. Device shutdown therefore
+  calls `stop()` for any recorder, even when `recording()` is already
+  false. `stop()` is idempotent: a stop racing the expiry waits for the
+  in-flight finalize and returns its stats. A stop task created on the
+  expiry callback's execution thread captures and returns that expiry
+  result without trying to join the callback's own timer. Calls created
+  by other threads while the callback is still running remain external
+  calls: they wait for the timer drain instead of using the callback's
+  reentrant fast path.
 
 ### The writable mode (ADR-0008)
 
@@ -698,7 +705,10 @@ class TraceRecordSource : public source::BlobSource {
 writer side: a bounded in-memory queue (drop-counted overflow, adjacent
 coalescing within the 1 MiB count cap, > 1 MiB reads pre-split) drained
 at `stop()` through the codec's conforming writer; the duration timer is
-cancellable and device-side (expiry finalizes without any client call).
+joinable and device-side (expiry finalizes without any client call, while
+external shutdown/explicit stop is the timer completion barrier). Re-entrant
+`start()` from the expiry callback is rejected; schedule any follow-up
+window after the callback returns.
 `start()` validates the duration bound and the absolute output path and
 opens the output file fail-fast. **Never throws from the read path** —
 `record()` is `noexcept`; an append failure drops and counts. The design
@@ -901,6 +911,36 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   `image: trace recording stop is idempotent and reports expiry stats` —
   the device-side timer finalizes with no client call and a late stop
   returns the same stats;
+  `image: trace recording stop drains an awakened duration timer` —
+  explicit shutdown stop waits for a timer that already woke before it
+  touched recorder state;
+  `image: trace recording expiry callback is skipped when explicit stop wins` —
+  a timer that already captured the expiry callback but loses finalization
+  to an explicit shutdown stop returns that shutdown result without
+  emitting an expiry callback;
+  `image: trace recording shutdown joins expiry finalization` —
+  shutdown stop joins an expiry-owned finalize while `recording()` is
+  already false;
+  `image: trace recording late stop waits for expiry callback completion` —
+  a cached late stop waits for the timer's callback tail to finish;
+  `image: trace recording timer losing stop race skips expiry callback` —
+  if an external stop wins after the timer copied its callback but before
+  it owns finalization, no expiry callback is emitted for the external
+  stop result;
+  `image: trace recording expiry callback stop never joins itself` —
+  a stop task created re-entrantly from the expiry callback returns the
+  captured expiry result without joining its own timer or stopping a
+  restarted recording, and a callback-created start is rejected;
+  `image: trace recording external stop during expiry callback drains timer` —
+  a stop task created by another thread while the expiry callback is
+  running still waits for the timer frame to finish before returning;
+  `image: trace recording external start during expiry callback drains timer` —
+  a start task created by another thread while the expiry callback is
+  running waits for the stale timer drain instead of being rejected as
+  callback-reentrant;
+  `image: trace recording stale stop never drains a restarted timer` —
+  a late stop waiting on an old timer drain stays bound to that old
+  timer after a new recording starts;
   `image: concurrent trace stops join the winning finalize` — an
   expiry stop and explicit stop are held after both observe Recording;
   the loser joins and returns the winner's result;

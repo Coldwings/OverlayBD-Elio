@@ -31,6 +31,7 @@
 #include "image/trace_record.hpp"
 
 #include <elio/coro/task.hpp>
+#include <elio/sync/mutex.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -107,6 +108,15 @@ struct DeviceControlHooks {
     /// workload inside the recording window; the real device passes
     /// nothing (the workload is guest IO).
     std::function<void()> on_start;
+    /// Graceful-shutdown trace-start admission guard. The device
+    /// shutdown path sets `trace_start_stopping`, takes and releases
+    /// `trace_start_gate`, then calls TraceRecorder::stop("shutdown").
+    /// A trace_start that already passed admission finishes before that
+    /// drain returns; every later trace_start gets a clean
+    /// "device is shutting down" reply instead of arming a timer after
+    /// the shutdown stop barrier.
+    std::shared_ptr<std::atomic<bool>> trace_start_stopping;
+    std::shared_ptr<elio::sync::mutex> trace_start_gate;
     /// D3 resize executor (null/empty members = resize unsupported).
     ResizeExecutor resize;
 };

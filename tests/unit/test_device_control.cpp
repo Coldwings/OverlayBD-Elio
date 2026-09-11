@@ -11,6 +11,7 @@
 
 #include <elio/io/io_awaitables.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/sync/mutex.hpp>
 #include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -24,6 +25,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -160,6 +162,62 @@ TEST_CASE("supervisor: device trace control answers malformed-typed fields with 
     REQUIRE(ok_stop.value("ok", false) == true);
     REQUIRE(ok_stop.value("seq", 0) == 4);
     REQUIRE(ok_stop.value("records", 1) == 0);  // empty window
+}
+
+TEST_CASE("supervisor: trace start is rejected after shutdown admission closes",
+          "[supervisor]") {
+    test::TempDir dir;
+    const std::string out = dir / "out.trace";
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
+
+    nlohmann::json reply;
+    bool recording_after_reply = true;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        auto channel =
+            std::make_shared<supervisor::ControlChannelWriter>(fds[1]);
+        auto stopping = std::make_shared<std::atomic<bool>>(false);
+        auto gate = std::make_shared<elio::sync::mutex>();
+        supervisor::DeviceControlHooks hooks;
+        hooks.trace_start_stopping = stopping;
+        hooks.trace_start_gate = gate;
+        elio::go([channel, rec, hooks]() mutable -> elio::coro::task<void> {
+            co_await supervisor::run_device_control(channel, rec,
+                                                    std::move(hooks));
+        });
+
+        co_await gate->lock();
+        nlohmann::json cmd = {{"cmd", "trace_start"},
+                              {"path", out},
+                              {"duration_sec", 300},
+                              {"seq", 1}};
+        const std::string line = cmd.dump() + "\n";
+        const auto w = co_await elio::io::async_write(fds[0], line.data(),
+                                                      line.size(), -1);
+        if (w.result != static_cast<ssize_t>(line.size())) {
+            gate->unlock();
+            co_return 1;
+        }
+        stopping->store(true, std::memory_order_release);
+        gate->unlock();
+        std::string rbuf;
+        if (!co_await rpc_read_line(fds[0], rbuf, reply)) co_return 2;
+        recording_after_reply = rec->recording();
+        ::shutdown(fds[1], SHUT_RDWR);
+        co_await elio::time::sleep_for(300ms);
+        co_return 0;
+    });
+    ::close(fds[0]);
+    ::close(fds[1]);
+    REQUIRE(rc == 0);
+    REQUIRE(reply.value("reply", "") == "trace_start");
+    REQUIRE(reply.value("ok", true) == false);
+    REQUIRE(reply.value("seq", 0) == 1);
+    REQUIRE(reply.value("error", "").find("shutting down") !=
+            std::string::npos);
+    REQUIRE_FALSE(recording_after_reply);
+    REQUIRE_FALSE(std::filesystem::exists(out));
 }
 
 TEST_CASE("supervisor: control channel writer loops short writes and never throws",

@@ -51,6 +51,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 namespace obd::image {
 
@@ -106,26 +107,32 @@ public:
     /// is irrelevant — the timer lives in the device process) and
     /// `on_expire` receives the result. `on_expire` runs on the timer
     /// coroutine; keep it short (a best-effort control-channel write).
+    /// Re-entrant start() from `on_expire` is rejected: callers that want a
+    /// follow-up window must schedule it after the callback returns.
     /// Returns false with `error` set when a recording is in progress
     /// OR still finalizing (a start must never slip into an in-flight
     /// finalize: it would wipe the draining queue, corrupt the
     /// finalize's stats, and strand the new recording's state), when
     /// the duration is out of bounds, or the path is not writable.
-    /// Requires a running Elio scheduler. LIFETIME: the duration timer
-    /// is a detached coroutine on the caller's scheduler — the recorder
-    /// must be stopped (stop()) before that scheduler shuts down; a
-    /// stop cancels the timer for an immediate exit.
+    /// Requires a running Elio scheduler. LIFETIME: external stop() is
+    /// the completion barrier for the duration timer; it cancels a
+    /// sleeping timer and waits until the timer coroutine has destroyed
+    /// its frame before returning to the caller.
     elio::coro::task<bool> start(
         std::string path, uint32_t duration_sec,
         std::function<void(const FinalizeResult&)> on_expire,
         std::string& error);
 
     /// Finalizes the current recording (header checksum rewrite via the
-    /// codec writer, file write + fsync). Idempotent: a stop after the
-    /// recording already finalized (explicit stop, expiry, shutdown)
-    /// returns the cached result of that finalize. A stop with no
-    /// recording ever started returns {!ok, "no trace recording in
-    /// progress"}.
+    /// codec writer, file write + fsync) and drains the duration timer
+    /// coroutine before returning. Re-entrant stop() created from
+    /// `on_expire` captures that expiry result when the task is created and
+    /// returns it without joining the current timer; normal external stops
+    /// remain the completion barrier.
+    /// Idempotent: a stop after the recording
+    /// already finalized (explicit stop, expiry, shutdown) returns the
+    /// cached result of that finalize. A stop with no recording ever
+    /// started returns {!ok, "no trace recording in progress"}.
     elio::coro::task<FinalizeResult> stop(std::string reason);
 
     /// Stats of the last (or current) finalize; nullopt before any.
@@ -165,6 +172,38 @@ public:
         stop_claim_hook_ = std::move(hook);
     }
 
+    /// Test-only: when set, the duration timer co_awaits this hook after
+    /// its sleep completes and before it reads recorder state.
+    void set_timer_awake_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        timer_awake_hook_ = std::move(hook);
+    }
+
+    /// Test-only: when set, the first caller draining a duration timer
+    /// co_awaits this hook after claiming that timer's handle.
+    void set_timer_drain_claim_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        timer_drain_claim_hook_ = std::move(hook);
+    }
+
+    /// Test-only: when set, callers waiting for another drain owner
+    /// co_await this hook after observing that owner.
+    void set_timer_drain_wait_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        timer_drain_wait_hook_ = std::move(hook);
+    }
+
+    /// Test-only: when set, the duration timer co_awaits this hook after
+    /// the expiry callback and before its coroutine returns.
+    void set_timer_exit_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        timer_exit_hook_ = std::move(hook);
+    }
+
 private:
     enum class State : int { Idle = 0, Recording = 1, Finalizing = 2 };
 
@@ -173,13 +212,40 @@ private:
         std::optional<FinalizeResult> result;
     };
 
+    struct TimerDrain {
+        bool draining = false;
+        bool drained = false;
+    };
+
+    class TimerCallbackScope {
+    public:
+        TimerCallbackScope(TraceRecorder& recorder, FinalizeResult result);
+        ~TimerCallbackScope();
+
+        TimerCallbackScope(const TimerCallbackScope&) = delete;
+        TimerCallbackScope& operator=(const TimerCallbackScope&) = delete;
+
+    private:
+        TraceRecorder& recorder_;
+    };
+
+    elio::coro::task<bool> start_impl(
+        std::string path, uint32_t duration_sec,
+        std::function<void(const FinalizeResult&)> on_expire,
+        std::string& error, bool from_timer_callback);
+
     /// The duration timer body: ONE cancellable sleep — a stop/shutdown
     /// cancels it for an immediate exit, so the timer never parks a
-    /// multi-minute sleep into the scheduler's teardown drain (detached
-    /// tasks must not outlive the scheduler).
+    /// multi-minute sleep into the scheduler's teardown drain.
     elio::coro::task<void> run_timer(
         uint64_t generation, uint32_t duration_sec,
         std::shared_ptr<elio::coro::cancel_source> cancel);
+
+    elio::coro::task<FinalizeResult> stop_impl(
+        std::string reason, bool from_timer, bool* owns_finalize = nullptr);
+    elio::coro::task<void> drain_timer_task(
+        std::shared_ptr<TimerDrain> drain);
+    bool in_timer_callback_locked() const;
 
     /// Shared finalize: drain + write + fsync + digest. Caller holds
     /// state transition; returns the filled result (reason set by caller).
@@ -201,9 +267,17 @@ private:
     std::optional<FinalizeResult> last_;
     std::shared_ptr<FinalizeCompletion> finalizing_;
     std::shared_ptr<elio::coro::cancel_source> timer_cancel_;
-    std::function<elio::coro::task<void>()> finalize_hook_;     // test-only
-    std::function<elio::coro::task<void>()> start_hook_;        // test-only
-    std::function<elio::coro::task<void>()> stop_claim_hook_;   // test-only
+    std::optional<elio::coro::join_handle<void>> timer_task_;
+    std::shared_ptr<TimerDrain> timer_drain_;
+    std::optional<FinalizeResult> timer_callback_result_;
+    std::thread::id timer_callback_thread_;
+    std::function<elio::coro::task<void>()> finalize_hook_;      // test-only
+    std::function<elio::coro::task<void>()> start_hook_;         // test-only
+    std::function<elio::coro::task<void>()> stop_claim_hook_;    // test-only
+    std::function<elio::coro::task<void>()> timer_awake_hook_;   // test-only
+    std::function<elio::coro::task<void>()> timer_drain_claim_hook_;
+    std::function<elio::coro::task<void>()> timer_drain_wait_hook_;
+    std::function<elio::coro::task<void>()> timer_exit_hook_;    // test-only
 };
 
 using TraceRecorderPtr = std::shared_ptr<TraceRecorder>;
