@@ -612,6 +612,11 @@ uint64_t count_payload_blocks(const Node& node) {
 
 void allocate_blocks(Node& node, uint32_t& next_block) {
     const uint64_t data_blocks = file_data_blocks(node);
+    if (node.kind == NodeKind::Dir && data_blocks > kMaxBuiltInDirectoryBlocks) {
+        throw std::runtime_error(
+            "built-in ext2 backend supports directories up to 12 data blocks: " +
+            (node.name.empty() ? std::string("/") : node.name));
+    }
     if (node.kind == NodeKind::File && data_blocks > 12) node.indirect_block = next_block++;
     for (uint64_t i = 0; i < data_blocks; ++i) node.blocks.push_back(next_block++);
     for (auto& [_, child] : node.children) allocate_blocks(*child, next_block);
