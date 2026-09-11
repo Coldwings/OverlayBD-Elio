@@ -336,9 +336,9 @@ contracts above:
   replay. LayerStore background fill is a separate ADR-0012 Fill
   scavenger class behind Prefetch and is governed by the `download`
   config. Trace recording is a supervisor command path (ADR-0013; see
-  `docs/supervisor.md`) that observes remote reads; it does not create a
-  separate Prefetch traffic class, and issue #33 tracks filtering
-  recordings down to OnDemand reads only.
+  `docs/supervisor.md`) that records fully satisfied remote reads at the
+  trace tap; it does not create a separate Prefetch traffic class, and
+  issue #33 tracks filtering recordings down to OnDemand reads only.
 - **Discard / punch-hole** is supported only for writable devices
   (ADR-0009). Read-only images do not advertise discard limits, so the
   kernel never issues discard/write-zeroes to them; writable sparse

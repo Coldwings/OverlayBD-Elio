@@ -1078,8 +1078,11 @@ single Range-capable blob. No external golden files.
   the config flag plus the blob magic; remote lowers without `dir` are
   not warmed (populate is a no-op on the bare `RegistrySource`); both
   replay and the structural warm-up are still awaited inline during
-  bring-up; and supervisor-driven trace recording currently observes all
-  remote reads below the LayerStore until issue #33 narrows the default
+  bring-up; and supervisor-driven trace recording currently records only
+  fully satisfied remote `pread`s at the `TraceRecordSource` tap. When
+  `LayerStore` is active that tap sits below it; no-`dir` and ADR-0016
+  degraded remote-only chains are tapped before the direct
+  `AdmissionSource` wrapper. Issue #33 tracks narrowing the default
   recording set to OnDemand traffic.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
