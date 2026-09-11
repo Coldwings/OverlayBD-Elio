@@ -65,12 +65,11 @@ upstream findings bound the design:
   a blank disk is an empty LSMT layer.
 - **The streaming converter lives in this repository**, beside the
   format writers it must share. ADR-0019 narrows the first accepted
-  implementation, and the corresponding issue #41 optional-backend acceptance
-  criterion for this PR, to a dependency-free built-in ext2 backend for default
-  builds and CI; a pinned e2fsprogs/libe2fs backend may still be added later as
-  a converter-local extension with its own build flag and CI matrix. The
-  external CLI repository owns everything that merely talks to a registry:
-  reference resolution UX,
+  implementation to a dependency-free built-in ext2 backend for default builds
+  and CI; a pinned e2fsprogs/libe2fs backend may still be added later as a
+  converter-local extension with its own build flag and CI matrix. The external
+  CLI repository owns everything that merely talks to a registry: reference
+  resolution UX,
   digest and manifest construction, blob upload, artifact push, and
   trace-layer packaging. The C++ side's only obligation is that the
   supervisor protocol can express every capability the CLI needs.

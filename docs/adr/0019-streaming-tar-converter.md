@@ -3,8 +3,7 @@
 - Status: accepted
 - Date: 2026-09-12
 - Supersedes: none
-- Updates: ADR-0014 (converter backend scope); issue #41 optional-backend
-  acceptance for this first converter PR
+- Updates: ADR-0014 (converter backend scope)
 - Binds: docs/design-assumptions.md, docs/binaries.md, docs/operations.md,
   docs/format.md, tools/obd_convert_main.cpp
 
@@ -15,12 +14,11 @@ layer twice must produce the same layer bytes, and image builds must not depend
 on a host block device, mount, or `mkfs` subprocess. It named a pinned
 libe2fs/e2fsprogs fork as the upstream-proven way to build ext filesystems as a
 pure library. This ADR updates that converter-backend detail for the first
-repository-owned converter and narrows issue #41's optional-backend acceptance
-criterion for this PR: the initial accepted scope is the dependency-free
+repository-owned converter: the initial accepted scope is the dependency-free
 built-in backend that can run in the default build and CI. Because the built-in
-backend is always present, this PR has no separate libe2fs-enabled CI matrix; a
-pinned libe2fs backend remains a future converter-local extension with its own
-build flag and CI matrix if added.
+backend is always present, the initial converter has no separate
+backend-enabled CI dimension; a pinned libe2fs backend remains a future
+converter-local extension with its own build flag and CI matrix if added.
 
 The project already has byte-compatible LSMT writers and deterministic seal
 machinery. The missing piece is a rootfs-tar reader plus filesystem-image
