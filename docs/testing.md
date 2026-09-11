@@ -467,6 +467,9 @@ Every test, grouped by area, with the property it guards.
 - `source: registry re-auths after expires_in lifetime elapses` — with
   `expires_in=1` (800 ms cache lifetime) the token is reused inside the
   lifetime and re-fetched after it.
+- `source: registry self-mode URL cache follows bearer expiry` — an
+  already-open Self-mode source on the same URL refreshes before data GETs
+  once the bearer token passes its proactive expiry.
 - `source: registry keeps the cached token within expires_in lifetime` —
   with `expires_in=100` no re-auth happens across repeated resolutions
   and reads far inside the 80 s cache lifetime.

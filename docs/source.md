@@ -458,9 +458,11 @@ of the OAuth2 `expires_in` lifetime (30 s fallback for absent/unparsable/
 negative values, capped at 7 days) keyed by
 `realm|service|scope`, with single-flight exchanges and a per-key generation
 counter (ADR-0015); per-URL resolution (final URL + auth header) cached
-300 s; 401/403 on a data request drops the cached URL info and re-resolves
-with a strictly newer token generation; a 206 whose `Content-Range` does not
-start at `offset` invalidates the cache and retries. Both caches and the
+300 s, except Self-mode Bearer entries expire no later than the token's
+proactive refresh deadline; 401/403 on a data request drops the cached URL
+info and re-resolves with a strictly newer token generation; a 206 whose
+`Content-Range` does not start at `offset` invalidates the cache and
+retries. Both caches and the
 in-flight exchange map are guarded by an `elio::sync::mutex`; network IO
 never happens under the lock except during the resolve probe sequence,
 which is naturally serialized per URL.
@@ -1101,6 +1103,9 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: registry re-auths after expires_in lifetime elapses` — with
   `expires_in=1` (800 ms cache lifetime) a resolution within the lifetime
   reuses the token and a resolution after it performs a new exchange.
+- `source: registry self-mode URL cache follows bearer expiry` — an
+  already-open Self-mode source on the same URL refreshes before data GETs
+  once the bearer token passes its proactive expiry.
 - `source: registry keeps the cached token within expires_in lifetime` —
   with `expires_in=100` (80 s cache lifetime) repeated resolutions and
   reads never hit the token endpoint again.
