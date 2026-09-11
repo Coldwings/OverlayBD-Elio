@@ -664,7 +664,10 @@ region as the file's last 4096 bytes, `index_offset = 4096` (the
 data-region start / first allowed index position), total file size 8192 —
 every reader bound check in `LsmtLayer::open` is satisfiable. Returns 0 or
 a negative -errno (`-EINVAL` when `vsize` is not a positive multiple of
-512; an error path unlinks the partial file).
+512). Setup and serialization may throw, including rejection of a user tag
+longer than 255 bytes. Once the output is opened, both error returns and
+exception unwinding close its descriptor and remove the partial file;
+success retains the output.
 
 **Determinism.** The layer obeys the seal determinism rule with no data
 and no index entries, so its bytes are a pure function of `vsize` (and the
@@ -1051,6 +1054,12 @@ writers and readers agree on the same bytes.
   (`index_offset = 4096`, empty index), and a merged single-layer view
   reads the whole requested range — head and tail — as zeroes. Guards the
   ADR-0014 zero-base format.
+- `format: empty lsmt exceptions release output ownership` — an oversized
+  tag causes serialization to throw; the helper closes its inode-specific
+  descriptor and removes the partial output even during exception unwinding.
+- `format: empty lsmt preserves validation and tag boundaries` — invalid
+  virtual sizes fail before truncation, missing parents retain the open errno,
+  and a 255-byte tag produces a valid empty layer.
 - `format: empty lsmt layer bytes are deterministic per virtual size` —
   two empty layers of the same `vsize` are byte-identical; a different
   `vsize` differs. The header uuid is pinned against an independently

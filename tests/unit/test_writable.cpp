@@ -1419,6 +1419,62 @@ TEST_CASE("format: offline seal rejects a virtual_size below the content extent"
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("format: empty lsmt exceptions release output ownership", "[format]") {
+    TempDir dir;
+    const std::string path = dir / "empty.lsmt";
+    test::write_file(path, std::vector<uint8_t>{'x'});
+    // Keep the inode alive even if the helper unlinks it during unwinding.
+    const int sentinel = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    REQUIRE(sentinel >= 0);
+    struct CloseFd {
+        int fd;
+        ~CloseFd() { ::close(fd); }
+    } owner{sentinel};
+    const BackingInode backing(path);
+    const size_t before = backing.descriptors();
+    const std::string oversized_tag(256, 'x');
+    bool threw = false;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        try {
+            (void)co_await format::create_empty_lsmt_layer(path, 512, oversized_tag);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(threw);
+    CHECK(backing.descriptors() == before);
+    CHECK_FALSE(std::filesystem::exists(path));
+}
+
+TEST_CASE("format: empty lsmt preserves validation and tag boundaries", "[format]") {
+    TempDir dir;
+    const std::string path = dir / "empty.lsmt";
+    test::write_file(path, std::vector<uint8_t>{'x'});
+    const std::string valid_tag(255, 't');
+    const std::string missing = dir / "missing/empty.lsmt";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        for (uint64_t size : {uint64_t{0}, uint64_t{513}}) {
+            const int invalid = co_await format::create_empty_lsmt_layer(path, size);
+            REQUIRE(invalid == -EINVAL);
+            REQUIRE(file_bytes(path) == 1);
+        }
+        const int absent = co_await format::create_empty_lsmt_layer(missing, 512);
+        REQUIRE(absent == -ENOENT);
+        const int created = co_await format::create_empty_lsmt_layer(path, 512, valid_tag);
+        REQUIRE(created == 0);
+        REQUIRE(file_bytes(path) == 8192);
+        auto source = co_await source::LocalFileSource::open(path);
+        auto layer = co_await format::LsmtLayer::open(std::move(source));
+        REQUIRE(layer->header().user_tag == valid_tag);
+        REQUIRE(layer->virtual_size() == 512);
+        REQUIRE(layer->segments().empty());
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("format: empty lsmt layer bytes are deterministic per virtual size",
           "[format]") {
     // ADR-0014: the empty layer's uuid is derived from the content digest

@@ -44,7 +44,10 @@ namespace obd::format {
 /// region at byte 0, trailer region as the file's last 4096 bytes,
 /// index_offset = 4096 (the data-region start / first allowed index
 /// position), total file size 8192. Returns 0 or a negative -errno
-/// (-EINVAL when vsize is not a positive multiple of 512).
+/// (-EINVAL when vsize is not a positive multiple of 512). Setup and
+/// serialization may throw (including user_tag longer than 255 bytes).
+/// After opening the output, every failure closes it and removes the partial
+/// file; successful output is retained.
 elio::coro::task<int> create_empty_lsmt_layer(const std::string& path,
                                               uint64_t vsize,
                                               const std::string& user_tag = "");
