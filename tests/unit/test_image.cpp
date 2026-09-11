@@ -68,8 +68,7 @@ TEST_CASE("image: per-image download overrides merge over global defaults",
     REQUIRE(image::ImageConfig::digest_sha256_hex("sha512:abc").empty());
 }
 
-TEST_CASE("image: invalid download tryCnt is rejected at config boundaries",
-          "[image]") {
+TEST_CASE("image: invalid download tryCnt is rejected at config boundaries", "[image]") {
     auto expect_trycnt_error = [](auto&& fn) {
         try {
             fn();
