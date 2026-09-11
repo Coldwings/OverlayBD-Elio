@@ -32,8 +32,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <exception>
 #include <filesystem>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -408,6 +410,19 @@ public:
     void set_serialized(bool on) {
         serialized_.store(on, std::memory_order_relaxed);
     }
+    /// Test hook: block data GETs after they have been counted. Size probes
+    /// stay unblocked, so image assembly can complete before a live reader
+    /// is intentionally parked.
+    void block_data_gets() {
+        blocked_data_gets_.store(0, std::memory_order_relaxed);
+        data_blocked_.store(true, std::memory_order_release);
+    }
+    void release_data_gets() {
+        data_blocked_.store(false, std::memory_order_release);
+    }
+    uint64_t blocked_data_gets() const {
+        return blocked_data_gets_.load(std::memory_order_acquire);
+    }
 
 private:
     struct Stats {
@@ -455,6 +470,13 @@ private:
                 std::lock_guard lk(log_mu_);
                 log_.emplace_back(name, first);
             }
+            if (data_blocked_.load(std::memory_order_acquire)) {
+                blocked_data_gets_.fetch_add(1, std::memory_order_acq_rel);
+                while (data_blocked_.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(
+                        std::chrono::milliseconds(1));
+                }
+            }
             const int64_t lat = latency_ms_.load(std::memory_order_relaxed);
             if (lat > 0) {
                 if (serialized_.load(std::memory_order_relaxed)) {
@@ -493,6 +515,8 @@ private:
     std::vector<std::pair<std::string, uint64_t>> log_;
     std::atomic<int64_t> latency_ms_{0};
     std::atomic<bool> serialized_{false};
+    std::atomic<bool> data_blocked_{false};
+    std::atomic<uint64_t> blocked_data_gets_{0};
     elio::sync::mutex service_mu_;
 };
 
@@ -1429,81 +1453,117 @@ TEST_CASE("integration: admission funnel bounds on-demand latency under scavenge
             co_await server.run();
         });
         BlobGuard guard{server};
-        const bool server_running =
-            co_await test::wait_server_running(server);
-        REQUIRE(server_running);
-
-        auto cfgj = remote_image_config_with_dir(
-            server.repo_base(), sha256_hex_of(blob), blob.size(), layer_dir);
-        cfgj["download"] = nlohmann::json{
-            {"enable", true}, {"delay", 0}, {"delayExtra", 0}};
-        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
-        const image::GlobalConfig global;
-        auto opened = co_await image::open_image(cfg, global);
-        REQUIRE(opened.layer_stores.size() == 1);
-        source::LayerStore* store = opened.layer_stores[0];
-
-        // Prefetch storm: six coroutines warming cold ranges of the same
-        // store through populate() — scavenger pressure at the funnel on
-        // top of the background fill. The 1 ms sleep every iteration is
-        // LOAD-BEARING, not a pacing nicety: once the store is Complete
-        // (the structural warm-up fetches most extents during bring-up,
-        // so the fill frequently finishes mid-test), populate() becomes
-        // a no-op that returns WITHOUT any suspension point — a storm
-        // coroutine would then spin on its scheduler worker forever,
-        // never observe storm_stop, and starve the other coroutines on
-        // few-worker machines (the CI hang, issue #35).
+        std::optional<image::OpenedImage> opened;
         std::atomic<bool> storm_stop{false};
         std::atomic<int> storm_done{0};
-        for (int i = 0; i < 6; ++i) {
-            elio::go([&, i]() -> elio::coro::task<void> {
-                const uint64_t total = store->size();
-                uint64_t off = static_cast<uint64_t>(i) * 256 * 1024;
-                while (!storm_stop.load(std::memory_order_relaxed)) {
-                    const ssize_t pr =
-                        co_await store->populate(off % total, 256 * 1024);
-                    if (pr < 0) break;
-                    off += 6 * 256 * 1024;
-                    co_await elio::time::sleep_for(
-                        std::chrono::milliseconds(1));
+        std::vector<elio::coro::join_handle<void>> storm_tasks;
+        int storm_spawned = 0;
+        bool storm_joined = false;
+        bool cleaned = false;
+        auto join_storm = [&]() -> elio::coro::task<void> {
+            if (storm_joined) co_return;
+            storm_stop.store(true, std::memory_order_relaxed);
+            storm_joined = true;
+            std::exception_ptr first_failure;
+            for (auto& task : storm_tasks) {
+                try {
+                    co_await task;
+                } catch (...) {
+                    if (!first_failure) first_failure = std::current_exception();
                 }
-                storm_done.fetch_add(1, std::memory_order_relaxed);
-            });
-        }
+            }
+            if (first_failure) std::rethrow_exception(first_failure);
+            co_return;
+        };
+        auto cleanup = [&]() -> elio::coro::task<void> {
+            if (cleaned) co_return;
+            cleaned = true;
+            co_await join_storm();
+            if (opened) co_await image::park_image_fills(*opened);
+            co_return;
+        };
 
-        // On-demand phase: sequential guest reads of cold extents, each
-        // individually timed. With a capacity-1 source at 25 ms and the
-        // window ceiling at 32, the worst case is ~32 queued scavenger
-        // service times (~0.8 s); 2 s leaves scheduling slack while
-        // still failing any run where on-demand traffic queues behind
-        // unbounded scavenger load.
-        constexpr int kReads = 12;
-        std::vector<uint8_t> buf(16 * 1024);
-        for (int i = 0; i < kReads; ++i) {
-            // Sector-aligned (A3), spread across the 4 MiB image.
-            const uint64_t off = static_cast<uint64_t>(i) * 256 * 1024;
-            const auto t0 = std::chrono::steady_clock::now();
-            const ssize_t r = co_await opened.root->pread(
-                buf.data(), buf.size(), off);
-            const auto elapsed = std::chrono::steady_clock::now() - t0;
-            REQUIRE(r == static_cast<ssize_t>(buf.size()));
-            REQUIRE(buf == std::vector<uint8_t>(
-                               raw.begin() + static_cast<ptrdiff_t>(off),
-                               raw.begin() + static_cast<ptrdiff_t>(
-                                                 off + buf.size())));
-            REQUIRE(elapsed < std::chrono::seconds(2));
-        }
+        std::exception_ptr failure;
+        try {
+            const bool server_running =
+                co_await test::wait_server_running(server);
+            REQUIRE(server_running);
 
-        // The storm really was throttled at the funnel (not merely
-        // absent): at least one scavenger request queued.
-        REQUIRE(opened.funnel->scavenger_waits() > 0);
+            auto cfgj = remote_image_config_with_dir(
+                server.repo_base(), sha256_hex_of(blob), blob.size(), layer_dir);
+            cfgj["download"] = nlohmann::json{
+                {"enable", true}, {"delay", 0}, {"delayExtra", 0}};
+            const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+            const image::GlobalConfig global;
+            opened.emplace(co_await image::open_image(cfg, global));
+            REQUIRE(opened->layer_stores.size() == 1);
+            source::LayerStore* store = opened->layer_stores[0];
 
-        storm_stop.store(true, std::memory_order_relaxed);
-        for (int i = 0; i < 5000 && storm_done.load() < 6; ++i) {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            // Prefetch storm: six coroutines warming cold ranges of the same
+            // store through populate() — scavenger pressure at the funnel on
+            // top of the background fill. The 1 ms sleep every iteration is
+            // LOAD-BEARING, not a pacing nicety: once the store is Complete
+            // (the structural warm-up fetches most extents during bring-up,
+            // so the fill frequently finishes mid-test), populate() becomes
+            // a no-op that returns WITHOUT any suspension point — a storm
+            // coroutine would then spin on its scheduler worker forever,
+            // never observe storm_stop, and starve the other coroutines on
+            // few-worker machines (the CI hang, issue #35).
+            for (int i = 0; i < 6; ++i) {
+                ++storm_spawned;
+                storm_tasks.push_back(
+                    elio::spawn([&, store, i]() -> elio::coro::task<void> {
+                        const uint64_t total = store->size();
+                        uint64_t off = static_cast<uint64_t>(i) * 256 * 1024;
+                        while (!storm_stop.load(std::memory_order_relaxed)) {
+                            const ssize_t pr = co_await store->populate(
+                                off % total, 256 * 1024);
+                            if (pr < 0) break;
+                            off += 6 * 256 * 1024;
+                            co_await elio::time::sleep_for(
+                                std::chrono::milliseconds(1));
+                        }
+                        storm_done.fetch_add(1, std::memory_order_relaxed);
+                    }));
+            }
+
+            // On-demand phase: sequential guest reads of cold extents, each
+            // individually timed. With a capacity-1 source at 25 ms and the
+            // window ceiling at 32, the worst case is ~32 queued scavenger
+            // service times (~0.8 s); 2 s leaves scheduling slack while
+            // still failing any run where on-demand traffic queues behind
+            // unbounded scavenger load.
+            constexpr int kReads = 12;
+            std::vector<uint8_t> buf(16 * 1024);
+            for (int i = 0; i < kReads; ++i) {
+                // Sector-aligned (A3), spread across the 4 MiB image.
+                const uint64_t off = static_cast<uint64_t>(i) * 256 * 1024;
+                const auto t0 = std::chrono::steady_clock::now();
+                const ssize_t r = co_await opened->root->pread(
+                    buf.data(), buf.size(), off);
+                const auto elapsed = std::chrono::steady_clock::now() - t0;
+                REQUIRE(r == static_cast<ssize_t>(buf.size()));
+                REQUIRE(buf == std::vector<uint8_t>(
+                                   raw.begin() + static_cast<ptrdiff_t>(off),
+                                   raw.begin() + static_cast<ptrdiff_t>(
+                                                     off + buf.size())));
+                REQUIRE(elapsed < std::chrono::seconds(2));
+            }
+
+            // The storm really was throttled at the funnel (not merely
+            // absent): at least one scavenger request queued.
+            REQUIRE(opened->funnel->scavenger_waits() > 0);
+
+            storm_stop.store(true, std::memory_order_relaxed);
+            for (int i = 0; i < 5000 && storm_done.load() < storm_spawned;
+                 ++i) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            REQUIRE(storm_done.load() == storm_spawned);
+        } catch (...) {
+            failure = std::current_exception();
         }
-        REQUIRE(storm_done.load() == 6);
-        co_await image::park_image_fills(opened);
+        co_await test::finish_with_async_cleanup(failure, cleanup);
         co_return 0;
     });
     REQUIRE(rc == 0);
@@ -1539,84 +1599,220 @@ TEST_CASE("integration: admission funnel collapses scavenger traffic under on-de
             co_await server.run();
         });
         BlobGuard guard{server};
-        const bool server_running =
-            co_await test::wait_server_running(server);
-        REQUIRE(server_running);
-
-        nlohmann::json cfgj;
-        cfgj["repoBlobUrl"] = server.repo_base();
-        cfgj["lowers"] = nlohmann::json::array(
-            {nlohmann::json{{"digest", digest0},
-                            {"size", blob0.size()},
-                            {"dir", layer_dir0}},
-             nlohmann::json{{"digest", digest1},
-                            {"size", blob1.size()},
-                            {"dir", layer_dir1}}});
-        cfgj["download"] = nlohmann::json{
-            {"enable", true}, {"delay", 0}, {"delayExtra", 0}};
-        const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
-        // Structural warm-up windows at 0 (ADR-0012): the phase-1
-        // on-demand fetch counts below assume every read extent is cold;
-        // pre-warmed head/tail extents would shrink them.
-        image::GlobalConfig global;
-        global.prefetch_head_kb = 0;
-        global.prefetch_tail_kb = 0;
-        auto opened = co_await image::open_image(cfg, global);
-        REQUIRE(opened.layer_stores.size() == 2);
-        source::LayerStore* top = opened.layer_stores[1];
-
-        const uint64_t extents =
-            (top->size() + 64 * 1024 - 1) / (64 * 1024);
-        REQUIRE(extents >= 64);  // enough cold extents for a real storm
-
-        // Phase 1: eight concurrent on-demand readers streaming cold
-        // extents of the top layer's store, partitioned by stride.
+        std::optional<image::OpenedImage> opened;
+        std::atomic<bool> readers_stop{false};
         std::atomic<int> readers_done{0};
-        const uint64_t d0_before = server.data_gets(digest0);
-        const uint64_t d1_before = server.data_gets(digest1);
-        for (int i = 0; i < 8; ++i) {
-            elio::go([&, i]() -> elio::coro::task<void> {
-                std::vector<uint8_t> buf(64 * 1024);
-                for (uint64_t e = static_cast<uint64_t>(i); e < extents;
-                     e += 8) {
-                    const ssize_t r = co_await top->pread(
-                        buf.data(), buf.size(), e * 64 * 1024);
-                    if (r <= 0) break;
+        std::vector<elio::coro::join_handle<void>> reader_tasks;
+        bool readers_joined = false;
+        bool cleaned = false;
+        auto join_readers = [&]() -> elio::coro::task<void> {
+            if (readers_joined) co_return;
+            readers_stop.store(true, std::memory_order_relaxed);
+            readers_joined = true;
+            std::exception_ptr first_failure;
+            for (auto& task : reader_tasks) {
+                try {
+                    co_await task;
+                } catch (...) {
+                    if (!first_failure) first_failure = std::current_exception();
                 }
-                readers_done.fetch_add(1, std::memory_order_relaxed);
-            });
-        }
-        for (int i = 0; i < 30000 && readers_done.load() < 8; ++i) {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
-        }
-        REQUIRE(readers_done.load() == 8);
+            }
+            if (first_failure) std::rethrow_exception(first_failure);
+            co_return;
+        };
+        auto cleanup = [&]() -> elio::coro::task<void> {
+            if (cleaned) co_return;
+            cleaned = true;
+            co_await join_readers();
+            if (opened) co_await image::park_image_fills(*opened);
+            co_return;
+        };
 
-        // The contention was real (dozens of on-demand fetches)...
-        const uint64_t d1_during =
-            server.data_gets(digest1) - d1_before;
-        REQUIRE(d1_during >= 48);
-        // ...and the shadowed bottom layer's fill collapsed under it:
-        // unrestricted it would have fetched roughly one extent per
-        // 20 ms for the whole phase.
-        const uint64_t d0_during =
-            server.data_gets(digest0) - d0_before;
-        REQUIRE(d0_during <= 6);
+        std::exception_ptr failure;
+        try {
+            const bool server_running =
+                co_await test::wait_server_running(server);
+            REQUIRE(server_running);
 
-        // Phase 2: contention over — the scavenger flows again.
-        bool recovered = false;
-        for (int i = 0; i < 15000 && !recovered; ++i) {
-            recovered = server.data_gets(digest0) >=
-                        d0_before + d0_during + 15;
-            if (!recovered) {
+            nlohmann::json cfgj;
+            cfgj["repoBlobUrl"] = server.repo_base();
+            cfgj["lowers"] = nlohmann::json::array(
+                {nlohmann::json{{"digest", digest0},
+                                {"size", blob0.size()},
+                                {"dir", layer_dir0}},
+                 nlohmann::json{{"digest", digest1},
+                                {"size", blob1.size()},
+                                {"dir", layer_dir1}}});
+            cfgj["download"] = nlohmann::json{
+                {"enable", true}, {"delay", 0}, {"delayExtra", 0}};
+            const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+            // Structural warm-up windows at 0 (ADR-0012): the phase-1
+            // on-demand fetch counts below assume every read extent is cold;
+            // pre-warmed head/tail extents would shrink them.
+            image::GlobalConfig global;
+            global.prefetch_head_kb = 0;
+            global.prefetch_tail_kb = 0;
+            opened.emplace(co_await image::open_image(cfg, global));
+            REQUIRE(opened->layer_stores.size() == 2);
+            source::LayerStore* top = opened->layer_stores[1];
+
+            const uint64_t extents =
+                (top->size() + 64 * 1024 - 1) / (64 * 1024);
+            REQUIRE(extents >= 64);  // enough cold extents for a real storm
+
+            // Phase 1: eight concurrent on-demand readers streaming cold
+            // extents of the top layer's store, partitioned by stride.
+            const uint64_t d0_before = server.data_gets(digest0);
+            const uint64_t d1_before = server.data_gets(digest1);
+            for (int i = 0; i < 8; ++i) {
+                reader_tasks.push_back(
+                    elio::spawn([&, top, extents, i]() -> elio::coro::task<void> {
+                        std::vector<uint8_t> buf(64 * 1024);
+                        for (uint64_t e = static_cast<uint64_t>(i);
+                             e < extents &&
+                             !readers_stop.load(std::memory_order_relaxed);
+                             e += 8) {
+                            const ssize_t r = co_await top->pread(
+                                buf.data(), buf.size(), e * 64 * 1024);
+                            if (r <= 0) break;
+                        }
+                        readers_done.fetch_add(1, std::memory_order_relaxed);
+                    }));
+            }
+            for (int i = 0; i < 30000 && readers_done.load() < 8; ++i) {
                 co_await elio::time::sleep_for(std::chrono::milliseconds(1));
             }
-        }
-        REQUIRE(recovered);
+            REQUIRE(readers_done.load() == 8);
+            co_await join_readers();
 
-        co_await image::park_image_fills(opened);
+            // The contention was real (dozens of on-demand fetches)...
+            const uint64_t d1_during =
+                server.data_gets(digest1) - d1_before;
+            REQUIRE(d1_during >= 48);
+            // ...and the shadowed bottom layer's fill collapsed under it:
+            // unrestricted it would have fetched roughly one extent per
+            // 20 ms for the whole phase.
+            const uint64_t d0_during =
+                server.data_gets(digest0) - d0_before;
+            REQUIRE(d0_during <= 6);
+
+            // Phase 2: contention over — the scavenger flows again.
+            bool recovered = false;
+            for (int i = 0; i < 15000 && !recovered; ++i) {
+                recovered = server.data_gets(digest0) >=
+                            d0_before + d0_during + 15;
+                if (!recovered) {
+                    co_await elio::time::sleep_for(
+                        std::chrono::milliseconds(1));
+                }
+            }
+            REQUIRE(recovered);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        co_await test::finish_with_async_cleanup(failure, cleanup);
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: issue28 hidden cleanup probe preserves assertion failure",
+          "[integration][.][issue28-harness]") {
+    TempDir dir;
+    const auto raw = test::pattern_bytes(512 * 2048, 109);  // 1 MiB
+    const auto blob = make_zfile_blob(dir, raw);
+    const std::string digest = "sha256:" + sha256_hex_of(blob);
+    const std::string layer_dir = dir / "layer_issue28_probe";
+    std::filesystem::create_directories(layer_dir);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobMapServer server({{digest, blob}});
+        elio::go([&server]() -> elio::coro::task<void> {
+            co_await server.run();
+        });
+        BlobGuard guard{server};
+        std::optional<image::OpenedImage> opened;
+        std::vector<elio::coro::join_handle<void>> readers;
+        std::atomic<int> readers_started{0};
+        bool readers_joined = false;
+        bool cleaned = false;
+        auto join_readers = [&]() -> elio::coro::task<void> {
+            if (readers_joined) co_return;
+            server.release_data_gets();
+            readers_joined = true;
+            std::exception_ptr first_failure;
+            for (auto& reader : readers) {
+                try {
+                    co_await reader;
+                } catch (...) {
+                    if (!first_failure) first_failure = std::current_exception();
+                }
+            }
+            if (first_failure) std::rethrow_exception(first_failure);
+            co_return;
+        };
+        auto cleanup = [&]() -> elio::coro::task<void> {
+            if (cleaned) co_return;
+            cleaned = true;
+            co_await join_readers();
+            if (opened) co_await image::park_image_fills(*opened);
+            co_return;
+        };
+
+        std::exception_ptr failure;
+        try {
+            const bool server_running =
+                co_await test::wait_server_running(server);
+            REQUIRE(server_running);
+
+            auto cfgj = remote_image_config_with_dir(
+                server.repo_base(), sha256_hex_of(blob), blob.size(), layer_dir);
+            cfgj["download"] = nlohmann::json{
+                {"enable", true}, {"delay", 5}, {"delayExtra", 0}};
+            const auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+            image::GlobalConfig global;
+            global.prefetch_head_kb = 0;
+            global.prefetch_tail_kb = 0;
+            opened.emplace(co_await image::open_image(cfg, global));
+            REQUIRE(opened->layer_stores.size() == 1);
+            source::LayerStore* store = opened->layer_stores[0];
+            server.block_data_gets();
+
+            for (int i = 0; i < 2; ++i) {
+                readers.push_back(
+                    elio::spawn([&, store, i]() -> elio::coro::task<void> {
+                        readers_started.fetch_add(1, std::memory_order_relaxed);
+                        std::vector<uint8_t> buf(64 * 1024);
+                        const uint64_t off = static_cast<uint64_t>(i) *
+                                             64 * 1024;
+                        const ssize_t r = co_await store->pread(
+                            buf.data(), buf.size(), off);
+                        (void)r;
+                    }));
+            }
+            for (int i = 0; i < 5000 &&
+                            (readers_started.load() < 2 ||
+                             server.blocked_data_gets() < 1);
+                 ++i) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            INFO("issue28 intentional failure marker: live readers are blocked");
+            REQUIRE(readers_started.load() == 2);
+            REQUIRE(server.blocked_data_gets() >= 1);
+            REQUIRE(false);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        co_await test::finish_with_async_cleanup(failure, cleanup);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: issue28 hidden sibling runs after failed cleanup probe",
+          "[integration][.][issue28-harness]") {
+    std::cout << "issue28 sibling executed after cleanup probe" << std::endl;
+    REQUIRE(true);
 }
 
 TEST_CASE("integration: concurrent mock servers bind distinct ephemeral ports",

@@ -124,6 +124,17 @@ macro aliases, process line splices, or evaluate conditional compilation
 (disabled branches are checked too). Keep coroutine work outside assertion
 arguments instead of wrapping it in another macro.
 
+When an async test owns an `OpenedImage`, `LayerStore`, or joinable reader
+task, cleanup must run in the same coroutine frame that owns those objects.
+A wrapper around `test::run_coro` is too late: a failing `REQUIRE` has
+already unwound the coroutine body's locals by the time the exception
+reaches an outer function. Keep long-lived handles outside the guarded
+`try`, record `std::current_exception()`, drain spawned work, park image
+fills, and then call `test::finish_with_async_cleanup` so Catch2 still
+reports the original assertion. The hidden issue-28 selftest runs this
+path under CTest and expects the probe to fail with the real assertion,
+not a fatal signal.
+
 ## Golden values and cross-validation
 
 Format-level behavior is pinned against **upstream OverlayBD format
@@ -1163,6 +1174,15 @@ Every test, grouped by area, with the property it guards.
   on-demand readers stream cold extents of the top layer, the shadowed
   bottom layer's fill makes essentially no progress, and resumes once
   the contention stops (ADR-0012 acceptance).
+- `integration: issue28 hidden cleanup probe preserves assertion failure` —
+  hidden CTest probe: two reader coroutines are live, at least one is
+  parked on a blocked registry data GET, the test deliberately fails a
+  `REQUIRE`, the same coroutine frame drains readers and parks fills, and
+  Catch2 reports the original assertion instead of a fatal signal.
+- `integration: issue28 hidden sibling runs after failed cleanup probe` —
+  hidden companion selected in the same subprocess as the failing probe,
+  proving the integration-test binary stays alive for sibling cases after
+  the issue-28 cleanup path rethrows the Catch2 failure.
 - `integration: structural warm-up fetches head and tail extents at bring-up` —
   the ADR-0012 cold-start floor end to end: with warm-up enabled
   (256 KiB windows), `open_image` alone — no device read — fetches a
