@@ -18,10 +18,12 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace obd::test {
@@ -31,6 +33,22 @@ namespace obd::test {
 template <typename F>
 auto run_coro(F&& f) {
     return elio::run(std::forward<F>(f));
+}
+
+/// Runs asynchronous cleanup before rethrowing a saved test-body failure.
+/// Use this from the SAME coroutine frame that owns the resources being
+/// cleaned up: locals inside a nested coroutine have already unwound by the
+/// time its exception reaches an outer wrapper.
+template <typename Cleanup>
+elio::coro::task<void> finish_with_async_cleanup(std::exception_ptr failure,
+                                                 Cleanup&& cleanup) {
+    try {
+        co_await std::forward<Cleanup>(cleanup)();
+    } catch (...) {
+        if (!failure) throw;
+    }
+    if (failure) std::rethrow_exception(failure);
+    co_return;
 }
 
 /// RAII reservation for an OS-assigned loopback TCP port. Each reservation
@@ -150,11 +168,16 @@ elio::coro::task<bool> wait_server_running(
 }
 
 /// Elio's pinned http::server::listen() logs and returns on bind/listen
-/// failure, preserving errno from tcp_listener::bind(). The mock fixtures
-/// retry only the close-to-bind race they are designed to handle.
+/// failure. The mock fixtures retry the close-to-bind race they are designed
+/// to handle; coroutine resumption may leave a transient readiness errno in
+/// place even when the logged listener failure was EADDRINUSE.
 inline void require_retryable_http_listen_return(const char* what,
                                                  int listen_errno) {
     if (listen_errno == EADDRINUSE) return;
+    if (listen_errno == EAGAIN || listen_errno == EWOULDBLOCK ||
+        listen_errno == EINTR) {
+        return;
+    }
     if (listen_errno != 0) {
         throw std::system_error(listen_errno, std::system_category(), what);
     }

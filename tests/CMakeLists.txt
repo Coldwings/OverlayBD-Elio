@@ -104,6 +104,12 @@ catch_discover_tests(obd_integration_tests
     PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
                TIMEOUT 300)
 
+add_test(NAME issue28-harness-failure-selftest
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_issue28_harness_failure.py
+        $<TARGET_FILE:obd_integration_tests>)
+set_tests_properties(issue28-harness-failure-selftest PROPERTIES TIMEOUT 120)
+
 # Inspect every first-party translation unit, including binary/test helpers.
 # The check uses the real build commands, so a forgotten target is observable.
 if(CMAKE_GENERATOR MATCHES "Makefiles|Ninja")
