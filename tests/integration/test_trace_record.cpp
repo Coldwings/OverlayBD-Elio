@@ -80,7 +80,7 @@ public:
         return "http://127.0.0.1:" + std::to_string(port_) + "/v2";
     }
 
-private:
+    // Exercise the same handler directly without starting background server tasks.
     elio::coro::task<http::response> handler(http::context& ctx) {
         const std::string name(ctx.req().path().substr(4));
         const auto it = blobs_.find(name);
@@ -113,9 +113,9 @@ private:
             }
             char* endp = nullptr;
             errno = 0;
+            const std::string first_token(range.substr(6, dash - 6));
             const uint64_t a =
-                std::strtoull(std::string(range.substr(6, dash - 6)).c_str(),
-                              &endp, 10);
+                std::strtoull(first_token.c_str(), &endp, 10);
             if (errno != 0 || endp == nullptr || *endp != '\0') {
                 http::response resp(http::status::bad_request);
                 resp.set_header("Content-Length", "0");
@@ -124,8 +124,9 @@ private:
             first = a;
             partial = true;
             if (dash + 1 < range.size()) {
-                const uint64_t b = std::strtoull(
-                    std::string(range.substr(dash + 1)).c_str(), &endp, 10);
+                const std::string last_token(range.substr(dash + 1));
+                const uint64_t b =
+                    std::strtoull(last_token.c_str(), &endp, 10);
                 if (errno != 0 || endp == nullptr || *endp != '\0') {
                     http::response resp(http::status::bad_request);
                     resp.set_header("Content-Length", "0");
@@ -155,6 +156,7 @@ private:
         co_return resp;
     }
 
+private:
     std::map<std::string, std::vector<uint8_t>> blobs_;
     uint16_t port_;
     std::unique_ptr<http::server> server_;
@@ -400,6 +402,46 @@ std::vector<uint8_t> read_whole_file(const std::string& path) {
 }
 
 }  // namespace
+
+TEST_CASE("integration: trace mock range parsing retains numeric storage", "[integration][trace]") {
+    TraceBlobServer server({{"data", {'a', 'b', 'c', 'd'}}, {"empty", {}}}, 0);
+    struct Case {
+        std::string path;
+        std::string range;
+        uint16_t status;
+        std::string body;
+    };
+    const std::string zeros(32, '0');
+    const std::vector<Case> cases{
+        {"data", "", 200, "abcd"},
+        {"data", "bytes=1-2", 206, "bc"},
+        {"data", "bytes=" + zeros + "1-2", 206, "bc"},
+        {"data", "bytes=1-" + zeros + "2", 206, "bc"},
+        {"data", "bytes=2-", 206, "cd"},
+        {"data", "bytes=2-99", 206, "cd"},
+        {"data", "bytes=1", 400, ""},
+        {"data", "bytes=-1", 400, ""},
+        {"data", "bytes=1x-2", 400, ""},
+        {"data", "bytes=1-2x", 400, ""},
+        {"data", "bytes=" + std::string(32, '9') + "-2", 400, ""},
+        {"data", "bytes=1-" + std::string(32, '9'), 400, ""},
+        {"data", "bytes=4-", 416, ""},
+        {"data", "bytes=3-1", 416, ""},
+        {"empty", "bytes=0-", 416, ""},
+        {"missing", "bytes=0-", 404, ""},
+    };
+    for (const auto& item : cases) {
+        http::request request(http::method::GET, "/v2/" + item.path);
+        if (!item.range.empty()) request.set_header("Range", item.range);
+        http::context context(std::move(request), "127.0.0.1");
+        auto response = test::run_coro([&]() -> elio::coro::task<http::response> {
+            co_return co_await server.handler(context);
+        });
+        INFO(item.path << " " << item.range);
+        CHECK(response.status_code() == item.status);
+        CHECK(response.body() == item.body);
+    }
+}
 
 TEST_CASE("integration: trace recording captures remote reads end to end",
           "[integration]") {
