@@ -597,6 +597,10 @@ Every test, grouped by area, with the property it guards.
 - `image: trace recording stop is idempotent and reports expiry stats` —
   the device-side timer finalizes with no client call; a late stop
   returns the same stats.
+- `image: concurrent trace stops join the winning finalize` — an
+  expiry stop and explicit stop are held after both observe Recording;
+  the losing stop waits for and returns the winner's finalized path,
+  digest, reason, and counts instead of reporting no recording.
 - `image: trace recording captures only remote fetches through the layer store`
   — local hits record nothing; misses record exactly the fetched
   extents.

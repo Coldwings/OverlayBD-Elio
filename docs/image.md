@@ -901,6 +901,9 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   `image: trace recording stop is idempotent and reports expiry stats` —
   the device-side timer finalizes with no client call and a late stop
   returns the same stats;
+  `image: concurrent trace stops join the winning finalize` — an
+  expiry stop and explicit stop are held after both observe Recording;
+  the loser joins and returns the winner's result;
   `image: trace recording captures only remote fetches through the layer store`
   — local hits record nothing, misses record exactly the fetched
   extents;

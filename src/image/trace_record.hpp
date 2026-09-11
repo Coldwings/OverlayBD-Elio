@@ -155,8 +155,23 @@ public:
         start_hook_ = std::move(hook);
     }
 
+    /// Test-only: when set, stop() co_awaits this hook after observing
+    /// Recording and before selecting the finalizer owner. This makes the
+    /// stop-vs-stop ownership race deterministic without weakening the
+    /// production state transition.
+    void set_stop_claim_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        stop_claim_hook_ = std::move(hook);
+    }
+
 private:
     enum class State : int { Idle = 0, Recording = 1, Finalizing = 2 };
+
+    struct FinalizeCompletion {
+        uint64_t generation = 0;
+        std::optional<FinalizeResult> result;
+    };
 
     /// The duration timer body: ONE cancellable sleep — a stop/shutdown
     /// cancels it for an immediate exit, so the timer never parks a
@@ -184,9 +199,11 @@ private:
     std::string path_;
     std::function<void(const FinalizeResult&)> on_expire_;
     std::optional<FinalizeResult> last_;
+    std::shared_ptr<FinalizeCompletion> finalizing_;
     std::shared_ptr<elio::coro::cancel_source> timer_cancel_;
-    std::function<elio::coro::task<void>()> finalize_hook_;  // test-only
-    std::function<elio::coro::task<void>()> start_hook_;     // test-only
+    std::function<elio::coro::task<void>()> finalize_hook_;     // test-only
+    std::function<elio::coro::task<void>()> start_hook_;        // test-only
+    std::function<elio::coro::task<void>()> stop_claim_hook_;   // test-only
 };
 
 using TraceRecorderPtr = std::shared_ptr<TraceRecorder>;

@@ -46,6 +46,22 @@ elio::coro::task<ssize_t> read_at(source::BlobSource& src, uint64_t offset,
     co_return r;
 }
 
+elio::coro::task<image::TraceRecorder::FinalizeResult> marked_stop(
+    std::shared_ptr<image::TraceRecorder> rec, std::atomic<bool>* entered,
+    std::string reason) {
+    entered->store(true, std::memory_order_release);
+    co_return co_await rec->stop(std::move(reason));
+}
+
+elio::coro::task<image::TraceRecorder::FinalizeResult> await_stop_handle(
+    elio::coro::join_handle<image::TraceRecorder::FinalizeResult>& handle) {
+    auto result = co_await handle;
+    while (!handle.is_destroyed()) {
+        co_await elio::time::sleep_for(1ms);
+    }
+    co_return result;
+}
+
 /// Starts the recorder, runs `body` (a coroutine lambda), and ALWAYS
 /// stops — even when the body throws — so the duration timer never
 /// leaks into scheduler teardown. Returns the stop result.
@@ -402,6 +418,139 @@ TEST_CASE("image: trace recording stop is idempotent and reports expiry stats",
     REQUIRE(again.sha256 == expired->sha256);
     const auto records = parse_file(out);
     REQUIRE(records.size() == 1);
+}
+
+TEST_CASE("image: concurrent trace stops join the winning finalize",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 74);
+    const std::string out = dir / "out.trace";
+    std::atomic<int> stop_claim_entries{0};
+    std::atomic<bool> first_stop_claim_release{false};
+    std::atomic<bool> second_stop_claim_release{false};
+    std::atomic<bool> finalize_entered{false};
+    std::atomic<bool> finalize_release{false};
+    std::atomic<bool> explicit_stop_entered{false};
+    std::optional<image::TraceRecorder::FinalizeResult> expiry_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> explicit_stop;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_stop_claim_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                const int entry =
+                    stop_claim_entries.fetch_add(
+                        1, std::memory_order_acq_rel) +
+                    1;
+                auto& release = entry == 1 ? first_stop_claim_release
+                                           : second_stop_claim_release;
+                while (!release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        rec->set_finalize_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                finalize_entered.store(true, std::memory_order_release);
+                while (!finalize_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        auto release_all = [&] {
+            first_stop_claim_release.store(true, std::memory_order_release);
+            second_stop_claim_release.store(true, std::memory_order_release);
+            finalize_release.store(true, std::memory_order_release);
+            rec->set_stop_claim_hook_for_test(nullptr);
+            rec->set_finalize_hook_for_test(nullptr);
+        };
+        image::TraceRecordSource tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            out, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!started) co_return 1;
+        const ssize_t r1 = co_await read_at(tap, 0, 4096);
+        if (r1 != 4096) {
+            release_all();
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+
+        // Both stop callers are held after observing Recording but before
+        // finalizer ownership is selected. The old split-state stop() let
+        // both callers pass its first check; the loser then saw the winner's
+        // Recording -> Finalizing transition as "not Recording" and returned
+        // a spurious no-recording error. The fixed stop() selects or joins
+        // under one state decision and binds joiners to that finalize result.
+        auto expiry_task = elio::spawn(rec->stop("expired"));
+        for (int i = 0;
+             i < 5000 &&
+             stop_claim_entries.load(std::memory_order_acquire) < 1; ++i) {
+            co_await elio::time::sleep_for(1ms);
+        }
+        if (stop_claim_entries.load(std::memory_order_acquire) < 1) {
+            release_all();
+            expiry_stop = co_await await_stop_handle(expiry_task);
+            co_return 3;
+        }
+
+        auto explicit_task = elio::spawn(marked_stop, rec,
+                                        &explicit_stop_entered,
+                                        std::string("stopped"));
+        for (int i = 0;
+             i < 5000 &&
+             (stop_claim_entries.load(std::memory_order_acquire) < 2 ||
+              !explicit_stop_entered.load(std::memory_order_acquire)); ++i) {
+            co_await elio::time::sleep_for(1ms);
+        }
+        if (stop_claim_entries.load(std::memory_order_acquire) < 2 ||
+            !explicit_stop_entered.load(std::memory_order_acquire)) {
+            release_all();
+            expiry_stop = co_await await_stop_handle(expiry_task);
+            explicit_stop = co_await await_stop_handle(explicit_task);
+            co_return 4;
+        }
+
+        // Let the first stop (the simulated expiry) claim finalization,
+        // then hold it in the finalize hook before releasing the explicit
+        // stop to join that exact completion.
+        first_stop_claim_release.store(true, std::memory_order_release);
+        for (int i = 0;
+             i < 5000 &&
+             !finalize_entered.load(std::memory_order_acquire); ++i) {
+            co_await elio::time::sleep_for(1ms);
+        }
+        if (!finalize_entered.load(std::memory_order_acquire)) {
+            release_all();
+            expiry_stop = co_await await_stop_handle(expiry_task);
+            explicit_stop = co_await await_stop_handle(explicit_task);
+            co_return 5;
+        }
+        // Give the loser a chance to hit the join path while finalization is
+        // still held. The old split-state implementation could return a
+        // spurious no-recording error from this window.
+        second_stop_claim_release.store(true, std::memory_order_release);
+        co_await elio::time::sleep_for(10ms);
+        release_all();
+        expiry_stop = co_await await_stop_handle(expiry_task);
+        explicit_stop = co_await await_stop_handle(explicit_task);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(expiry_stop->ok);
+    REQUIRE(explicit_stop->ok);
+    REQUIRE(expiry_stop->reason == "expired");
+    REQUIRE(explicit_stop->reason == "expired");
+    REQUIRE(explicit_stop->path == expiry_stop->path);
+    REQUIRE(explicit_stop->records == expiry_stop->records);
+    REQUIRE(explicit_stop->dropped == expiry_stop->dropped);
+    REQUIRE(explicit_stop->size == expiry_stop->size);
+    REQUIRE(explicit_stop->sha256 == expiry_stop->sha256);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 4096, 0});
 }
 
 TEST_CASE("image: trace recording captures only remote fetches through the layer store",
