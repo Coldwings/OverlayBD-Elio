@@ -391,6 +391,9 @@ Every test, grouped by area, with the property it guards.
   `checkpoint()` uses the same durability path as `flush()`, so graceful
   shutdown persists pending discard masks even though sparse uppers never
   seal.
+- `format: sparse layer checkpoint is terminal` — after sparse
+  `checkpoint()` succeeds, later writes, discards, grows and repeated
+  checkpoints fail with `-EROFS`.
 - `format: sparse layer grow republishes zero mask size` — after an online
   sparse grow, the next `flush()` republishes the dirty zero-mask sidecar
   with the grown virtual size before recovery with the old configuration.

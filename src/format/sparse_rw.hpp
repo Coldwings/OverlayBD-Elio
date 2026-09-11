@@ -69,6 +69,14 @@ private:
                            uint64_t vsize) const;
     int persist_current_zero_masks() const;
     void load_zero_masks();
+    elio::coro::task<int> flush_locked();
+
+    enum class Lifecycle {
+        kOpen,
+        kGrowing,
+        kCheckpointing,
+        kCheckpointed,
+    };
 
     int fd_ = -1;                    // RW fd (writes + flushes)
     std::unique_ptr<View> ro_;       // RO view for data_source()
@@ -81,6 +89,7 @@ private:
     /// Serializes pwrite/discard/flush durability ordering without
     /// blocking an Elio worker while disk work is offloaded.
     elio::sync::mutex op_mu_;
+    std::atomic<Lifecycle> lifecycle_{Lifecycle::kOpen};
     mutable std::mutex meta_mu_;
     uint64_t zero_masks_generation_ = 0;
     bool zero_masks_dirty_ = false;

@@ -499,12 +499,13 @@ the current index: sorted, disjoint, 512B sector units, tag 0.
 `pwrite`/`discard` accept the new range. Grow-only: a request smaller
 than the current size returns `-EINVAL`; an equal request is an
 idempotent no-op (retried grows after a partial kernel failure land
-here). It is **BLOCKING** (header rewrite + fsync for LSMT, ftruncate
-for sparse) — run it off an Elio worker via `elio::spawn_blocking`, as
-the device resize executor does (docs/supervisor.md). LSMT direct
-concurrent `grow()`/`checkpoint()`/`seal()` calls are rejected with
-`-EBUSY`; the supervisor normally serializes those operations before
-they reach the layer.
+here). It is **BLOCKING** (header rewrite + fsync for LSMT, ftruncate +
+fdatasync for sparse) — run it off an Elio worker via
+`elio::spawn_blocking`, as the device resize executor does
+(docs/supervisor.md). LSMT direct concurrent `grow()`/`checkpoint()`/`seal()`
+calls, and sparse direct concurrent `grow()`/`checkpoint()` calls, are
+rejected with `-EBUSY`; the supervisor normally serializes those
+operations before they reach the layer.
 
 ### `src/format/sparse_rw.hpp` — `SparseRwLayer`
 

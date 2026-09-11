@@ -1299,6 +1299,31 @@ TEST_CASE("format: sparse layer checkpoint persists a dirty zero mask",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("format: sparse layer checkpoint is terminal", "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const auto data = sectors_pattern(0, 4, 1206);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        const int cr = co_await layer->checkpoint();
+        REQUIRE(cr == 0);
+
+        const ssize_t wr =
+            co_await layer->pwrite(data.data(), data.size(), 0);
+        REQUIRE(wr == -EROFS);
+        const int dr = co_await layer->discard(8 * 512, 4 * 512);
+        REQUIRE(dr == -EROFS);
+        const int gr = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 64); });
+        REQUIRE(gr == -EROFS);
+        const int cr2 = co_await layer->checkpoint();
+        REQUIRE(cr2 == -EROFS);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("format: sparse layer grow republishes zero mask size",
           "[format]") {
     TempDir dir;
