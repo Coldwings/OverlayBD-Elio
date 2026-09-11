@@ -34,8 +34,9 @@ public:
                                     uint64_t offset) override;
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
-    /// Persists dirty zero-mask metadata after syncing sparse data. Sparse
-    /// uppers never seal (ADR-0014 upstream parity).
+    /// Persists dirty zero-mask metadata through the ordered data-file and
+    /// sidecar durability path shared with flush(). Sparse uppers never seal
+    /// (ADR-0014 upstream parity).
     elio::coro::task<int> checkpoint() override;
 
     /// D3 grow-only vsize extension (see WritableLayer::grow): extends
@@ -55,21 +56,7 @@ public:
 
 private:
     class View;
-
-    SparseRwLayer() = default;
-    bool has_zero_masks() const;
-    bool has_zero_masks_locked() const;
-    bool range_intersects_zero_mask_locked(uint64_t lo, uint64_t hi) const;
-    std::vector<bytes::segment_mapping> zero_mask_segments() const;
-    std::vector<bytes::segment_mapping> zero_mask_segments_locked() const;
-    void insert_live_extent(uint64_t off, uint64_t len);
-    void insert_zero_extent(uint64_t off, uint64_t len);
-    void erase_range(uint64_t lo, uint64_t hi);
-    int persist_zero_masks(const std::vector<bytes::segment_mapping>& zeroes,
-                           uint64_t vsize) const;
-    int persist_current_zero_masks() const;
-    void load_zero_masks();
-    elio::coro::task<int> flush_locked();
+    friend struct SparseRwLayerTestAccess;
 
     enum class Lifecycle {
         kOpen,
@@ -77,6 +64,33 @@ private:
         kCheckpointing,
         kCheckpointed,
     };
+
+    struct ZeroMaskPersistResult {
+        int rc = 0;
+        bool namespace_committed = false;
+    };
+
+    SparseRwLayer() = default;
+    bool has_zero_masks_locked() const;
+    bool range_intersects_zero_mask_locked(uint64_t lo, uint64_t hi) const;
+    std::vector<bytes::segment_mapping> zero_mask_segments_locked() const;
+    void insert_live_extent(uint64_t off, uint64_t len);
+    void erase_range(uint64_t lo, uint64_t hi);
+    int begin_data_op(uint64_t offset, uint64_t len);
+    int begin_flush_op(bool* already_checkpointed);
+    int begin_grow_op();
+    int begin_checkpoint_op();
+    void end_data_op();
+    void end_grow_op();
+    void end_checkpoint_op(Lifecycle next);
+    bool dirty_zero_masks_need_data_first() const;
+    ZeroMaskPersistResult persist_zero_masks(
+        const std::vector<bytes::segment_mapping>& zeroes,
+        uint64_t vsize) const;
+    int sync_data_file() const;
+    void load_zero_masks();
+    elio::coro::task<int> publish_data_first_zero_masks_locked();
+    elio::coro::task<int> flush_locked();
 
     int fd_ = -1;                    // RW fd (writes + flushes)
     std::unique_ptr<View> ro_;       // RO view for data_source()
@@ -89,10 +103,17 @@ private:
     /// Serializes pwrite/discard/flush durability ordering without
     /// blocking an Elio worker while disk work is offloaded.
     elio::sync::mutex op_mu_;
+    /// Synchronous admission gate shared by grow/checkpoint and coroutine
+    /// operations. Operations register active_ops_ while holding this mutex,
+    /// so grow/checkpoint can atomically close admission and observe whether
+    /// any already-admitted operation exists.
+    std::mutex state_gate_mu_;
+    std::atomic<uint32_t> active_ops_{0};
     std::atomic<Lifecycle> lifecycle_{Lifecycle::kOpen};
     mutable std::mutex meta_mu_;
     uint64_t zero_masks_generation_ = 0;
     bool zero_masks_dirty_ = false;
+    bool zero_masks_data_first_ = false;
 };
 
 }  // namespace obd::format

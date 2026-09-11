@@ -75,7 +75,9 @@ public:
         return segments();
     }
 
-    /// The file view segment data is read from (identity for sparse).
+    /// The file view segment data is read from (identity for sparse). A
+    /// grow-capable writable layer may expose a view whose size() tracks
+    /// virtual_size() after successful grow() calls.
     virtual source::BlobSource& data_source() = 0;
 };
 

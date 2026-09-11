@@ -44,6 +44,52 @@ struct LsmtRwLayerTestAccess {
     }
 };
 
+struct SparseRwLayerTestAccess {
+    static int begin_data(SparseRwLayer& layer, uint64_t offset,
+                          uint64_t len) {
+        return layer.begin_data_op(offset, len);
+    }
+    static void end_data(SparseRwLayer& layer) { layer.end_data_op(); }
+    static void end_active(SparseRwLayer& layer) { layer.end_data_op(); }
+    static int begin_flush(SparseRwLayer& layer, bool* already_checkpointed) {
+        return layer.begin_flush_op(already_checkpointed);
+    }
+    static int begin_grow(SparseRwLayer& layer) {
+        return layer.begin_grow_op();
+    }
+    static void end_grow(SparseRwLayer& layer) { layer.end_grow_op(); }
+    static int begin_checkpoint(SparseRwLayer& layer) {
+        return layer.begin_checkpoint_op();
+    }
+    static void end_checkpoint(SparseRwLayer& layer) {
+        layer.end_checkpoint_op(SparseRwLayer::Lifecycle::kOpen);
+    }
+    static int persist_zero_masks(
+        SparseRwLayer& layer,
+        const std::vector<bytes::segment_mapping>& zeroes,
+        uint64_t vsize) {
+        return layer.persist_zero_masks(zeroes, vsize).rc;
+    }
+};
+
+struct MergedWritableTestAccess {
+    static int begin_data(MergedWritable& merged, uint64_t offset,
+                          uint64_t len) {
+        return merged.begin_data_op(offset, len);
+    }
+    static void end_data(MergedWritable& merged) { merged.end_data_op(); }
+    static int begin_flush(MergedWritable& merged) {
+        return merged.begin_flush_op();
+    }
+    static int begin_grow(MergedWritable& merged) {
+        return merged.begin_grow_op();
+    }
+    static void end_grow(MergedWritable& merged) { merged.end_grow_op(); }
+    static void invalidate_index(MergedWritable& merged) {
+        merged.invalidate_index();
+    }
+};
+
 }  // namespace obd::format
 
 namespace {
@@ -110,11 +156,12 @@ uint64_t sparse_zero_mask_vsize(const std::string& path) {
 }
 
 elio::coro::task<int> expect_sparse_zero_mask_reject(
-    std::string path, std::vector<uint8_t> raw, std::string needle) {
+    std::string path, std::vector<uint8_t> raw, std::string needle,
+    uint64_t open_vsize = 512 * 64) {
     test::write_file(path + ".zeroes", raw);
     bool threw = false;
     try {
-        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 64);
+        auto reopened = co_await format::SparseRwLayer::open(path, open_vsize);
         (void)reopened;
     } catch (const std::exception& e) {
         threw = true;
@@ -1220,7 +1267,7 @@ TEST_CASE("format: sparse layer discard keeps a durable zero mask",
             for (size_t i = 2 * 512; i < 6 * 512; ++i) REQUIRE(buf[i] == 0);
             REQUIRE(std::memcmp(buf.data() + 6 * 512, a.data() + 6 * 512,
                                 2 * 512) == 0);
-            REQUIRE(::access((path + ".zeroes").c_str(), F_OK) != 0);
+            REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
             int frc = co_await layer->flush();
             REQUIRE(frc == 0);
             REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
@@ -1260,6 +1307,7 @@ TEST_CASE("format: sparse layer reopen accepts a published grown zero mask",
                 co_await format::SparseRwLayer::open(path, 512 * 64);
             REQUIRE(layer->virtual_size() == 512 * 64);
         }
+        REQUIRE(::truncate(path.c_str(), 512 * 96) == 0);
         write_sparse_zero_mask(path, 512 * 96, {{10, 4}});
 
         auto reopened =
@@ -1283,17 +1331,55 @@ TEST_CASE("format: sparse layer checkpoint persists a dirty zero mask",
         auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
         const int dr = co_await layer->discard(8 * 512, 4 * 512);
         REQUIRE(dr == 0);
-        REQUIRE(::access((path + ".zeroes").c_str(), F_OK) != 0);
+        REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
+        REQUIRE(sparse_zero_mask_vsize(path) == 512 * 32);
+
+        const int gr = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 64); });
+        REQUIRE(gr == 0);
+        REQUIRE(layer->virtual_size() == 512 * 64);
+        REQUIRE(sparse_zero_mask_vsize(path) == 512 * 32);
 
         const int cr = co_await layer->checkpoint();
         REQUIRE(cr == 0);
         REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
+        REQUIRE(sparse_zero_mask_vsize(path) == 512 * 64);
 
         auto reopened = co_await format::SparseRwLayer::open(path, 512 * 32);
+        REQUIRE(reopened->virtual_size() == 512 * 64);
         REQUIRE(reopened->segments().size() == 1);
         REQUIRE(reopened->segments()[0].offset == 8);
         REQUIRE(reopened->segments()[0].length == 4);
         REQUIRE(reopened->segments()[0].zeroed);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse layer checkpoint failure can retry", "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const auto data = sectors_pattern(0, 1, 1207);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        const int dr = co_await layer->discard(8 * 512, 4 * 512);
+        REQUIRE(dr == 0);
+        const std::string sidecar = path + ".zeroes";
+        REQUIRE(::unlink(sidecar.c_str()) == 0);
+        REQUIRE(::mkdir(sidecar.c_str(), 0700) == 0);
+
+        const int first_checkpoint = co_await layer->checkpoint();
+        REQUIRE(first_checkpoint < 0);
+        const ssize_t wr = co_await layer->pwrite(data.data(), data.size(), 0);
+        REQUIRE(wr == static_cast<ssize_t>(data.size()));
+
+        REQUIRE(::rmdir(sidecar.c_str()) == 0);
+        const int retry_checkpoint = co_await layer->checkpoint();
+        REQUIRE(retry_checkpoint == 0);
+        const ssize_t after_checkpoint =
+            co_await layer->pwrite(data.data(), data.size(), 0);
+        REQUIRE(after_checkpoint == -EROFS);
         co_return 0;
     });
     REQUIRE(rc == 0);
@@ -1335,16 +1421,15 @@ TEST_CASE("format: sparse layer grow republishes zero mask size",
                 co_await format::SparseRwLayer::open(path, 512 * 32);
             const int dr = co_await layer->discard(8 * 512, 4 * 512);
             REQUIRE(dr == 0);
-            int frc = co_await layer->flush();
-            REQUIRE(frc == 0);
             REQUIRE(sparse_zero_mask_vsize(path) == 512 * 32);
 
             const int gr = co_await elio::spawn_blocking(
                 [&] { return layer->grow(512 * 96); });
             REQUIRE(gr == 0);
-            frc = co_await layer->flush();
-            REQUIRE(frc == 0);
             REQUIRE(layer->virtual_size() == 512 * 96);
+            REQUIRE(sparse_zero_mask_vsize(path) == 512 * 32);
+            int frc = co_await layer->flush();
+            REQUIRE(frc == 0);
         }
 
         REQUIRE(sparse_zero_mask_vsize(path) == 512 * 96);
@@ -1466,6 +1551,28 @@ TEST_CASE("format: sparse zero mask sidecar preserves grown size",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("format: sparse zero mask writer rejects oversized vsize",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 512 * 64);
+        bytes::segment_mapping z;
+        z.offset = 8;
+        z.length = 1;
+        z.zeroed = true;
+        const std::vector<bytes::segment_mapping> zeroes{z};
+        const int prc = format::SparseRwLayerTestAccess::persist_zero_masks(
+            *layer, zeroes,
+            (bytes::segment_mapping::kInvalidOffset + 1) * 512);
+        REQUIRE(prc == -EFBIG);
+        REQUIRE(::access((path + ".zeroes").c_str(), F_OK) != 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("format: sparse zero mask sidecar rejects malformed metadata",
           "[format]") {
     TempDir dir;
@@ -1481,18 +1588,31 @@ TEST_CASE("format: sparse zero mask sidecar rejects malformed metadata",
     auto huge_count_seed = make_sparse_zero_mask(512 * 64, {});
     bytes::store_u64_le(huge_count_seed.data() + 16,
                         format::lsmt::kMaxRoIndexSize + 1);
+    auto oversized_vsize_seed = make_sparse_zero_mask(
+        (bytes::segment_mapping::kInvalidOffset + 2) * 512, {});
+    auto untrusted_large_vsize_seed = make_sparse_zero_mask(
+        (bytes::segment_mapping::kInvalidOffset + 1) * 512, {});
     auto overlapping_seed =
         make_sparse_zero_mask(512 * 64, {{10, 4}, {12, 1}});
     auto overflow_seed = make_sparse_zero_mask(512 * 64, {{63, 2}});
+    auto invalid_offset_seed = make_sparse_zero_mask(
+        bytes::segment_mapping::kInvalidOffset * 512,
+        {{bytes::segment_mapping::kInvalidOffset, 1}});
 
     const int rc = test::run_coro([&, bad_magic = std::move(bad_magic_seed),
-                                   truncated = std::move(truncated_seed),
-                                   bad_vsize = std::move(bad_vsize_seed),
-                                   bad_size = std::move(bad_size_seed),
-                                   huge_count = std::move(huge_count_seed),
-                                   overlapping = std::move(overlapping_seed),
-                                   overflow = std::move(overflow_seed)]()
-                                      mutable -> elio::coro::task<int> {
+                                    truncated = std::move(truncated_seed),
+                                    bad_vsize = std::move(bad_vsize_seed),
+                                    bad_size = std::move(bad_size_seed),
+                                     huge_count = std::move(huge_count_seed),
+                                     oversized_vsize =
+                                         std::move(oversized_vsize_seed),
+                                     untrusted_large_vsize =
+                                         std::move(untrusted_large_vsize_seed),
+                                     overlapping = std::move(overlapping_seed),
+                                     overflow = std::move(overflow_seed),
+                                     invalid_offset =
+                                        std::move(invalid_offset_seed)]()
+                                       mutable -> elio::coro::task<int> {
         {
             auto layer =
                 co_await format::SparseRwLayer::open(path, 512 * 64);
@@ -1520,11 +1640,26 @@ TEST_CASE("format: sparse zero mask sidecar rejects malformed metadata",
         REQUIRE(rejected == 0);
 
         rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(oversized_vsize), std::string("vsize mismatch"));
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(untrusted_large_vsize),
+            std::string("vsize mismatch"),
+            (bytes::segment_mapping::kInvalidOffset + 1) * 512);
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
             path, std::move(overlapping), std::string("invalid segment"));
         REQUIRE(rejected == 0);
 
         rejected = co_await expect_sparse_zero_mask_reject(
             path, std::move(overflow), std::string("invalid segment"));
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(invalid_offset), std::string("invalid segment"),
+            bytes::segment_mapping::kInvalidOffset * 512);
         REQUIRE(rejected == 0);
 
         co_return 0;
@@ -1669,6 +1804,240 @@ TEST_CASE("format: merged writable sparse discard masks the lower layer",
             REQUIRE(std::memcmp(buf.data() + 16 * 512,
                                 lower_raw.data() + 16 * 512, 16 * 512) == 0);
         }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged writable sparse discard survives reopen without flush",
+          "[format]") {
+    TempDir dir;
+    const auto lower_raw = test::pattern_bytes(512 * 32, 75);
+    std::string lower_lsmt;
+    make_lsmt_lower(dir.str(), "lower", lower_raw, &lower_lsmt);
+    const std::string upper = dir / "upper.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto open_merged = [&]() ->
+            elio::coro::task<std::unique_ptr<format::MergedWritable>> {
+            std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+            auto s = co_await source::LocalFileSource::open(lower_lsmt);
+            source::BlobSourcePtr b = std::move(s);
+            layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
+            auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+            co_return co_await format::MergedWritable::open(
+                std::move(layers), std::move(top));
+        };
+
+        {
+            auto merged = co_await open_merged();
+            const int dr = co_await merged->discard(8 * 512, 8 * 512);
+            REQUIRE(dr == 0);
+            REQUIRE(::access((upper + ".zeroes").c_str(), F_OK) == 0);
+        }
+
+        {
+            auto merged = co_await open_merged();
+            std::vector<uint8_t> buf(512 * 32);
+            const ssize_t r = co_await merged->pread(buf.data(), buf.size(), 0);
+            REQUIRE(r == static_cast<ssize_t>(buf.size()));
+            REQUIRE(std::memcmp(buf.data(), lower_raw.data(), 8 * 512) == 0);
+            for (size_t i = 8 * 512; i < 16 * 512; ++i) REQUIRE(buf[i] == 0);
+            REQUIRE(std::memcmp(buf.data() + 16 * 512,
+                                lower_raw.data() + 16 * 512, 16 * 512) == 0);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse write retries pending zero-mask removal before later writes",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const auto first = test::pattern_bytes(8 * 512, 125);
+    const auto second = test::pattern_bytes(512, 126);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const std::string sidecar = path + ".zeroes";
+        {
+            auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+            const int dr = co_await layer->discard(8 * 512, 8 * 512);
+            REQUIRE(dr == 0);
+            const int initial_flush = co_await layer->flush();
+            REQUIRE(initial_flush == 0);
+            REQUIRE(::unlink(sidecar.c_str()) == 0);
+            REQUIRE(::mkdir(sidecar.c_str(), 0700) == 0);
+
+            const ssize_t first_wr =
+                co_await layer->pwrite(first.data(), first.size(), 8 * 512);
+            REQUIRE(first_wr < 0);
+
+            const ssize_t second_wr =
+                co_await layer->pwrite(second.data(), second.size(), 20 * 512);
+            REQUIRE(second_wr < 0);
+
+            REQUIRE(::rmdir(sidecar.c_str()) == 0);
+            const int fr = co_await layer->flush();
+            REQUIRE(fr == 0);
+            const ssize_t retry_wr =
+                co_await layer->pwrite(second.data(), second.size(), 20 * 512);
+            REQUIRE(retry_wr == static_cast<ssize_t>(second.size()));
+            const int final_flush = co_await layer->flush();
+            REQUIRE(final_flush == 0);
+        }
+
+        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 32);
+        std::vector<uint8_t> first_buf(first.size());
+        ssize_t r =
+            co_await reopened->pread(first_buf.data(), first_buf.size(), 8 * 512);
+        REQUIRE(r == static_cast<ssize_t>(first_buf.size()));
+        REQUIRE(std::memcmp(first_buf.data(), first.data(), first_buf.size()) ==
+                0);
+        std::vector<uint8_t> second_buf(second.size());
+        r = co_await reopened->pread(second_buf.data(), second_buf.size(),
+                                     20 * 512);
+        REQUIRE(r == static_cast<ssize_t>(second_buf.size()));
+        REQUIRE(std::memcmp(second_buf.data(), second.data(),
+                            second_buf.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged writable sparse write over discard survives reopen without flush",
+          "[format]") {
+    TempDir dir;
+    const auto lower_raw = test::pattern_bytes(512 * 32, 77);
+    const auto patch = test::pattern_bytes(2 * 512, 92);
+    std::string lower_lsmt;
+    make_lsmt_lower(dir.str(), "lower", lower_raw, &lower_lsmt);
+    const std::string upper = dir / "upper.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto open_merged = [&]() ->
+            elio::coro::task<std::unique_ptr<format::MergedWritable>> {
+            std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+            auto s = co_await source::LocalFileSource::open(lower_lsmt);
+            source::BlobSourcePtr b = std::move(s);
+            layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
+            auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+            co_return co_await format::MergedWritable::open(
+                std::move(layers), std::move(top));
+        };
+
+        {
+            auto merged = co_await open_merged();
+            const int dr = co_await merged->discard(8 * 512, 8 * 512);
+            REQUIRE(dr == 0);
+            const ssize_t wr =
+                co_await merged->pwrite(patch.data(), patch.size(), 10 * 512);
+            REQUIRE(wr == static_cast<ssize_t>(patch.size()));
+        }
+
+        auto merged = co_await open_merged();
+        std::vector<uint8_t> buf(512 * 32);
+        const ssize_t r = co_await merged->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), lower_raw.data(), 8 * 512) == 0);
+        for (size_t i = 8 * 512; i < 10 * 512; ++i) REQUIRE(buf[i] == 0);
+        REQUIRE(std::memcmp(buf.data() + 10 * 512, patch.data(),
+                            patch.size()) == 0);
+        for (size_t i = 12 * 512; i < 16 * 512; ++i) REQUIRE(buf[i] == 0);
+        REQUIRE(std::memcmp(buf.data() + 16 * 512,
+                            lower_raw.data() + 16 * 512, 16 * 512) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged writable invalid index fails closed after sparse discard",
+          "[format]") {
+    TempDir dir;
+    const auto lower_raw = test::pattern_bytes(512 * 32, 76);
+    std::string lower_lsmt;
+    make_lsmt_lower(dir.str(), "lower", lower_raw, &lower_lsmt);
+    const std::string upper = dir / "upper.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        auto s = co_await source::LocalFileSource::open(lower_lsmt);
+        source::BlobSourcePtr b = std::move(s);
+        layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
+        auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+        auto merged = co_await format::MergedWritable::open(
+            std::move(layers), std::move(top));
+
+        const int dr = co_await merged->discard(8 * 512, 8 * 512);
+        REQUIRE(dr == 0);
+        format::MergedWritableTestAccess::invalidate_index(*merged);
+
+        std::vector<uint8_t> buf(512 * 32, 0xff);
+        const ssize_t r = co_await merged->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == -EIO);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse grow rejects oversized zero-mask window",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const uint64_t oversized =
+        (bytes::segment_mapping::kInvalidOffset + 1) * 512;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        const int dr = co_await layer->discard(8 * 512, 4 * 512);
+        REQUIRE(dr == 0);
+
+        const int gr = co_await elio::spawn_blocking(
+            [&] { return layer->grow(oversized); });
+        REQUIRE(gr == -EFBIG);
+        REQUIRE(layer->virtual_size() == 512 * 32);
+        const int fr = co_await layer->flush();
+        REQUIRE(fr == 0);
+        REQUIRE(sparse_zero_mask_vsize(path) == 512 * 32);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse grow preserves an unflushed discard mask on reopen",
+          "[format]") {
+    TempDir dir;
+    const auto lower_raw = test::pattern_bytes(512 * 96, 74);
+    std::string lower_lsmt;
+    make_lsmt_lower(dir.str(), "lower", lower_raw, &lower_lsmt);
+    const std::string upper = dir / "upper.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto top = co_await format::SparseRwLayer::open(upper, 512 * 64);
+            const int dr = co_await top->discard(8 * 512, 8 * 512);
+            REQUIRE(dr == 0);
+            const int gr = co_await elio::spawn_blocking(
+                [&] { return top->grow(512 * 96); });
+            REQUIRE(gr == 0);
+            REQUIRE(top->virtual_size() == 512 * 96);
+        }
+
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        auto s = co_await source::LocalFileSource::open(lower_lsmt);
+        source::BlobSourcePtr b = std::move(s);
+        layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
+        auto top = co_await format::SparseRwLayer::open(upper, 512 * 64);
+        auto merged = co_await format::MergedWritable::open(
+            std::move(layers), std::move(top));
+
+        std::vector<uint8_t> buf(512 * 32);
+        const ssize_t r = co_await merged->pread(buf.data(), buf.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), lower_raw.data(), 8 * 512) == 0);
+        for (size_t i = 8 * 512; i < 16 * 512; ++i) REQUIRE(buf[i] == 0);
+        REQUIRE(std::memcmp(buf.data() + 16 * 512,
+                            lower_raw.data() + 16 * 512, 16 * 512) == 0);
         co_return 0;
     });
     REQUIRE(rc == 0);
@@ -1978,6 +2347,103 @@ TEST_CASE("format: sparse layer grow extends the write window", "[format]") {
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("format: sparse layer direct grow gates reject overlaps",
+          "[format]") {
+    TempDir dir;
+    const std::string data_path = dir / "sparse-data.sparse";
+    const std::string flush_path = dir / "sparse-flush.sparse";
+    const std::string checkpoint_path = dir / "sparse-checkpoint.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto data_layer =
+            co_await format::SparseRwLayer::open(data_path, 512 * 64);
+        int gate =
+            format::SparseRwLayerTestAccess::begin_data(*data_layer, 0, 512);
+        REQUIRE(gate == 0);
+        int grow_busy = co_await elio::spawn_blocking(
+            [&] { return data_layer->grow(512 * 128); });
+        REQUIRE(grow_busy == -EBUSY);
+        format::SparseRwLayerTestAccess::end_active(*data_layer);
+        int grow_retry = co_await elio::spawn_blocking(
+            [&] { return data_layer->grow(512 * 128); });
+        REQUIRE(grow_retry == 0);
+
+        auto flush_layer =
+            co_await format::SparseRwLayer::open(flush_path, 512 * 64);
+        bool already_checkpointed = true;
+        gate = format::SparseRwLayerTestAccess::begin_flush(
+            *flush_layer, &already_checkpointed);
+        REQUIRE(gate == 0);
+        REQUIRE_FALSE(already_checkpointed);
+        grow_busy = co_await elio::spawn_blocking(
+            [&] { return flush_layer->grow(512 * 128); });
+        REQUIRE(grow_busy == -EBUSY);
+        format::SparseRwLayerTestAccess::end_active(*flush_layer);
+        grow_retry = co_await elio::spawn_blocking(
+            [&] { return flush_layer->grow(512 * 128); });
+        REQUIRE(grow_retry == 0);
+
+        auto checkpoint_layer =
+            co_await format::SparseRwLayer::open(checkpoint_path, 512 * 64);
+        gate =
+            format::SparseRwLayerTestAccess::begin_checkpoint(*checkpoint_layer);
+        REQUIRE(gate == 0);
+        grow_busy = co_await elio::spawn_blocking(
+            [&] { return checkpoint_layer->grow(512 * 128); });
+        REQUIRE(grow_busy == -EBUSY);
+        format::SparseRwLayerTestAccess::end_checkpoint(*checkpoint_layer);
+        grow_retry = co_await elio::spawn_blocking(
+            [&] { return checkpoint_layer->grow(512 * 128); });
+        REQUIRE(grow_retry == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse layer grow rejects direct operation overlaps",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const auto payload = sectors_pattern(0, 1, 718);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 512 * 64);
+
+        int gate = format::SparseRwLayerTestAccess::begin_grow(*layer);
+        REQUIRE(gate == 0);
+        ssize_t wr = co_await layer->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(wr == -EBUSY);
+        int dr = co_await layer->discard(0, 512);
+        REQUIRE(dr == -EBUSY);
+        int fr = co_await layer->flush();
+        REQUIRE(fr == -EBUSY);
+        int cr = co_await layer->checkpoint();
+        REQUIRE(cr == -EBUSY);
+        format::SparseRwLayerTestAccess::end_grow(*layer);
+
+        gate = format::SparseRwLayerTestAccess::begin_data(*layer, 0, 512);
+        REQUIRE(gate == 0);
+        int gr = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 96); });
+        REQUIRE(gr == -EBUSY);
+        format::SparseRwLayerTestAccess::end_data(*layer);
+
+        gate = format::SparseRwLayerTestAccess::begin_checkpoint(*layer);
+        REQUIRE(gate == 0);
+        gr = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 96); });
+        REQUIRE(gr == -EBUSY);
+        format::SparseRwLayerTestAccess::end_checkpoint(*layer);
+
+        gr = co_await elio::spawn_blocking(
+            [&] { return layer->grow(512 * 96); });
+        REQUIRE(gr == 0);
+        REQUIRE(layer->virtual_size() == 512 * 96);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("format: merged writable grows with its writable top", "[format]") {
     // D3 data-plane grow at the merged-view level: MergedWritable::grow
     // extends the writable top first, then the merged view — pwrite/
@@ -2023,6 +2489,52 @@ TEST_CASE("format: merged writable grows with its writable top", "[format]") {
         REQUIRE(rg == static_cast<ssize_t>(gap.size()));
         REQUIRE(std::memcmp(gap.data(), std::vector<uint8_t>(4096, 0).data(),
                             gap.size()) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged writable grow rejects direct operation overlaps",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.rw";
+    const auto payload = sectors_pattern(0, 1, 717);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        std::vector<std::unique_ptr<format::LsmtLayer>> none;
+        auto merged =
+            co_await format::MergedWritable::open(std::move(none),
+                                                  std::move(top));
+
+        int gate = format::MergedWritableTestAccess::begin_grow(*merged);
+        REQUIRE(gate == 0);
+        ssize_t wr = co_await merged->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(wr == -EBUSY);
+        int dr = co_await merged->discard(0, 512);
+        REQUIRE(dr == -EBUSY);
+        int fr = co_await merged->flush();
+        REQUIRE(fr == -EBUSY);
+        format::MergedWritableTestAccess::end_grow(*merged);
+
+        gate = format::MergedWritableTestAccess::begin_data(*merged, 0, 512);
+        REQUIRE(gate == 0);
+        int gr = co_await elio::spawn_blocking(
+            [&] { return merged->grow(512 * 96); });
+        REQUIRE(gr == -EBUSY);
+        format::MergedWritableTestAccess::end_data(*merged);
+
+        gate = format::MergedWritableTestAccess::begin_flush(*merged);
+        REQUIRE(gate == 0);
+        gr = co_await elio::spawn_blocking(
+            [&] { return merged->grow(512 * 96); });
+        REQUIRE(gr == -EBUSY);
+        format::MergedWritableTestAccess::end_data(*merged);
+
+        gr = co_await elio::spawn_blocking(
+            [&] { return merged->grow(512 * 96); });
+        REQUIRE(gr == 0);
+        REQUIRE(merged->size() == 512 * 96);
         co_return 0;
     });
     REQUIRE(rc == 0);
