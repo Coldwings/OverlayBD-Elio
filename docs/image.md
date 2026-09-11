@@ -268,13 +268,15 @@ docs/operations.md. Design:
   `format::trace::TraceWriter` — 24×N framing, raw-chaining CRC-32C,
   header checksum rewritten on `finalize()` — then writes + fsyncs the
   blob and reports `{path, sha256, size, records, dropped}`. The
-  duration timer is a joinable recorder task; a non-timer `stop()`
-  cancels a sleeping timer and waits until the timer coroutine has
-  destroyed its frame, including expiry callbacks that run after an
-  expiry-owned finalize. Device shutdown therefore calls `stop()` for
-  any recorder, even when `recording()` is already false. `stop()` is
-  idempotent: a stop racing the expiry waits for the in-flight finalize
-  and returns its stats.
+  duration timer is a joinable recorder task; an external,
+  non-reentrant `stop()` cancels a sleeping timer and waits until the
+  timer coroutine has destroyed its frame, including expiry callbacks
+  that run after an expiry-owned finalize. Device shutdown therefore
+  calls `stop()` for any recorder, even when `recording()` is already
+  false. `stop()` is idempotent: a stop racing the expiry waits for the
+  in-flight finalize and returns its stats. A stop task created from the
+  expiry callback captures and returns that expiry result without trying
+  to join the callback's own timer.
 
 ### The writable mode (ADR-0008)
 
@@ -701,7 +703,7 @@ writer side: a bounded in-memory queue (drop-counted overflow, adjacent
 coalescing within the 1 MiB count cap, > 1 MiB reads pre-split) drained
 at `stop()` through the codec's conforming writer; the duration timer is
 joinable and device-side (expiry finalizes without any client call, while
-shutdown/explicit stop is the timer completion barrier). Re-entrant
+external shutdown/explicit stop is the timer completion barrier). Re-entrant
 `start()` from the expiry callback is rejected; schedule any follow-up
 window after the callback returns.
 `start()` validates the duration bound and the absolute output path and
@@ -916,8 +918,8 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   a cached late stop waits for the timer's callback tail to finish;
   `image: trace recording expiry callback stop never joins itself` —
   a stop task created re-entrantly from the expiry callback returns the
-  expiry result without joining its own timer, and a callback-created
-  start is rejected;
+  captured expiry result without joining its own timer or stopping a
+  restarted recording, and a callback-created start is rejected;
   `image: trace recording stale stop never drains a restarted timer` —
   a late stop waiting on an old timer drain stays bound to that old
   timer after a new recording starts;

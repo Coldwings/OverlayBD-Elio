@@ -23,18 +23,28 @@ namespace obd::image {
 
 namespace {
 
-thread_local std::vector<const TraceRecorder*> timer_callback_stack;
+struct TimerCallbackFrame {
+    const TraceRecorder* recorder;
+    TraceRecorder::FinalizeResult result;
+};
+
+thread_local std::vector<TimerCallbackFrame> timer_callback_stack;
 
 class TimerCallbackScope {
 public:
-    explicit TimerCallbackScope(const TraceRecorder* recorder)
+    TimerCallbackScope(const TraceRecorder* recorder,
+                       TraceRecorder::FinalizeResult result)
         : recorder_(recorder) {
-        timer_callback_stack.push_back(recorder_);
+        timer_callback_stack.push_back(
+            TimerCallbackFrame{recorder_, std::move(result)});
     }
 
     ~TimerCallbackScope() {
-        auto it = std::find(timer_callback_stack.rbegin(),
-                            timer_callback_stack.rend(), recorder_);
+        auto it = std::find_if(timer_callback_stack.rbegin(),
+                               timer_callback_stack.rend(),
+                               [&](const TimerCallbackFrame& frame) {
+                                   return frame.recorder == recorder_;
+                               });
         if (it != timer_callback_stack.rend()) {
             timer_callback_stack.erase(std::next(it).base());
         }
@@ -48,8 +58,27 @@ private:
 };
 
 bool in_timer_callback(const TraceRecorder* recorder) {
-    return std::find(timer_callback_stack.begin(), timer_callback_stack.end(),
-                     recorder) != timer_callback_stack.end();
+    return std::find_if(timer_callback_stack.begin(), timer_callback_stack.end(),
+                        [&](const TimerCallbackFrame& frame) {
+                            return frame.recorder == recorder;
+                        }) != timer_callback_stack.end();
+}
+
+bool timer_callback_result(const TraceRecorder* recorder,
+                           TraceRecorder::FinalizeResult& result) {
+    auto it = std::find_if(timer_callback_stack.rbegin(),
+                           timer_callback_stack.rend(),
+                           [&](const TimerCallbackFrame& frame) {
+                               return frame.recorder == recorder;
+                           });
+    if (it == timer_callback_stack.rend()) return false;
+    result = it->result;
+    return true;
+}
+
+elio::coro::task<TraceRecorder::FinalizeResult> ready_finalize_result(
+    TraceRecorder::FinalizeResult result) {
+    co_return result;
 }
 
 }  // namespace
@@ -282,10 +311,9 @@ elio::coro::task<void> TraceRecorder::run_timer(
     // Duration expired: finalize exactly like an explicit stop; the
     // CLI's fate is irrelevant (ADR-0013 server-side bound). This is
     // the timer itself, so it must not try to join its own handle.
-    FinalizeResult res = co_await stop_impl(
-        "expired", /*from_timer=*/true, /*from_timer_callback=*/false);
+    FinalizeResult res = co_await stop_impl("expired", /*from_timer=*/true);
     if (cb) {
-        TimerCallbackScope callback_scope(this);
+        TimerCallbackScope callback_scope(this, res);
         cb(res);
     }
     std::function<elio::coro::task<void>()> exit_hook;
@@ -299,8 +327,11 @@ elio::coro::task<void> TraceRecorder::run_timer(
 
 elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
     std::string reason) {
-    return stop_impl(std::move(reason), /*from_timer=*/false,
-                     in_timer_callback(this));
+    FinalizeResult result;
+    if (timer_callback_result(this, result)) {
+        return ready_finalize_result(std::move(result));
+    }
+    return stop_impl(std::move(reason), /*from_timer=*/false);
 }
 
 elio::coro::task<void> TraceRecorder::drain_timer_task(
@@ -358,7 +389,7 @@ elio::coro::task<void> TraceRecorder::drain_timer_task(
 }
 
 elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
-    std::string reason, bool from_timer, bool from_timer_callback) {
+    std::string reason, bool from_timer) {
     // A concurrent stop while another caller is finalizing (an explicit
     // stop racing the duration expiry) captures that finalization's
     // completion object and waits for exactly that result. It must not
@@ -445,7 +476,7 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
     if (!have_result) {
         res.error = "no trace recording in progress";
     }
-    if (!from_timer && drain_to_join && !from_timer_callback) {
+    if (!from_timer && drain_to_join) {
         co_await drain_timer_task(std::move(drain_to_join));
     }
     co_return res;

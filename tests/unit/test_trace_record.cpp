@@ -682,11 +682,17 @@ TEST_CASE("image: trace recording expiry callback stop never joins itself",
     bool callback_made_stop_task = false;
     std::optional<elio::coro::task<image::TraceRecorder::FinalizeResult>>
         callback_stop_task;
+    std::optional<elio::coro::task<image::TraceRecorder::FinalizeResult>>
+        self_join_stop_task;
     std::optional<elio::coro::task<bool>> callback_start_task;
     std::optional<image::TraceRecorder::FinalizeResult> callback_stop;
-    std::optional<image::TraceRecorder::FinalizeResult> shutdown_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> self_join_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> cleanup_stop;
     bool callback_start_ok = true;
     std::string callback_start_error;
+    bool restarted = false;
+    std::string restart_error;
+    bool recording_after_callback_stop = false;
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto rec = std::make_shared<image::TraceRecorder>();
@@ -703,6 +709,7 @@ TEST_CASE("image: trace recording expiry callback stop never joins itself",
         const bool started = co_await rec->start(
             out, 1,
             [&](const image::TraceRecorder::FinalizeResult&) {
+                self_join_stop_task.emplace(rec->stop("self-join"));
                 callback_stop_task.emplace(rec->stop("callback"));
                 callback_start_task.emplace(rec->start(
                     next_out, 300,
@@ -722,11 +729,36 @@ TEST_CASE("image: trace recording expiry callback stop never joins itself",
         const bool exit_held = co_await wait_until([&] {
             return timer_exit_entered.load(std::memory_order_acquire);
         });
-        if (!exit_held || !callback_made_stop_task || !callback_stop_task ||
-            !callback_start_task) {
+        if (!exit_held || !callback_made_stop_task || !self_join_stop_task ||
+            !callback_stop_task || !callback_start_task) {
             timer_exit_release.store(true, std::memory_order_release);
-            shutdown_stop = co_await rec->stop("cleanup");
+            cleanup_stop = co_await rec->stop("cleanup");
             co_return 3;
+        }
+
+        auto self_join_stop_handle =
+            elio::spawn(std::move(*self_join_stop_task));
+        const bool self_join_ready = co_await wait_until([&] {
+            return self_join_stop_handle.is_ready() ||
+                   self_join_stop_handle.is_destroyed();
+        }, 200);
+        if (!self_join_ready) {
+            timer_exit_release.store(true, std::memory_order_release);
+            self_join_stop = co_await await_stop_handle(self_join_stop_handle);
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 4;
+        }
+        self_join_stop = co_await await_stop_handle(self_join_stop_handle);
+
+        timer_exit_release.store(true, std::memory_order_release);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        restarted = co_await rec->start(
+            next_out, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {},
+            restart_error);
+        if (!restarted) {
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 5;
         }
 
         auto reentrant_stop = elio::spawn(std::move(*callback_stop_task));
@@ -734,42 +766,44 @@ TEST_CASE("image: trace recording expiry callback stop never joins itself",
             return reentrant_stop.is_ready() || reentrant_stop.is_destroyed();
         }, 200);
         if (!reentrant_ready) {
-            timer_exit_release.store(true, std::memory_order_release);
             callback_stop = co_await await_stop_handle(reentrant_stop);
-            shutdown_stop = co_await rec->stop("cleanup");
-            co_return 4;
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 6;
         }
         callback_stop = co_await await_stop_handle(reentrant_stop);
+        recording_after_callback_stop = rec->recording();
 
         auto reentrant_start = elio::spawn(std::move(*callback_start_task));
         const bool start_ready = co_await wait_until([&] {
             return reentrant_start.is_ready() || reentrant_start.is_destroyed();
         }, 200);
         if (!start_ready) {
-            timer_exit_release.store(true, std::memory_order_release);
             callback_start_ok = co_await await_bool_handle(reentrant_start);
-            shutdown_stop = co_await rec->stop("cleanup");
-            co_return 5;
+            cleanup_stop = co_await rec->stop("cleanup");
+            co_return 7;
         }
         callback_start_ok = co_await await_bool_handle(reentrant_start);
-        timer_exit_release.store(true, std::memory_order_release);
-        shutdown_stop = co_await rec->stop("shutdown");
-        rec->set_timer_exit_hook_for_test(nullptr);
+        cleanup_stop = co_await rec->stop("cleanup");
         co_return 0;
     });
     REQUIRE(rc == 0);
 
+    REQUIRE(restarted);
+    REQUIRE(recording_after_callback_stop);
+    REQUIRE(self_join_stop.has_value());
+    REQUIRE(self_join_stop->ok);
+    REQUIRE(self_join_stop->reason == "expired");
     REQUIRE(callback_stop.has_value());
     REQUIRE(callback_stop->ok);
     REQUIRE(callback_stop->reason == "expired");
     REQUIRE_FALSE(callback_start_ok);
     REQUIRE(callback_start_error.find("expiry callback") !=
             std::string::npos);
-    REQUIRE(shutdown_stop.has_value());
-    REQUIRE(shutdown_stop->ok);
-    REQUIRE(shutdown_stop->reason == "expired");
+    REQUIRE(cleanup_stop.has_value());
+    REQUIRE(cleanup_stop->ok);
+    REQUIRE(cleanup_stop->reason == "cleanup");
     REQUIRE(parse_file(out).size() == 1);
-    REQUIRE_FALSE(std::filesystem::exists(next_out));
+    REQUIRE(parse_file(next_out).empty());
 }
 
 TEST_CASE("image: trace recording stale stop never drains a restarted timer",
