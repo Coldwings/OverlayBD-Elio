@@ -881,7 +881,8 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
 - `integration: completed layer store commit binds read-only without remote reads` —
   a single-extent layer driven to completion renames to
   `overlaybd.commit`; a reopen binds the commit marker via the local probe
-  and serves byte-exact reads with zero remote data reads.
+  and serves byte-exact reads with zero remote data reads while sweeping stale
+  `.download.*`/`.bitmap.*` files beside the committed layer.
 - `integration: enabled-but-unreachable DART falls back to direct reads` —
   with `p2pConfig` enabled against a dead address, `open_image` still opens
   and serves the full image directly from the registry (ADR-0005).

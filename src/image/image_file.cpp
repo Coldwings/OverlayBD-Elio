@@ -16,6 +16,7 @@
 #include "source/tar_offset.hpp"
 
 #include <elio/log/macros.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
 
 #include <sys/stat.h>
@@ -23,6 +24,9 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <memory>
+#include <string>
+#include <string_view>
 
 namespace obd::image {
 
@@ -34,18 +38,25 @@ bool is_regular_file(const std::string& path) {
            S_ISREG(st.st_mode);
 }
 
+struct LocalProbe {
+    std::string path;
+    bool layer_store_commit = false;
+};
+
 /// overlaybd's per-lower local probe: an explicit layer file first, then
 /// the commit markers inside the layer directory.
-std::string probe_local_blob(const LowerConfig& lower) {
-    if (is_regular_file(lower.file)) return lower.file;
+LocalProbe probe_local_blob(const LowerConfig& lower) {
+    if (is_regular_file(lower.file)) return {lower.file, false};
     if (!lower.dir.empty()) {
         for (const char* name :
              {"overlaybd.commit", ".commit", "overlaybd.sealed"}) {
             const std::string p = lower.dir + "/" + name;
-            if (is_regular_file(p)) return p;
+            if (is_regular_file(p)) {
+                return {p, std::string_view(name) == "overlaybd.commit"};
+            }
         }
     }
-    return "";
+    return {};
 }
 
 /// Read cap for the trace blob itself: a conforming trace is small
@@ -219,11 +230,41 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         const auto& lower = data_lowers[layer_index];
         source::BlobSourcePtr raw;
         TraceRecordSource* tap = nullptr;
-        const std::string local_path = probe_local_blob(lower);
-        if (!local_path.empty()) {
+        const LocalProbe local = probe_local_blob(lower);
+        if (!local.path.empty()) {
+            if (local.layer_store_commit) {
+                const size_t sweep_dir_len = lower.dir.size();
+                auto sweep_dir_owner =
+                    std::make_unique<char[]>(sweep_dir_len + 1);
+                std::copy_n(lower.dir.data(), sweep_dir_len,
+                            sweep_dir_owner.get());
+                sweep_dir_owner[sweep_dir_len] = '\0';
+                char* const sweep_dir_data = sweep_dir_owner.release();
+                size_t swept = 0;
+                try {
+                    swept = co_await elio::spawn_blocking(
+                        [sweep_dir_data, sweep_dir_len]() noexcept -> size_t {
+                            std::unique_ptr<char[]> owned_dir(sweep_dir_data);
+                            try {
+                                return source::sweep_stale_layer_store_pairs(
+                                    std::string(owned_dir.get(), sweep_dir_len));
+                            } catch (...) {
+                                return 0;
+                            }
+                        });
+                } catch (...) {
+                    delete[] sweep_dir_data;
+                }
+                if (swept != 0) {
+                    ELIO_LOG_INFO(
+                        "layer {} swept {} stale layer-store files beside "
+                        "the committed local source",
+                        lower.digest, swept);
+                }
+            }
             ELIO_LOG_INFO("layer {} from local file {}", lower.digest,
-                          local_path);
-            raw = co_await source::LocalFileSource::open(local_path);
+                          local.path);
+            raw = co_await source::LocalFileSource::open(local.path);
         } else {
             if (cfg.repo_blob_url.empty()) {
                 throw error(EINVAL, "no local blob and no repoBlobUrl for " +

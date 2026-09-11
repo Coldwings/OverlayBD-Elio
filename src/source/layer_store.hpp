@@ -47,6 +47,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -58,6 +59,11 @@
 #include <vector>
 
 namespace obd::source {
+
+/// Best-effort cold-path cleanup for staging pairs that cannot be resumed
+/// once `<dir>/overlaybd.commit` is the committed local source.
+/// Returns the number of files removed and ignores environmental failures.
+size_t sweep_stale_layer_store_pairs(const std::string& dir) noexcept;
 
 class LayerStore final : public BlobSource {
 public:
