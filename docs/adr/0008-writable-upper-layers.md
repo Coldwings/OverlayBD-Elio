@@ -58,7 +58,8 @@ a standard sealed LSMT file at seal time.
 - The ublk data plane forwards `WRITE`/`FLUSH` to the writable root when
   present and keeps answering `-EROFS` otherwise; the device advertises
   `UBLK_ATTR_READ_ONLY` only for read-only images. `DISCARD`/punch-hole
-  remain unsupported (`EOPNOTSUPP`) in this revision.
+  reaches the writable root when advertised and masks lower layers with
+  zeroes.
 - Config compatibility: unknown `upper` types are rejected with `EINVAL`;
   an absent or empty `upper` keeps the read-only behavior. The `upper`
   field name and `dir` semantics follow overlaybd-snapshotter convention;

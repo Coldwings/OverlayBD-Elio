@@ -523,28 +523,35 @@ A sparse file whose live written extents form identity mappings
 (`moffset == offset`) plus zero-mask mappings for discarded ranges. `open`
 requires `vsize` to be a non-zero multiple of 512 (throws
 `obd::error(EINVAL)` otherwise), opens `path` with `O_RDWR | O_CREAT`
-(existing content is kept — **no truncation**), sizes it to `vsize` with
-`ftruncate`, and, for a pre-existing file, rebuilds live coverage from the
-kernel fiemap (`SEEK_DATA`/`SEEK_HOLE`) before loading discard masks from
-`<path>.zeroes`. Fiemap boundaries are rounded outward to whole sectors
-(only whole sectors are ever written). Filesystem or malformed sidecar
-errors throw `obd::error`.
+(existing content is reused), and sizes it to the maximum of the supplied
+`vsize`, the current sparse file length, and any valid `<path>.zeroes`
+declared size. That grow-only recovery rule prevents an online-grown
+upper from being truncated back to an older configured size on restart.
+For a pre-existing file, `open` rebuilds live coverage from the kernel
+fiemap (`SEEK_DATA`/`SEEK_HOLE`) before loading discard masks from the
+sidecar. Fiemap boundaries are rounded outward to whole sectors (only
+whole sectors are ever written). Filesystem or malformed sidecar errors
+throw `obd::error`; a sidecar recorded at an older, smaller vsize marks
+the sidecar dirty so the next durability boundary rewrites it at the
+current effective size.
 
 `pwrite`/`pread` return `-EINVAL` on unaligned or out-of-`vsize` requests;
 writes are split at the 14-bit segment-length cap, replace any overlapping
 zero-mask coverage, and merge into the identity segment set (overlapping
 and adjacent live extents coalesce). `discard` performs a real
 `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`, records zeroed
-segments for the discarded range, and atomically rewrites `<path>.zeroes`
-so a reopened sparse upper still masks lower layers in `MergedWritable`.
-`flush()` is `fdatasync` for the sparse data file and returns 0 or
-`-errno`; zero-mask metadata is fsynced when it is rewritten.
+segments for the discarded range, and marks the sidecar dirty so a
+reopened sparse upper still masks lower layers in `MergedWritable` after
+the next durability boundary. `flush()` offloads the blocking durability
+work, first `fdatasync`ing the sparse data file, then atomically rewriting
+and fsyncing `<path>.zeroes` when the zero mask changed; it returns 0 or
+`-errno`. `checkpoint()` delegates to the same flush path.
 
-On reopen, fiemap live coverage wins wherever the filesystem still reports
-data, and the sidecar fills only uncovered zero-mask gaps. That preserves
-correct reads across filesystem-block granularity differences: a sub-block
-punch may recover as a fatter live extent, while fully deallocated
-lower-only discards still remain top-layer zero masks.
+On reopen, the sidecar zero-mask coverage overlays the fiemap live
+coverage. That preserves correct reads across filesystem-block granularity
+differences: a sub-block punch may recover as a fatter live extent, but
+the recorded zero mask still wins over that live range and lower-only
+discards remain top-layer zero masks.
 
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 

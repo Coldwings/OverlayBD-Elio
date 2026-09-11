@@ -6,6 +6,7 @@
 
 #include <elio/coro/task.hpp>
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -24,17 +25,21 @@ public:
     elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                     uint64_t offset) override;
 
-    uint64_t size() const noexcept override { return size_; }
+    uint64_t size() const noexcept override {
+        return size_.load(std::memory_order_acquire);
+    }
     std::string_view label() const noexcept override { return label_; }
 
     int fd() const noexcept { return fd_; }
-    void set_size_for_sparse_writable(uint64_t size) noexcept { size_ = size; }
+    void set_size_for_sparse_writable(uint64_t size) noexcept {
+        size_.store(size, std::memory_order_release);
+    }
 
 private:
     LocalFileSource() = default;
 
     int fd_ = -1;
-    uint64_t size_ = 0;
+    std::atomic<uint64_t> size_{0};
     std::string label_;
 };
 

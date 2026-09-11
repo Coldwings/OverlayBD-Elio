@@ -77,8 +77,8 @@ uppers never seal.
 Discard's intended device contract is mask-with-zeroes semantics
 (ADR-0009): a discarded range should read back as zeroes rather than fall
 through to the lowers. LSMT-RW satisfies this by recording zeroed segments;
-sparse satisfies it by punching holes while persisting sidecar zero-mask
-metadata for lower-layer masking.
+sparse satisfies it by punching holes while recording sidecar zero-mask
+metadata for lower-layer masking, persisted at `flush()`/`checkpoint()`.
 
 ## A9. DART is never on the required path
 

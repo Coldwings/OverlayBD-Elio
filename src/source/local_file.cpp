@@ -30,7 +30,8 @@ elio::coro::task<std::unique_ptr<LocalFileSource>> LocalFileSource::open(
     }
     auto src = std::unique_ptr<LocalFileSource>(new LocalFileSource());
     src->fd_ = fd;
-    src->size_ = static_cast<uint64_t>(st.st_size);
+    src->size_.store(static_cast<uint64_t>(st.st_size),
+                     std::memory_order_release);
     src->label_ = std::move(path);
     co_return src;
 }
@@ -45,8 +46,9 @@ LocalFileSource::~LocalFileSource() {
 
 elio::coro::task<ssize_t> LocalFileSource::pread(void* buf, size_t count,
                                                  uint64_t offset) {
-    if (offset >= size_) co_return 0;
-    if (count > size_ - offset) count = static_cast<size_t>(size_ - offset);
+    const uint64_t bound = size_.load(std::memory_order_acquire);
+    if (offset >= bound) co_return 0;
+    if (count > bound - offset) count = static_cast<size_t>(bound - offset);
     uint8_t* p = static_cast<uint8_t*>(buf);
     size_t done = 0;
     while (done < count) {

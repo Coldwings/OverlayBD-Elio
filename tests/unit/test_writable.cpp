@@ -18,6 +18,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstring>
+#include <initializer_list>
+#include <utility>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -49,6 +52,62 @@ uint64_t file_bytes(const std::string& path) {
     struct stat st {};
     REQUIRE(::stat(path.c_str(), &st) == 0);
     return static_cast<uint64_t>(st.st_size);
+}
+
+std::vector<uint8_t> make_sparse_zero_mask(
+    uint64_t vsize,
+    std::initializer_list<std::pair<uint64_t, uint64_t>> zeroes) {
+    constexpr size_t kHeaderSize = 32;
+    constexpr char kMagic[8] = {'O', 'B', 'D', 'S', 'P', 'Z', 'M', '1'};
+    std::vector<uint8_t> raw(
+        kHeaderSize + zeroes.size() * bytes::segment_mapping::kEncodedSize,
+        0);
+    std::memcpy(raw.data(), kMagic, sizeof(kMagic));
+    bytes::store_u64_le(raw.data() + 8, vsize);
+    bytes::store_u64_le(raw.data() + 16, zeroes.size());
+    size_t i = 0;
+    for (const auto& [offset, length] : zeroes) {
+        bytes::segment_mapping z;
+        z.offset = offset;
+        z.length = static_cast<uint32_t>(length);
+        z.moffset = 0;
+        z.zeroed = true;
+        z.tag = 0;
+        bytes::store_segment_le(
+            raw.data() + kHeaderSize +
+                i * bytes::segment_mapping::kEncodedSize,
+            z);
+        ++i;
+    }
+    return raw;
+}
+
+void write_sparse_zero_mask(const std::string& path, uint64_t vsize,
+                            std::initializer_list<std::pair<uint64_t, uint64_t>>
+                                zeroes) {
+    const auto raw = make_sparse_zero_mask(vsize, zeroes);
+    const std::string sidecar = path + ".zeroes";
+    const int fd =
+        ::open(sidecar.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    REQUIRE(fd >= 0);
+    REQUIRE(::pwrite(fd, raw.data(), raw.size(), 0) ==
+            static_cast<ssize_t>(raw.size()));
+    REQUIRE(::close(fd) == 0);
+}
+
+elio::coro::task<int> expect_sparse_zero_mask_reject(
+    std::string path, std::vector<uint8_t> raw, std::string needle) {
+    test::write_file(path + ".zeroes", raw);
+    bool threw = false;
+    try {
+        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 64);
+        (void)reopened;
+    } catch (const std::exception& e) {
+        threw = true;
+        REQUIRE(std::string(e.what()).find(needle) != std::string::npos);
+    }
+    REQUIRE(threw);
+    co_return 0;
 }
 
 // Match the backing inode, including after seal() replaces its pathname.
@@ -1147,17 +1206,21 @@ TEST_CASE("format: sparse layer discard keeps a durable zero mask",
             for (size_t i = 2 * 512; i < 6 * 512; ++i) REQUIRE(buf[i] == 0);
             REQUIRE(std::memcmp(buf.data() + 6 * 512, a.data() + 6 * 512,
                                 2 * 512) == 0);
+            REQUIRE(::access((path + ".zeroes").c_str(), F_OK) != 0);
             int frc = co_await layer->flush();
             REQUIRE(frc == 0);
+            REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
             int gr = co_await elio::spawn_blocking(
                 [&] { return layer->grow(512 * 96); });
             REQUIRE(gr == 0);
         }
-        // Reopen: fiemap and the zero-mask sidecar preserve the visible
-        // zeroes after process restart.
+        // Reopen with the original configured size: the sparse file grew
+        // online, so recovery must keep the larger file-backed window while
+        // accepting the older sidecar header.
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 96);
+                co_await format::SparseRwLayer::open(path, 512 * 64);
+            REQUIRE(layer->virtual_size() == 512 * 96);
             std::vector<uint8_t> buf(512 * 8);
             ssize_t r =
                 co_await layer->pread(buf.data(), buf.size(), 8 * 512);
@@ -1167,6 +1230,221 @@ TEST_CASE("format: sparse layer discard keeps a durable zero mask",
             REQUIRE(std::memcmp(buf.data() + 6 * 512, a.data() + 6 * 512,
                                 2 * 512) == 0);
         }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse layer reopen accepts a published grown zero mask",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer =
+                co_await format::SparseRwLayer::open(path, 512 * 64);
+            REQUIRE(layer->virtual_size() == 512 * 64);
+        }
+        write_sparse_zero_mask(path, 512 * 96, {{10, 4}});
+
+        auto reopened =
+            co_await format::SparseRwLayer::open(path, 512 * 64);
+        REQUIRE(reopened->virtual_size() == 512 * 96);
+        REQUIRE(reopened->segments().size() == 1);
+        REQUIRE(reopened->segments()[0].offset == 10);
+        REQUIRE(reopened->segments()[0].length == 4);
+        REQUIRE(reopened->segments()[0].zeroed);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse layer checkpoint persists a dirty zero mask",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        const int dr = co_await layer->discard(8 * 512, 4 * 512);
+        REQUIRE(dr == 0);
+        REQUIRE(::access((path + ".zeroes").c_str(), F_OK) != 0);
+
+        const int cr = co_await layer->checkpoint();
+        REQUIRE(cr == 0);
+        REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
+
+        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 32);
+        REQUIRE(reopened->segments().size() == 1);
+        REQUIRE(reopened->segments()[0].offset == 8);
+        REQUIRE(reopened->segments()[0].length == 4);
+        REQUIRE(reopened->segments()[0].zeroed);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse zero mask sidecar overrides live fiemap coverage",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const auto live = sectors_pattern(8, 8, 1201);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer =
+                co_await format::SparseRwLayer::open(path, 512 * 64);
+            const ssize_t r =
+                co_await layer->pwrite(live.data(), live.size(), 8 * 512);
+            REQUIRE(r == static_cast<ssize_t>(live.size()));
+            const int frc = co_await layer->flush();
+            REQUIRE(frc == 0);
+        }
+
+        write_sparse_zero_mask(path, 512 * 64, {{10, 4}});
+
+        auto layer = co_await format::SparseRwLayer::open(path, 512 * 64);
+        REQUIRE(layer->segments().size() == 3);
+        REQUIRE(layer->segments()[0].offset == 8);
+        REQUIRE(layer->segments()[0].length == 2);
+        REQUIRE_FALSE(layer->segments()[0].zeroed);
+        REQUIRE(layer->segments()[1].offset == 10);
+        REQUIRE(layer->segments()[1].length == 4);
+        REQUIRE(layer->segments()[1].zeroed);
+        REQUIRE(layer->segments()[2].offset == 14);
+        REQUIRE(layer->segments()[2].length == 2);
+        REQUIRE_FALSE(layer->segments()[2].zeroed);
+
+        std::vector<uint8_t> buf(512 * 8, 0xff);
+        const ssize_t r = co_await layer->pread(buf.data(), buf.size(),
+                                                8 * 512);
+        REQUIRE(r == static_cast<ssize_t>(buf.size()));
+        REQUIRE(std::memcmp(buf.data(), live.data(), 2 * 512) == 0);
+        for (size_t i = 2 * 512; i < 6 * 512; ++i) REQUIRE(buf[i] == 0);
+        REQUIRE(std::memcmp(buf.data() + 6 * 512, live.data() + 6 * 512,
+                            2 * 512) == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse zero mask sidecar preserves grown size",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const auto live = sectors_pattern(8, 8, 1202);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer =
+                co_await format::SparseRwLayer::open(path, 512 * 96);
+            const ssize_t r =
+                co_await layer->pwrite(live.data(), live.size(), 8 * 512);
+            REQUIRE(r == static_cast<ssize_t>(live.size()));
+            const int frc = co_await layer->flush();
+            REQUIRE(frc == 0);
+        }
+
+        write_sparse_zero_mask(path, 512 * 96, {{10, 4}, {80, 4}});
+
+        {
+            auto layer =
+                co_await format::SparseRwLayer::open(path, 512 * 64);
+            REQUIRE(layer->virtual_size() == 512 * 96);
+            REQUIRE(layer->segments().size() == 4);
+            REQUIRE(layer->segments()[0].offset == 8);
+            REQUIRE(layer->segments()[0].length == 2);
+            REQUIRE_FALSE(layer->segments()[0].zeroed);
+            REQUIRE(layer->segments()[1].offset == 10);
+            REQUIRE(layer->segments()[1].length == 4);
+            REQUIRE(layer->segments()[1].zeroed);
+            REQUIRE(layer->segments()[2].offset == 14);
+            REQUIRE(layer->segments()[2].length == 2);
+            REQUIRE_FALSE(layer->segments()[2].zeroed);
+            REQUIRE(layer->segments()[3].offset == 80);
+            REQUIRE(layer->segments()[3].length == 4);
+            REQUIRE(layer->segments()[3].zeroed);
+
+            std::vector<uint8_t> buf(512 * 8, 0xff);
+            const ssize_t r = co_await layer->pread(buf.data(), buf.size(),
+                                                    8 * 512);
+            REQUIRE(r == static_cast<ssize_t>(buf.size()));
+            REQUIRE(std::memcmp(buf.data(), live.data(), 2 * 512) == 0);
+            for (size_t i = 2 * 512; i < 6 * 512; ++i) REQUIRE(buf[i] == 0);
+            REQUIRE(std::memcmp(buf.data() + 6 * 512, live.data() + 6 * 512,
+                                2 * 512) == 0);
+            const int frc = co_await layer->flush();
+            REQUIRE(frc == 0);
+        }
+
+        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 64);
+        REQUIRE(reopened->virtual_size() == 512 * 96);
+        REQUIRE(reopened->segments().size() == 4);
+        REQUIRE(reopened->segments()[1].offset == 10);
+        REQUIRE(reopened->segments()[1].length == 4);
+        REQUIRE(reopened->segments()[1].zeroed);
+        REQUIRE(reopened->segments()[3].offset == 80);
+        REQUIRE(reopened->segments()[3].length == 4);
+        REQUIRE(reopened->segments()[3].zeroed);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse zero mask sidecar rejects malformed metadata",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    auto bad_magic_seed = make_sparse_zero_mask(512 * 64, {{10, 4}});
+    bad_magic_seed[0] = 'X';
+    std::vector<uint8_t> truncated_seed = {'O', 'B', 'D', 'S',
+                                           'P', 'Z', 'M', '1'};
+    auto bad_vsize_seed = make_sparse_zero_mask(512 * 64, {{10, 4}});
+    bytes::store_u64_le(bad_vsize_seed.data() + 8, 123);
+    auto bad_size_seed = make_sparse_zero_mask(512 * 64, {{10, 4}});
+    bytes::store_u64_le(bad_size_seed.data() + 16, 2);
+    auto overlapping_seed =
+        make_sparse_zero_mask(512 * 64, {{10, 4}, {12, 1}});
+    auto overflow_seed = make_sparse_zero_mask(512 * 64, {{63, 2}});
+
+    const int rc = test::run_coro([&, bad_magic = std::move(bad_magic_seed),
+                                   truncated = std::move(truncated_seed),
+                                   bad_vsize = std::move(bad_vsize_seed),
+                                   bad_size = std::move(bad_size_seed),
+                                   overlapping = std::move(overlapping_seed),
+                                   overflow = std::move(overflow_seed)]()
+                                      mutable -> elio::coro::task<int> {
+        {
+            auto layer =
+                co_await format::SparseRwLayer::open(path, 512 * 64);
+            REQUIRE(layer->virtual_size() == 512 * 64);
+        }
+
+        int rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(bad_magic), std::string("bad magic"));
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(truncated), std::string("truncated"));
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(bad_vsize), std::string("vsize mismatch"));
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(bad_size), std::string("size mismatch"));
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(overlapping), std::string("invalid segment"));
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(overflow), std::string("invalid segment"));
+        REQUIRE(rejected == 0);
+
         co_return 0;
     });
     REQUIRE(rc == 0);

@@ -384,8 +384,27 @@ Every test, grouped by area, with the property it guards.
   the patch, an unrelated live range and all remaining zeroes. Also covers
   a rewrite crossing the maximum segment/write-piece length (issue #13).
 - `format: sparse layer discard keeps a durable zero mask` — discard
-  records sidecar zero-mask coverage so reads stay correct across reopen
-  and lower layers remain masked (ADR-0009).
+  records dirty sidecar zero-mask coverage; `flush()` publishes it after
+  the sparse data fd syncs so reads stay correct across reopen and lower
+  layers remain masked (ADR-0009).
+- `format: sparse layer checkpoint persists a dirty zero mask` — sparse
+  `checkpoint()` uses the same durability path as `flush()`, so graceful
+  shutdown persists pending discard masks even though sparse uppers never
+  seal.
+- `format: sparse zero mask sidecar overrides live fiemap coverage` — a
+  recovered sidecar zero range overlays an overlapping live extent from
+  fiemap, preserving sub-block discard masks across filesystems with
+  coarse extent reporting.
+- `format: sparse layer reopen accepts a published grown zero mask` —
+  recovery accepts a sidecar recorded at a larger online-grow size than
+  the supplied configuration and keeps that larger sparse write window.
+- `format: sparse zero mask sidecar preserves grown size` — recovery
+  reopens an online-grown sparse upper with the original configured size,
+  preserves the grown window and zero masks, and keeps the sidecar
+  consistent after flush.
+- `format: sparse zero mask sidecar rejects malformed metadata` — reopen
+  rejects truncated sidecars, bad magic, mismatched sizes, invalid vsize
+  fields and overlapping or out-of-range zero segments.
 - `format: fresh sparse layer ignores stale zero mask sidecar` — a newly
   created sparse upper removes any stale sidecar instead of inheriting old
   discard masks from a previous file at the same path.

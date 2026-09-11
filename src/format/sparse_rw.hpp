@@ -11,6 +11,7 @@
 #include "source/local_file.hpp"
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,8 @@ namespace obd::format {
 
 class SparseRwLayer final : public WritableLayer {
 public:
+    ~SparseRwLayer() override;
+
     /// Opens (creating if needed) `path` as a sparse file of `vsize` bytes.
     /// Existing content is kept; written extents are recovered via fiemap.
     static elio::coro::task<std::unique_ptr<SparseRwLayer>> open(
@@ -29,9 +32,8 @@ public:
                                     uint64_t offset) override;
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
-    /// No-op: sparse live extents are durable via fiemap and zero masks are
-    /// persisted eagerly in the sidecar (sparse uppers never seal —
-    /// ADR-0014 upstream parity).
+    /// Persists dirty zero-mask metadata after syncing sparse data. Sparse
+    /// uppers never seal (ADR-0014 upstream parity).
     elio::coro::task<int> checkpoint() override;
 
     /// D3 grow-only vsize extension (see WritableLayer::grow): extends
@@ -51,11 +53,15 @@ public:
 private:
     SparseRwLayer() = default;
     bool has_zero_masks() const;
+    bool has_zero_masks_locked() const;
+    std::vector<bytes::segment_mapping> zero_mask_segments() const;
+    std::vector<bytes::segment_mapping> zero_mask_segments_locked() const;
     void insert_live_extent(uint64_t off, uint64_t len);
     void insert_zero_extent(uint64_t off, uint64_t len);
-    void insert_zero_gaps(uint64_t off, uint64_t len);
     void erase_range(uint64_t lo, uint64_t hi);
-    int persist_zero_masks() const;
+    int persist_zero_masks(const std::vector<bytes::segment_mapping>& zeroes,
+                           uint64_t vsize) const;
+    int persist_current_zero_masks() const;
     void load_zero_masks();
 
     int fd_ = -1;                    // RW fd (writes + flushes)
@@ -66,6 +72,9 @@ private:
     std::atomic<uint64_t> vsize_{0}; // bytes
     std::string zero_mask_path_;
     std::vector<bytes::segment_mapping> segments_;
+    mutable std::mutex meta_mu_;
+    uint64_t zero_masks_generation_ = 0;
+    bool zero_masks_dirty_ = false;
 };
 
 }  // namespace obd::format

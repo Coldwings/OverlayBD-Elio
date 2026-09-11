@@ -345,8 +345,8 @@ contracts above:
   Read-only images do not advertise discard limits, so the kernel never
   issues discard/write-zeroes to them. Writable LSMT-RW uppers satisfy the
   ADR-0009 mask contract with zeroed segments. Sparse uppers satisfy the
-  same merged-view mask by punching top-file holes and persisting sidecar
-  zero-mask metadata for those ranges.
+  same merged-view mask by punching top-file holes and recording sidecar
+  zero-mask metadata that `flush()`/`checkpoint()` persists.
 - **LSMT-RW durability:** an unsealed `overlaybd.rw` upper keeps its
   segment index in memory only; unsealed data is **not restart-recoverable**
   as a writable upper. A graceful obd-device shutdown checkpoint is the

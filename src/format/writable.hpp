@@ -46,8 +46,8 @@ public:
     /// Persists whatever on-disk state an offline seal needs (ADR-0014),
     /// without sealing. Called once by the device process on graceful
     /// shutdown, after IO has drained; it is terminal — no pwrite/discard
-    /// may follow. Layers whose state is already durable (sparse) return 0
-    /// without doing work. Returns 0 or a negative -errno.
+    /// may follow. Sparse layers use this hook to publish any dirty
+    /// discard zero-mask sidecar state. Returns 0 or a negative -errno.
     virtual elio::coro::task<int> checkpoint() = 0;
 
     virtual uint64_t virtual_size() const = 0;
