@@ -204,6 +204,14 @@ std::vector<uint8_t> make_tiny_file_tar() {
     return tar;
 }
 
+std::vector<uint8_t> make_file_then_directory_budget_tar() {
+    std::vector<uint8_t> tar;
+    append_tar_entry(tar, "tiny", '0', 0644, 0, 0, {'x'});
+    append_tar_entry(tar, "extra/", '5', 0755, 0, 0);
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
 std::vector<uint8_t> make_many_root_files_tar(size_t count) {
     std::vector<uint8_t> tar;
     tar.reserve((count + 2) * 512);
@@ -617,6 +625,19 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
     REQUIRE(too_small.err.find("contents and ext2 metadata exceed image budget") !=
             std::string::npos);
     REQUIRE(::stat((too_small_dir + "/small.lsmt").c_str(), &st) != 0);
+
+    const auto file_then_dir_tar = make_file_then_directory_budget_tar();
+    const std::string file_then_dir_path =
+        test::write_file(dir / "file-then-dir.tar", file_then_dir_tar);
+    const std::string file_then_dir_dir = dir / "file-then-dir";
+    const auto file_then_dir =
+        run_convert({"--input", file_then_dir_path, "--out-dir",
+                     file_then_dir_dir, "--name", "file-then-dir",
+                     "--size", "40960"});
+    REQUIRE(file_then_dir.exit_code == 1);
+    REQUIRE(file_then_dir.err.find("contents and ext2 metadata exceed image budget") !=
+            std::string::npos);
+    REQUIRE(::stat((file_then_dir_dir + "/file-then-dir.lsmt").c_str(), &st) != 0);
 
     const std::vector<uint8_t> missing_end_tar(tiny_tar.begin(),
                                                tiny_tar.end() - 1024);

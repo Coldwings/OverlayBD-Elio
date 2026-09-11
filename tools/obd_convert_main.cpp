@@ -503,6 +503,17 @@ struct TarReader {
             name);
     }
 
+    uint64_t required_image_blocks(uint64_t payload_blocks) const {
+        return metadata_blocks_for_nodes(node_count) + reserved_directory_blocks +
+               payload_blocks;
+    }
+
+    void ensure_image_budget(const std::string& name) const {
+        if (required_image_blocks(reserved_payload_blocks) > max_image_blocks) {
+            throw image_budget_error(name);
+        }
+    }
+
     void reserve_directory_child(Node& parent, const std::string& leaf) {
         const uint64_t next_blocks = directory_blocks_with_pending_child(parent, leaf);
         if (next_blocks > kMaxBuiltInDirectoryBlocks) {
@@ -524,6 +535,7 @@ struct TarReader {
                 reserve_directory_child(*cur, part);
                 auto dir = std::make_unique<Node>(part, NodeKind::Dir, cur);
                 reserved_directory_blocks += dir->dir_blocks;
+                ensure_image_budget(part);
                 it = cur->children.emplace(part, std::move(dir)).first;
             }
             if (it->second->kind != NodeKind::Dir) {
@@ -541,8 +553,7 @@ struct TarReader {
             throw image_budget_error(name);
         }
         const uint64_t reserved_after = reserved_payload_blocks + blocks;
-        const uint64_t required_blocks =
-            metadata_blocks_for_nodes(node_count) + reserved_directory_blocks + reserved_after;
+        const uint64_t required_blocks = required_image_blocks(reserved_after);
         if (required_blocks > max_image_blocks) {
             throw image_budget_error(name);
         }
@@ -609,6 +620,7 @@ struct TarReader {
             if (node_count >= kMaxBuiltInNodes) throw_too_many_inodes();
             ++node_count;
             reserve_directory_child(parent, leaf);
+            ensure_image_budget(name);
             auto node = std::make_unique<Node>(leaf, kind, &parent);
             node->perm = perm;
             node->uid = static_cast<uint32_t>(uid);
