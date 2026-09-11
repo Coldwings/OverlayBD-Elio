@@ -1,4 +1,4 @@
-// Unit tests: trace replay (ADR-0013, proposed) — populate translation in
+// Unit tests: trace replay (ADR-0013, accepted) — populate translation in
 // recorded order, upstream-parity skip rules, replay budgets, and local
 // trace-layer assembly. Trace blobs are built with the spec-pinned codec
 // (src/format/trace.hpp; its golden bytes are pinned in test_trace.cpp).

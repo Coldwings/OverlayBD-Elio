@@ -207,9 +207,11 @@ A per-image config may add a writable upper:
   later `create`/recovery open truncates a fresh unsealed LSMT-RW upper.
   On a **graceful shutdown** (SIGTERM, e.g. via `destroy` or `commit`)
   obd-device checkpoints the upper's in-memory index into the file; that
-  checkpoint is what the offline `commit` seal consumes. A crashed or
-  SIGKILLed device leaves no checkpoint and its unsealed upper is
-  unsealable. Use `commit` before relying on LSMT-RW writes after device
+  checkpoint is what the offline `commit` seal consumes. A crash or
+  SIGKILL before a successful graceful-shutdown checkpoint leaves no
+  checkpoint and its unsealed upper is unsealable; if the kill races after
+  that checkpoint has already been written, offline `commit` can still
+  consume it. Use `commit` before relying on LSMT-RW writes after device
   teardown.
 - `type: "sparse"` → a sparse file (`<dir>/overlaybd.sparse`); after an
   unclean shutdown the written extents are recovered via fiemap scanning.
