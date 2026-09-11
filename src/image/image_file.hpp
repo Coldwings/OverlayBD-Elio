@@ -29,7 +29,8 @@
 // (trace) layer — it is set aside from the merge (not a data layer) and
 // its trace blob is replayed as populate() warm-up on the data lowers'
 // source chains (trace-format.md §6). Replay is opportunistic: a
-// missing/malformed trace never fails assembly.
+// missing/malformed/slow trace never fails assembly; the trace blob load
+// itself is wall-clock bounded before replay is attempted.
 //
 // Structural warm-up (ADR-0012's cold-start floor): before replay, the
 // head/tail windows of every data lower's stored-blob view are
@@ -47,6 +48,7 @@
 
 #include <elio/coro/task.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -130,5 +132,12 @@ elio::coro::task<void> park_image_fills(const OpenedImage& opened);
 /// rule is unit-testable without a device or kernel.
 uint64_t device_capacity_bytes(uint64_t image_bytes, uint64_t override_bytes,
                                std::string* error);
+
+#ifdef OBD_TEST_HOOKS
+namespace test_hooks {
+std::chrono::milliseconds trace_blob_load_budget_for_test();
+void set_trace_blob_load_budget_for_test(std::chrono::milliseconds budget);
+}  // namespace test_hooks
+#endif
 
 }  // namespace obd::image
