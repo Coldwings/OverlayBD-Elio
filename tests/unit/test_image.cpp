@@ -19,7 +19,7 @@ TEST_CASE("image: global config parses overlaybd.json fields", "[image]") {
     const std::string text = R"({
         "credentialConfig": {"mode": "file", "path": "/tmp/cred.json"},
         "p2pConfig": {"enable": true, "address": "localhost:19145/dart"},
-        "download": {"enable": true, "delay": 120, "maxMBps": 50},
+        "download": {"enable": true, "delay": 120, "maxMBps": 50, "tryCnt": 1},
         "prefetch": {"enable": false},
         "logConfig": {"logLevel": 0},
         "cacheConfig": {"ignored": true}
@@ -31,7 +31,7 @@ TEST_CASE("image: global config parses overlaybd.json fields", "[image]") {
     REQUIRE(g.download.enable);
     REQUIRE(g.download.delay_sec == 120);
     REQUIRE(g.download.max_mbps == 50);
-    REQUIRE(g.download.try_count == 5);  // defaults preserved
+    REQUIRE(g.download.try_count == 1);
     REQUIRE(!g.prefetch_enable);  // prefetch.enable honored (ADR-0012)
     REQUIRE(g.log_level == 0);
     // Absent prefetch section: the default is enabled.
@@ -48,7 +48,7 @@ TEST_CASE("image: per-image download overrides merge over global defaults",
     const std::string text = R"({
         "repoBlobUrl": "https://reg.example.com/v2/lib/nginx/blobs",
         "lowers": [{"digest": "sha256:aaa", "size": 123, "dir": "/l1"}],
-        "download": {"maxMBps": 10}
+        "download": {"maxMBps": 10, "tryCnt": 5}
     })";
     const auto cfg = image::ImageConfig::from_json_text(text, defaults);
     REQUIRE(cfg.repo_blob_url ==
@@ -59,6 +59,7 @@ TEST_CASE("image: per-image download overrides merge over global defaults",
     REQUIRE(cfg.download.enable);           // inherited
     REQUIRE(cfg.download.delay_sec == 300); // inherited
     REQUIRE(cfg.download.max_mbps == 10);   // overridden
+    REQUIRE(cfg.download.try_count == 5);   // unsigned JSON integer accepted
     REQUIRE(image::ImageConfig::digest_sha256_hex("sha256:abc") == "abc");
     REQUIRE(image::ImageConfig::digest_sha256_hex("sha512:abc").empty());
 }
