@@ -396,6 +396,14 @@ void verify_tar_checksum(const std::array<uint8_t, 512>& header) {
     if (expected != actual) throw std::runtime_error("tar header checksum mismatch");
 }
 
+void verify_ustar_header(const std::array<uint8_t, 512>& header) {
+    if (std::memcmp(header.data() + 257, "ustar", 5) != 0 ||
+        header[262] != '\0' ||
+        std::memcmp(header.data() + 263, "00", 2) != 0) {
+        throw std::runtime_error("unsupported tar header: expected ustar magic and version");
+    }
+}
+
 struct TarReader {
     int fd;
     std::string work_dir;
@@ -445,6 +453,7 @@ struct TarReader {
             if (!read_exact(fd, header.data(), header.size(), true)) break;
             if (all_zero(header)) break;
             verify_tar_checksum(header);
+            verify_ustar_header(header);
 
             std::string name = tar_string(header.data(), 100);
             const std::string prefix = tar_string(header.data() + 345, 155);

@@ -159,6 +159,17 @@ void append_tar_entry(std::vector<uint8_t>& tar, const std::string& name,
     tar.resize(static_cast<size_t>(((tar.size() + 511) / 512) * 512), 0);
 }
 
+void rewrite_tar_checksum(std::vector<uint8_t>& tar, size_t header_offset) {
+    REQUIRE(header_offset + 512 <= tar.size());
+    uint8_t* h = tar.data() + header_offset;
+    std::memset(h + 148, ' ', 8);
+    uint32_t sum = 0;
+    for (size_t i = 0; i < 512; ++i) sum += h[i];
+    std::snprintf(reinterpret_cast<char*>(h + 148), 8, "%06o", sum);
+    h[154] = '\0';
+    h[155] = ' ';
+}
+
 std::vector<uint8_t> make_rootfs_tar() {
     std::vector<uint8_t> tar;
     append_tar_entry(tar, "etc/", '5', 0750, 5, 6);
@@ -363,11 +374,19 @@ TEST_CASE("cli: obd-convert builds a deterministic ext2 layer from tar", "[cli]"
     const auto b = run_convert({"--input", "-", "--out-dir", out_b,
                                 "--name", "rootfs"}, &tar);
     REQUIRE(b.exit_code == 0);
+    const uint64_t explicit_size = 8ull * 1024 * 1024;
+    const std::string out_sized = dir / "sized";
+    const auto sized = run_convert({"--input", tar_path, "--out-dir", out_sized,
+                                    "--name", "rootfs", "--size",
+                                    std::to_string(explicit_size)});
+    REQUIRE(sized.exit_code == 0);
 
     const auto ja = nlohmann::json::parse(a.out);
     const auto jb = nlohmann::json::parse(b.out);
+    const auto js = nlohmann::json::parse(sized.out);
     REQUIRE(ja["converter"]["backend"].get<std::string>() == "builtin-ext2");
     REQUIRE(ja["converter"]["filesystem"].get<std::string>() == "ext2");
+    REQUIRE(js["converter"]["virtual_size"].get<uint64_t>() == explicit_size);
     const std::string layer_a = ja["lowers"][0]["file"].get<std::string>();
     const std::string layer_b = jb["lowers"][0]["file"].get<std::string>();
     REQUIRE(file_sha256(layer_a) == file_sha256(layer_b));
@@ -482,6 +501,30 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
     REQUIRE(result.err.find("unsupported tar entry type") != std::string::npos);
     struct stat st {};
     REQUIRE(::stat((out_dir + "/bad.lsmt").c_str(), &st) != 0);
+
+    std::vector<uint8_t> legacy_tar;
+    append_tar_entry(legacy_tar, "legacy-file", '0', 0644, 0, 0);
+    std::fill(legacy_tar.begin() + 257, legacy_tar.begin() + 265, 0);
+    rewrite_tar_checksum(legacy_tar, 0);
+    legacy_tar.resize(legacy_tar.size() + 1024, 0);
+    const std::string legacy_path = test::write_file(dir / "legacy.tar", legacy_tar);
+    const std::string legacy_dir = dir / "legacy";
+    const auto legacy_result = run_convert({"--input", legacy_path, "--out-dir",
+                                            legacy_dir, "--name", "legacy"});
+    REQUIRE(legacy_result.exit_code == 1);
+    REQUIRE(legacy_result.err.find("expected ustar magic and version") !=
+            std::string::npos);
+    REQUIRE(::stat((legacy_dir + "/legacy.lsmt").c_str(), &st) != 0);
+
+    const auto valid_tar = make_rootfs_tar();
+    const std::string valid_tar_path = test::write_file(dir / "rootfs.tar", valid_tar);
+    const std::string too_small_dir = dir / "too-small";
+    const auto too_small = run_convert({"--input", valid_tar_path, "--out-dir",
+                                        too_small_dir, "--name", "small",
+                                        "--size", "4096"});
+    REQUIRE(too_small.exit_code == 1);
+    REQUIRE(too_small.err.find("--size is too small") != std::string::npos);
+    REQUIRE(::stat((too_small_dir + "/small.lsmt").c_str(), &st) != 0);
 
     const std::string many_dir = dir / "many-dir";
     const auto many = make_many_root_files_tar(4100);

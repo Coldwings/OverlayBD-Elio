@@ -319,11 +319,13 @@ output).
   real converter twice, once from a tar file and once from stdin, requires
   byte-identical LSMT sha256 output, verifies the printed digest/metadata, and
   reads the produced layer back as an ext2 image to check file content, mode,
-  uid/gid and symlink target.
+  uid/gid, explicit zero modes and symlink target. It also covers an explicit
+  aligned `--size` value.
 - `cli: obd-convert rejects unsupported tar entries before writing a layer` —
-  proves unsupported tar entry types, directories beyond the direct-block
-  backend limit, and inode counts beyond the bitmap capacity fail with exit 1
-  and do not publish an LSMT output file.
+  proves unsupported tar entry types, non-ustar headers, too-small explicit
+  `--size` values, directories beyond the direct-block backend limit, and inode
+  counts beyond the bitmap capacity fail with exit 1 and do not publish an LSMT
+  output file.
 - `cli: obd-convert atomically replaces existing output symlinks` — verifies
   converter outputs are completed in a private temporary workspace and published
   by rename instead of following or truncating an existing output symlink.
