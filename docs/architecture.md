@@ -340,12 +340,13 @@ contracts above:
   reads at the trace tap; it does not call `populate` or use the Prefetch
   class, and issue #33 tracks filtering recordings down to OnDemand reads
   only.
-- **Discard / punch-hole** is supported only for writable devices
-  (ADR-0009). Read-only images do not advertise discard limits, so the
-  kernel never issues discard/write-zeroes to them. Writable LSMT-RW
-  uppers mask discarded ranges with zeroed segments; sparse uppers punch
-  holes in the top file, and #85 tracks the remaining sparse merged-view
-  lower-mask gap.
+- **Discard / punch-hole** reaches only writable devices (ADR-0009).
+  Read-only images do not advertise discard limits, so the kernel never
+  issues discard/write-zeroes to them. Writable LSMT-RW uppers satisfy the
+  ADR-0009 mask contract with zeroed segments. Sparse uppers currently
+  only punch holes in the top file; in a merged view that can expose lower
+  layer bytes instead of masking them with zeroes, and #85 tracks that
+  remaining sparse merged-view gap.
 - **LSMT-RW durability:** an unsealed `overlaybd.rw` upper keeps its
   segment index in memory only; unsealed data is **not restart-recoverable**
   as a writable upper. A graceful obd-device shutdown checkpoint is the
