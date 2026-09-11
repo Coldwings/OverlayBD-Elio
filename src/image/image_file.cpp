@@ -135,6 +135,9 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     if (cfg.lowers.empty()) {
         throw error(EINVAL, "image config has no lowers");
     }
+    if (cfg.download.try_count == 0) {
+        throw error(EINVAL, "image download.tryCnt must be at least 1");
+    }
 
     // Credentials: a missing credential file is not fatal (anonymous pull).
     source::CredentialStorePtr creds =

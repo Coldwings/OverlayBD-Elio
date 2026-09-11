@@ -69,7 +69,7 @@ come from `src/image/config.hpp::DownloadConfig`:
 | `delay` | uint32 | `300` | Fill start delay in seconds after device open. |
 | `delayExtra` | uint32 | `30` | Plus a uniform random extra of 0..`delayExtra` seconds. |
 | `maxMBps` | uint32 | `100` | Fill throughput throttle, MiB/s. |
-| `tryCnt` | uint32 | `5` | Completion-verify attempts before giving up (a failed sha256 verification discards the staging pair and restarts). |
+| `tryCnt` | uint32, range `1..4294967295` | `5` | Completion-verify attempts before giving up (a failed sha256 verification discards the staging pair and restarts); zero, negative, and out-of-range values are structural configuration errors (ADR-0018). |
 | `blockSize` | uint32 | `262144` (256 KiB) | Fill range-read coalescing cap in bytes (contiguous missing extents are fetched in reads of up to this size, never more than 1 MiB, and split back into 64 KiB extents for accounting). |
 
 With `enable` set, every remote layer's `LayerStore` starts a background

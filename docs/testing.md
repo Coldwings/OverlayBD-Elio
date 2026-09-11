@@ -549,6 +549,10 @@ Every test, grouped by area, with the property it guards.
   sections parse with the documented defaults.
 - `image: per-image download overrides merge over global defaults` —
   only fields present in the image's `download` section override.
+- `image: invalid download tryCnt is rejected at config boundaries` —
+  zero, negative, and out-of-range JSON values fail before conversion, and
+  programmatic zero fails at assembly entry before persistence fallback
+  can swallow it.
 - `image: upper config parses; unknown type rejected` — `lsmt`/`sparse`
   parse; any other `upper.type` fails with `EINVAL` (ADR-0008).
 - `image: assembly from local layer files reads merged content` —

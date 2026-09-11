@@ -19,7 +19,7 @@ TEST_CASE("image: global config parses overlaybd.json fields", "[image]") {
     const std::string text = R"({
         "credentialConfig": {"mode": "file", "path": "/tmp/cred.json"},
         "p2pConfig": {"enable": true, "address": "localhost:19145/dart"},
-        "download": {"enable": true, "delay": 120, "maxMBps": 50},
+        "download": {"enable": true, "delay": 120, "maxMBps": 50, "tryCnt": 1},
         "prefetch": {"enable": false},
         "logConfig": {"logLevel": 0},
         "cacheConfig": {"ignored": true}
@@ -31,12 +31,16 @@ TEST_CASE("image: global config parses overlaybd.json fields", "[image]") {
     REQUIRE(g.download.enable);
     REQUIRE(g.download.delay_sec == 120);
     REQUIRE(g.download.max_mbps == 50);
-    REQUIRE(g.download.try_count == 5);  // defaults preserved
+    REQUIRE(g.download.try_count == 1);
     REQUIRE(!g.prefetch_enable);  // prefetch.enable honored (ADR-0012)
     REQUIRE(g.log_level == 0);
     // Absent prefetch section: the default is enabled.
     const auto g2 = image::GlobalConfig::from_json_text("{}");
     REQUIRE(g2.prefetch_enable);
+
+    const auto default_try =
+        image::GlobalConfig::from_json_text(R"({"download": {"enable": true}})");
+    REQUIRE(default_try.download.try_count == 5);
 }
 
 TEST_CASE("image: per-image download overrides merge over global defaults",
@@ -48,7 +52,7 @@ TEST_CASE("image: per-image download overrides merge over global defaults",
     const std::string text = R"({
         "repoBlobUrl": "https://reg.example.com/v2/lib/nginx/blobs",
         "lowers": [{"digest": "sha256:aaa", "size": 123, "dir": "/l1"}],
-        "download": {"maxMBps": 10}
+        "download": {"maxMBps": 10, "tryCnt": 5}
     })";
     const auto cfg = image::ImageConfig::from_json_text(text, defaults);
     REQUIRE(cfg.repo_blob_url ==
@@ -59,8 +63,81 @@ TEST_CASE("image: per-image download overrides merge over global defaults",
     REQUIRE(cfg.download.enable);           // inherited
     REQUIRE(cfg.download.delay_sec == 300); // inherited
     REQUIRE(cfg.download.max_mbps == 10);   // overridden
+    REQUIRE(cfg.download.try_count == 5);   // unsigned JSON integer accepted
     REQUIRE(image::ImageConfig::digest_sha256_hex("sha256:abc") == "abc");
     REQUIRE(image::ImageConfig::digest_sha256_hex("sha512:abc").empty());
+}
+
+TEST_CASE("image: invalid download tryCnt is rejected at config boundaries", "[image]") {
+    auto expect_trycnt_error = [](auto&& fn) {
+        try {
+            fn();
+            FAIL("invalid download.tryCnt should fail");
+        } catch (const error& e) {
+            REQUIRE(e.errno_value() == EINVAL);
+            REQUIRE(std::string(e.what()).find("download.tryCnt") !=
+                    std::string::npos);
+        }
+    };
+
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": 0}})");
+    });
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": -1}})");
+    });
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": 4294967296}})");
+    });
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": 1.5}})");
+    });
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": "2"}})");
+    });
+
+    image::DownloadConfig defaults;
+    defaults.try_count = 7;
+    expect_trycnt_error([&] {
+        (void)image::ImageConfig::from_json_text(
+            R"({
+                "repoBlobUrl": "https://reg.example.com/v2/lib/nginx/blobs",
+                "lowers": [{"digest": "sha256:aaa", "size": 123}],
+                "download": {"tryCnt": -1}
+            })",
+            defaults);
+    });
+
+    TempDir dir;
+    nlohmann::json cfgj;
+    cfgj["repoBlobUrl"] = "http://127.0.0.1:1/v2";
+    cfgj["lowers"] = nlohmann::json::array({nlohmann::json{
+        {"digest", "sha256:" + std::string(64, 'a')},
+        {"size", 65536},
+        {"dir", dir / "layer"}}});
+    auto cfg = image::ImageConfig::from_json_text(cfgj.dump(), {});
+    cfg.download.try_count = 0;
+
+    int thrown_errno = 0;
+    std::string thrown_message;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const image::GlobalConfig global;
+        try {
+            (void)co_await image::open_image(cfg, global);
+        } catch (const error& e) {
+            thrown_errno = e.errno_value();
+            thrown_message = e.what();
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(thrown_errno == EINVAL);
+    REQUIRE(thrown_message.find("download.tryCnt") != std::string::npos);
 }
 
 TEST_CASE("image: upper config parses; unknown type rejected", "[image]") {
