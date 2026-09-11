@@ -600,6 +600,15 @@ Every test, grouped by area, with the property it guards.
 - `image: trace recording stop is idempotent and reports expiry stats` —
   the device-side timer finalizes with no client call; a late stop
   returns the same stats.
+- `image: trace recording stop drains an awakened duration timer` —
+  explicit shutdown stop waits for a timer that already woke before it
+  touched recorder state.
+- `image: trace recording shutdown joins expiry finalization` —
+  shutdown stop joins an expiry-owned finalize while `recording()` is
+  already false and returns the expiry result.
+- `image: trace recording late stop waits for expiry callback completion` —
+  a cached late stop waits for the timer's expiry callback tail to
+  finish before returning.
 - `image: concurrent trace stops join the winning finalize` — an
   expiry stop and explicit stop are held after both observe Recording;
   the losing stop waits for and returns the winner's finalized path,

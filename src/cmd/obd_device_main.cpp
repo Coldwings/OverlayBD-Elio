@@ -88,6 +88,14 @@ elio::coro::task<int> device_main(Args args) {
     auto resize_gate = std::make_shared<std::mutex>();
     std::optional<elio::coro::join_handle<void>> control;
     int result = 0;
+    auto finish_trace_recording = [&]() -> elio::coro::task<void> {
+        if (!opened.recorder) co_return;
+        const auto tres = co_await opened.recorder->stop("shutdown");
+        if (!tres.ok && tres.error != "no trace recording in progress") {
+            ELIO_LOG_ERROR("trace finalize on shutdown failed: {}",
+                           tres.error);
+        }
+    };
     try {
         obd::image::GlobalConfig global =
             args.global.empty()
@@ -277,16 +285,11 @@ elio::coro::task<int> device_main(Args args) {
             std::lock_guard<std::mutex> drain(*resize_gate);
         });
         co_await dev->stop_async();
-        // ADR-0013: finalize any active trace recording BEFORE the source
-        // chain can go away (the taps feed the recorder; a shutdown
-        // finalize keeps the produced blob valid).
-        if (opened.recorder && opened.recorder->recording()) {
-            const auto tres = co_await opened.recorder->stop("shutdown");
-            if (!tres.ok) {
-                ELIO_LOG_ERROR("trace finalize on shutdown failed: {}",
-                               tres.error);
-            }
-        }
+        // ADR-0013: finalize and drain any trace recording BEFORE the source
+        // chain can go away. Do not gate this on recording(): an expiry-owned
+        // finalize has already lowered the hot-path flag while its timer
+        // coroutine may still be writing the file or sending the callback.
+        co_await finish_trace_recording();
         // ADR-0014: with the queues drained, persist the writable top's
         // index so the supervisor can seal the upper offline (commit). A
         // checkpoint failure is logged, not fatal: shutdown continues and
@@ -351,6 +354,7 @@ elio::coro::task<int> device_main(Args args) {
     }
     if (dev) {
         co_await dev->stop_async();
+        co_await finish_trace_recording();
         // The normal path already parks fills before reporting stopped.
         // Retain the same owners during exceptional cleanup as well.
         if (result != 0) co_await obd::image::park_image_fills(opened);
