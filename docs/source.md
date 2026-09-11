@@ -106,7 +106,9 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
   whether the registry serves the blob itself (Self mode: the
   `Authorization` header rides on every data request) or redirects to a CDN
   (Redirect mode: the `Location` URL is cached for 300 s and fetched
-  *without* auth — CDNs reject unexpected headers).
+  *without* auth — CDNs reject unexpected headers). Self-mode Bearer
+  URL-info entries expire no later than the token proactive refresh
+  deadline (ADR-0017).
 - **Retries** — data requests retry up to 3 times with a short backoff on
   transport failures, stale-token 401/403s (dropping the cached URL info and
   re-resolving), and 429s.
@@ -945,11 +947,13 @@ Breaking changes (require an ADR per the trigger list in
 - **The registry wire behavior** is an operator contract: GET-with-Range
   only, the bearer-token flow, Self/Redirect redirect handling, and the
   status→errno mapping mirror overlaybd `registryfs_v2.cpp`. Cache policy
-  on top of that wire behavior is ours (ADR-0015): token lifetime is 80%
-  of the server's `expires_in` (30 s fallback) with single-flight,
-  generation-counted re-auth; the redirect/URL-info cache keeps its fixed
-  300 s. Registries and CDNs that work with overlaybd must keep working
-  here.
+  on top of that wire behavior is ours (ADR-0015, ADR-0017): token
+  lifetime is 80% of the server's `expires_in` (30 s fallback) with
+  single-flight, generation-counted re-auth; Redirect, anonymous, and
+  Basic URL-info entries keep the fixed 300 s lifetime, while Self-mode
+  Bearer URL-info entries expire no later than the token proactive
+  refresh deadline. Registries and CDNs that work with overlaybd must
+  keep working here.
 - **The DART integration shape** (ADR-0005): DART stays an external process
   reached by prefix passthrough (`base + "/" + full upstream URL`, embedded
   scheme preserved); in-process P2P is rejected. Enabled-but-unreachable
@@ -1247,11 +1251,12 @@ directly.
   `RegistryClientConfig::max_response_size` (64 MiB default); larger single
   requests must be split by the caller (the format readers already read in
   bounded blocks).
-- **Redirect cache lifetime is fixed** — the redirect/URL-info cache
-  lifetime is a 300 s constant, not config (the token cache honors
-  `expires_in`, ADR-0015; redirect responses carry no comparable declared
-  lifetime). Registries issuing shorter-lived redirect targets rely on the
-  401-drop-and-re-resolve path.
+- **URL-info cache lifetime is mode-dependent** — Redirect, anonymous,
+  and Basic URL-info entries use the fixed 300 s lifetime; Self-mode
+  Bearer entries are capped by the token proactive refresh deadline
+  (ADR-0017). The lifetime is not config. Registries issuing shorter-lived
+  redirect targets rely on the 401-drop-and-re-resolve path because
+  redirect responses carry no comparable declared lifetime.
 - **Prefetch is structural warm-up plus trace replay** — overlaybd's
   dynamic prefetcher and TurboOCI paths are out of scope (ADR-0007). The
   structural head/tail warm-up (ADR-0012's cold-start floor) and the
