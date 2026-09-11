@@ -1,19 +1,27 @@
 // Shared test support: coroutine runner, in-memory BlobSource, temp dirs,
-// tar header builder.
+// tar header builder, ephemeral-port helper.
 #pragma once
 
 #include "source/blob_source.hpp"
 
 #include <elio/coro/task.hpp>
 #include <elio/runtime/async_main.hpp>
+#include <elio/time/timer.hpp>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace obd::test {
@@ -23,6 +31,135 @@ namespace obd::test {
 template <typename F>
 auto run_coro(F&& f) {
     return elio::run(std::forward<F>(f));
+}
+
+/// RAII reservation for an OS-assigned loopback TCP port. Each reservation
+/// binds port 0 and reads the assigned port with getsockname(); mock servers
+/// keep the reservation until immediately before their real HTTP listener
+/// binds the same port. If an unrelated process wins that close-to-bind
+/// window, the fixture reserves a fresh port and test code waits for
+/// `is_running()` before publishing URLs/configuration. This removes the
+/// repository's fixed-port collisions across sibling worktrees (issue #15).
+class ReservedTcpPort {
+public:
+    ReservedTcpPort() { reset(); }
+    ~ReservedTcpPort() { release(); }
+
+    ReservedTcpPort(const ReservedTcpPort&) = delete;
+    ReservedTcpPort& operator=(const ReservedTcpPort&) = delete;
+
+    uint16_t port() const noexcept { return port_; }
+
+    void reset() {
+        release();
+        port_ = 0;
+
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            throw std::system_error(errno, std::system_category(), "socket");
+        }
+        sockaddr_in sa {};
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port = 0;
+        if (::bind(fd, reinterpret_cast<const sockaddr*>(&sa), sizeof(sa)) !=
+            0) {
+            const int e = errno;
+            ::close(fd);
+            throw std::system_error(e, std::system_category(), "bind");
+        }
+        socklen_t len = sizeof(sa);
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &len) != 0) {
+            const int e = errno;
+            ::close(fd);
+            throw std::system_error(e, std::system_category(), "getsockname");
+        }
+        const auto port = ntohs(sa.sin_port);
+        if (port == 0) {
+            ::close(fd);
+            throw std::runtime_error("ReservedTcpPort: no port assigned");
+        }
+        fd_ = fd;
+        port_ = port;
+    }
+
+    void release() noexcept {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+private:
+    int fd_ = -1;
+    uint16_t port_ = 0;
+};
+
+/// Binds and listens on a specific loopback port to force a deterministic
+/// EADDRINUSE collision in mock-server fixture tests.
+class TcpPortBlocker {
+public:
+    explicit TcpPortBlocker(uint16_t port) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd_ < 0) {
+            throw std::system_error(errno, std::system_category(), "socket");
+        }
+        sockaddr_in sa {};
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port = htons(port);
+        if (::bind(fd_, reinterpret_cast<const sockaddr*>(&sa), sizeof(sa)) !=
+            0) {
+            const int e = errno;
+            release();
+            throw std::system_error(e, std::system_category(), "bind");
+        }
+        if (::listen(fd_, 1) != 0) {
+            const int e = errno;
+            release();
+            throw std::system_error(e, std::system_category(), "listen");
+        }
+    }
+    ~TcpPortBlocker() { release(); }
+
+    TcpPortBlocker(const TcpPortBlocker&) = delete;
+    TcpPortBlocker& operator=(const TcpPortBlocker&) = delete;
+
+private:
+    void release() noexcept {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    int fd_ = -1;
+};
+
+template <typename Server>
+elio::coro::task<bool> wait_server_running(
+    const Server& server,
+    std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    constexpr auto kPoll = std::chrono::milliseconds(5);
+    for (auto waited = std::chrono::milliseconds(0); waited < timeout;
+         waited += kPoll) {
+        if (server.is_running()) co_return true;
+        co_await elio::time::sleep_for(kPoll);
+    }
+    co_return server.is_running();
+}
+
+/// Elio's pinned http::server::listen() logs and returns on bind/listen
+/// failure, preserving errno from tcp_listener::bind(). The mock fixtures
+/// retry only the close-to-bind race they are designed to handle.
+inline void require_retryable_http_listen_return(const char* what,
+                                                 int listen_errno) {
+    if (listen_errno == EADDRINUSE) return;
+    if (listen_errno != 0) {
+        throw std::system_error(listen_errno, std::system_category(), what);
+    }
+    throw std::runtime_error(std::string(what) +
+                             ": listen returned before stop without errno");
 }
 
 /// In-memory BlobSource with read counting and failure injection.

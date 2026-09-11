@@ -45,8 +45,10 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <thread>
 
 using namespace obd;
@@ -60,22 +62,52 @@ namespace http = elio::http;
 namespace {
 
 /// Minimal mock registry: a blob map behind GET /v2/<digest> with Range
-/// support (mirrors the integration suite's BlobMapServer, trimmed).
+/// support (mirrors the integration suite's BlobMapServer, trimmed). The
+/// listener port is OS-assigned (ephemeral, issue #15) so concurrent suite
+/// runs on one machine never collide on a fixed 1920x port.
 class TraceBlobServer {
 public:
-    TraceBlobServer(std::map<std::string, std::vector<uint8_t>> blobs,
-                    uint16_t port)
-        : blobs_(std::move(blobs)), port_(port) {
+    explicit TraceBlobServer(std::map<std::string, std::vector<uint8_t>> blobs)
+        : blobs_(std::move(blobs)),
+          port_lease_(), port_(port_lease_.port()) {
         http::router r;
         r.add_route(http::method::GET, "/v2/*",
                     [this](http::context& ctx) { return handler(ctx); });
         server_ = std::make_unique<http::server>(std::move(r));
     }
     elio::coro::task<void> run() {
-        co_await server_->listen(elio::net::socket_address(
-            elio::net::ipv4_address("127.0.0.1", port_)));
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            port_lease_.reset();
+            port_ = port_lease_.port();
+            port_lease_.release();
+            if (before_listen_) before_listen_(port_);
+            try {
+                errno = 0;
+                co_await server_->listen(elio::net::socket_address(
+                    elio::net::ipv4_address("127.0.0.1", port_)));
+                const int listen_errno = errno;
+                if (!stop_requested_.load(std::memory_order_acquire) &&
+                    !server_->is_running()) {
+                    test::require_retryable_http_listen_return(
+                        "TraceBlobServer listen", listen_errno);
+                }
+            } catch (const std::system_error& e) {
+                if (e.code().value() != EADDRINUSE) throw;
+            }
+            if (!stop_requested_.load(std::memory_order_acquire)) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
     }
-    void stop() { server_->stop(); }
+    void stop() {
+        stop_requested_.store(true, std::memory_order_release);
+        server_->stop();
+    }
+    bool is_running() const noexcept { return server_->is_running(); }
+    void set_before_listen_hook(std::function<void(uint16_t)> hook) {
+        before_listen_ = std::move(hook);
+    }
+    uint16_t port() const noexcept { return port_; }
     std::string repo_base() const {
         return "http://127.0.0.1:" + std::to_string(port_) + "/v2";
     }
@@ -158,8 +190,11 @@ public:
 
 private:
     std::map<std::string, std::vector<uint8_t>> blobs_;
+    test::ReservedTcpPort port_lease_;
     uint16_t port_;
     std::unique_ptr<http::server> server_;
+    std::function<void(uint16_t)> before_listen_;
+    std::atomic<bool> stop_requested_{false};
 };
 
 /// tar-wraps a payload the way overlaybd-commit wraps layer blobs.
@@ -306,11 +341,14 @@ struct SigMaskGuard {
 using CheckFn = std::function<void(bool, const char*)>;
 
 /// Drives a real supervisor daemon plus the mock registry while
-/// `client_body(sock, check)` runs on a helper thread, then SIGTERMs the
-/// daemon. Returns the number of failed client checks.
-template <typename F>
+/// `prepare()` runs after the mock registry is actually listening so configs
+/// can publish the final ephemeral port. Then `client_body(sock, check)` runs
+/// on a helper thread, and the helper SIGTERMs the daemon. Returns the number
+/// of failed client checks.
+template <typename PrepareFn, typename F>
 int run_trace_daemon_case(supervisor::DaemonConfig cfg,
-                          TraceBlobServer& server, F&& client_body) {
+                          TraceBlobServer& server, PrepareFn&& prepare,
+                          F&& client_body) {
     std::atomic<bool> client_done{false};
     std::atomic<int> failures{0};
     std::string fail_msg;
@@ -320,21 +358,32 @@ int run_trace_daemon_case(supervisor::DaemonConfig cfg,
             fail_msg = what;
         }
     };
-    std::thread client([&] {
-        try {
-            client_body(cfg.socket_path, check);
-        } catch (const std::exception& e) {
-            check(false, "client RPC threw");
-            fail_msg = e.what();
-        }
-        client_done.store(true);
-    });
+    std::thread client;
 
     std::atomic<int> daemon_rc{-1};
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         elio::go([&server]() -> elio::coro::task<void> {
             co_await server.run();
         });
+        if (!co_await test::wait_server_running(server)) {
+            server.stop();
+            co_return -EADDRINUSE;
+        }
+        try {
+            prepare();
+            client = std::thread([&] {
+                try {
+                    client_body(cfg.socket_path, check);
+                } catch (const std::exception& e) {
+                    check(false, "client RPC threw");
+                    fail_msg = e.what();
+                }
+                client_done.store(true);
+            });
+        } catch (...) {
+            server.stop();
+            throw;
+        }
         elio::go([&]() -> elio::coro::task<void> {
             daemon_rc.store(co_await supervisor::run_daemon(cfg));
         });
@@ -351,7 +400,7 @@ int run_trace_daemon_case(supervisor::DaemonConfig cfg,
         co_await elio::time::sleep_for(20ms);
         co_return 0;
     });
-    client.join();
+    if (client.joinable()) client.join();
     INFO(fail_msg);
     REQUIRE(rc == 0);
     REQUIRE(daemon_rc.load() >= 0);
@@ -404,7 +453,7 @@ std::vector<uint8_t> read_whole_file(const std::string& path) {
 }  // namespace
 
 TEST_CASE("integration: trace mock range parsing retains numeric storage", "[integration][trace]") {
-    TraceBlobServer server({{"data", {'a', 'b', 'c', 'd'}}, {"empty", {}}}, 0);
+    TraceBlobServer server({{"data", {'a', 'b', 'c', 'd'}}, {"empty", {}}});
     struct Case {
         std::string path;
         std::string range;
@@ -451,15 +500,26 @@ TEST_CASE("integration: trace recording captures remote reads end to end",
     const std::string layer_dir = dir / "layer0";
     const std::string trace_path = dir / "out.trace";
     std::filesystem::create_directories(layer_dir);
-    TraceBlobServer server({{img.digest, img.blob}}, 19207);
-    const std::string cfg_path =
-        write_image_config(dir, server.repo_base(), img, layer_dir);
+    TraceBlobServer server({{img.digest, img.blob}});
+    std::optional<test::TcpPortBlocker> blocker;
+    std::atomic<bool> armed{true};
+    std::atomic<uint16_t> blocked_port{0};
+    server.set_before_listen_hook([&](uint16_t port) {
+        if (!armed.exchange(false)) return;
+        blocker.emplace(port);
+        blocked_port.store(port, std::memory_order_release);
+    });
+    std::string cfg_path;
 
     auto guard = block_daemon_signals();
     std::string stop_sha256;  // threaded out of the client (L5)
 
     const int failures = run_trace_daemon_case(
         trace_test_cfg(sock), server,
+        [&] {
+            cfg_path =
+                write_image_config(dir, server.repo_base(), img, layer_dir);
+        },
         [&](const std::string& s, const CheckFn& check) {
             for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
                 std::this_thread::sleep_for(20ms);
@@ -518,6 +578,9 @@ TEST_CASE("integration: trace recording captures remote reads end to end",
                   "status does not show stopped");
         });
     REQUIRE(failures == 0);
+    REQUIRE(blocked_port.load(std::memory_order_acquire) != 0);
+    REQUIRE(server.port() != blocked_port.load(std::memory_order_acquire));
+    blocker.reset();
 
     // The blob passes the codec reader (the C2 golden path) and matches
     // the workload's remote fetches: the three middle-extent reads
@@ -546,14 +609,17 @@ TEST_CASE("integration: trace recording duration expiry finalizes without a clie
     const std::string layer_dir = dir / "layer0";
     const std::string trace_path = dir / "out.trace";
     std::filesystem::create_directories(layer_dir);
-    TraceBlobServer server({{img.digest, img.blob}}, 19208);
-    const std::string cfg_path =
-        write_image_config(dir, server.repo_base(), img, layer_dir);
+    TraceBlobServer server({{img.digest, img.blob}});
+    std::string cfg_path;
 
     auto guard = block_daemon_signals();
 
     const int failures = run_trace_daemon_case(
         trace_test_cfg(sock), server,
+        [&] {
+            cfg_path =
+                write_image_config(dir, server.repo_base(), img, layer_dir);
+        },
         [&](const std::string& s, const CheckFn& check) {
             for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
                 std::this_thread::sleep_for(20ms);
@@ -617,14 +683,17 @@ TEST_CASE("integration: trace recording survives client disconnect mid-record",
     const std::string layer_dir = dir / "layer0";
     const std::string trace_path = dir / "out.trace";
     std::filesystem::create_directories(layer_dir);
-    TraceBlobServer server({{img.digest, img.blob}}, 19209);
-    const std::string cfg_path =
-        write_image_config(dir, server.repo_base(), img, layer_dir);
+    TraceBlobServer server({{img.digest, img.blob}});
+    std::string cfg_path;
 
     auto guard = block_daemon_signals();
 
     const int failures = run_trace_daemon_case(
         trace_test_cfg(sock), server,
+        [&] {
+            cfg_path =
+                write_image_config(dir, server.repo_base(), img, layer_dir);
+        },
         [&](const std::string& s, const CheckFn& check) {
             for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
                 std::this_thread::sleep_for(20ms);
@@ -685,14 +754,17 @@ TEST_CASE("integration: trace recording rejects bad requests cleanly",
     const std::string layer_dir = dir / "layer0";
     const std::string trace_path = dir / "out.trace";
     std::filesystem::create_directories(layer_dir);
-    TraceBlobServer server({{img.digest, img.blob}}, 19210);
-    const std::string cfg_path =
-        write_image_config(dir, server.repo_base(), img, layer_dir);
+    TraceBlobServer server({{img.digest, img.blob}});
+    std::string cfg_path;
 
     auto guard = block_daemon_signals();
 
     const int failures = run_trace_daemon_case(
         trace_test_cfg(sock), server,
+        [&] {
+            cfg_path =
+                write_image_config(dir, server.repo_base(), img, layer_dir);
+        },
         [&](const std::string& s, const CheckFn& check) {
             for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
                 std::this_thread::sleep_for(20ms);
@@ -795,14 +867,17 @@ TEST_CASE("integration: trace recording crash mid-record marks the trace lost",
     const std::string layer_dir = dir / "layer0";
     const std::string trace_path = dir / "out.trace";
     std::filesystem::create_directories(layer_dir);
-    TraceBlobServer server({{img.digest, img.blob}}, 19211);
-    const std::string cfg_path =
-        write_image_config(dir, server.repo_base(), img, layer_dir);
+    TraceBlobServer server({{img.digest, img.blob}});
+    std::string cfg_path;
 
     auto guard = block_daemon_signals();
 
     const int failures = run_trace_daemon_case(
         trace_test_cfg(sock), server,
+        [&] {
+            cfg_path =
+                write_image_config(dir, server.repo_base(), img, layer_dir);
+        },
         [&](const std::string& s, const CheckFn& check) {
             for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
                 std::this_thread::sleep_for(20ms);
