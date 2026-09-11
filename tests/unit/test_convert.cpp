@@ -600,7 +600,8 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
                                         too_small_dir, "--name", "small",
                                         "--size", "36864"});
     REQUIRE(too_small.exit_code == 1);
-    REQUIRE(too_small.err.find("--size is too small") != std::string::npos);
+    REQUIRE(too_small.err.find("payloads exceed image budget") !=
+            std::string::npos);
     REQUIRE(::stat((too_small_dir + "/small.lsmt").c_str(), &st) != 0);
 
     const std::vector<uint8_t> missing_end_tar(tiny_tar.begin(),
