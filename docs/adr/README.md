@@ -139,3 +139,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0015](./0015-registry-token-singleflight-and-expiry.md) | Single-flight registry token re-auth with expires_in-honoring cache lifetimes | superseded by ADR-0017 |
 | [0016](./0016-persistence-never-gates-boot.md) | Layer persistence is best-effort — an unusable layer dir degrades to remote-only, never fails assembly | accepted |
 | [0017](./0017-self-mode-bearer-url-info-expiry.md) | Cap Self-mode Bearer URL-info cache by token expiry | accepted |
+| [0018](./0018-download-trycnt-structural-boundary.md) | Treat invalid download tryCnt as a structural configuration error | proposed |

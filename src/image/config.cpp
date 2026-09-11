@@ -42,7 +42,33 @@ void apply_download_json(const nlohmann::json& j,
     if (j.contains("delayExtra"))
         base.delay_extra_sec = j["delayExtra"].get<uint32_t>();
     if (j.contains("maxMBps")) base.max_mbps = j["maxMBps"].get<uint32_t>();
-    if (j.contains("tryCnt")) base.try_count = j["tryCnt"].get<uint32_t>();
+    if (j.contains("tryCnt")) {
+        const auto& v = j["tryCnt"];
+        uint64_t raw = 0;
+        if (v.is_number_unsigned()) {
+            raw = v.get<uint64_t>();
+        } else {
+            const int64_t signed_raw = v.get<int64_t>();
+            if (signed_raw < 0) {
+                throw error(EINVAL,
+                            "download.tryCnt out of range: " +
+                                std::to_string(signed_raw) +
+                                " (want 1.." +
+                                std::to_string(std::numeric_limits<uint32_t>::max()) +
+                                ")");
+            }
+            raw = static_cast<uint64_t>(signed_raw);
+        }
+        if (raw == 0 ||
+            raw > std::numeric_limits<uint32_t>::max()) {
+            throw error(EINVAL,
+                        "download.tryCnt out of range: " +
+                            std::to_string(raw) + " (want 1.." +
+                            std::to_string(std::numeric_limits<uint32_t>::max()) +
+                            ")");
+        }
+        base.try_count = static_cast<uint32_t>(raw);
+    }
     if (j.contains("blockSize"))
         base.block_size = j["blockSize"].get<uint32_t>();
 }

@@ -63,34 +63,43 @@ TEST_CASE("image: per-image download overrides merge over global defaults",
     REQUIRE(image::ImageConfig::digest_sha256_hex("sha512:abc").empty());
 }
 
-TEST_CASE("image: zero download tryCnt is rejected at config boundaries",
+TEST_CASE("image: invalid download tryCnt is rejected at config boundaries",
           "[image]") {
-    try {
+    auto expect_trycnt_error = [](auto&& fn) {
+        try {
+            fn();
+            FAIL("invalid download.tryCnt should fail");
+        } catch (const error& e) {
+            REQUIRE(e.errno_value() == EINVAL);
+            REQUIRE(std::string(e.what()).find("download.tryCnt") !=
+                    std::string::npos);
+        }
+    };
+
+    expect_trycnt_error([] {
         (void)image::GlobalConfig::from_json_text(
             R"({"download": {"tryCnt": 0}})");
-        FAIL("global download.tryCnt=0 should fail");
-    } catch (const error& e) {
-        REQUIRE(e.errno_value() == EINVAL);
-        REQUIRE(std::string(e.what()).find("download.tryCnt") !=
-                std::string::npos);
-    }
+    });
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": -1}})");
+    });
+    expect_trycnt_error([] {
+        (void)image::GlobalConfig::from_json_text(
+            R"({"download": {"tryCnt": 4294967296}})");
+    });
 
     image::DownloadConfig defaults;
     defaults.try_count = 7;
-    try {
+    expect_trycnt_error([&] {
         (void)image::ImageConfig::from_json_text(
             R"({
                 "repoBlobUrl": "https://reg.example.com/v2/lib/nginx/blobs",
                 "lowers": [{"digest": "sha256:aaa", "size": 123}],
-                "download": {"tryCnt": 0}
+                "download": {"tryCnt": -1}
             })",
             defaults);
-        FAIL("per-image download.tryCnt=0 should fail");
-    } catch (const error& e) {
-        REQUIRE(e.errno_value() == EINVAL);
-        REQUIRE(std::string(e.what()).find("download.tryCnt") !=
-                std::string::npos);
-    }
+    });
 
     TempDir dir;
     nlohmann::json cfgj;
