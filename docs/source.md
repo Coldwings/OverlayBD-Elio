@@ -183,8 +183,10 @@ onto the ADR-0011 machinery):
   walk resumes — persisted extents survive in the sidecar, so progress is
   never lost;
 - completion rides the same sha256-verify + atomic rename as read-through
-  warming; a verification mismatch restarts fresh, bounded by `try_count`
-  (the `tryCnt` knob);
+  warming; an all-present bitmap is only a pending verification state, so
+  fill waits for the writer's verification outcome and resumes automatically
+  when a mismatch restarts fresh, bounded by `try_count` (the `tryCnt`
+  knob);
 - `Bypass` disables fill (the same rule as on-demand persistence), and a
   `populate`/prefetch path shares the extent map with both.
 
@@ -834,7 +836,8 @@ remote bytes into a sparse local staging file with a sidecar extent map
   `expected_sha256_hex` (skipped with a log when empty), and on match
   atomically renames it to `<dir>/overlaybd.commit` (state `Complete`;
   subsequent reads use the commit file without CRC). On mismatch it deletes
-  the pair and restarts fresh with a new nonce, bounded by
+  the pair, drops queued cache writes from the failed attempt, and restarts
+  fresh with a new nonce, bounded by
   `Config::try_count`; exhaustion leaves the store serving remotely in
   `Bypass` (logged as an error).
 - Observability — `state()` (`src/source/layer_store.hpp::LayerStore::State`),
@@ -842,10 +845,10 @@ remote bytes into a sparse local staging file with a sidecar extent map
   `crc_failures()`, `remote_fetches()`, `coalesced_joins()`,
   `fill_status()` are relaxed atomic snapshots, safe to poll from any
   thread.
-- `src/source/layer_store.hpp::LayerStore::set_test_write_hook` — test-only
-  hook invoked by the writer thread before persisting each entry; a non-zero
-  return is treated as a pwrite failure with that errno. Not part of the
-  module API.
+- `src/source/layer_store.hpp::LayerStore::set_test_write_hook` /
+  `set_test_completion_hook` — test-only writer-thread hooks used to
+  inject write failures or schedule completion-verification races. Not part
+  of the module API.
 
 Complexity: `pread` costs one local read + CRC32 per present extent, one
 coalesced remote fetch per missing extent, plus one memcpy per extent; the
