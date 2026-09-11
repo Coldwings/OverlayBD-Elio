@@ -242,7 +242,9 @@ void usage(const char* argv0) {
                  "the deterministic built-in ext2 backend. No device, mount, or\n"
                  "mkfs subprocess is used. JSON manifest metadata is printed to\n"
                  "stdout. The built-in backend supports regular files,\n"
-                 "directories, and short symlinks.\n",
+                 "directories up to 12 data blocks, short symlinks,\n"
+                 "uid/gid <= 65535, at most 32768 inodes, and images\n"
+                 "up to 128 MiB.\n",
                  argv0);
 }
 
