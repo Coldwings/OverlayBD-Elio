@@ -318,8 +318,8 @@ Every test, grouped by area, with the property it guards.
   non-multiple `data_size` tail is accepted, ignored, and unchecksummed
   (trace-format.md §7 rule 4).
 - `format: trace parser exposes unknown op bytes to the caller` — no op
-  validation at parse time; nonzero padding is checksummed, not
-  interpreted (trace-format.md §7/§8).
+  validation at parse time; nonzero record padding is checksummed,
+  not interpreted (trace-format.md §7/§8).
 - `format: trace writer enforces the conforming-writer contract` — count 0
   and > 1 MiB, op 'W', and negative offsets are rejected
   (trace-format.md §10 rule 4).

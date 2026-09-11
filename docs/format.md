@@ -134,8 +134,8 @@ file.
 
 The prefetch trace blob is a 24-byte header (magic, `data_size`,
 CRC-32C checksum) followed by fixed 24-byte records, an LP64
-little-endian raw struct image with padding bytes included in the
-checksum. The byte-level authority is
+little-endian raw struct image. The checksum covers record bytes,
+including record padding, but not header bytes or header padding. The byte-level authority is
 [trace-format.md](./trace-format.md); the codec in `trace.hpp` implements
 its parser acceptance rules (§7) and conforming-writer contract (§10)
 with no third-party dependencies, reusing the in-repo raw-chaining
@@ -1110,8 +1110,8 @@ writers and readers agree on the same bytes.
   `data_size = 25` blob decodes its one full record and ignores the
   unchecksummed trailing byte (§7 rule 4, §12.2).
 - `format: trace parser exposes unknown op bytes to the caller` — 'W' and
-  arbitrary op bytes parse fine; nonzero padding is checksummed but not
-  interpreted (§7, §8).
+  arbitrary op bytes parse fine; nonzero record padding is
+  checksummed but not interpreted (§7, §8).
 - `format: trace writer enforces the conforming-writer contract` — count 0
   and > 1 MiB, op 'W', and negative offsets are rejected; boundary values
   pass; rejected appends leave the blob unchanged (§10 rule 4).
