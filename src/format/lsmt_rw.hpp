@@ -23,6 +23,8 @@
 #include "source/local_file.hpp"
 
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <string>
 
 namespace obd::format {
@@ -73,7 +75,8 @@ public:
     /// file can later be sealed offline by seal_file() (ADR-0014). Called
     /// by the device process on graceful shutdown after IO has drained.
     /// Terminal: pwrite/discard after a checkpoint return -EROFS. Returns 0
-    /// or a negative -errno; -EROFS when already sealed or checkpointed.
+    /// or a negative -errno; -EROFS when already sealed or checkpointed,
+    /// -EBUSY when a direct grow/checkpoint/seal call is already in flight.
     elio::coro::task<int> checkpoint() override;
 
     uint64_t virtual_size() const override {
@@ -82,8 +85,9 @@ public:
     const std::vector<bytes::segment_mapping>& segments() const override {
         return segments_;
     }
-    /// The file view segment data is read from; its size tracks appends
-    /// (unlike a LocalFileSource, which pins the size at open).
+    /// The file view segment data is read from; its descriptor handle and
+    /// size track appends and a successful live seal (unlike a
+    /// LocalFileSource, which pins the size at open).
     source::BlobSource& data_source() override;
 
     bool sealed() const noexcept {
@@ -94,13 +98,15 @@ public:
     /// rewrites the on-disk declared-size header (uuid preserved) so a
     /// later checkpoint/offline seal stays consistent with the grown
     /// size. BLOCKING (header rewrite + fsync): run off an Elio worker
-    /// via elio::spawn_blocking. Returns 0 or a negative -errno.
+    /// via elio::spawn_blocking. Returns 0 or a negative -errno; -EBUSY
+    /// when a direct grow/checkpoint/seal call is already in flight.
     int grow(uint64_t vsize) override;
 
     /// Compacts and seals the file in place (atomic rename); afterwards it
     /// is a standard sealed LSMT RO file. Subsequent pwrite returns -EROFS.
     /// The sealed uuid is content-derived (see the file header comment), so
-    /// identical content seals to identical bytes (ADR-0014).
+    /// identical content seals to identical bytes (ADR-0014). Returns -EBUSY
+    /// when a direct grow/checkpoint/seal call is already in flight.
     elio::coro::task<int> seal(const std::string& user_tag = "");
 
     /// Offline seal (ADR-0014): opens a checkpointed unsealed RW file at
@@ -128,6 +134,7 @@ public:
 
 private:
     LsmtRwLayer() = default;
+    friend struct LsmtRwLayerTestAccess;
 
     /// Opens an existing checkpointed RW file (no truncation) with its
     /// index loaded from the on-disk unsealed trailer. Returns a negative
@@ -135,7 +142,13 @@ private:
     static elio::coro::task<std::unique_ptr<LsmtRwLayer>> open_checkpointed(
         const std::string& path, int* error);
 
-    int fd_ = -1;                   // owned RW fd; View only borrows it
+    int begin_grow_op();
+    void end_grow_op();
+    int begin_terminal_op(bool allow_checkpointed);
+    void end_terminal_op();
+
+    class FdHandle;                 // shared fd lifetime across in-flight IO
+    std::atomic<std::shared_ptr<FdHandle>> fd_;
     class View;                     // fd-backed BlobSource with dynamic size
     std::unique_ptr<View> view_;
     std::atomic<uint64_t> data_bytes_{0};  // upper bound for view reads
@@ -155,6 +168,9 @@ private:
     /// rewritten after the shutdown checkpoint. (No TSAN in this build.)
     std::atomic<bool> sealed_{false};
     std::atomic<bool> checkpointed_{false};  // terminal: no more pwrite/discard
+    std::mutex state_gate_mu_;
+    bool grow_op_in_progress_ = false;
+    bool terminal_op_in_progress_ = false;
     std::vector<bytes::segment_mapping> segments_;
 };
 

@@ -218,6 +218,18 @@ Every test, grouped by area, with the property it guards.
 - `format: lsmt rw seal compacts into a standard sealed layer` —
   `seal()` turns the unsealed RW file into a byte-standard sealed LSMT
   RO layer that the normal reader opens.
+- `format: lsmt rw seal rebinds live reads to the compacted inode` —
+  successful live `seal()` keeps the original layer, a retained
+  `data_source()` reference, current `segments()` and a fresh RO reopen
+  coherent with the compacted published inode.
+- `format: lsmt rw failed live seal keeps original backing` — a live
+  seal serialization exception removes the unpublished output, preserves
+  the original backing descriptor and UUID, and still allows a later
+  checkpoint/offline seal.
+- `format: lsmt rw direct terminal and grow gates reject overlaps` —
+  direct overlapping `grow()`/`checkpoint()`/`seal()` calls return
+  `-EBUSY` while the in-flight operation retains its gate, and the
+  rejected operation can be retried after release.
 - `format: lsmt rw seal is deterministic for identical content` —
   identical upper content seals to byte-identical files with equal
   content-derived uuids (ADR-0014 seal determinism); a different write

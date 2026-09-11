@@ -498,7 +498,10 @@ than the current size returns `-EINVAL`; an equal request is an
 idempotent no-op (retried grows after a partial kernel failure land
 here). It is **BLOCKING** (header rewrite + fsync for LSMT, ftruncate
 for sparse) — run it off an Elio worker via `elio::spawn_blocking`, as
-the device resize executor does (docs/supervisor.md).
+the device resize executor does (docs/supervisor.md). LSMT direct
+concurrent `grow()`/`checkpoint()`/`seal()` calls are rejected with
+`-EBUSY`; the supervisor normally serializes those operations before
+they reach the layer.
 
 ### `src/format/sparse_rw.hpp` — `SparseRwLayer`
 
@@ -605,13 +608,16 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
   checkpoint/offline seal stay valid. `-EINVAL` on unaligned/out-of-`vsize`
   ranges, `-EROFS` once checkpointed or sealed.
 - `data_source()`: an fd-backed `BlobSource` view whose size **tracks
-  appends** (an `std::atomic<uint64_t>` upper bound), unlike a
-  `LocalFileSource` which pins `st_size` at open.
-- Descriptor lifetime: the layer owns the backing descriptor from successful
-  open through destruction, including setup exceptions. `data_source()` borrows
-  that descriptor and the layer's size state; callers must finish all operations
-  and stop using the view before destroying the layer. A live layer retains its
-  original inode after `seal()` replaces the pathname; destruction closes it.
+  appends and a successful live seal** (an `std::atomic<uint64_t>` upper
+  bound), unlike a `LocalFileSource` which pins `st_size` at open.
+- Descriptor lifetime: the layer owns a shared handle for the backing
+  descriptor from successful open through destruction, including setup
+  exceptions. `data_source()` borrows that handle slot and the layer's size
+  state; callers must finish all operations and stop using the view before
+  destroying the layer. A successful live `seal()` atomically publishes the
+  compacted inode and swaps the handle so the layer and existing view use it;
+  the replaced descriptor closes after any in-flight users release their
+  handle. Destruction closes whichever descriptor handle is current.
   `seal_file()` destroys its reopened layer after sealing (also on rejection or
   failure), releasing the replaced inode. Compaction and digest descriptors
   have scoped ownership so exceptions also close them.
@@ -621,7 +627,8 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
   obd-device on graceful shutdown; it is terminal — `pwrite`/`discard`
   afterwards return `-EROFS`, as does a second `checkpoint()`. This is the
   only on-disk persistence of the RW index; a crash before it loses the
-  unsealed writes.
+  unsealed writes. Direct concurrent `grow()`/`checkpoint()`/`seal()` calls
+  return `-EBUSY`.
 - `seal(user_tag)`: compacts the file into a **standard sealed LSMT RO
   file**: live segments are copied out packed sequentially into
   `<path>.sealing.<pid>` (a per-process tmp name — two seals never
@@ -629,8 +636,11 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
   dropped; zeroed segments consume no data space),
   followed by the padded index, a sealed header and trailer, `fdatasync`,
   and an **atomic rename** over `path`. Afterwards `sealed()` is true and
-  `pwrite` returns `-EROFS`. Returns 0 or a negative -errno; on failure the
-  temp file is unlinked and the original file is untouched.
+  `pwrite`/`discard`/`grow` and repeat `seal()` return `-EROFS`; serialized
+  reads through the original layer and its existing `data_source()` use the
+  compacted published file. Returns 0 or a negative -errno; on failure the temp
+  file is unlinked and the original file is untouched. Direct concurrent
+  `grow()`/`checkpoint()`/`seal()` calls return `-EBUSY`.
 - `seal_file(path, user_tag, sha256_hex, size)` (ADR-0014 offline commit):
   opens a **checkpointed** RW file without truncating (index loaded from
   the on-disk unsealed trailer, validated with the `LsmtLayer::open`
@@ -1023,6 +1033,18 @@ writers and readers agree on the same bytes.
   padded index + trailer), post-seal `pwrite` returns `-EROFS`, and the
   sealed file loads through the read-only `LsmtLayer` path with the patched
   content. Guards compaction, atomic rename, and RO compatibility.
+- `format: lsmt rw seal rebinds live reads to the compacted inode` — after
+  reverse physical allocation and a zeroed segment, successful live `seal()`
+  keeps original-layer `pread`, a retained `data_source()` reference, current
+  `segments()` plus `data_source()`, and a fresh `LsmtLayer` reopen coherent
+  with the compacted published file.
+- `format: lsmt rw failed live seal keeps original backing` — an exception
+  during live seal serialization removes the unpublished output and keeps the
+  original backing descriptor, bytes and live reads intact.
+- `format: lsmt rw direct terminal and grow gates reject overlaps` — direct
+  overlapping `grow()`/`checkpoint()`/`seal()` calls return `-EBUSY` while
+  the in-flight operation retains its gate, and the rejected operation can be
+  retried after release.
 - `format: lsmt rw seal is deterministic for identical content` — the
   ADR-0014 seal determinism invariant: two uppers with identical write
   sequences seal to byte-identical files (equal sha256), their sealed
