@@ -375,6 +375,7 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
         }
         std::string auth;
         uint64_t token_generation = 0;
+        std::optional<std::chrono::steady_clock::time_point> token_expiry;
         if (challenge->bearer) {
             const std::string key = challenge->realm + "|" +
                                     challenge->service + "|" +
@@ -384,6 +385,7 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
                 url, min_token_generation);
             auth = "Bearer " + entry.token;
             token_generation = entry.generation;
+            token_expiry = entry.expiry;
         } else {
             // Basic auth: credentials from the store for the blob URL.
             if (creds_) {
@@ -420,9 +422,15 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
         // The redirect/URL-info responses (3xx Location, probe 200/206)
         // carry no server-declared expiry in the registryfs v2 contract —
         // CDN signed-URL lifetimes live inside opaque query parameters —
-        // so the fixed 300 s cache lifetime stays (ADR-0015).
+        // so the fixed 300 s cache lifetime stays for anonymous, Basic and
+        // Redirect mode. Self-mode Bearer entries carry Authorization on
+        // every data request, so they must not outlive the token's
+        // proactive refresh deadline.
         info.expiry = std::chrono::steady_clock::now() +
                       std::chrono::seconds(300);
+        if (!info.auth_header.empty() && token_expiry.has_value()) {
+            info.expiry = std::min(info.expiry, *token_expiry);
+        }
         info.token_generation = token_generation;
     } else {
         throw_errno(status_to_errno(status),

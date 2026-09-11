@@ -12,7 +12,8 @@
 //     coroutine performs the exchange, the rest await it.
 //   * 3xx redirects → cache the Location for 300s and GET it without auth
 //     (registryfs_v2.cpp Redirect mode); otherwise re-send with auth per
-//     request (Self mode).
+//     request (Self mode). Self-mode Bearer URL-info entries expire no
+//     later than their token's proactive refresh deadline.
 //   * Retries 3x with short backoff; 416 → -ERANGE; 429 → -EBUSY;
 //     401/403 after token refresh → -EPERM.
 //   * When an accelerate prefix (DART proxy, ADR-0005) is configured, the

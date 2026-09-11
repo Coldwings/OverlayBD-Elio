@@ -495,6 +495,45 @@ TEST_CASE("source: registry re-auths after expires_in lifetime elapses",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("source: registry self-mode URL cache follows bearer expiry",
+          "[source]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto blob = test::pattern_bytes(64 * 1024, 29);
+        MockRegistry mock(blob, 19201);
+        mock.expires_in_ = 1;  // cache lifetime: 80% of 1 s = 800 ms
+        elio::go([&mock]() -> elio::coro::task<void> {
+            co_await mock.run();
+        });
+        MockGuard guard{mock};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(50));
+
+        auto client = std::make_shared<source::RegistryClient>(
+            test_creds(), source::RegistryClientConfig{});
+        const std::string url = "http://127.0.0.1:19201/v2/auth/x";
+        auto src = co_await source::RegistrySource::open(client, url);
+        REQUIRE(mock.token_hits_.load() == 1);
+
+        std::vector<uint8_t> buf(1024);
+        const ssize_t read_before =
+            co_await src->pread(buf.data(), buf.size(), 0);
+        REQUIRE(read_before == 1024);
+        REQUIRE(mock.token_hits_.load() == 1);
+
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1200));
+        // Same URL and same already-open source: the URL-info cache must not
+        // keep a Self-mode Bearer Authorization header past the token's
+        // proactive expiry. The mock still accepts the old token, so this
+        // proves refresh happened before any rejected data request.
+        const ssize_t read_after =
+            co_await src->pread(buf.data(), buf.size(), 4096);
+        REQUIRE(read_after == 1024);
+        REQUIRE(mock.token_hits_.load() == 2);
+        co_await wait_drained(mock);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("source: registry keeps the cached token within expires_in lifetime", "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto blob = test::pattern_bytes(64 * 1024, 28);
