@@ -36,8 +36,9 @@ Design goals, and the decisions that fix them:
   copy-on-write writable disk without mutating the sealed lowers.
 
 The shipped binaries are `obd-supervisor` (the daemon), `obd-device` (the
-per-device server, spawned by the supervisor), `obdctl` (control CLI), and
-`obd-mkimage` (test-image generator).
+per-device server, spawned by the supervisor), `obdctl` (control CLI),
+`obd-mkimage` (test-image generator), and `obd-convert` (deterministic
+rootfs-tar converter).
 
 ## Data Flow
 
@@ -237,8 +238,9 @@ device with `--config`, optional `--global`, `--control-fd 3`, and
 optional `--dev-id`, and serves one image on one ublk device
 (`/dev/ublkb<N>`); `obdctl` speaks the control protocol with plain
 blocking IO (no Elio runtime); `obd-mkimage` generates OverlayBD-format
-test images for fixtures and golden tests. Usage, flags, and behavior
-guarantees live in the binaries document.
+test images for fixtures and golden tests; `obd-convert` builds deterministic
+rootfs-tar LSMT layers without devices, mounts, or host mkfs. Usage, flags,
+and behavior guarantees live in the binaries document.
 
 ## Concurrency & Call Permissions
 

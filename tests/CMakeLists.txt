@@ -43,6 +43,7 @@ add_executable(obd_unit_tests
     unit/test_image.cpp
     unit/test_writable.cpp
     unit/test_cli.cpp
+    unit/test_convert.cpp
     unit/test_supervisor.cpp)
 obd_target_warnings(obd_unit_tests)
 target_include_directories(obd_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -50,8 +51,9 @@ target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
 # The CLI test EXECUTES the real obdctl binary (argv → wire translation),
 # so the test target depends on it and is told its path.
 target_compile_definitions(obd_unit_tests
-    PRIVATE OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>")
-add_dependencies(obd_unit_tests obdctl)
+    PRIVATE OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>"
+            OBD_TEST_OBD_CONVERT_BIN="$<TARGET_FILE:obd-convert>")
+add_dependencies(obd_unit_tests obdctl obd-convert)
 catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
     PROPERTIES TIMEOUT 60)
 

@@ -840,8 +840,10 @@ region digests and the index CRC when `calc_digest` is set.
 
 Both writers are **synchronous cold-path utilities** (plain POSIX IO, retry
 on `EINTR`, throw on error). Produced files are byte-compatible with
-upstream overlaybd readers. Used by `obd-mkimage` and the test fixtures;
-the data plane never writes.
+upstream overlaybd readers. Used by `obd-mkimage`, `obd-convert` and the test
+fixtures; the data plane never writes. Callers that need byte-identical output
+must pass deterministic writer options; the raw writer's default UUID is random
+for fixture convenience.
 
 ### `src/format/trace.hpp` — `namespace obd::format::trace`
 
@@ -955,6 +957,11 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
   `format: empty lsmt layer bytes are deterministic per virtual size`);
   an empty commit (`seal` of a never-written upper, empty `user_tag`)
   reproduces the base exactly.
+- **Converter determinism (ADR-0019).** `obd-convert` writes a deterministic
+  raw filesystem image first, then calls `write_lsmt_single_layer` with an
+  explicit UUID derived from that raw image's SHA-256 digest and a fixed
+  converter tag. The resulting LSMT file is a standard sealed lower; pinned by
+  `cli: obd-convert builds a deterministic ext2 layer from tar`.
 - **Error channels.** Cold paths (`open`, `parse`, writers) throw
   `obd::format_error` / `obd::error`; hot paths (`pread`/`pwrite`/`flush`)
   return negative -errno and never throw (the `source::BlobSource`

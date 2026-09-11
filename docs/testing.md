@@ -1140,6 +1140,14 @@ Every test, grouped by area, with the property it guards.
   forwarded, not refused. The test server's accept is bounded, so a CLI
   that wrongly rejects an argument fails the assertion instead of hanging
   the job (#11).
+- `cli: obd-convert builds a deterministic ext2 layer from tar` — the REAL
+  converter binary consumes the same rootfs tar from a file and from stdin,
+  emits byte-identical sealed LSMT layers, reports the correct digest and
+  metadata, and the test reads the layer back as an ext2 image to verify file
+  content, mode, uid/gid and short symlink target (ADR-0019).
+- `cli: obd-convert rejects unsupported tar entries before writing a layer` —
+  a tar entry outside the built-in backend's feature set exits 1 with a clear
+  error and leaves no published LSMT layer behind.
 
 ### integration
 

@@ -1,0 +1,375 @@
+// Unit tests: obd-convert CLI — rootfs tar stream to deterministic LSMT layer.
+#include "common/bytes.hpp"
+#include "common/sha256.hpp"
+#include "format/lsmt.hpp"
+#include "source/local_file.hpp"
+
+#include "../support.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <initializer_list>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace obd;
+using obd::test::TempDir;
+
+#ifndef OBD_TEST_OBD_CONVERT_BIN
+#define OBD_TEST_OBD_CONVERT_BIN "obd-convert"
+#endif
+
+namespace {
+
+struct CommandResult {
+    int exit_code = -1;
+    std::string out;
+    std::string err;
+};
+
+void write_all_fd(int fd, const void* data, size_t size) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    size_t done = 0;
+    while (done < size) {
+        const ssize_t w = ::write(fd, p + done, size - done);
+        REQUIRE(w > 0);
+        done += static_cast<size_t>(w);
+    }
+}
+
+std::string read_all_fd(int fd) {
+    std::string out;
+    std::array<char, 4096> buf {};
+    for (;;) {
+        const ssize_t r = ::read(fd, buf.data(), buf.size());
+        if (r < 0 && errno == EINTR) continue;
+        REQUIRE(r >= 0);
+        if (r == 0) break;
+        out.append(buf.data(), static_cast<size_t>(r));
+    }
+    return out;
+}
+
+CommandResult run_convert(const std::vector<std::string>& args,
+                          const std::vector<uint8_t>* stdin_data = nullptr) {
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+    REQUIRE(::pipe(stdout_pipe) == 0);
+    REQUIRE(::pipe(stderr_pipe) == 0);
+    int stdin_pipe[2] = {-1, -1};
+    if (stdin_data) REQUIRE(::pipe(stdin_pipe) == 0);
+
+    std::vector<std::string> storage;
+    storage.emplace_back(OBD_TEST_OBD_CONVERT_BIN);
+    storage.insert(storage.end(), args.begin(), args.end());
+    std::vector<char*> argv;
+    for (auto& s : storage) argv.push_back(s.data());
+    argv.push_back(nullptr);
+
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        if (stdin_data) {
+            ::close(stdin_pipe[1]);
+            ::dup2(stdin_pipe[0], STDIN_FILENO);
+            ::close(stdin_pipe[0]);
+        }
+        ::close(stdout_pipe[0]);
+        ::close(stderr_pipe[0]);
+        ::dup2(stdout_pipe[1], STDOUT_FILENO);
+        ::dup2(stderr_pipe[1], STDERR_FILENO);
+        ::close(stdout_pipe[1]);
+        ::close(stderr_pipe[1]);
+        ::execv(OBD_TEST_OBD_CONVERT_BIN, argv.data());
+        _exit(127);
+    }
+
+    ::close(stdout_pipe[1]);
+    ::close(stderr_pipe[1]);
+    if (stdin_data) {
+        ::close(stdin_pipe[0]);
+        write_all_fd(stdin_pipe[1], stdin_data->data(), stdin_data->size());
+        ::close(stdin_pipe[1]);
+    }
+
+    CommandResult result;
+    result.out = read_all_fd(stdout_pipe[0]);
+    result.err = read_all_fd(stderr_pipe[0]);
+    ::close(stdout_pipe[0]);
+    ::close(stderr_pipe[0]);
+
+    int status = 0;
+    REQUIRE(::waitpid(pid, &status, 0) == pid);
+    REQUIRE(WIFEXITED(status));
+    result.exit_code = WEXITSTATUS(status);
+    return result;
+}
+
+void fill_octal(uint8_t* out, size_t width, uint64_t value) {
+    std::memset(out, 0, width);
+    char fmt[16];
+    std::snprintf(fmt, sizeof(fmt), "%%0%zulo", width - 1);
+    std::snprintf(reinterpret_cast<char*>(out), width, fmt,
+                  static_cast<unsigned long>(value));
+}
+
+void append_tar_entry(std::vector<uint8_t>& tar, const std::string& name,
+                      char typeflag, uint64_t mode, uint64_t uid,
+                      uint64_t gid, const std::vector<uint8_t>& payload = {},
+                      const std::string& link_target = {}) {
+    std::array<uint8_t, 512> h {};
+    REQUIRE(name.size() <= 100);
+    std::memcpy(h.data(), name.data(), name.size());
+    fill_octal(h.data() + 100, 8, mode);
+    fill_octal(h.data() + 108, 8, uid);
+    fill_octal(h.data() + 116, 8, gid);
+    fill_octal(h.data() + 124, 12, payload.size());
+    fill_octal(h.data() + 136, 12, 0);
+    h[156] = static_cast<uint8_t>(typeflag);
+    if (!link_target.empty()) {
+        REQUIRE(link_target.size() <= 100);
+        std::memcpy(h.data() + 157, link_target.data(), link_target.size());
+    }
+    std::memcpy(h.data() + 257, "ustar", 5);
+    std::memcpy(h.data() + 263, "00", 2);
+    std::memset(h.data() + 148, ' ', 8);
+    uint32_t sum = 0;
+    for (uint8_t b : h) sum += b;
+    std::snprintf(reinterpret_cast<char*>(h.data() + 148), 8, "%06o", sum);
+    h[154] = '\0';
+    h[155] = ' ';
+    tar.insert(tar.end(), h.begin(), h.end());
+    tar.insert(tar.end(), payload.begin(), payload.end());
+    tar.resize(static_cast<size_t>(((tar.size() + 511) / 512) * 512), 0);
+}
+
+std::vector<uint8_t> make_rootfs_tar() {
+    std::vector<uint8_t> tar;
+    append_tar_entry(tar, "etc/", '5', 0750, 5, 6);
+    const std::vector<uint8_t> hello = {'h', 'e', 'l', 'l', 'o', '\n'};
+    append_tar_entry(tar, "etc/hello.txt", '0', 0640, 1000, 1001, hello);
+    const std::vector<uint8_t> tool = test::pattern_bytes(7000, 77);
+    append_tar_entry(tar, "bin/tool", '0', 0755, 0, 0, tool);
+    append_tar_entry(tar, "link-to-hello", '2', 0777, 7, 8, {}, "etc/hello.txt");
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
+std::string file_sha256(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    common::Sha256 h;
+    std::array<uint8_t, 65536> buf {};
+    for (;;) {
+        const ssize_t r = ::read(fd, buf.data(), buf.size());
+        REQUIRE(r >= 0);
+        if (r == 0) break;
+        h.update(buf.data(), static_cast<size_t>(r));
+    }
+    REQUIRE(::close(fd) == 0);
+    return h.final_hex();
+}
+
+struct Ext2Inode {
+    uint16_t mode = 0;
+    uint16_t uid = 0;
+    uint16_t gid = 0;
+    uint32_t size = 0;
+    std::array<uint32_t, 15> blocks {};
+};
+
+class Ext2View {
+public:
+    explicit Ext2View(std::vector<uint8_t> raw) : raw_(std::move(raw)) {
+        REQUIRE(raw_.size() >= 8192);
+        const uint8_t* sb = raw_.data() + 1024;
+        REQUIRE(bytes::load_u16_le(sb + 56) == 0xef53);
+        block_size_ = 1024u << bytes::load_u32_le(sb + 24);
+        REQUIRE(block_size_ == 4096);
+        inode_size_ = bytes::load_u16_le(sb + 88);
+        REQUIRE(inode_size_ == 128);
+        const uint8_t* gd = raw_.data() + block_size_;
+        inode_table_block_ = bytes::load_u32_le(gd + 8);
+    }
+
+    Ext2Inode inode(uint32_t ino) const {
+        const uint64_t off = static_cast<uint64_t>(inode_table_block_) * block_size_ +
+                             static_cast<uint64_t>(ino - 1) * inode_size_;
+        REQUIRE(off + inode_size_ <= raw_.size());
+        const uint8_t* p = raw_.data() + off;
+        Ext2Inode n;
+        n.mode = bytes::load_u16_le(p + 0);
+        n.uid = bytes::load_u16_le(p + 2);
+        n.size = bytes::load_u32_le(p + 4);
+        n.gid = bytes::load_u16_le(p + 24);
+        for (size_t i = 0; i < n.blocks.size(); ++i) {
+            n.blocks[i] = bytes::load_u32_le(p + 40 + i * 4);
+        }
+        return n;
+    }
+
+    std::map<std::string, uint32_t> list_dir(uint32_t ino) const {
+        const Ext2Inode dir = inode(ino);
+        std::map<std::string, uint32_t> out;
+        for (size_t i = 0; i < 12 && dir.blocks[i] != 0; ++i) {
+            const uint64_t base = static_cast<uint64_t>(dir.blocks[i]) * block_size_;
+            REQUIRE(base + block_size_ <= raw_.size());
+            uint32_t pos = 0;
+            while (pos < block_size_) {
+                const uint8_t* e = raw_.data() + base + pos;
+                const uint32_t child_ino = bytes::load_u32_le(e);
+                const uint16_t rec_len = bytes::load_u16_le(e + 4);
+                const uint8_t name_len = e[6];
+                REQUIRE(rec_len >= 8);
+                REQUIRE(pos + rec_len <= block_size_);
+                REQUIRE(name_len <= rec_len - 8);
+                if (child_ino != 0) {
+                    out.emplace(std::string(reinterpret_cast<const char*>(e + 8), name_len),
+                                child_ino);
+                }
+                pos += rec_len;
+            }
+        }
+        return out;
+    }
+
+    uint32_t lookup(std::initializer_list<std::string> path) const {
+        uint32_t ino = 2;
+        for (const auto& part : path) {
+            const auto entries = list_dir(ino);
+            auto it = entries.find(part);
+            REQUIRE(it != entries.end());
+            ino = it->second;
+        }
+        return ino;
+    }
+
+    std::vector<uint8_t> read_file(uint32_t ino) const {
+        const Ext2Inode file = inode(ino);
+        std::vector<uint8_t> out;
+        out.reserve(file.size);
+        for (size_t i = 0; i < 12 && out.size() < file.size; ++i) {
+            REQUIRE(file.blocks[i] != 0);
+            const uint64_t base = static_cast<uint64_t>(file.blocks[i]) * block_size_;
+            REQUIRE(base + block_size_ <= raw_.size());
+            const size_t want = std::min<size_t>(block_size_, file.size - out.size());
+            out.insert(out.end(), raw_.begin() + base, raw_.begin() + base + want);
+        }
+        REQUIRE(out.size() == file.size);
+        return out;
+    }
+
+    std::string inline_symlink(uint32_t ino) const {
+        const uint64_t off = static_cast<uint64_t>(inode_table_block_) * block_size_ +
+                             static_cast<uint64_t>(ino - 1) * inode_size_ + 40;
+        const Ext2Inode link = inode(ino);
+        REQUIRE(link.size <= 60);
+        return std::string(reinterpret_cast<const char*>(raw_.data() + off), link.size);
+    }
+
+private:
+    std::vector<uint8_t> raw_;
+    uint32_t block_size_ = 0;
+    uint32_t inode_size_ = 0;
+    uint32_t inode_table_block_ = 0;
+};
+
+std::vector<uint8_t> read_layer_raw(const std::string& path) {
+    return test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
+        auto local = co_await source::LocalFileSource::open(path);
+        source::BlobSourcePtr base = std::move(local);
+        auto layer = co_await format::LsmtLayer::open(std::move(base));
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(std::move(layer));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        std::vector<uint8_t> raw(merged->size());
+        const ssize_t r = co_await merged->pread(raw.data(), raw.size(), 0);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        co_return raw;
+    });
+}
+
+}  // namespace
+
+// NOTE: name on one source line (check-docs extracts names line-wise).
+TEST_CASE("cli: obd-convert builds a deterministic ext2 layer from tar", "[cli]") {
+    TempDir dir;
+    const auto tar = make_rootfs_tar();
+    const std::string tar_path = test::write_file(dir / "rootfs.tar", tar);
+    const std::string out_a = dir / "a";
+    const std::string out_b = dir / "b";
+
+    const auto a = run_convert({"--input", tar_path, "--out-dir", out_a,
+                                "--name", "rootfs"});
+    REQUIRE(a.exit_code == 0);
+    const auto b = run_convert({"--input", "-", "--out-dir", out_b,
+                                "--name", "rootfs"}, &tar);
+    REQUIRE(b.exit_code == 0);
+
+    const auto ja = nlohmann::json::parse(a.out);
+    const auto jb = nlohmann::json::parse(b.out);
+    REQUIRE(ja["converter"]["backend"].get<std::string>() == "builtin-ext2");
+    REQUIRE(ja["converter"]["filesystem"].get<std::string>() == "ext2");
+    const std::string layer_a = ja["lowers"][0]["file"].get<std::string>();
+    const std::string layer_b = jb["lowers"][0]["file"].get<std::string>();
+    REQUIRE(file_sha256(layer_a) == file_sha256(layer_b));
+    REQUIRE(ja["lowers"][0]["digest"].get<std::string>() ==
+            "sha256:" + file_sha256(layer_a));
+
+    Ext2View fs(read_layer_raw(layer_a));
+    const uint32_t etc_ino = fs.lookup({"etc"});
+    const auto etc = fs.inode(etc_ino);
+    REQUIRE((etc.mode & 0170000) == 0040000);
+    REQUIRE((etc.mode & 07777) == 0750);
+    REQUIRE(etc.uid == 5);
+    REQUIRE(etc.gid == 6);
+
+    const uint32_t hello_ino = fs.lookup({"etc", "hello.txt"});
+    const auto hello = fs.inode(hello_ino);
+    REQUIRE((hello.mode & 0170000) == 0100000);
+    REQUIRE((hello.mode & 07777) == 0640);
+    REQUIRE(hello.uid == 1000);
+    REQUIRE(hello.gid == 1001);
+    const auto hello_bytes = fs.read_file(hello_ino);
+    REQUIRE(std::string(hello_bytes.begin(), hello_bytes.end()) == "hello\n");
+
+    const uint32_t tool_ino = fs.lookup({"bin", "tool"});
+    REQUIRE(fs.read_file(tool_ino) == test::pattern_bytes(7000, 77));
+
+    const uint32_t link_ino = fs.lookup({"link-to-hello"});
+    const auto link = fs.inode(link_ino);
+    REQUIRE((link.mode & 0170000) == 0120000);
+    REQUIRE(link.uid == 7);
+    REQUIRE(link.gid == 8);
+    REQUIRE(fs.inline_symlink(link_ino) == "etc/hello.txt");
+}
+
+// NOTE: name on one source line (check-docs extracts names line-wise).
+TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a layer", "[cli]") {
+    TempDir dir;
+    std::vector<uint8_t> tar;
+    append_tar_entry(tar, "dev/null", '3', 0600, 0, 0);
+    tar.resize(tar.size() + 1024, 0);
+    const std::string tar_path = test::write_file(dir / "bad.tar", tar);
+    const std::string out_dir = dir / "out";
+
+    const auto result = run_convert({"--input", tar_path, "--out-dir", out_dir,
+                                     "--name", "bad"});
+    REQUIRE(result.exit_code == 1);
+    REQUIRE(result.err.find("unsupported tar entry type") != std::string::npos);
+    struct stat st {};
+    REQUIRE(::stat((out_dir + "/bad.lsmt").c_str(), &st) != 0);
+}

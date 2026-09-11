@@ -1,8 +1,8 @@
-# Binaries: obd-supervisor, obd-device, obdctl, obd-mkimage
+# Binaries: obd-supervisor, obd-device, obdctl, obd-mkimage, obd-convert
 
 ## Overview
 
-The repository builds four executables:
+The repository builds five executables:
 
 - **obd-supervisor** — the per-node daemon. It owns the control plane: a
   Unix domain socket accepting JSON-lines commands, and one isolated child
@@ -20,6 +20,10 @@ The repository builds four executables:
   prints a ready-to-use `lowers[]` config snippet on stdout. It exists to
   produce fixtures for tests and local bring-up, not for production image
   builds.
+- **obd-convert** — the deterministic rootfs-tar converter (ADR-0019). It
+  reads a ustar archive from a file or stdin, builds a bounded ext2-compatible
+  filesystem image without a device, mount, or host mkfs subprocess, seals it
+  as an LSMT-RO layer, and prints manifest metadata.
 
 Interactions: `obdctl → obd-supervisor` over the supervisor UDS (default
 `/run/overlaybd-elio/supervisor.sock`); `obd-supervisor → obd-device` by
@@ -161,11 +165,47 @@ stdout:
 which can be dropped into a per-image `config.json` for tests (see
 [config.md](./config.md)).
 
+### obd-convert
+
+```
+obd-convert --input <rootfs.tar|-> --out-dir <dir> [--name base]
+            [--size bytes] [--keep-raw]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--input PATH|-` | required | Rootfs ustar archive. `-` reads stdin. |
+| `--out-dir DIR` | required | Output directory; it is created if missing. |
+| `--name STR` | `layer` | Basename of the produced layer. The value must be a plain file stem using letters, digits, `.`, `_`, or `-`. |
+| `--size BYTES` | auto | Raw filesystem size. When omitted, the built-in backend picks the smallest 4 KiB-aligned size with room for the archive, rounded with slack. When provided, it must be a 4 KiB multiple and large enough for the contents. |
+| `--keep-raw` | off | Keep the intermediate `<out-dir>/.<name>.ext2.tmp` filesystem image for inspection. By default it is removed after the LSMT layer is written. |
+
+On success, `obd-convert` writes `<out-dir>/<name>.lsmt` and prints a JSON
+snippet compatible with a `lowers[]` entry plus converter metadata:
+
+```json
+{
+  "lowers": [
+    { "digest": "sha256:<hex>", "size": <bytes>, "file": "<blob path>" }
+  ],
+  "repoBlobUrl": "",
+  "converter": {
+    "backend": "builtin-ext2",
+    "filesystem": "ext2",
+    "raw_digest": "sha256:<hex>",
+    "virtual_size": <bytes>
+  }
+}
+```
+
+The built-in backend supports regular files, directories and short inline
+symlinks. It rejects unsupported tar entries before publishing an LSMT layer.
+
 ## Behavior & guarantees
 
 ### Exit behavior
 
-- All four binaries: exit `0` on success, `1` on runtime failure (message on
+- All five binaries: exit `0` on success, `1` on runtime failure (message on
   stderr, and for obd-device additionally a `failed` status report), `2` on
   usage errors (unknown argument, missing option value, missing required
   option). obdctl exits `0` exactly when the supervisor's reply carries
@@ -225,14 +265,14 @@ output).
 
 ### Concurrency and stability notes
 
-- obdctl and obd-mkimage are single-threaded, synchronous tools; they hold
-  no state between invocations.
+- obdctl, obd-mkimage and obd-convert are single-threaded, synchronous
+  tools; they hold no state between invocations.
 - The supervisor↔obdctl command protocol and the supervisor↔obd-device
   status protocol are wire contracts between binaries that may be upgraded
   independently; changes require an ADR (trigger T1, see
   [adr/README.md](./adr/README.md)).
 - Command-line parsing is exact-token matching: `--socket=PATH` style
-  combined forms are *not* accepted by any of the four binaries.
+  combined forms are *not* accepted by any of the five binaries.
 
 ## Testing
 
@@ -272,6 +312,14 @@ output).
   single-layer writer output reads back and merges correctly) and
   `format: zfile round-trip reads back the original content` (the ZFile
   writer output decompresses byte-identically).
+- `cli: obd-convert builds a deterministic ext2 layer from tar` — executes the
+  real converter twice, once from a tar file and once from stdin, requires
+  byte-identical LSMT sha256 output, verifies the printed digest/metadata, and
+  reads the produced layer back as an ext2 image to check file content, mode,
+  uid/gid and symlink target.
+- `cli: obd-convert rejects unsupported tar entries before writing a layer` —
+  proves unsupported tar entry types fail with exit 1 and do not publish an
+  LSMT output file.
 
 Run with:
 
@@ -293,6 +341,11 @@ ctest --test-dir build --output-on-failure
 - obd-mkimage builds single-layer images only, on a synchronous cold path;
   it is a fixture generator, not a replacement for the upstream
   `overlaybd-*` image toolchain.
+- obd-convert's built-in backend is intentionally bounded: ext2-compatible
+  output only, 4 KiB blocks, images up to 128 MiB, uid/gid up to 65535,
+  regular files, directories and short inline symlinks. It rejects PAX/GNU
+  long names, hardlinks, device nodes, FIFOs, sparse tar files, xattrs and
+  wider ext4 features until a pinned converter-local backend implements them.
 - obd-supervisor runs host `mkfs.<type>` for mode-3 blank creates only;
   the mkfs binaries are host prerequisites for that mode, never bundled
   (ADR-0014).

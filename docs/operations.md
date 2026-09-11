@@ -118,6 +118,23 @@ obd-mkimage --input raw.img --out-dir /var/lib/overlaybd-elio/blobs \
             --name base --zfile --zstd
 ```
 
+To build a deterministic image layer from a rootfs tar, use `obd-convert`
+(ADR-0019). It does not create a device, mount a filesystem, or run host
+`mkfs`; it builds the filesystem image in userspace and seals it as a standard
+LSMT layer:
+
+```bash
+obd-convert --input rootfs.tar --out-dir /var/lib/overlaybd-elio/blobs \
+            --name base
+# or stream input:
+tar -C rootfs -cf - . | obd-convert --input - \
+    --out-dir /var/lib/overlaybd-elio/blobs --name base
+```
+
+Paste the printed `lowers[]` entry into the image config. The `converter`
+metadata records the backend (`builtin-ext2`), raw filesystem digest and raw
+virtual size for build logs; it is not required by `config.json`.
+
 ## Creating devices: three modes (ADR-0014)
 
 `create` makes devices in one of three modes; blank (raw) devices are
@@ -184,7 +201,9 @@ created with `obdctl create-blank` (or the equivalent `create` with a
 > and layout heuristics, so two runs over the same input produce
 > different bytes and content-addressed layer reuse collapses. It exists
 > purely as a runtime convenience for scratch data disks (ADR-0014); the
-> deterministic image-build path is the pinned-library converter. The
+> deterministic image-build path is `obd-convert` (ADR-0019), whose default
+> built-in backend writes an ext2-compatible image without host formatting.
+> A future pinned libe2fs backend must keep the same boundary. The
 > supervisor enforces the boundary for its own convenience runs: a mode-3
 > device is marked at create time and `obdctl commit` refuses it with
 > "host mkfs ... cannot be sealed". A mode-2 blank that *you* format is
@@ -455,8 +474,13 @@ correlate by device id and by the supervisor's spawn logs.
   later data-file sync.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
   or mutate registry content (ADR-0007). Writable uppers are local-only;
-  `commit` (ADR-0014) seals an upper into a local layer file —
-  publishing it as an OCI artifact is the external CLI's job.
+  `commit` (ADR-0014) and `obd-convert` (ADR-0019) produce local layer files —
+  publishing them as OCI artifacts is the external CLI's job.
+- **Built-in converter bounds.** The default `obd-convert` backend is
+  deterministic and unprivileged, but intentionally small: ext2-compatible
+  output only, images up to 128 MiB, regular files, directories and short
+  symlinks. PAX/xattrs/devices/hardlinks/sparse tar entries require a future
+  backend.
 - **Credentials**: only `credentialConfig` `mode=file` is honored; other
   modes are ignored with a warning (see [config.md](./config.md)).
 - **One supervisor per node** is the expected topology; multiple
