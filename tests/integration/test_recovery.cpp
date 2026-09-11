@@ -115,6 +115,11 @@ size_t count_lines(const std::string& path) {
     return n;
 }
 
+bool status_has_no_trace(const nlohmann::json& status) {
+    const auto it = status.find("trace");
+    return it == status.end() || it->is_null();
+}
+
 }  // namespace
 
 TEST_CASE("supervisor: crashed device child is recovered with bounded respawns",
@@ -391,6 +396,845 @@ done
     CHECK(mask_rc == 0);
 }
 
+void check_delayed_trace_start_metadata_ownership(
+    const std::string& scenario) {
+    test::TempDir dir;
+    const std::string sock = dir / "s.sock";
+    const std::string config = test::write_file(
+        dir / "config.json", std::vector<uint8_t>{'{', '}'});
+    const std::string script = dir / "device.sh";
+    // The fake accepts trace_start immediately but stays alive so the
+    // supervisor can park the client handler after route_device_reply. That
+    // recreates the #65 window: reply accepted, client reply not yet built.
+    const std::string content = R"SH(#!/bin/sh
+printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
+while IFS= read -r line <&3; do
+    seq=$(printf '%s\n' "$line" | sed -n 's/.*"seq":\([0-9][0-9]*\).*/\1/p')
+    cmd=$(printf '%s\n' "$line" | sed -n 's/.*"cmd":"\([^"]*\)".*/\1/p')
+    if [ "$cmd" = trace_start ]; then
+        printf '{"reply":"trace_start","seq":%s,"ok":true,"path":"old-trace","duration_sec":60}\n' "$seq" >&3
+    elif [ "$cmd" = trace_stop ]; then
+        printf '{"reply":"trace_stop","seq":%s,"ok":true,"path":"old-trace","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":48,"records":2,"dropped":0}\n' "$seq" >&3
+    fi
+done
+)SH";
+    test::write_file(script,
+                     std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    sigset_t block, prev;
+    ::sigemptyset(&block);
+    ::sigaddset(&block, SIGTERM);
+    ::sigaddset(&block, SIGINT);
+    ::sigaddset(&block, SIGCHLD);
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &prev) == 0);
+
+    auto gate_owner = std::make_shared<supervisor::detail::DaemonTestGate>();
+    auto& gate = *gate_owner;
+    std::atomic<bool> done{false};
+    std::atomic<int> daemon_rc{-1};
+    std::vector<std::string> failures;
+    std::string starter_error;
+    nlohmann::json start_reply;
+    pid_t original_pid = -1;
+    auto check = [&](bool ok, const char* message) {
+        if (!ok) failures.emplace_back(message);
+    };
+    auto has_no_trace = [](const nlohmann::json& status) {
+        const auto it = status.find("trace");
+        return it == status.end() || it->is_null();
+    };
+    std::thread client([&] {
+        std::thread starter;
+        auto rpc = [&](const nlohmann::json& command) {
+            return nlohmann::json::parse(uds_rpc(sock, command.dump() + "\n"));
+        };
+        try {
+            for (int i = 0; i < 500 && !std::filesystem::exists(sock); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            const auto created = rpc({{"cmd", "create"},
+                                      {"id", "d1"},
+                                      {"config", config}});
+            if (!created.value("ok", false)) {
+                throw std::runtime_error("create failed");
+            }
+            const auto before = rpc({{"cmd", "status"}, {"id", "d1"}});
+            original_pid = before.at("pid").get<pid_t>();
+            check(has_no_trace(before), "fresh device unexpectedly has trace");
+
+            gate.arm("command_result");
+            starter = std::thread([&] {
+                try {
+                    start_reply = rpc({{"cmd", "trace_start"},
+                                       {"id", "d1"},
+                                       {"path", dir / "trace"},
+                                       {"duration_sec", 60}});
+                } catch (const std::exception& e) {
+                    starter_error = e.what();
+                }
+            });
+            if (!gate.wait()) {
+                throw std::runtime_error("trace_start handler did not park");
+            }
+            const auto routed = rpc({{"cmd", "status"}, {"id", "d1"}});
+            check(routed.at("pid") == original_pid,
+                  "routed status observed wrong child");
+            check(routed.at("trace").at("state") == "recording",
+                  "trace_start was not published at reply routing");
+
+            if (scenario == "recovery") {
+                check(::kill(original_pid, SIGKILL) == 0,
+                      "could not kill original child");
+                nlohmann::json current;
+                for (int i = 0; i < 500; ++i) {
+                    current = rpc({{"cmd", "status"}, {"id", "d1"}});
+                    if (current.value("recoveries", 0) == 1 &&
+                        current.value("state", "") == "ready") {
+                        break;
+                    }
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(10));
+                }
+                check(current.value("recoveries", 0) == 1,
+                      "replacement not published");
+                check(current.at("pid") != original_pid,
+                      "recovery reused original pid");
+                check(current.at("trace").at("state") == "lost",
+                      "old recording was not marked lost before recovery");
+                check(current.at("trace").at("reason") == "device_exit",
+                      "lost trace reason is not device_exit");
+            } else if (scenario == "reuse") {
+                const auto destroyed =
+                    rpc({{"cmd", "destroy"}, {"id", "d1"}});
+                check(destroyed.value("ok", false),
+                      "destroy before id reuse failed");
+                const auto recreated = rpc({{"cmd", "create"},
+                                            {"id", "d1"},
+                                            {"config", config}});
+                check(recreated.value("ok", false),
+                      "re-create with reused id failed");
+                const auto fresh = rpc({{"cmd", "status"}, {"id", "d1"}});
+                check(fresh.at("pid") != original_pid,
+                      "reused id kept original child");
+                check(has_no_trace(fresh),
+                      "fresh reused id inherited old trace while parked");
+            } else {
+                failures.emplace_back("unknown scenario: " + scenario);
+            }
+        } catch (const std::exception& e) {
+            failures.emplace_back(e.what());
+        }
+        gate.release();
+        if (starter.joinable()) starter.join();
+        if (!starter_error.empty()) failures.push_back(starter_error);
+        try {
+            check(start_reply.value("ok", false),
+                  "parked trace_start did not return success");
+            if (scenario == "recovery") {
+                const auto final = rpc({{"cmd", "status"}, {"id", "d1"}});
+                check(final.at("trace").at("state") == "lost",
+                      "late handler restored recording after recovery");
+                check(final.at("trace").at("reason") == "device_exit",
+                      "late handler changed lost reason");
+            } else if (scenario == "reuse") {
+                const auto final = rpc({{"cmd", "status"}, {"id", "d1"}});
+                check(has_no_trace(final),
+                      "late handler wrote trace into reused id");
+            }
+            check(rpc({{"cmd", "destroy"}, {"id", "d1"}})
+                      .value("ok", false),
+                  "final destroy failed");
+        } catch (const std::exception& e) {
+            failures.emplace_back(e.what());
+        }
+        done.store(true);
+    });
+    supervisor::DaemonConfig cfg;
+    cfg.socket_path = sock;
+    cfg.device_bin = script;
+    cfg.global_config = "";
+    cfg.max_recovery_attempts = scenario == "recovery" ? 1 : 0;
+    cfg.ready_timeout_sec = 3;
+    cfg.stop_timeout_sec = 1;
+    elio::run_config runtime;
+    runtime.num_threads = 4;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        elio::go_to(0, [&]() -> elio::coro::task<void> {
+            daemon_rc.store(co_await supervisor::detail::run_daemon_with_test_gate(
+                cfg, gate_owner));
+        });
+        while (!done.load()) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        ::kill(::getpid(), SIGTERM);
+        while (daemon_rc.load() < 0) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        co_return 0;
+    }, runtime);
+    client.join();
+    const int mask_rc = ::sigprocmask(SIG_SETMASK, &prev, nullptr);
+    std::string failure_text;
+    for (const auto& failure : failures) failure_text += failure + "\n";
+    INFO(failure_text);
+    INFO("scenario: " << scenario);
+    INFO("start reply: " << start_reply.dump());
+    CHECK(failures.empty());
+    CHECK_FALSE(gate.timeout());
+    CHECK(rc == 0);
+    CHECK(daemon_rc.load() == 0);
+    CHECK(mask_rc == 0);
+}
+
+void check_trace_stop_history_survives_eof() {
+    test::TempDir dir;
+    const std::string sock = dir / "s.sock";
+    const std::string config = test::write_file(
+        dir / "config.json", std::vector<uint8_t>{'{', '}'});
+    const std::string script = dir / "device.sh";
+    const std::string content = R"SH(#!/bin/sh
+printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
+while IFS= read -r line <&3; do
+    seq=$(printf '%s\n' "$line" | sed -n 's/.*"seq":\([0-9][0-9]*\).*/\1/p')
+    cmd=$(printf '%s\n' "$line" | sed -n 's/.*"cmd":"\([^"]*\)".*/\1/p')
+    if [ "$cmd" = trace_start ]; then
+        printf '{"reply":"trace_start","seq":%s,"ok":true,"path":"trace","duration_sec":60}\n' "$seq" >&3
+    elif [ "$cmd" = trace_stop ]; then
+        printf '{"reply":"trace_stop","seq":%s,"ok":true,"path":"trace","sha256":"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210","size":96,"records":4,"dropped":1}\n' "$seq" >&3
+    fi
+done
+)SH";
+    test::write_file(script,
+                     std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    sigset_t block, prev;
+    ::sigemptyset(&block);
+    ::sigaddset(&block, SIGTERM);
+    ::sigaddset(&block, SIGINT);
+    ::sigaddset(&block, SIGCHLD);
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &prev) == 0);
+
+    std::atomic<bool> done{false};
+    std::atomic<int> daemon_rc{-1};
+    std::vector<std::string> failures;
+    nlohmann::json after_eof;
+    auto check = [&](bool ok, const char* message) {
+        if (!ok) failures.emplace_back(message);
+    };
+    std::thread client([&] {
+        auto rpc = [&](const nlohmann::json& command) {
+            return nlohmann::json::parse(uds_rpc(sock, command.dump() + "\n"));
+        };
+        try {
+            for (int i = 0; i < 500 && !std::filesystem::exists(sock); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            const auto created = rpc({{"cmd", "create"},
+                                      {"id", "d1"},
+                                      {"config", config}});
+            if (!created.value("ok", false)) {
+                throw std::runtime_error("create failed");
+            }
+            const auto started = rpc({{"cmd", "trace_start"},
+                                      {"id", "d1"},
+                                      {"path", dir / "trace"},
+                                      {"duration_sec", 60}});
+            check(started.value("ok", false), "trace_start failed");
+            const auto stopped = rpc({{"cmd", "trace_stop"}, {"id", "d1"}});
+            check(stopped.value("ok", false), "trace_stop failed");
+            const auto before = rpc({{"cmd", "status"}, {"id", "d1"}});
+            const auto pid = before.at("pid").get<pid_t>();
+            check(before.at("trace").at("state") == "stopped",
+                  "stop did not publish stopped trace");
+            check(before.at("trace").at("reason") == "stopped",
+                  "stop did not publish stopped reason");
+            check(::kill(pid, SIGKILL) == 0, "could not kill stopped child");
+            for (int i = 0; i < 500; ++i) {
+                after_eof = rpc({{"cmd", "status"}, {"id", "d1"}});
+                if (after_eof.value("state", "") == "exited") break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            check(after_eof.value("state", "") == "exited",
+                  "stopped child exit was not observed");
+            check(after_eof.at("trace").at("state") == "stopped",
+                  "EOF changed stopped trace state");
+            check(after_eof.at("trace").at("reason") == "stopped",
+                  "EOF changed stopped trace reason");
+            check(after_eof.at("trace").at("sha256")
+                      .get<std::string>()
+                      .size() == 64,
+                  "stopped sha256 missing after EOF");
+            check(after_eof.at("trace").at("size") == 96,
+                  "stopped size changed after EOF");
+            check(rpc({{"cmd", "destroy"}, {"id", "d1"}})
+                      .value("ok", false),
+                  "destroy failed");
+        } catch (const std::exception& e) {
+            failures.emplace_back(e.what());
+        }
+        done.store(true);
+    });
+    supervisor::DaemonConfig cfg;
+    cfg.socket_path = sock;
+    cfg.device_bin = script;
+    cfg.global_config = "";
+    cfg.max_recovery_attempts = 0;
+    cfg.ready_timeout_sec = 3;
+    cfg.stop_timeout_sec = 1;
+    elio::run_config runtime;
+    runtime.num_threads = 4;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        elio::go_to(0, [&]() -> elio::coro::task<void> {
+            daemon_rc.store(co_await supervisor::run_daemon(cfg));
+        });
+        while (!done.load()) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        ::kill(::getpid(), SIGTERM);
+        while (daemon_rc.load() < 0) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        co_return 0;
+    }, runtime);
+    client.join();
+    const int mask_rc = ::sigprocmask(SIG_SETMASK, &prev, nullptr);
+    std::string failure_text;
+    for (const auto& failure : failures) failure_text += failure + "\n";
+    INFO(failure_text);
+    INFO("after EOF: " << after_eof.dump());
+    CHECK(failures.empty());
+    CHECK(rc == 0);
+    CHECK(daemon_rc.load() == 0);
+    CHECK(mask_rc == 0);
+}
+
+void check_timed_out_trace_start_reply_does_not_publish() {
+    test::TempDir dir;
+    const std::string sock = dir / "s.sock";
+    const std::string config = test::write_file(
+        dir / "config.json", std::vector<uint8_t>{'{', '}'});
+    const std::string script = dir / "device.sh";
+    const std::string commands = dir / "commands";
+    const std::string control = dir / "control";
+    REQUIRE(::mkfifo(control.c_str(), 0600) == 0);
+    const std::string content = "#!/bin/sh\n"
+        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+        "while IFS= read -r line <&3; do\n"
+        "    printf '%s\\n' \"$line\" >> \"" + commands + "\"\n"
+        "    seq=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"seq\":\\([0-9][0-9]*\\).*/\\1/p')\n"
+        "    cmd=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"cmd\":\"\\([^\"]*\\)\".*/\\1/p')\n"
+        "    if [ \"$cmd\" = trace_start ]; then\n"
+        "        while IFS= read -r action < \"" + control + "\"; do\n"
+        "            [ \"$action\" = reply ] && { printf '{\"reply\":\"trace_start\",\"seq\":%s,\"ok\":true,\"path\":\"late-trace\",\"duration_sec\":60}\\n' \"$seq\" >&3; break; }\n"
+        "            [ \"$action\" = eof ] && exit 0\n"
+        "        done\n"
+        "    fi\n"
+        "done\n";
+    test::write_file(script,
+                     std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    sigset_t block, prev;
+    ::sigemptyset(&block);
+    ::sigaddset(&block, SIGTERM);
+    ::sigaddset(&block, SIGINT);
+    ::sigaddset(&block, SIGCHLD);
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &prev) == 0);
+
+    auto gate = std::make_shared<supervisor::detail::DaemonTestGate>(
+        std::chrono::milliseconds(100));
+    std::atomic<bool> done{false};
+    std::atomic<int> daemon_rc{-1};
+    std::vector<std::string> failures;
+    nlohmann::json start_reply;
+    nlohmann::json status_while_parked;
+    nlohmann::json final_status;
+    auto check = [&](bool ok, const char* message) {
+        if (!ok) failures.emplace_back(message);
+    };
+    auto wait_until = [](auto&& condition) {
+        for (int i = 0; i < 500; ++i) {
+            if (condition()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return condition();
+    };
+    std::thread client([&] {
+        int control_fd = -1;
+        std::thread starter;
+        std::string start_error;
+        auto rpc = [&](const nlohmann::json& command) {
+            return nlohmann::json::parse(uds_rpc(sock, command.dump() + "\n"));
+        };
+        try {
+            control_fd = ::open(control.c_str(),
+                                O_RDWR | O_NONBLOCK | O_CLOEXEC);
+            if (control_fd < 0) {
+                throw std::system_error(errno, std::generic_category(),
+                                        "fixture FIFO open");
+            }
+            if (!wait_until([&] { return std::filesystem::exists(sock); })) {
+                throw std::runtime_error("listener did not appear");
+            }
+            const auto created = rpc({{"cmd", "create"},
+                                      {"id", "d1"},
+                                      {"config", config}});
+            if (!created.value("ok", false)) {
+                throw std::runtime_error("create failed");
+            }
+            gate->arm("command_result");
+            starter = std::thread([&] {
+                try {
+                    start_reply = rpc({{"cmd", "trace_start"},
+                                       {"id", "d1"},
+                                       {"path", dir / "trace"},
+                                       {"duration_sec", 60}});
+                } catch (const std::exception& e) {
+                    start_error = e.what();
+                }
+            });
+            if (!wait_until([&] { return count_lines(commands) == 1; })) {
+                throw std::runtime_error("trace_start did not reach fake child");
+            }
+            if (!gate->wait()) {
+                throw std::runtime_error("trace_start did not reach timeout gate");
+            }
+            const auto routed_before = gate->count("device_reply_routed");
+            const std::string action = "reply\n";
+            const ssize_t n = ::write(control_fd, action.data(), action.size());
+            if (n != static_cast<ssize_t>(action.size())) {
+                throw std::runtime_error("fixture FIFO reply write failed");
+            }
+            if (!wait_until([&] {
+                    return gate->count("device_reply_routed") > routed_before;
+                })) {
+                throw std::runtime_error("late trace_start reply was not routed");
+            }
+            status_while_parked = rpc({{"cmd", "status"}, {"id", "d1"}});
+            check(status_has_no_trace(status_while_parked),
+                  "late timed-out reply published trace metadata");
+            gate->release();
+            starter.join();
+            if (!start_error.empty()) failures.emplace_back(start_error);
+            check(!start_reply.value("ok", true),
+                  "trace_start did not report timeout");
+            check(start_reply.value("error", "") ==
+                      "device control channel timeout: d1",
+                  "trace_start reported the wrong timeout error");
+            final_status = rpc({{"cmd", "status"}, {"id", "d1"}});
+            check(status_has_no_trace(final_status),
+                  "timeout cleanup left trace metadata behind");
+            check(rpc({{"cmd", "destroy"}, {"id", "d1"}})
+                      .value("ok", false),
+                  "destroy failed");
+        } catch (const std::exception& e) {
+            failures.emplace_back(e.what());
+        }
+        gate->release();
+        if (control_fd >= 0) ::close(control_fd);
+        if (starter.joinable()) starter.join();
+        done.store(true);
+    });
+    supervisor::DaemonConfig cfg;
+    cfg.socket_path = sock;
+    cfg.device_bin = script;
+    cfg.global_config = "";
+    cfg.max_recovery_attempts = 0;
+    cfg.ready_timeout_sec = 3;
+    cfg.stop_timeout_sec = 1;
+    elio::run_config runtime;
+    runtime.num_threads = 4;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        elio::go_to(0, [&]() -> elio::coro::task<void> {
+            daemon_rc.store(co_await supervisor::detail::run_daemon_with_test_gate(
+                cfg, gate));
+        });
+        while (!done.load()) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        ::kill(::getpid(), SIGTERM);
+        while (daemon_rc.load() < 0) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        co_return 0;
+    }, runtime);
+    client.join();
+    const int mask_rc = ::sigprocmask(SIG_SETMASK, &prev, nullptr);
+    std::string failure_text;
+    for (const auto& failure : failures) failure_text += failure + "\n";
+    INFO(failure_text);
+    INFO("status while parked: " << status_while_parked.dump());
+    INFO("start reply: " << start_reply.dump());
+    INFO("final status: " << final_status.dump());
+    CHECK(failures.empty());
+    CHECK_FALSE(gate->timeout());
+    CHECK(rc == 0);
+    CHECK(daemon_rc.load() == 0);
+    CHECK(mask_rc == 0);
+}
+
+void check_malformed_trace_start_success_reply(const std::string& scenario) {
+    test::TempDir dir;
+    const std::string sock = dir / "s.sock";
+    const std::string config = test::write_file(
+        dir / "config.json", std::vector<uint8_t>{'{', '}'});
+    const std::string script = dir / "device.sh";
+    const std::string trace_reply =
+        scenario == "wrong_kind"
+            ? "printf '{\"reply\":\"resize\",\"seq\":%s,\"ok\":true,\"size\":4096}\\n' \"$seq\" >&3\n"
+            : "printf '{\"reply\":\"trace_start\",\"seq\":%s,\"ok\":true}\\n' \"$seq\" >&3\n";
+    const std::string content = "#!/bin/sh\n"
+        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+        "while IFS= read -r line <&3; do\n"
+        "    seq=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"seq\":\\([0-9][0-9]*\\).*/\\1/p')\n"
+        "    cmd=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"cmd\":\"\\([^\"]*\\)\".*/\\1/p')\n"
+        "    if [ \"$cmd\" = trace_start ]; then\n"
+        "        " + trace_reply +
+        "    fi\n"
+        "done\n";
+    test::write_file(script,
+                     std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    sigset_t block, prev;
+    ::sigemptyset(&block);
+    ::sigaddset(&block, SIGTERM);
+    ::sigaddset(&block, SIGINT);
+    ::sigaddset(&block, SIGCHLD);
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &prev) == 0);
+
+    std::atomic<bool> done{false};
+    std::atomic<int> daemon_rc{-1};
+    std::vector<std::string> failures;
+    nlohmann::json start_reply;
+    nlohmann::json status;
+    auto check = [&](bool ok, const char* message) {
+        if (!ok) failures.emplace_back(message);
+    };
+    std::thread client([&] {
+        auto rpc = [&](const nlohmann::json& command) {
+            return nlohmann::json::parse(uds_rpc(sock, command.dump() + "\n"));
+        };
+        try {
+            for (int i = 0; i < 500 && !std::filesystem::exists(sock); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            const auto created = rpc({{"cmd", "create"},
+                                      {"id", "d1"},
+                                      {"config", config}});
+            if (!created.value("ok", false)) {
+                throw std::runtime_error("create failed");
+            }
+            start_reply = rpc({{"cmd", "trace_start"},
+                               {"id", "d1"},
+                               {"path", dir / "trace"},
+                               {"duration_sec", 60}});
+            check(!start_reply.value("ok", true),
+                  "malformed trace_start reply was accepted");
+            check(start_reply.value("error", "") ==
+                      "malformed trace_start reply",
+                  "wrong malformed trace_start error");
+            status = rpc({{"cmd", "status"}, {"id", "d1"}});
+            check(status_has_no_trace(status),
+                  "malformed trace_start published trace metadata");
+            check(rpc({{"cmd", "destroy"}, {"id", "d1"}})
+                      .value("ok", false),
+                  "destroy failed");
+        } catch (const std::exception& e) {
+            failures.emplace_back(e.what());
+        }
+        done.store(true);
+    });
+    supervisor::DaemonConfig cfg;
+    cfg.socket_path = sock;
+    cfg.device_bin = script;
+    cfg.global_config = "";
+    cfg.max_recovery_attempts = 0;
+    cfg.ready_timeout_sec = 3;
+    cfg.stop_timeout_sec = 1;
+    elio::run_config runtime;
+    runtime.num_threads = 4;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        elio::go_to(0, [&]() -> elio::coro::task<void> {
+            daemon_rc.store(co_await supervisor::run_daemon(cfg));
+        });
+        while (!done.load()) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        ::kill(::getpid(), SIGTERM);
+        while (daemon_rc.load() < 0) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        co_return 0;
+    }, runtime);
+    client.join();
+    const int mask_rc = ::sigprocmask(SIG_SETMASK, &prev, nullptr);
+    std::string failure_text;
+    for (const auto& failure : failures) failure_text += failure + "\n";
+    INFO(failure_text);
+    INFO("scenario: " << scenario);
+    INFO("start reply: " << start_reply.dump());
+    INFO("status: " << status.dump());
+    CHECK(failures.empty());
+    CHECK(rc == 0);
+    CHECK(daemon_rc.load() == 0);
+    CHECK(mask_rc == 0);
+}
+
+
+void check_delayed_trace_stop_metadata_ownership() {
+    test::TempDir dir;
+    const std::string sock = dir / "s.sock";
+    const std::string config = test::write_file(
+        dir / "config.json", std::vector<uint8_t>{'{', '}'});
+    const std::string script = dir / "device.sh";
+    const std::string content = R"SH(#!/bin/sh
+printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
+while IFS= read -r line <&3; do
+    seq=$(printf '%s\n' "$line" | sed -n 's/.*"seq":\([0-9][0-9]*\).*/\1/p')
+    cmd=$(printf '%s\n' "$line" | sed -n 's/.*"cmd":"\([^"]*\)".*/\1/p')
+    if [ "$cmd" = trace_start ]; then
+        printf '{"reply":"trace_start","seq":%s,"ok":true,"path":"trace","duration_sec":60}\n' "$seq" >&3
+    elif [ "$cmd" = trace_stop ]; then
+        printf '{"reply":"trace_stop","seq":%s,"ok":true,"path":"trace","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":128,"records":8,"dropped":0}\n' "$seq" >&3
+    fi
+done
+)SH";
+    test::write_file(script,
+                     std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    sigset_t block, prev;
+    ::sigemptyset(&block);
+    ::sigaddset(&block, SIGTERM);
+    ::sigaddset(&block, SIGINT);
+    ::sigaddset(&block, SIGCHLD);
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &prev) == 0);
+
+    auto gate_owner = std::make_shared<supervisor::detail::DaemonTestGate>();
+    auto& gate = *gate_owner;
+    std::atomic<bool> done{false};
+    std::atomic<int> daemon_rc{-1};
+    std::vector<std::string> failures;
+    std::string stopper_error;
+    nlohmann::json stop_reply;
+    nlohmann::json stopped_old_entry;
+    nlohmann::json fresh_reused_entry;
+    nlohmann::json final_reused_entry;
+    pid_t original_pid = -1;
+    auto check = [&](bool ok, const char* message) {
+        if (!ok) failures.emplace_back(message);
+    };
+    std::thread client([&] {
+        std::thread stopper;
+        auto rpc = [&](const nlohmann::json& command) {
+            return nlohmann::json::parse(uds_rpc(sock, command.dump() + "\n"));
+        };
+        try {
+            for (int i = 0; i < 500 && !std::filesystem::exists(sock); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            const auto created = rpc({{"cmd", "create"},
+                                      {"id", "d1"},
+                                      {"config", config}});
+            if (!created.value("ok", false)) {
+                throw std::runtime_error("create failed");
+            }
+            const auto started = rpc({{"cmd", "trace_start"},
+                                      {"id", "d1"},
+                                      {"path", dir / "trace"},
+                                      {"duration_sec", 60}});
+            check(started.value("ok", false), "trace_start failed");
+            const auto before_stop = rpc({{"cmd", "status"}, {"id", "d1"}});
+            original_pid = before_stop.at("pid").get<pid_t>();
+            check(before_stop.at("trace").at("state") == "recording",
+                  "trace_start did not publish recording state");
+
+            gate.arm("command_result");
+            stopper = std::thread([&] {
+                try {
+                    stop_reply = rpc({{"cmd", "trace_stop"}, {"id", "d1"}});
+                } catch (const std::exception& e) {
+                    stopper_error = e.what();
+                }
+            });
+            if (!gate.wait()) {
+                throw std::runtime_error("trace_stop handler did not park");
+            }
+            stopped_old_entry = rpc({{"cmd", "status"}, {"id", "d1"}});
+            check(stopped_old_entry.at("pid") == original_pid,
+                  "parked stop status observed wrong child");
+            check(stopped_old_entry.at("trace").at("state") == "stopped",
+                  "trace_stop was not published at reply routing");
+            check(stopped_old_entry.at("trace").at("records") == 8,
+                  "trace_stop metadata was not published on old entry");
+
+            const auto destroyed = rpc({{"cmd", "destroy"}, {"id", "d1"}});
+            check(destroyed.value("ok", false), "destroy before id reuse failed");
+            const auto recreated = rpc({{"cmd", "create"},
+                                        {"id", "d1"},
+                                        {"config", config}});
+            check(recreated.value("ok", false), "re-create with reused id failed");
+            fresh_reused_entry = rpc({{"cmd", "status"}, {"id", "d1"}});
+            check(fresh_reused_entry.at("pid") != original_pid,
+                  "reused id kept original child");
+            check(status_has_no_trace(fresh_reused_entry),
+                  "fresh reused id inherited old stopped trace");
+        } catch (const std::exception& e) {
+            failures.emplace_back(e.what());
+        }
+        gate.release();
+        if (stopper.joinable()) stopper.join();
+        if (!stopper_error.empty()) failures.push_back(stopper_error);
+        try {
+            check(stop_reply.value("ok", false),
+                  "parked trace_stop did not return success");
+            final_reused_entry = rpc({{"cmd", "status"}, {"id", "d1"}});
+            check(status_has_no_trace(final_reused_entry),
+                  "late trace_stop handler wrote stopped trace into reused id");
+            check(rpc({{"cmd", "destroy"}, {"id", "d1"}})
+                      .value("ok", false),
+                  "final destroy failed");
+        } catch (const std::exception& e) {
+            failures.emplace_back(e.what());
+        }
+        done.store(true);
+    });
+    supervisor::DaemonConfig cfg;
+    cfg.socket_path = sock;
+    cfg.device_bin = script;
+    cfg.global_config = "";
+    cfg.max_recovery_attempts = 0;
+    cfg.ready_timeout_sec = 3;
+    cfg.stop_timeout_sec = 1;
+    elio::run_config runtime;
+    runtime.num_threads = 4;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        elio::go_to(0, [&]() -> elio::coro::task<void> {
+            daemon_rc.store(co_await supervisor::detail::run_daemon_with_test_gate(
+                cfg, gate_owner));
+        });
+        while (!done.load()) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        ::kill(::getpid(), SIGTERM);
+        while (daemon_rc.load() < 0) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        co_return 0;
+    }, runtime);
+    client.join();
+    const int mask_rc = ::sigprocmask(SIG_SETMASK, &prev, nullptr);
+    std::string failure_text;
+    for (const auto& failure : failures) failure_text += failure + "\n";
+    INFO(failure_text);
+    INFO("stop reply: " << stop_reply.dump());
+    INFO("stopped old entry: " << stopped_old_entry.dump());
+    INFO("fresh reused entry: " << fresh_reused_entry.dump());
+    INFO("final reused entry: " << final_reused_entry.dump());
+    CHECK(failures.empty());
+    CHECK_FALSE(gate.timeout());
+    CHECK(rc == 0);
+    CHECK(daemon_rc.load() == 0);
+    CHECK(mask_rc == 0);
+}
+
+void check_malformed_trace_stop_success_reply(const std::string& scenario) {
+    test::TempDir dir;
+    const std::string sock = dir / "s.sock";
+    const std::string config = test::write_file(
+        dir / "config.json", std::vector<uint8_t>{'{', '}'});
+    const std::string script = dir / "device.sh";
+    const std::string stop_reply =
+        scenario == "wrong_kind"
+            ? "printf '{\"reply\":\"resize\",\"seq\":%s,\"ok\":true,\"size\":4096}\\n' \"$seq\" >&3\n"
+            : "printf '{\"reply\":\"trace_stop\",\"seq\":%s,\"ok\":true,\"path\":false,\"sha256\":42,\"size\":\"big\",\"records\":0,\"dropped\":0}\\n' \"$seq\" >&3\n";
+    const std::string content = "#!/bin/sh\n"
+        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+        "while IFS= read -r line <&3; do\n"
+        "    seq=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"seq\":\\([0-9][0-9]*\\).*/\\1/p')\n"
+        "    cmd=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"cmd\":\"\\([^\"]*\\)\".*/\\1/p')\n"
+        "    if [ \"$cmd\" = trace_start ]; then\n"
+        "        printf '{\"reply\":\"trace_start\",\"seq\":%s,\"ok\":true,\"path\":\"trace\",\"duration_sec\":60}\\n' \"$seq\" >&3\n"
+        "    elif [ \"$cmd\" = trace_stop ]; then\n"
+        "        " + stop_reply +
+        "    fi\n"
+        "done\n";
+    test::write_file(script,
+                     std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    sigset_t block, prev;
+    ::sigemptyset(&block);
+    ::sigaddset(&block, SIGTERM);
+    ::sigaddset(&block, SIGINT);
+    ::sigaddset(&block, SIGCHLD);
+    REQUIRE(::sigprocmask(SIG_BLOCK, &block, &prev) == 0);
+
+    std::atomic<bool> done{false};
+    std::atomic<int> daemon_rc{-1};
+    std::vector<std::string> failures;
+    nlohmann::json trace_stop_reply;
+    nlohmann::json status_after_stop;
+    auto check = [&](bool ok, const char* message) {
+        if (!ok) failures.emplace_back(message);
+    };
+    std::thread client([&] {
+        auto rpc = [&](const nlohmann::json& command) {
+            return nlohmann::json::parse(uds_rpc(sock, command.dump() + "\n"));
+        };
+        try {
+            for (int i = 0; i < 500 && !std::filesystem::exists(sock); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            const auto created = rpc({{"cmd", "create"},
+                                      {"id", "d1"},
+                                      {"config", config}});
+            if (!created.value("ok", false)) {
+                throw std::runtime_error("create failed");
+            }
+            const auto started = rpc({{"cmd", "trace_start"},
+                                      {"id", "d1"},
+                                      {"path", dir / "trace"},
+                                      {"duration_sec", 60}});
+            check(started.value("ok", false), "trace_start failed");
+            trace_stop_reply = rpc({{"cmd", "trace_stop"}, {"id", "d1"}});
+            check(!trace_stop_reply.value("ok", true),
+                  "malformed trace_stop reply was accepted");
+            check(trace_stop_reply.value("error", "") ==
+                      "malformed trace_stop reply",
+                  "wrong malformed trace_stop error");
+            status_after_stop = rpc({{"cmd", "status"}, {"id", "d1"}});
+            check(status_after_stop.at("trace").at("state") == "recording",
+                  "malformed trace_stop published stopped metadata");
+            check(rpc({{"cmd", "destroy"}, {"id", "d1"}})
+                      .value("ok", false),
+                  "destroy failed");
+        } catch (const std::exception& e) {
+            failures.emplace_back(e.what());
+        }
+        done.store(true);
+    });
+    supervisor::DaemonConfig cfg;
+    cfg.socket_path = sock;
+    cfg.device_bin = script;
+    cfg.global_config = "";
+    cfg.max_recovery_attempts = 0;
+    cfg.ready_timeout_sec = 3;
+    cfg.stop_timeout_sec = 1;
+    elio::run_config runtime;
+    runtime.num_threads = 4;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        elio::go_to(0, [&]() -> elio::coro::task<void> {
+            daemon_rc.store(co_await supervisor::run_daemon(cfg));
+        });
+        while (!done.load()) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        ::kill(::getpid(), SIGTERM);
+        while (daemon_rc.load() < 0) co_await elio::time::sleep_for(
+            std::chrono::milliseconds(10));
+        co_return 0;
+    }, runtime);
+    client.join();
+    const int mask_rc = ::sigprocmask(SIG_SETMASK, &prev, nullptr);
+    std::string failure_text;
+    for (const auto& failure : failures) failure_text += failure + "\n";
+    INFO(failure_text);
+    INFO("scenario: " << scenario);
+    INFO("trace_stop reply: " << trace_stop_reply.dump());
+    INFO("status after stop: " << status_after_stop.dump());
+    CHECK(failures.empty());
+    CHECK(rc == 0);
+    CHECK(daemon_rc.load() == 0);
+    CHECK(mask_rc == 0);
+}
+
 }  // namespace
 
 TEST_CASE("supervisor: recovery publishes child and count together", "[supervisor][recovery-snapshot]") {
@@ -403,6 +1247,42 @@ TEST_CASE("supervisor: status owns its child generation and trace snapshot", "[s
 
 TEST_CASE("supervisor: list owns its child generation and trace snapshot", "[supervisor][recovery-snapshot]") {
     check_recovery_observation("list");
+}
+
+TEST_CASE("supervisor: trace start metadata is owned by crashed generation", "[supervisor][trace-metadata]") {
+    check_delayed_trace_start_metadata_ownership("recovery");
+}
+
+TEST_CASE("supervisor: trace start metadata cannot rewrite a reused id", "[supervisor][trace-metadata]") {
+    check_delayed_trace_start_metadata_ownership("reuse");
+}
+
+TEST_CASE("supervisor: timed-out trace start reply cannot publish metadata", "[supervisor][trace-metadata]") {
+    check_timed_out_trace_start_reply_does_not_publish();
+}
+
+TEST_CASE("supervisor: trace start rejects wrong success discriminator", "[supervisor][trace-metadata]") {
+    check_malformed_trace_start_success_reply("wrong_kind");
+}
+
+TEST_CASE("supervisor: trace start rejects success without metadata", "[supervisor][trace-metadata]") {
+    check_malformed_trace_start_success_reply("missing_fields");
+}
+
+TEST_CASE("supervisor: trace stop metadata cannot rewrite a reused id", "[supervisor][trace-metadata]") {
+    check_delayed_trace_stop_metadata_ownership();
+}
+
+TEST_CASE("supervisor: trace stop rejects wrong success discriminator", "[supervisor][trace-metadata]") {
+    check_malformed_trace_stop_success_reply("wrong_kind");
+}
+
+TEST_CASE("supervisor: trace stop rejects malformed success metadata", "[supervisor][trace-metadata]") {
+    check_malformed_trace_stop_success_reply("wrong_types");
+}
+
+TEST_CASE("supervisor: trace stop history survives child EOF", "[supervisor][trace-metadata]") {
+    check_trace_stop_history_survives_eof();
 }
 
 namespace {
