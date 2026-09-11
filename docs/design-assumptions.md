@@ -152,3 +152,16 @@ keep flowing through P2P). The rules:
   wait or local skip result.
 - **Source clients stay class-agnostic** — the funnel governs admission,
   never source selection (A9's fallback semantics are untouched).
+
+
+## A13. Build-side conversion is deterministic and device-free
+
+Rootfs-tar image conversion is a cold build path, never a runtime data-plane
+operation. `obd-convert` (ADR-0019) must build local layer files without a
+block device, mount, or host `mkfs` subprocess, and identical tar bytes plus
+identical options must produce byte-identical LSMT layer bytes. The default
+backend keeps only tar metadata in memory and spools payloads to disk before
+writing a deterministic ext2-compatible raw image. Future converter-local
+backends, including any pinned libe2fs backend, must preserve this contract
+and must not add dependencies to image assembly, the supervisor, source reads,
+or ublk data-plane targets.

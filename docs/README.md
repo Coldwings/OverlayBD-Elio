@@ -21,7 +21,7 @@ contract), testing status, and stability guarantees.
 | [image.md](./image.md) | `src/image` — config.json parsing and image assembly (read-only or with a writable upper) | Implemented, tests passing |
 | [ublk.md](./ublk.md) | `src/ublk` — ublk control plane, per-queue data plane, Elio bridge | Implemented, tests passing |
 | [supervisor.md](./supervisor.md) | `src/supervisor` — daemon, per-device child lifecycle, control protocol | Implemented, tests passing |
-| [binaries.md](./binaries.md) | `obd-supervisor`, `obd-device`, `obdctl`, `obd-mkimage` — usage and behavior | Implemented, tests passing |
+| [binaries.md](./binaries.md) | `obd-supervisor`, `obd-device`, `obdctl`, `obd-mkimage`, `obd-convert` — usage and behavior | Implemented, tests passing |
 | [config.md](./config.md) | configuration reference — global config, per-image config.json, compatibility notes | Living contract |
 | [testing.md](./testing.md) | test strategy — unit, integration, privileged ublk E2E, fixtures | Living policy |
 | [operations.md](./operations.md) | deployment and operations guide | Living policy |

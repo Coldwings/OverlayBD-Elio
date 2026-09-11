@@ -30,7 +30,7 @@ A read-first block-device stack for OverlayBD-format container images:
 
 Binaries: `obd-supervisor` (daemon), `obd-device` (per-device server, spawned
 by the supervisor), `obdctl` (control CLI), `obd-mkimage` (test-image
-generator).
+generator), `obd-convert` (deterministic rootfs-tar converter).
 
 ## Repository layout
 
@@ -42,7 +42,7 @@ src/image/        image assembly from overlaybd-compatible config.json
 src/ublk/         ublk control + per-queue data plane + Elio bridge
 src/supervisor/   daemon, child-process lifecycle, control-socket protocol
 src/cmd/          binary entry points (obd-supervisor, obd-device)
-tools/            obdctl, obd-mkimage
+tools/            obdctl, obd-mkimage, obd-convert
 tests/unit/       Catch2 unit tests
 tests/integration/  end-to-end tests (mock registry; ublk tests self-skip without /dev/ublk-control)
 docs/             official, git-tracked documentation (English)

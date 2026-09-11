@@ -24,10 +24,9 @@ images built by upstream `overlaybd-*` tools load identically here:
   single-file LSMT with in-place edit and seal compaction), and
   `MergedWritable` (copy-on-write merged view implementing
   `source::WritableBlobSource`).
-- **Fixture writers** (`writer.hpp`) — synchronous cold-path writers that
-  produce upstream-readable sealed ZFile and LSMT files; used by
-  `obd-mkimage` and the test fixtures. The data plane never writes through
-  these.
+- **Cold-path writers** (`writer.hpp`) — synchronous writers that produce
+  upstream-readable sealed ZFile and LSMT files for `obd-mkimage`,
+  `obd-convert`, and test fixtures. The data plane never writes through these.
 - **Trace codec** (`trace.hpp`) — the upstream OverlayBD prefetch trace
   blob (ADR-0013): an in-memory parser and conforming writer for
   the raw-struct wire format specified in
@@ -779,7 +778,7 @@ plus a writable top layer, as one block source.
   dispatches WRITE/FLUSH/DISCARD/WRITE_ZEROES to; a read-only image root
   simply does not implement the interface and writes/discards get `-EROFS`.
 
-### `src/format/writer.hpp` — fixture writers (`namespace obd::format`)
+### `src/format/writer.hpp` — cold-path writers (`namespace obd::format`)
 
 `src/format/writer.hpp::generate_uuid`
 
@@ -840,8 +839,10 @@ region digests and the index CRC when `calc_digest` is set.
 
 Both writers are **synchronous cold-path utilities** (plain POSIX IO, retry
 on `EINTR`, throw on error). Produced files are byte-compatible with
-upstream overlaybd readers. Used by `obd-mkimage` and the test fixtures;
-the data plane never writes.
+upstream overlaybd readers. Used by `obd-mkimage`, `obd-convert` and the test
+fixtures; the data plane never writes. Callers that need byte-identical output
+must pass deterministic writer options; the raw writer's default UUID is random
+for fixture convenience.
 
 ### `src/format/trace.hpp` — `namespace obd::format::trace`
 
@@ -955,6 +956,12 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
   `format: empty lsmt layer bytes are deterministic per virtual size`);
   an empty commit (`seal` of a never-written upper, empty `user_tag`)
   reproduces the base exactly.
+- **Converter determinism (ADR-0019).** `obd-convert` writes a deterministic
+  raw filesystem image first, then calls `write_lsmt_single_layer` with an
+  explicit UUID derived from that raw image's SHA-256 digest and a fixed
+  converter tag, using a private temporary workspace before atomically
+  publishing the final path. The resulting LSMT file is a standard sealed lower;
+  pinned by `cli: obd-convert builds a deterministic ext2 layer from tar`.
 - **Error channels.** Cold paths (`open`, `parse`, writers) throw
   `obd::format_error` / `obd::error`; hot paths (`pread`/`pwrite`/`flush`)
   return negative -errno and never throw (the `source::BlobSource`

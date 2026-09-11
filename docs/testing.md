@@ -1140,6 +1140,27 @@ Every test, grouped by area, with the property it guards.
   forwarded, not refused. The test server's accept is bounded, so a CLI
   that wrongly rejects an argument fails the assertion instead of hanging
   the job (#11).
+- `cli: obd-convert builds a deterministic ext2 layer from tar` — the REAL
+  converter binary consumes the same rootfs tar from a file and from stdin,
+  emits byte-identical sealed LSMT layers, reports the correct digest and
+  metadata, and the test reads the layer back as an ext2 image to verify file
+  content including a single-indirect regular file, explicit `0000` modes,
+  uid/gid and short symlink target (ADR-0019). It also verifies an explicit
+  aligned `--size` value controls the raw filesystem virtual size.
+- `cli: obd-convert atomically replaces existing output symlinks` — pre-creates
+  symlinks at the final LSMT and kept-raw output paths, then verifies
+  `obd-convert` replaces those paths with regular files without truncating the
+  symlink target.
+- `cli: obd-convert reports usage errors with exit 2` — unknown options,
+  missing option values, and non-numeric `--size` values are classified as
+  usage errors rather than runtime conversion failures.
+- `cli: obd-convert rejects unsupported tar entries before writing a layer` —
+  a tar entry outside the built-in backend's feature set, a checksum-valid
+  non-ustar header, an empty stream, a malformed two-zero-block end marker, a
+  regular file beyond the single-indirect backend limit, a too-small explicit
+  `--size`, aggregate payloads beyond the image budget, a directory requiring
+  more than 12 data blocks, or a tree requiring more than 32768 inodes exits 1
+  with a clear error and leaves no published LSMT layer behind.
 
 ### integration
 

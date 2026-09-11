@@ -140,3 +140,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0016](./0016-persistence-never-gates-boot.md) | Layer persistence is best-effort — an unusable layer dir degrades to remote-only, never fails assembly | accepted |
 | [0017](./0017-self-mode-bearer-url-info-expiry.md) | Cap Self-mode Bearer URL-info cache by token expiry | accepted |
 | [0018](./0018-download-trycnt-structural-boundary.md) | Treat invalid download tryCnt as a structural configuration error | proposed |
+| [0019](./0019-streaming-tar-converter.md) | Build tar streams into deterministic device-free LSMT layers | accepted |

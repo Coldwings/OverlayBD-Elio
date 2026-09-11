@@ -27,6 +27,8 @@ of pulling and unpacking full image layers first.
 - **Writable uppers** — optional copy-on-write upper layers: a sparse
   file, or an in-place-edit LSMT-RW layer that seals into a standard LSMT
   lower (ADR-0008).
+- **Deterministic local builds** — `obd-convert` turns a rootfs tar stream into
+  a sealed LSMT layer without a block device, mount, or host mkfs (ADR-0019).
 
 ## Architecture
 
@@ -93,7 +95,7 @@ src/image/        image assembly from overlaybd-compatible config.json
 src/ublk/         ublk control + per-queue data plane + Elio bridge
 src/supervisor/   daemon, child lifecycle, control protocol
 src/cmd/          obd-supervisor, obd-device
-tools/            obdctl, obd-mkimage
+tools/            obdctl, obd-mkimage, obd-convert
 tests/            Catch2 unit + integration tests
 docs/             official documentation (see docs/README.md)
 docs/adr/         Architecture Decision Records
@@ -118,5 +120,6 @@ in-place-edit LSMT-RW with seal), discard/write-zeroes plumbing
 persisted at flush/checkpoint),
 ublk data plane, supervisor process model with ublk
 USER_RECOVERY crash recovery (ADR-0010), structural warm-up, trace replay,
-and supervisor-driven trace recording (ADR-0012/0013). Deferred by design:
-TurboOCI and the upstream dynamic prefetch file-list mode.
+supervisor-driven trace recording (ADR-0012/0013), and deterministic rootfs
+conversion to local LSMT layers (ADR-0019). Deferred by design: TurboOCI and
+the upstream dynamic prefetch file-list mode.
