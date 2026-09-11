@@ -218,47 +218,70 @@ elio::coro::task<void> TraceRecorder::run_timer(
 elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
     std::string reason) {
     // A concurrent stop while another caller is finalizing (an explicit
-    // stop racing the duration expiry) WAITS for that finalize and then
-    // reports its cached result below — never a spurious "no recording"
-    // error. The finalize is a bounded in-memory drain plus one file
-    // write, so the poll is short.
-    for (;;) {
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            if (state_ != State::Finalizing) break;
-        }
-        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
-    }
+    // stop racing the duration expiry) captures that finalization's
+    // completion object and waits for exactly that result. It must not
+    // poll the global state alone: the owner can publish Idle and a new
+    // start can enter Recording before a waiter wakes.
     int fd;
     std::string path;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (state_ != State::Recording) {
-            // Idempotent stop: report the cached finalize when there was
-            // one (a stop racing the expiry gets the expiry's stats).
-            if (last_.has_value()) co_return *last_;
-            FinalizeResult res;
-            res.error = "no trace recording in progress";
-            co_return res;
+    std::shared_ptr<FinalizeCompletion> joined_finalize;
+    std::shared_ptr<FinalizeCompletion> owned_finalize;
+    bool stop_claim_hook_ran = false;
+    for (;;) {
+        std::function<elio::coro::task<void>()> stop_claim_hook;
+        bool wait_for_finalizer = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (joined_finalize) {
+                if (joined_finalize->result.has_value()) {
+                    co_return *joined_finalize->result;
+                }
+                wait_for_finalizer = true;
+            } else if (state_ == State::Finalizing) {
+                joined_finalize = finalizing_;
+                wait_for_finalizer = true;
+            } else if (state_ != State::Recording) {
+                // Idempotent stop: report the cached finalize when there was
+                // one (a stop racing the expiry gets the expiry's stats).
+                if (last_.has_value()) co_return *last_;
+                FinalizeResult res;
+                res.error = "no trace recording in progress";
+                co_return res;
+            } else if (!stop_claim_hook_ran && stop_claim_hook_) {
+                stop_claim_hook = stop_claim_hook_;
+                stop_claim_hook_ran = true;
+            } else {
+                state_ = State::Finalizing;
+                ++generation_;  // invalidate the duration timer
+                owned_finalize = std::make_shared<FinalizeCompletion>();
+                owned_finalize->generation = generation_;
+                finalizing_ = owned_finalize;
+                fd = fd_;
+                fd_ = -1;
+                path = path_;
+                if (timer_cancel_) timer_cancel_->cancel();  // immediate exit
+                // Drop the hot-path gate inside the same lock hold: no record()
+                // must slip into pending_ after the drain below has copied it
+                // (the pre-fix order released the lock first, leaving a window
+                // where a late record() appended into the drained queue and was
+                // silently lost).
+                active_.store(false, std::memory_order_release);
+                break;
+            }
         }
-        state_ = State::Finalizing;
-        ++generation_;  // invalidate the duration timer
-        fd = fd_;
-        fd_ = -1;
-        path = path_;
-        if (timer_cancel_) timer_cancel_->cancel();  // immediate exit
-        // Drop the hot-path gate inside the same lock hold: no record()
-        // must slip into pending_ after the drain below has copied it
-        // (the pre-fix order released the lock first, leaving a window
-        // where a late record() appended into the drained queue and was
-        // silently lost).
-        active_.store(false, std::memory_order_release);
+        if (stop_claim_hook) {
+            co_await stop_claim_hook();
+        } else if (wait_for_finalizer) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
     }
     FinalizeResult res =
         co_await finalize_locked_state(fd, std::move(path), reason);
     {
         std::lock_guard<std::mutex> lk(mu_);
         last_ = res;
+        if (owned_finalize) owned_finalize->result = res;
+        if (finalizing_ == owned_finalize) finalizing_.reset();
         state_ = State::Idle;
         on_expire_ = nullptr;
     }
