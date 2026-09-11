@@ -15,8 +15,10 @@ on a host block device, mount, or `mkfs` subprocess. It named a pinned
 libe2fs/e2fsprogs fork as the upstream-proven way to build ext filesystems as a
 pure library. This ADR updates that converter-backend detail for the first
 repository-owned converter: the initial accepted scope is the dependency-free
-built-in backend that can run in the default build and CI, while a pinned
-libe2fs backend remains a future converter-local extension.
+built-in backend that can run in the default build and CI. Because the built-in
+backend is always present, the initial converter has no separate
+backend-enabled CI dimension; a pinned libe2fs backend remains a future
+converter-local extension with its own build flag and CI matrix if added.
 
 The project already has byte-compatible LSMT writers and deterministic seal
 machinery. The missing piece is a rootfs-tar reader plus filesystem-image
@@ -31,8 +33,8 @@ deterministic ext2-compatible filesystem image with the built-in backend, seals
 that raw image as a single LSMT-RO layer, and prints manifest metadata
 (`digest`, `size`, `file`, and converter fields) on stdout.
 
-The built-in backend is the default no-extra-dependency backend and satisfies
-the current #41 converter scope. It must not invoke host `mkfs`, open a block
+The built-in backend is the default no-extra-dependency backend for the first
+accepted converter implementation. It must not invoke host `mkfs`, open a block
 device, or mount anything. All filesystem fields that would otherwise vary by
 host or time are pinned: timestamps are zero, filesystem identity is
 deterministic/static, directory order is stable, and the LSMT UUID is derived

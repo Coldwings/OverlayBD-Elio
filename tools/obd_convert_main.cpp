@@ -479,7 +479,6 @@ struct TarReader {
             full_write(out, buf.data(), chunk);
             left -= chunk;
         }
-        if (::fsync(out) != 0) obd::throw_errno(errno, "fsync failed for payload spool");
         return path;
     }
 
@@ -560,6 +559,9 @@ struct TarReader {
                 if (size > kMaxBuiltInFileBytes) {
                     throw std::runtime_error("built-in ext2 backend file is too large: " + name);
                 }
+                // Reserve declared ext2 payload blocks before reading bytes so an
+                // oversized archive cannot fill the temporary workspace and fail
+                // only after final image sizing.
                 reserve_regular_file_payload(size, name);
                 node->size = size;
                 if (size != 0) node->spool_path = spool_payload(size);
