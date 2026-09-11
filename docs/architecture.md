@@ -327,18 +327,19 @@ contracts above:
   from restart-recoverable inputs: sealed lowers and sparse writable
   extents can be reopened, but an unsealed LSMT-RW upper is not reopened
   by recovery even if graceful shutdown wrote a checkpoint.
-- **Prefetch** covers the structural head/tail warm-up (ADR-0012) and
-  trace replay (the upstream trace blob IS replayed through `populate`
-  when the image config marks an `accelerationLayer`, ADR-0013 — see
-  `docs/image.md`). These paths are admitted at the device's ADR-0012
-  funnel as the Prefetch scavenger class, and the `prefetch` config
-  section's `enable` switch is honored for structural warm-up and trace
-  replay. LayerStore background fill is a separate ADR-0012 Fill
+- **Prefetch** covers only the active populate paths: structural
+  head/tail warm-up (ADR-0012) and trace replay (the upstream trace blob
+  IS replayed through `populate` when the image config marks an
+  `accelerationLayer`, ADR-0013 — see `docs/image.md`). Those two paths
+  are admitted at the device's ADR-0012 funnel as the Prefetch scavenger
+  class, and the `prefetch` config section's `enable` switch is honored
+  for both. LayerStore background fill is a separate ADR-0012 Fill
   scavenger class behind Prefetch and is governed by the `download`
   config. Trace recording is a supervisor command path (ADR-0013; see
-  `docs/supervisor.md`) that records fully satisfied remote reads at the
-  trace tap; it does not create a separate Prefetch traffic class, and
-  issue #33 tracks filtering recordings down to OnDemand reads only.
+  `docs/supervisor.md`) that passively records fully satisfied remote
+  reads at the trace tap; it does not call `populate` or use the Prefetch
+  class, and issue #33 tracks filtering recordings down to OnDemand reads
+  only.
 - **Discard / punch-hole** is supported only for writable devices
   (ADR-0009). Read-only images do not advertise discard limits, so the
   kernel never issues discard/write-zeroes to them; writable sparse
