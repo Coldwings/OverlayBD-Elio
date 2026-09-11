@@ -296,11 +296,10 @@ Runbook notes:
 
 - **Record from a throwaway container.** The recording is only as clean
   as the workload: run the cold-path you want warmed later (app start,
-  dependency load) once, then stop. Structural warm-up, trace replay,
-  and background-fill traffic are remote reads too and would be recorded
-  — for a pristine workload trace, create the recording device with
-  `prefetch_enable: false` and `download.enable: false` in the global
-  config.
+  dependency load) once, then stop. The recorder filters the source
+  traffic class and records guest-driven OnDemand misses only; structural
+  warm-up, trace replay, and background fill may run during the window
+  without polluting the trace.
 - **The duration bound is enforced device-side** (1..3600 s, default
   300). A crashed or disconnected CLI can never leak a recording: on
   expiry the device finalizes exactly like an explicit stop, and the
@@ -316,9 +315,10 @@ Runbook notes:
   project's own `prefetch.trace` path. `dropped` counts reads shed
   under extreme pressure (bounded in-memory buffer); the blob remains
   valid and replayable, just with holes in its coverage.
-- **Only fully-satisfied REMOTE reads are recorded** (local cache hits
-  produce no record); offsets are payload offsets (the tar wrapper is
-  translated out) matching what the replay path consumes.
+- **Only fully-satisfied OnDemand REMOTE reads are recorded** (local
+  cache hits and synthetic Prefetch/Fill traffic produce no record);
+  offsets are payload offsets (the tar wrapper is translated out)
+  matching what the replay path consumes.
 - **Packaging into an image is external** (ADR-0014's tar bundle,
   member name `trace`, plus an `acceleration-layer` config entry); the
   daemon deliberately never rewrites image configs. When deriving a new

@@ -626,6 +626,16 @@ prefix is `/dart`).
 ```cpp
 enum class ReadClass : int { OnDemand = 0, Prefetch = 1, Fill = 2 };
 
+class ReadClassAwareSource {
+public:
+    virtual elio::coro::task<ssize_t> pread_with_class(
+        ReadClass cls, void* buf, size_t count, uint64_t offset) = 0;
+};
+
+elio::coro::task<ssize_t> pread_with_class(BlobSource& source,
+                                           ReadClass cls, void* buf,
+                                           size_t count, uint64_t offset);
+
 class AdmissionFunnel final {
 public:
     struct Config {
@@ -698,6 +708,11 @@ admission funnel (ADR-0012; see Concepts §"Read admission funnel").
 - The counters are relaxed atomic snapshots, safe to poll from any
   thread; `scavenger_waits()` counts queue events — the observable "the
   funnel is throttling" signal.
+- `ReadClassAwareSource` / `pread_with_class(source, cls, ...)` is the
+  opt-in metadata path for decorators that need the ADR-0012 class of a
+  remote read. Sources that do not implement the optional hook receive a
+  normal `BlobSource::pread`. Image trace recording uses this to record
+  only OnDemand traffic while leaving the base `BlobSource` API stable.
 - The `Config` window parameters are internal (the ADR-0012 window is
   not operator-configured); image assembly uses the defaults.
 
@@ -1279,12 +1294,12 @@ directly.
   is recognized in image assembly; see `docs/image.md`) both ride
   `populate` at the ADR-0012 Prefetch scavenger class. Supervisor-driven
   trace recording is implemented by a `TraceRecordSource` tap around the
-  remote source path and records only fully satisfied remote `pread`s:
-  when a configured `dir` opens an active `LayerStore`, the tap observes
-  reads below that store; no-`dir` lowers and ADR-0016 degraded
-  remote-only chains are tapped before the direct `AdmissionSource`
-  wrapper. Issue #33 tracks narrowing recordings to OnDemand traffic
-  only. The dynamic file-list fallback is unsupported by design;
+  remote source path and records only fully satisfied OnDemand remote
+  `pread`s: when a configured `dir` opens an active `LayerStore`, the
+  tap observes class-tagged reads below that store; no-`dir` lowers and
+  ADR-0016 degraded remote-only chains are tapped before the direct
+  `AdmissionSource` wrapper. Prefetch and Fill traffic is filtered out
+  by class. The dynamic file-list fallback is unsupported by design;
   detaching warm-up/replay off the bring-up path (now safe under the
   funnel) remains the open follow-up.
 - **credentialConfig mode=file only** — inline/secret credential modes are

@@ -87,6 +87,25 @@ enum class ReadClass : int {
     Fill = 2,      // background layer fill: scavenger, lowest priority
 };
 
+/// Optional decorator hook for sources that need to know the ADR-0012
+/// class of a remote read without widening BlobSource's base contract.
+/// Callers use the free pread_with_class helper below; ordinary sources
+/// continue to receive plain pread().
+class ReadClassAwareSource {
+public:
+    virtual ~ReadClassAwareSource() = default;
+
+    virtual elio::coro::task<ssize_t> pread_with_class(
+        ReadClass cls, void* buf, size_t count, uint64_t offset) = 0;
+};
+
+/// Forwards a class-tagged remote read when the source supports it;
+/// otherwise falls back to BlobSource::pread. This keeps the metadata
+/// path opt-in for taps such as TraceRecordSource.
+elio::coro::task<ssize_t> pread_with_class(BlobSource& source, ReadClass cls,
+                                           void* buf, size_t count,
+                                           uint64_t offset);
+
 class AdmissionFunnel final {
 public:
     struct Config {

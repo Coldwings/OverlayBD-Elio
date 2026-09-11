@@ -429,12 +429,11 @@ device over channel 2 and relays the reply. Contract:
   Busy versus unavailable is captured under the registry mutex when
   admission is rejected; completion or EOF of the earlier command cannot
   change the reason returned to that rejected client.
-- **Recording captures REMOTE reads only.** Records fire per
-  fully-satisfied pread on a lower's remote source — LayerStore local
-  hits produce no record. Structural warm-up, trace replay, and
-  background-fill traffic ARE remote reads and are recorded when they
-  fall inside the window (the runbook records with prefetch/download
-  off; docs/operations.md).
+- **Recording captures guest OnDemand REMOTE reads only.** Records fire
+  per fully-satisfied OnDemand pread on a lower's remote source —
+  LayerStore local hits produce no record, and structural warm-up, trace
+  replay, and background-fill traffic are filtered out even when they
+  fall inside the window.
 
 ### Channel 2: obd-device → supervisor (status channel, fd 3)
 

@@ -9,6 +9,15 @@
 
 namespace obd::source {
 
+elio::coro::task<ssize_t> pread_with_class(BlobSource& source, ReadClass cls,
+                                           void* buf, size_t count,
+                                           uint64_t offset) {
+    if (auto* aware = dynamic_cast<ReadClassAwareSource*>(&source)) {
+        co_return co_await aware->pread_with_class(cls, buf, count, offset);
+    }
+    co_return co_await source.pread(buf, count, offset);
+}
+
 AdmissionFunnel::AdmissionFunnel() : AdmissionFunnel(Config{}) {}
 
 AdmissionFunnel::AdmissionFunnel(Config cfg) : cfg_(cfg) {
@@ -223,7 +232,8 @@ elio::coro::task<ssize_t> AdmissionSource::pread(void* buf, size_t count,
                                                  uint64_t offset) {
     AdmissionFunnel::Permit permit =
         co_await funnel_->acquire(ReadClass::OnDemand);
-    co_return co_await inner_->pread(buf, count, offset);
+    co_return co_await pread_with_class(*inner_, ReadClass::OnDemand, buf,
+                                        count, offset);
 }
 
 elio::coro::task<ssize_t> AdmissionSource::populate(uint64_t offset,

@@ -845,6 +845,9 @@ Every test, grouped by area, with the property it guards.
 - `image: trace recording captures only remote fetches through the layer store`
   — local hits record nothing; misses record exactly the fetched
   extents.
+- `image: trace recording filters fill and prefetch layer-store reads` —
+  with background fill active and a Prefetch populate issued during the
+  recording window, the trace contains only the guest OnDemand extent.
 - `image: trace recording translates offsets out of the tar wrapper` —
   records address payload space; header-spanning fetches clamp to their
   payload overlap.

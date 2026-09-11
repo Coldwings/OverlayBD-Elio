@@ -6,13 +6,14 @@
 //
 //   * TraceRecordSource — the tap. Image assembly wraps every REMOTE
 //     lower's RegistrySource with it (before LayerStore/AdmissionSource
-//     consume it). Every pread on a lower's RegistrySource IS a remote
-//     read by construction: the LayerStore touches its remote source only
-//     on a local miss (local hits produce NO record, per the ADR), and
-//     the remote-only chains have no local cache at all. The tap is the
-//     narrowest common point of both chains, and it records in the
-//     layer-blob offset space the replay side addresses (payload space:
-//     the tar base offset learned from TarOffsetSource is subtracted).
+//     consume it). The LayerStore and AdmissionSource pass their
+//     ADR-0012 ReadClass to class-aware taps, so only guest-blocking
+//     OnDemand remote reads are recorded by default. Local LayerStore
+//     hits, structural warm-up, trace replay, and background fill
+//     produce no records. The tap is the narrowest common point of both
+//     chains, and it records in the layer-blob offset space the replay
+//     side addresses (payload space: the tar base offset learned from
+//     TarOffsetSource is subtracted).
 //
 //   * TraceRecorder — the sink. One per opened image, shared by every
 //     tap. record() is the hot path: one atomic load when idle; when
@@ -38,7 +39,7 @@
 #pragma once
 
 #include "format/trace.hpp"
-#include "source/blob_source.hpp"
+#include "source/admission.hpp"
 
 #include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
@@ -283,16 +284,21 @@ private:
 using TraceRecorderPtr = std::shared_ptr<TraceRecorder>;
 
 /// The record tap: wraps a lower's remote source; every fully-satisfied
-/// pread appends a record (layer-blob payload offset space) to the
-/// shared recorder when it is recording. Disabled cost: one atomic load
-/// per remote pread. Pass-through for populate/size/label.
-class TraceRecordSource final : public source::BlobSource {
+/// OnDemand pread appends a record (layer-blob payload offset space) to
+/// the shared recorder when it is recording. Prefetch/Fill reads are
+/// pass-through. Disabled cost: one atomic load per record-worthy
+/// remote pread. Pass-through for populate/size/label.
+class TraceRecordSource final : public source::BlobSource,
+                                public source::ReadClassAwareSource {
 public:
     TraceRecordSource(source::BlobSourcePtr inner, TraceRecorderPtr recorder,
                       uint32_t layer_index);
 
     elio::coro::task<ssize_t> pread(void* buf, size_t count,
                                     uint64_t offset) override;
+    elio::coro::task<ssize_t> pread_with_class(
+        source::ReadClass cls, void* buf, size_t count,
+        uint64_t offset) override;
     elio::coro::task<ssize_t> populate(uint64_t offset,
                                        size_t len) override {
         co_return co_await inner_->populate(offset, len);
