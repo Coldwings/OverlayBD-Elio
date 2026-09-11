@@ -106,6 +106,8 @@ public:
     /// is irrelevant — the timer lives in the device process) and
     /// `on_expire` receives the result. `on_expire` runs on the timer
     /// coroutine; keep it short (a best-effort control-channel write).
+    /// Re-entrant start() from `on_expire` is rejected: callers that want a
+    /// follow-up window must schedule it after the callback returns.
     /// Returns false with `error` set when a recording is in progress
     /// OR still finalizing (a start must never slip into an in-flight
     /// finalize: it would wipe the draining queue, corrupt the
@@ -122,7 +124,10 @@ public:
 
     /// Finalizes the current recording (header checksum rewrite via the
     /// codec writer, file write + fsync) and drains the duration timer
-    /// coroutine before returning. Idempotent: a stop after the recording
+    /// coroutine before returning. Re-entrant stop() created from
+    /// `on_expire` returns the cached expiry result without joining the
+    /// current timer; normal external stops remain the completion barrier.
+    /// Idempotent: a stop after the recording
     /// already finalized (explicit stop, expiry, shutdown) returns the
     /// cached result of that finalize. A stop with no recording ever
     /// started returns {!ok, "no trace recording in progress"}.
@@ -210,6 +215,11 @@ private:
         bool drained = false;
     };
 
+    elio::coro::task<bool> start_impl(
+        std::string path, uint32_t duration_sec,
+        std::function<void(const FinalizeResult&)> on_expire,
+        std::string& error, bool from_timer_callback);
+
     /// The duration timer body: ONE cancellable sleep — a stop/shutdown
     /// cancels it for an immediate exit, so the timer never parks a
     /// multi-minute sleep into the scheduler's teardown drain.
@@ -217,8 +227,8 @@ private:
         uint64_t generation, uint32_t duration_sec,
         std::shared_ptr<elio::coro::cancel_source> cancel);
 
-    elio::coro::task<FinalizeResult> stop_impl(std::string reason,
-                                               bool from_timer);
+    elio::coro::task<FinalizeResult> stop_impl(
+        std::string reason, bool from_timer, bool from_timer_callback);
     elio::coro::task<void> drain_timer_task(
         std::shared_ptr<TimerDrain> drain);
 

@@ -16,8 +16,43 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <iterator>
+#include <vector>
 
 namespace obd::image {
+
+namespace {
+
+thread_local std::vector<const TraceRecorder*> timer_callback_stack;
+
+class TimerCallbackScope {
+public:
+    explicit TimerCallbackScope(const TraceRecorder* recorder)
+        : recorder_(recorder) {
+        timer_callback_stack.push_back(recorder_);
+    }
+
+    ~TimerCallbackScope() {
+        auto it = std::find(timer_callback_stack.rbegin(),
+                            timer_callback_stack.rend(), recorder_);
+        if (it != timer_callback_stack.rend()) {
+            timer_callback_stack.erase(std::next(it).base());
+        }
+    }
+
+    TimerCallbackScope(const TimerCallbackScope&) = delete;
+    TimerCallbackScope& operator=(const TimerCallbackScope&) = delete;
+
+private:
+    const TraceRecorder* recorder_;
+};
+
+bool in_timer_callback(const TraceRecorder* recorder) {
+    return std::find(timer_callback_stack.begin(), timer_callback_stack.end(),
+                     recorder) != timer_callback_stack.end();
+}
+
+}  // namespace
 
 TraceRecorder::TraceRecorder(size_t max_pending) : max_pending_(max_pending) {}
 
@@ -78,6 +113,18 @@ elio::coro::task<bool> TraceRecorder::start(
     std::string path, uint32_t duration_sec,
     std::function<void(const FinalizeResult&)> on_expire,
     std::string& error) {
+    return start_impl(std::move(path), duration_sec, std::move(on_expire),
+                      error, in_timer_callback(this));
+}
+
+elio::coro::task<bool> TraceRecorder::start_impl(
+    std::string path, uint32_t duration_sec,
+    std::function<void(const FinalizeResult&)> on_expire,
+    std::string& error, bool from_timer_callback) {
+    if (from_timer_callback) {
+        error = "trace recorder expiry callback cannot start recording";
+        co_return false;
+    }
     if (duration_sec < kMinDurationSec || duration_sec > kMaxDurationSec) {
         error = "duration_sec out of bounds [" +
                 std::to_string(kMinDurationSec) + ", " +
@@ -235,8 +282,12 @@ elio::coro::task<void> TraceRecorder::run_timer(
     // Duration expired: finalize exactly like an explicit stop; the
     // CLI's fate is irrelevant (ADR-0013 server-side bound). This is
     // the timer itself, so it must not try to join its own handle.
-    FinalizeResult res = co_await stop_impl("expired", /*from_timer=*/true);
-    if (cb) cb(res);
+    FinalizeResult res = co_await stop_impl(
+        "expired", /*from_timer=*/true, /*from_timer_callback=*/false);
+    if (cb) {
+        TimerCallbackScope callback_scope(this);
+        cb(res);
+    }
     std::function<elio::coro::task<void>()> exit_hook;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -248,7 +299,8 @@ elio::coro::task<void> TraceRecorder::run_timer(
 
 elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
     std::string reason) {
-    co_return co_await stop_impl(std::move(reason), /*from_timer=*/false);
+    return stop_impl(std::move(reason), /*from_timer=*/false,
+                     in_timer_callback(this));
 }
 
 elio::coro::task<void> TraceRecorder::drain_timer_task(
@@ -306,7 +358,7 @@ elio::coro::task<void> TraceRecorder::drain_timer_task(
 }
 
 elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
-    std::string reason, bool from_timer) {
+    std::string reason, bool from_timer, bool from_timer_callback) {
     // A concurrent stop while another caller is finalizing (an explicit
     // stop racing the duration expiry) captures that finalization's
     // completion object and waits for exactly that result. It must not
@@ -393,7 +445,7 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
     if (!have_result) {
         res.error = "no trace recording in progress";
     }
-    if (!from_timer && drain_to_join) {
+    if (!from_timer && drain_to_join && !from_timer_callback) {
         co_await drain_timer_task(std::move(drain_to_join));
     }
     co_return res;

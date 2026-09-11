@@ -609,6 +609,10 @@ Every test, grouped by area, with the property it guards.
 - `image: trace recording late stop waits for expiry callback completion` —
   a cached late stop waits for the timer's expiry callback tail to
   finish before returning.
+- `image: trace recording expiry callback stop never joins itself` —
+  a stop task created re-entrantly from the expiry callback returns the
+  expiry result without joining its own timer, and a callback-created
+  start is rejected.
 - `image: trace recording stale stop never drains a restarted timer` —
   a late stop waiting on an old timer drain stays bound to that old
   timer after a new recording starts.

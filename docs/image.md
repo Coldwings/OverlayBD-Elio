@@ -701,7 +701,9 @@ writer side: a bounded in-memory queue (drop-counted overflow, adjacent
 coalescing within the 1 MiB count cap, > 1 MiB reads pre-split) drained
 at `stop()` through the codec's conforming writer; the duration timer is
 joinable and device-side (expiry finalizes without any client call, while
-shutdown/explicit stop is the timer completion barrier).
+shutdown/explicit stop is the timer completion barrier). Re-entrant
+`start()` from the expiry callback is rejected; schedule any follow-up
+window after the callback returns.
 `start()` validates the duration bound and the absolute output path and
 opens the output file fail-fast. **Never throws from the read path** —
 `record()` is `noexcept`; an append failure drops and counts. The design
@@ -912,6 +914,10 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   already false;
   `image: trace recording late stop waits for expiry callback completion` —
   a cached late stop waits for the timer's callback tail to finish;
+  `image: trace recording expiry callback stop never joins itself` —
+  a stop task created re-entrantly from the expiry callback returns the
+  expiry result without joining its own timer, and a callback-created
+  start is rejected;
   `image: trace recording stale stop never drains a restarted timer` —
   a late stop waiting on an old timer drain stays bound to that old
   timer after a new recording starts;

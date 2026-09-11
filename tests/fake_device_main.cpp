@@ -326,12 +326,15 @@ elio::coro::task<int> fake_main(Args args) {
                 break;
             }
         }
-        // Finalize any active recording, then park fills, before the
-        // chain dies (same ordering contract as the real device).
+        // Finalize and drain the recorder, then park fills, before the
+        // chain dies (same ordering contract as the real device). Do not
+        // gate on recording(): expiry finalization has already lowered that
+        // flag while the timer coroutine may still be alive.
         if (opened.has_value()) {
-            if (opened->recorder && opened->recorder->recording()) {
+            if (opened->recorder) {
                 const auto tres = co_await opened->recorder->stop("shutdown");
-                if (!tres.ok) {
+                if (!tres.ok &&
+                    tres.error != "no trace recording in progress") {
                     ELIO_LOG_ERROR("fake: trace finalize failed: {}",
                                    tres.error);
                 }
