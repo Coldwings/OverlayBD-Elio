@@ -825,6 +825,10 @@ Every test, grouped by area, with the property it guards.
   gets a clean error reply (with the `seq` correlation echoed) instead
   of an escaping `type_error` killing the loop, and a valid start/stop
   cycle afterwards proves the loop stayed alive (ADR-0013).
+- `supervisor: trace start is rejected after shutdown admission closes` —
+  a queued `trace_start` behind the device shutdown admission gate is
+  rejected with a clean shutting-down error and never arms a recorder
+  timer after shutdown has begun (ADR-0013).
 - `supervisor: device trace control skips an oversized line and stays alive` —
   the same loop over a real socketpair: a command line larger than the
   64 KiB cap (no newline inside) is discarded rather than mistaken for

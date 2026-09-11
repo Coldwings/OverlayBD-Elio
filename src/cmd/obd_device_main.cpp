@@ -19,6 +19,7 @@
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
+#include <elio/sync/mutex.hpp>
 
 #include <sys/socket.h>
 
@@ -86,8 +87,15 @@ elio::coro::task<int> device_main(Args args) {
     obd::image::OpenedImage opened;
     auto stopping = std::make_shared<std::atomic<bool>>(false);
     auto resize_gate = std::make_shared<std::mutex>();
+    auto trace_start_stopping = std::make_shared<std::atomic<bool>>(false);
+    auto trace_start_gate = std::make_shared<elio::sync::mutex>();
     std::optional<elio::coro::join_handle<void>> control;
     int result = 0;
+    auto close_trace_start_admission = [&]() -> elio::coro::task<void> {
+        trace_start_stopping->store(true, std::memory_order_release);
+        co_await trace_start_gate->lock();
+        trace_start_gate->unlock();
+    };
     auto finish_trace_recording = [&]() -> elio::coro::task<void> {
         if (!opened.recorder) co_return;
         const auto tres = co_await opened.recorder->stop("shutdown");
@@ -254,6 +262,8 @@ elio::coro::task<int> device_main(Args args) {
                           })
                     : std::function<int(uint64_t)>(),
                 [dev](uint64_t bytes) { return dev->resize_blocking(bytes); });
+            hooks.trace_start_stopping = trace_start_stopping;
+            hooks.trace_start_gate = trace_start_gate;
             control.emplace(elio::spawn(obd::supervisor::run_device_control,
                                         channel, opened.recorder,
                                         std::move(hooks)));
@@ -284,6 +294,7 @@ elio::coro::task<int> device_main(Args args) {
         co_await elio::spawn_blocking([&] {
             std::lock_guard<std::mutex> drain(*resize_gate);
         });
+        co_await close_trace_start_admission();
         co_await dev->stop_async();
         // ADR-0013: finalize and drain any trace recording BEFORE the source
         // chain can go away. Do not gate this on recording(): an expiry-owned
@@ -337,6 +348,7 @@ elio::coro::task<int> device_main(Args args) {
     co_await elio::spawn_blocking([&] {
         std::lock_guard<std::mutex> drain(*resize_gate);
     });
+    co_await close_trace_start_admission();
     if (control) {
         ::shutdown(args.control_fd, SHUT_RDWR);
         auto& control_task = *control;

@@ -903,6 +903,10 @@ needing a real ublk device or root.
   the device-side trace command loop over a real socketpair:
   wrong-typed `trace_start` fields get a clean error reply (seq echoed)
   and the loop keeps serving (never-throws contract, ADR-0013).
+- `supervisor: trace start is rejected after shutdown admission closes` —
+  the device-side command loop shares a shutdown admission gate with the
+  device shutdown path, so a queued `trace_start` is rejected cleanly
+  instead of arming a recorder after the shutdown stop barrier.
 - Trace recording (ADR-0013; integration,
   `tests/integration/test_trace_record.cpp`; the fake device opens a
   REAL image against a mock registry and serves the real device-side

@@ -25,6 +25,7 @@
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/signal/signalfd.hpp>
+#include <elio/sync/mutex.hpp>
 
 #include <sys/socket.h>
 
@@ -89,6 +90,14 @@ elio::coro::task<int> fake_main(Args args) {
         // path below can set/drain them; see make_resize_apply).
         auto stopping = std::make_shared<std::atomic<bool>>(false);
         auto resize_gate = std::make_shared<std::mutex>();
+        auto trace_start_stopping =
+            std::make_shared<std::atomic<bool>>(false);
+        auto trace_start_gate = std::make_shared<elio::sync::mutex>();
+        auto close_trace_start_admission = [&]() -> elio::coro::task<void> {
+            trace_start_stopping->store(true, std::memory_order_release);
+            co_await trace_start_gate->lock();
+            trace_start_gate->unlock();
+        };
         // D3 resize/checkpoint handles: `upper` is the image's writable
         // top (lsmt/sparse, sized at the headroom override); `blank_top`
         // is the blank device's merged writable top and `blank_merged`
@@ -305,6 +314,8 @@ elio::coro::task<int> fake_main(Args args) {
                     *fake_size = bytes;
                     return bytes;
                 });
+            hooks.trace_start_stopping = trace_start_stopping;
+            hooks.trace_start_gate = trace_start_gate;
             elio::go([channel, rec = opened.has_value()
                                      ? opened->recorder
                                      : obd::image::TraceRecorderPtr{},
@@ -331,6 +342,7 @@ elio::coro::task<int> fake_main(Args args) {
         // gate on recording(): expiry finalization has already lowered that
         // flag while the timer coroutine may still be alive.
         if (opened.has_value()) {
+            co_await close_trace_start_admission();
             if (opened->recorder) {
                 const auto tres = co_await opened->recorder->stop("shutdown");
                 if (!tres.ok &&
