@@ -214,6 +214,20 @@ std::vector<uint8_t> make_many_root_files_tar(size_t count) {
     return tar;
 }
 
+std::vector<uint8_t> make_sorted_directory_budget_tar() {
+    std::vector<uint8_t> tar;
+    constexpr size_t kExistingEntries = 156;
+    tar.reserve((kExistingEntries + 3) * 512);
+    for (size_t i = 0; i < kExistingEntries; ++i) {
+        std::string name = "b" + std::to_string(100 + i) + std::string(37, 'x');
+        REQUIRE(name.size() == 41);
+        append_tar_entry(tar, name, '2', 0777, 0, 0, {}, "x");
+    }
+    append_tar_entry(tar, "aaaaaaaaa", '0', 0644, 0, 0, {'x'});
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
 std::vector<uint8_t> make_many_inode_tar() {
     std::vector<uint8_t> tar;
     constexpr size_t kDirs = 11;
@@ -600,7 +614,7 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
                                         too_small_dir, "--name", "small",
                                         "--size", "36864"});
     REQUIRE(too_small.exit_code == 1);
-    REQUIRE(too_small.err.find("payloads exceed image budget") !=
+    REQUIRE(too_small.err.find("contents and ext2 metadata exceed image budget") !=
             std::string::npos);
     REQUIRE(::stat((too_small_dir + "/small.lsmt").c_str(), &st) != 0);
 
@@ -634,7 +648,7 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
                      explicit_budget_dir, "--name", "explicit-budget",
                      "--size", "8388608"});
     REQUIRE(explicit_budget.exit_code == 1);
-    REQUIRE(explicit_budget.err.find("payloads exceed image budget") !=
+    REQUIRE(explicit_budget.err.find("contents and ext2 metadata exceed image budget") !=
             std::string::npos);
     REQUIRE(::stat((explicit_budget_dir + "/explicit-budget.lsmt").c_str(),
                    &st) != 0);
@@ -645,14 +659,29 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
     const auto aggregate = run_convert({"--input", aggregate_tar, "--out-dir",
                                         aggregate_dir, "--name", "aggregate"});
     REQUIRE(aggregate.exit_code == 1);
-    REQUIRE(aggregate.err.find("payloads exceed image budget") !=
+    REQUIRE(aggregate.err.find("contents and ext2 metadata exceed image budget") !=
             std::string::npos);
     REQUIRE(::stat((aggregate_dir + "/aggregate.lsmt").c_str(), &st) != 0);
 
+    const auto sorted_budget_tar = make_sorted_directory_budget_tar();
+    const std::string sorted_budget_path =
+        test::write_file(dir / "sorted-budget.tar", sorted_budget_tar);
+    const std::string sorted_budget_dir = dir / "sorted-budget";
+    const auto sorted_budget =
+        run_convert({"--input", sorted_budget_path, "--out-dir",
+                     sorted_budget_dir, "--name", "sorted-budget",
+                     "--size", std::to_string(15ull * kExt2BlockSize)});
+    REQUIRE(sorted_budget.exit_code == 1);
+    REQUIRE(sorted_budget.err.find("contents and ext2 metadata exceed image budget") !=
+            std::string::npos);
+    REQUIRE(::stat((sorted_budget_dir + "/sorted-budget.lsmt").c_str(),
+                   &st) != 0);
+
     const std::string many_dir = dir / "many-dir";
     const auto many = make_many_root_files_tar(4100);
-    const auto dir_result = run_convert({"--input", "-", "--out-dir", many_dir,
-                                         "--name", "many"}, &many);
+    const std::string many_tar = test::write_file(dir / "many.tar", many);
+    const auto dir_result = run_convert({"--input", many_tar, "--out-dir",
+                                         many_dir, "--name", "many"});
     REQUIRE(dir_result.exit_code == 1);
     REQUIRE(dir_result.err.find("directories up to 12 data blocks") !=
             std::string::npos);

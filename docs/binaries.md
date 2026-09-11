@@ -326,7 +326,7 @@ output).
 - `cli: obd-convert rejects unsupported tar entries before writing a layer` —
   proves unsupported tar entry types, non-ustar headers, empty streams,
   malformed end-of-archive markers, regular files beyond the single-indirect
-  backend limit, too-small explicit `--size` values, aggregate payloads beyond
+  backend limit, too-small explicit `--size` values, tar contents plus ext2 metadata beyond
   the image budget, directories beyond the direct-block
   backend limit, and inode counts beyond the bitmap capacity fail with exit 1 and
   do not publish an LSMT output file.
