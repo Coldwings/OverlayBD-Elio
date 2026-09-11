@@ -483,10 +483,13 @@ stack. `pwrite`/`pread` offsets and counts must be 512-byte multiples (the
 same alignment contract as the read side); both return the byte count or a
 negative -errno. `pread` reads through this layer alone — holes read as
 zeroes and fall-through to lower layers is the merger's job. `flush` is the
-durability point (ublk FLUSH). `discard` (ADR-0009) masks a 512B-aligned
-range with zeroes — reads of the range return zeroes from this layer
-onwards and never fall through to lower layers. `checkpoint()` (ADR-0014)
-persists whatever on-disk state an offline seal needs, without sealing; it
+durability point (ublk FLUSH). `discard` (ADR-0009) is the writable-root
+hook for masking a 512B-aligned range with zeroes in the merged device
+contract. The LSMT-RW
+implementation satisfies that contract by retaining zeroed segments; the
+sparse implementation punches holes in the top file, and #85 tracks its
+current merged-view lower-mask gap. `checkpoint()` (ADR-0014) persists
+whatever on-disk state an offline seal needs, without sealing; it
 is called once by the device process on graceful shutdown after IO has
 drained and is terminal (no `pwrite`/`discard` may follow). `segments()` is
 the current index: sorted, disjoint, 512B sector units, tag 0.
@@ -529,6 +532,13 @@ ever written). Filesystem errors throw `obd::error`.
 writes are split at the 14-bit segment-length cap and merged into the
 identity segment set (overlapping and adjacent extents coalesce).
 `flush()` is `fdatasync` and returns 0 or `-errno`.
+
+`discard()` (ADR-0009) uses
+`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` and splits/trims
+the identity extent index. Fiemap is filesystem-block granular, so a
+sub-block punch zeroes but may not deallocate; a reopened index may be
+fatter than the pre-restart one, with identical reads because punched
+blocks read back as zeroes.
 
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 
@@ -593,12 +603,6 @@ An unsealed single-file LSMT with **in-place edit** (ADR-0008):
 - `pread`: sector-aligned; holes and zeroed segments read as zeroes; clamped
   at `virtual_size()`.
 - `flush()`: `fdatasync`; 0 or `-errno`.
-- `discard` (ADR-0009): a real
-  `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` plus a
-  split/trim of the extent index. Note the granularity caveat: fiemap is
-  filesystem-block granular, so a sub-block punch zeroes but cannot
-  deallocate — a reopened index may be fatter than the pre-restart one,
-  with identical reads (punched blocks read back as zeroes).
 - `discard` (ADR-0009): inserts **zeroed segments** covering the range
   (split/trimming overlapped segments exactly like `pwrite`); no data is
   written and superseded blocks become garbage that `seal()` drops. Zeroed
@@ -725,9 +729,11 @@ plus a writable top layer, as one block source.
   merged index (`rebuild_index()`). Write-heavy workloads should batch,
   since the rebuild is O(index size) per write.
 - `flush()` delegates to the top layer's `flush()`.
-- `discard()` (ADR-0009) delegates to the top layer and rebuilds the index;
-  the discarded range then reads as zeroes even when lower layers have data
-  there (mask semantics, matching upstream LSMT trim).
+- `discard()` (ADR-0009) delegates to the top layer and rebuilds the index.
+  With an LSMT-RW top, discarded ranges stay covered by zeroed segments and
+  mask lower-layer data (matching upstream LSMT trim). With a sparse top,
+  discard punches holes in the top file; #85 tracks the remaining
+  merged-view lower-mask gap.
 - As a `source::WritableBlobSource`, this is the device root the ublk bridge
   dispatches WRITE/FLUSH/DISCARD/WRITE_ZEROES to; a read-only image root
   simply does not implement the interface and writes/discards get `-EROFS`.
@@ -799,7 +805,7 @@ the data plane never writes.
 ### `src/format/trace.hpp` — `namespace obd::format::trace`
 
 Dependency-free codec for the upstream prefetch trace blob (ADR-0013,
-proposed; wire authority: [trace-format.md](./trace-format.md)). Pure
+accepted; wire authority: [trace-format.md](./trace-format.md)). Pure
 in-memory: no IO, no coroutines. Expected failure modes (corrupt input,
 contract-violating appends) are reported by result value, never by
 exception; the only exceptional way out is allocation failure
@@ -854,9 +860,9 @@ present from construction with checksum 0 and rewritten in place by
 `finalize()` (mirroring upstream's `PrefetcherImpl::dump`). `append`
 enforces §10 rule 4 — `op == 'R'`, `1 <= count <= kMaxRecordCount`,
 `offset >= 0` — and returns false (record rejected, blob unchanged) on a
-violation. The `finalize()` span borrows the writer; a memory buffer is
-the whole deliverable here, file writing lands with the record/replay
-features (not yet implemented).
+violation. The `finalize()` span borrows the writer; this codec stays
+purely in-memory, while live-device recording writes the finalized blob to
+an output file in `src/image/trace_record.hpp` / `.cpp`.
 
 ## Invariants & Guarantees
 

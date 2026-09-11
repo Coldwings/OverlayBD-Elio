@@ -1073,20 +1073,26 @@ single Range-capable blob. No external golden files.
   `enable`, `head_kb`, and `tail_kb` are honored (see `docs/config.md`
   for the full compatibility matrix). The trace layer IS recognized and
   replayed (ADR-0013; see Concepts → "The trace layer"), with
-  these gaps: trace **recording** is not implemented; the
-  dynamic-prefetch file-list fallback is rejected by design; the tar
-  member name (`trace`) is not checked — recognition is the config flag
-  plus the blob magic; remote lowers without `dir` are not warmed
-  (populate is a no-op on the bare `RegistrySource`); and both replay
-  and the structural warm-up are still awaited inline during bring-up —
-  detaching them into background scavenger warm-up is a follow-up the
-  ADR-0012 funnel now makes safe.
+  these gaps: the dynamic-prefetch file-list fallback is rejected by
+  design; the tar member name (`trace`) is not checked — recognition is
+  the config flag plus the blob magic; remote lowers without `dir` are
+  not warmed (populate is a no-op on the bare `RegistrySource`); both
+  replay and the structural warm-up are still awaited inline during
+  bring-up; and supervisor-driven trace recording currently records only
+  fully satisfied remote `pread`s at the `TraceRecordSource` tap. When
+  `LayerStore` is active that tap sits below it; no-`dir` and ADR-0016
+  degraded remote-only chains are tapped before the direct
+  `AdmissionSource` wrapper. Issue #33 tracks narrowing the default
+  recording set to OnDemand traffic.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
-- **Writable uppers are per-device and not sealed automatically** — the
-  ADR-0008 mode persists writes in the upper file across reopen, but
-  committing/sealing an upper into a new lower is an explicit, offline
-  operation (the supervisor's `commit` command, ADR-0014); TurboOCI and
+- **Writable uppers are per-device and not sealed automatically** — a
+  sparse upper can recover written extents from the file/fiemap across
+  reopen, while an unsealed LSMT-RW upper is not recovered by a later
+  image open even after graceful shutdown writes its checkpoint; that
+  checkpoint is consumed only by the supervisor's offline `commit`, and a
+  fresh open truncates the unsealed file. Committing/sealing an upper into
+  a new lower is an explicit, offline operation (ADR-0014); TurboOCI and
   registry write-back remain out of scope (ADR-0007).
 - **Sparse uppers depend on filesystem fiemap support** for extent recovery
   after reopen (see `docs/format.md`); exotic filesystems without

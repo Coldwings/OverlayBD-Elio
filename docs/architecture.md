@@ -98,10 +98,13 @@ previously-uncovered ranges are copy-on-write — new data lands in the
 upper and shadows the sealed lowers, which are never mutated. The upper
 is either an in-place-edit unsealed LSMT file (`<dir>/overlaybd.rw`) or
 a fiemap sparse file (`<dir>/overlaybd.sparse`); see `docs/config.md`.
-On a read-only device the root does not implement `WritableBlobSource`
-and writes are rejected with `-EROFS`. Operations the device does not
-advertise (write-same, write-zeroes, discard) are rejected with
-`-EOPNOTSUPP`.
+On a read-only device the root does not implement `WritableBlobSource`:
+`WRITE`, direct `DISCARD`, and direct `WRITE_ZEROES` return `-EROFS`, while
+read-only ublk params do not advertise discard/write-zeroes limits so the
+kernel normally never issues them. On a writable device `DISCARD` and
+`WRITE_ZEROES` are advertised and dispatched to the writable root (ADR-0009).
+`WRITE_SAME` and unknown operations are never advertised and are rejected
+defensively with `-EOPNOTSUPP`.
 
 ## Process Model
 
@@ -315,25 +318,40 @@ contracts above:
 
 - **TurboOCI** (the third upstream on-disk format) is not supported;
   deferred.
-- **ublk `USER_RECOVERY`** is not implemented; a device process crash
-  drops the device instead of recovering it. Deferred — the isolation
-  model (ADR-0004) bounds the blast radius meanwhile.
-- **Prefetch** covers the structural head/tail warm-up (ADR-0012),
-  trace replay (the upstream trace blob IS replayed through `populate`
-  when the image config marks an `accelerationLayer`, ADR-0013 — see
-  `docs/image.md`), and trace recording (the supervisor's
-  `trace_start`/`trace_stop` commands drive the record path, ADR-0013 —
-  see `docs/supervisor.md`); replay and recording traffic is admitted
-  at the device's ADR-0012 funnel as the Prefetch scavenger class, and
-  the `prefetch` config section's `enable` switch is honored. The
-  dynamic prefetcher stays out.
-- **Supervisor auto-restart** of crashed devices is not implemented;
-  devices stay `exited` until an explicit `destroy`/`create`. Deferred.
-- **Discard / punch-hole** are not advertised and are rejected with
-  `-EOPNOTSUPP` (v0.2).
+- **Crash recovery is bounded, not transparent persistence.** Devices are
+  created with ublk `USER_RECOVERY` when `ublkConfig.enableRecovery` is
+  true (the default) and the kernel supports it; the supervisor respawns
+  a crashed child in recovery mode up to `max_recovery_attempts`
+  (ADR-0010). Older kernels whose `ADD_DEV` call rejects the
+  recovery flags with `EINVAL` degrade to a non-recoverable device at
+  create time. Recovery reassembles the image
+  from restart-recoverable inputs: sealed lowers and sparse writable
+  extents can be reopened, but an unsealed LSMT-RW upper is not reopened
+  by recovery even if graceful shutdown wrote a checkpoint.
+- **Prefetch** covers only the active populate paths: structural
+  head/tail warm-up (ADR-0012) and trace replay (the upstream trace blob
+  IS replayed through `populate` when the image config marks an
+  `accelerationLayer`, ADR-0013 — see `docs/image.md`). Those two paths
+  are admitted at the device's ADR-0012 funnel as the Prefetch scavenger
+  class, and the `prefetch` config section's `enable` switch is honored
+  for both. LayerStore background fill is a separate ADR-0012 Fill
+  scavenger class behind Prefetch and is governed by the `download`
+  config. Trace recording is a supervisor command path (ADR-0013; see
+  `docs/supervisor.md`) that passively records fully satisfied remote
+  reads at the trace tap; it does not call `populate` or use the Prefetch
+  class, and issue #33 tracks filtering recordings down to OnDemand reads
+  only.
+- **Discard / punch-hole** reaches only writable devices (ADR-0009).
+  Read-only images do not advertise discard limits, so the kernel never
+  issues discard/write-zeroes to them. Writable LSMT-RW uppers satisfy the
+  ADR-0009 mask contract with zeroed segments. Sparse uppers currently
+  only punch holes in the top file; in a merged view that can expose lower
+  layer bytes instead of masking them with zeroes, and #85 tracks that
+  remaining sparse merged-view gap.
 - **LSMT-RW durability:** an unsealed `overlaybd.rw` upper keeps its
-  segment index in memory only; unsealed data is **not crash-durable**
-  and the file is not recoverable across process restarts until
-  `seal()` compacts it into a standard sealed LSMT layer. A graceful
-  obd-device shutdown checkpoints the index into the file (ADR-0014),
-  which is what the supervisor's offline `commit` seal consumes.
+  segment index in memory only; unsealed data is **not restart-recoverable**
+  as a writable upper. A graceful obd-device shutdown checkpoint is the
+  input to the supervisor's offline `commit` (ADR-0014), not a reopen path;
+  a later image open creates/truncates a fresh unsealed LSMT-RW file. Only
+  `seal()` / offline commit compacts the data into a standard sealed LSMT
+  layer.

@@ -202,13 +202,17 @@ A per-image config may add a writable upper:
   (`<dir>/overlaybd.rw`). **Durability rule: LSMT-RW data is not durable as
   a standard layer until it is sealed.** `seal()` compacts the writable
   layer into a standard sealed LSMT that ordinary OverlayBD tooling can
-  consume; before sealing, the file is an intermediate format that only
-  this stack reopens. A device destroyed without sealing keeps its data for
-  reopen by this stack, but do not ship the file elsewhere. On a **graceful
-  shutdown** (SIGTERM, e.g. via `destroy` or `commit`) obd-device
-  checkpoints the upper's in-memory index into the file; that checkpoint is
-  what the offline `commit` seal consumes. A crashed or SIGKILLed device
-  leaves no checkpoint and its unsealed upper is unsealable.
+  consume; before sealing, the file is an intermediate format for the live
+  device plus the offline `commit` path, not a normal reopen target. A
+  later `create`/recovery open truncates a fresh unsealed LSMT-RW upper.
+  On a **graceful shutdown** (SIGTERM, e.g. via `destroy` or `commit`)
+  obd-device checkpoints the upper's in-memory index into the file; that
+  checkpoint is what the offline `commit` seal consumes. A crash or
+  SIGKILL before a successful graceful-shutdown checkpoint leaves no
+  checkpoint and its unsealed upper is unsealable; if the kill races after
+  that checkpoint has already been written, offline `commit` can still
+  consume it. Use `commit` before relying on LSMT-RW writes after device
+  teardown.
 - `type: "sparse"` → a sparse file (`<dir>/overlaybd.sparse`); after an
   unclean shutdown the written extents are recovered via fiemap scanning.
   Sparse uppers never seal (ADR-0014 upstream parity).
@@ -234,10 +238,13 @@ Contract and runbook notes:
   reaped (bounded; SIGKILL on timeout) before any byte is sealed — there
   is no live seal. The device entry remains afterwards (`obdctl status`
   still works, state `exited`); `destroy` removes it as usual.
-- **Graceful shutdown is required.** The seal consumes the index
-  checkpoint obd-device writes on graceful shutdown. If the device crashed
-  or was SIGKILLed, commit fails with "no valid shutdown checkpoint" and the
-  unsealed upper's writes are lost (the ADR-0008 durability rule).
+- **Graceful shutdown checkpoint is required.** The seal consumes the
+  index checkpoint obd-device writes on graceful shutdown. If the device
+  crashes or is SIGKILLed before that checkpoint succeeds, commit fails
+  with "no valid shutdown checkpoint" and the unsealed upper's writes are
+  lost (the ADR-0008 durability rule). If a kill races after the
+  checkpoint has already been written, offline `commit` can still consume
+  that checkpoint.
 - **Deterministic output.** The sealed file is a pure function of the
   upper's content plus the `--tag` string: identical content and tag seal
   to identical bytes, so the reply's `sha256` is suitable for
@@ -424,10 +431,10 @@ correlate by device id and by the supervisor's spawn logs.
 | `create` fails with "virtual size not sector aligned" | The merged image size is zero or not a multiple of 512 bytes; the image is malformed for block serving. |
 | No `/dev/ublkb<N>` after a successful `create` | `ublk_drv` not loaded or missing udev; check `/dev/ublk-control` and `lsmod`. |
 | Slow first reads, DART warnings in the log | DART proxy configured but unreachable. This is handled: the source logs a warning and falls back to direct registry reads (guarded by `integration: enabled-but-unreachable DART falls back to direct reads`). Fix the `p2pConfig` address or disable P2P. |
-| A device child crashed | Siblings and the supervisor are unaffected (ADR-0004), and the device itself survives: the supervisor respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection (`destroy` + `create`). Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008), and commit of such an upper fails with "no valid shutdown checkpoint". |
-| `commit` fails with "no valid shutdown checkpoint" | The device crashed or was SIGKILLed instead of shutting down gracefully, so its LSMT-RW index never reached the disk. The unsealed upper is unsealable (ADR-0014); start over from the lowers. |
+| A device child crashed | Siblings and the supervisor are unaffected (ADR-0004), and the device itself survives: the supervisor respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection (`destroy` + `create`). Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008); offline `commit` only has input if graceful shutdown already wrote a valid checkpoint before the child died. |
+| `commit` fails with "no valid shutdown checkpoint" | No graceful-shutdown checkpoint reached disk before the child died, for example a crash or SIGKILL before `checkpoint()` completed. The unsealed upper is unsealable (ADR-0014); start over from the lowers. |
 | `commit` fails with "sparse uppers cannot be sealed" | Sparse uppers never seal (upstream parity, ADR-0014). Use `type: "lsmt"` uppers for content you intend to commit. |
-| `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard is supported only on writable devices (ADR-0009). |
+| `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard reaches only writable devices; LSMT-RW uppers satisfy ADR-0009 zero-mask semantics, while sparse-upper merged-view masking is tracked by #85. |
 | `resize` fails with a "grow-only" error | The requested size is at or below the device's current capacity; shrink is unsupported (ADR-0014). Grow to a larger size, or create with `--virtual-size` headroom if you need to plan ahead. |
 | `resize` fails with an `UPDATE_SIZE`-related error (`ENOTSUPP` 524 or `EOPNOTSUPP` 95) | The kernel driver predates `UBLK_U_CMD_UPDATE_SIZE` (needs the 6.16 cycle; pre-6.15 drivers answer `ENOTSUPP` 524, 6.15+ answer `EOPNOTSUPP` 95); the kernel capacity is unchanged and a retry succeeds once the driver accepts the command. `create --virtual-size` and `commit --virtual-size` do not need kernel support. |
 | A grown device crashes and its replacement rejects any resize back down toward the image size | Correct: the kernel kept the grown capacity across USER_RECOVERY, and the replacement seeds its grow-only baseline from that real capacity (GET_PARAMS) — shrinking is unsupported (ADR-0014). The fresh upper starts at the image's declared size (ADR-0008); grow further, or destroy + re-create from a committed layer, to change the size. |
@@ -440,9 +447,11 @@ correlate by device id and by the supervisor's spawn logs.
   image from disk; a sparse upper recovers via fiemap, an unsealed LSMT-RW
   upper does not (ADR-0008, ADR-0010). Choose the sparse upper when write
   durability across crashes matters.
-- **Discard masks, it does not punch through.** A discarded range reads
-  back as zeroes even if lower layers have data there (ADR-0009); this is
-  the upstream LSMT trim semantics, intentional.
+- **LSMT-RW discard masks, it does not punch through.** A discarded range
+  on an LSMT-RW upper reads back as zeroes even if lower layers have data
+  there (ADR-0009); this is the upstream LSMT trim semantics,
+  intentional. Sparse uppers punch holes in the top file; #85 tracks the
+  remaining sparse merged-view lower-mask gap.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
   or mutate registry content (ADR-0007). Writable uppers are local-only;
   `commit` (ADR-0014) seals an upper into a local layer file —
