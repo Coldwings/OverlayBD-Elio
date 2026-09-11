@@ -372,8 +372,10 @@ public:
 device roots with a writable upper layer (ADR-0008). `pwrite` writes `count`
 bytes at `offset` (both 512-byte multiples, like reads) and returns `count`
 or a negative `-errno`; `flush` is the durability point behind ublk FLUSH
-and returns 0 or a negative `-errno`. The ublk bridge answers `-EROFS` when
-the image root does not implement this interface.
+and returns 0 or a negative `-errno`. Grow-capable writable roots may report
+a larger `size()` after a successful resize, matching the widened block
+device. The ublk bridge answers `-EROFS` when the image root does not
+implement this interface.
 
 ### `local_file.hpp` — LocalFileSource
 

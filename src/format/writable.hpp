@@ -46,8 +46,8 @@ public:
     /// Persists whatever on-disk state an offline seal needs (ADR-0014),
     /// without sealing. Called once by the device process on graceful
     /// shutdown, after IO has drained; it is terminal — no pwrite/discard
-    /// may follow. Layers whose state is already durable (sparse) return 0
-    /// without doing work. Returns 0 or a negative -errno.
+    /// may follow. Sparse layers use this hook to publish any dirty
+    /// discard zero-mask sidecar state. Returns 0 or a negative -errno.
     virtual elio::coro::task<int> checkpoint() = 0;
 
     virtual uint64_t virtual_size() const = 0;
@@ -69,7 +69,15 @@ public:
     /// Current segment index: sorted, disjoint, 512B sector units, tag 0.
     virtual const std::vector<bytes::segment_mapping>& segments() const = 0;
 
-    /// The file view segment data is read from (identity for sparse).
+    /// Stable copy of the current segment index for callers that must not
+    /// borrow across concurrent writable-layer mutations.
+    virtual std::vector<bytes::segment_mapping> segments_snapshot() const {
+        return segments();
+    }
+
+    /// The file view segment data is read from (identity for sparse). A
+    /// grow-capable writable layer may expose a view whose size() tracks
+    /// virtual_size() after successful grow() calls.
     virtual source::BlobSource& data_source() = 0;
 };
 

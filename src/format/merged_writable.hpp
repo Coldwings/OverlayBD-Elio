@@ -9,7 +9,11 @@
 #include "format/writable.hpp"
 #include "source/blob_source.hpp"
 
+#include <elio/sync/mutex.hpp>
+
 #include <atomic>
+#include <memory>
+#include <mutex>
 
 namespace obd::format {
 
@@ -49,17 +53,35 @@ public:
 
     WritableLayer& writable_top() const noexcept { return *top_; }
 
-    const std::vector<bytes::segment_mapping>& merged_index() const noexcept {
-        return index_;
+    std::vector<bytes::segment_mapping> merged_index() const {
+        std::lock_guard lock(index_mu_);
+        return index_ ? *index_ : std::vector<bytes::segment_mapping>{};
     }
 
 private:
     MergedWritable() = default;
-    void rebuild_index();
+    friend struct MergedWritableTestAccess;
+    int begin_data_op(uint64_t offset, uint64_t len);
+    int begin_flush_op();
+    int begin_grow_op();
+    void end_data_op();
+    void end_grow_op();
+    int rebuild_index();
+    void invalidate_index();
 
     std::vector<std::unique_ptr<LsmtLayer>> layers_;  // topmost first (RO)
     std::unique_ptr<WritableLayer> top_;
-    std::vector<bytes::segment_mapping> index_;       // tag 0 = writable top
+    /// Serializes top-layer mutations and their merged-index rebuilds so an
+    /// older rebuild cannot publish after a newer write/discard.
+    elio::sync::mutex op_mu_;
+    /// Synchronous admission gate shared by grow and coroutine operations.
+    /// Operations increment active_ops_ while holding this mutex, so grow
+    /// cannot slip between an operation's state check and active registration.
+    std::mutex state_gate_mu_;
+    std::atomic<uint32_t> active_ops_{0};
+    std::atomic<bool> grow_active_{false};
+    std::shared_ptr<const std::vector<bytes::segment_mapping>> index_;
+    mutable std::mutex index_mu_;
     /// Device virtual size in bytes. Atomic: the device resize executor
     /// (a spawn_blocking pool thread) grows the merged view while bridge
     /// coroutines on Elio workers read/write through it.

@@ -473,7 +473,9 @@ public:
                                           uint64_t len) = 0;
     virtual elio::coro::task<int> checkpoint() = 0;
     virtual uint64_t virtual_size() const = 0;
+    virtual int grow(uint64_t vsize) = 0;
     virtual const std::vector<bytes::segment_mapping>& segments() const = 0;
+    virtual std::vector<bytes::segment_mapping> segments_snapshot() const;
     virtual source::BlobSource& data_source() = 0;
 };
 ```
@@ -487,24 +489,29 @@ durability point (ublk FLUSH). `discard` (ADR-0009) is the writable-root
 hook for masking a 512B-aligned range with zeroes in the merged device
 contract. The LSMT-RW
 implementation satisfies that contract by retaining zeroed segments; the
-sparse implementation punches holes in the top file, and #85 tracks its
-current merged-view lower-mask gap. `checkpoint()` (ADR-0014) persists
+sparse implementation punches holes and persists a sidecar zero map so
+reopen preserves the lower-layer mask. `checkpoint()` (ADR-0014) persists
 whatever on-disk state an offline seal needs, without sealing; it
 is called once by the device process on graceful shutdown after IO has
 drained and is terminal (no `pwrite`/`discard` may follow). `segments()` is
 the current index: sorted, disjoint, 512B sector units, tag 0.
-`data_source()` is the file view segment data is read from.
+`segments_snapshot()` returns a stable copy for callers that cannot borrow
+`segments()` across concurrent writable-layer mutations. `data_source()` is
+the file view segment data is read from.
 
 `grow(vsize)` (D3) extends the layer's write window to `vsize` bytes so
 `pwrite`/`discard` accept the new range. Grow-only: a request smaller
 than the current size returns `-EINVAL`; an equal request is an
 idempotent no-op (retried grows after a partial kernel failure land
-here). It is **BLOCKING** (header rewrite + fsync for LSMT, ftruncate
-for sparse) — run it off an Elio worker via `elio::spawn_blocking`, as
-the device resize executor does (docs/supervisor.md). LSMT direct
-concurrent `grow()`/`checkpoint()`/`seal()` calls are rejected with
-`-EBUSY`; the supervisor normally serializes those operations before
-they reach the layer.
+here). It is **BLOCKING** (header rewrite + fsync for LSMT, ftruncate +
+fdatasync for sparse) — run it off an Elio worker via
+`elio::spawn_blocking`, as the device resize executor does
+(docs/supervisor.md). LSMT direct concurrent `grow()`/`checkpoint()`/`seal()`
+calls are rejected with `-EBUSY`. Sparse direct `grow()` also
+coordinates with `pwrite()`/`discard()`/`flush()` and `checkpoint()`;
+overlapping direct calls return `-EBUSY` rather than letting a resize
+overtake data or sidecar durability. The supervisor normally serializes
+those operations before they reach the layer.
 
 ### `src/format/sparse_rw.hpp` — `SparseRwLayer`
 
@@ -519,26 +526,55 @@ public:
 };
 ```
 
-A sparse file whose written extents form the layer's segment index with
-**identity mapping** (`moffset == offset`). `open` requires `vsize` to be a
-non-zero multiple of 512 (throws `obd::error(EINVAL)` otherwise), opens
-`path` with `O_RDWR | O_CREAT` (existing content is kept — **no
-truncation**), sizes it to `vsize` with `ftruncate`, and, for a pre-existing
-file, rebuilds coverage from the kernel fiemap (`SEEK_DATA`/`SEEK_HOLE`),
-rounding extent boundaries outward to whole sectors (only whole sectors are
-ever written). Filesystem errors throw `obd::error`.
+A sparse file whose live written extents form identity mappings
+(`moffset == offset`) plus zero-mask mappings for discarded ranges. `open`
+requires `vsize` to be a non-zero multiple of 512 (throws
+`obd::error(EINVAL)` otherwise), opens `path` with `O_RDWR | O_CREAT`
+(existing content is reused), and sizes it to the maximum of the supplied
+`vsize` and the current sparse file length. A valid `<path>.zeroes`
+sidecar may declare that same trusted size or any smaller sector-aligned
+size; sidecars that declare a larger size are rejected as corrupted.
+This preserves online-grown uppers when the data file or caller-supplied
+size already records the grown window without allowing sidecar metadata
+alone to expand the device. For a pre-existing file, `open` rebuilds live
+coverage from the kernel fiemap (`SEEK_DATA`/`SEEK_HOLE`) before loading
+discard masks from the sidecar. Fiemap boundaries are rounded outward to
+whole sectors (only whole sectors are ever written). Filesystem or
+malformed sidecar errors throw `obd::error`; sidecars also reject entry
+counts above the read-only LSMT index maximum before allocating the
+encoded segment array. A sidecar recorded at an older, smaller vsize marks
+the sidecar dirty so the next durability boundary rewrites it at the
+current effective size.
 
 `pwrite`/`pread` return `-EINVAL` on unaligned or out-of-`vsize` requests;
-writes are split at the 14-bit segment-length cap and merged into the
-identity segment set (overlapping and adjacent extents coalesce).
-`flush()` is `fdatasync` and returns 0 or `-errno`.
+writes are split at the 14-bit segment-length cap, replace any overlapping
+zero-mask coverage, and merge into the identity segment set (overlapping
+and adjacent live extents coalesce). `discard` first publishes protective
+zero-mask coverage to `<path>.zeroes`, then performs the real
+`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` and marks the data
+file dirty, so a later size-changing `fdatasync` cannot make a lower-only
+hole durable without top-layer coverage. After the sidecar commit,
+punch-hole is a best-effort space-reclamation step: if it fails, the
+discard still succeeds semantically and reads remain masked by the zero
+sidecar. `pwrite`, `discard`, and `flush`
+serialize their sparse metadata updates so a durability publication cannot
+overtake an earlier write or discard. `flush()` offloads the blocking
+durability work and orders data-file sync versus sidecar rewrite by the
+pending zero-mask transition: writes that remove zero masks sync data
+before removing sidecar coverage, while new discard masks publish sidecar
+coverage before syncing the punched sparse file. It returns 0 or `-errno`.
+Direct `grow()` calls are rejected with `-EBUSY` while
+`pwrite()`/`discard()`/`flush()` or `checkpoint()` is active, and those
+coroutine operations likewise reject a concurrently active grow with
+`-EBUSY`. `checkpoint()` uses the same flush core, then marks the sparse
+upper terminal: later `pwrite()`, `discard()`, `grow()`, and a second
+`checkpoint()` return `-EROFS`.
 
-`discard()` (ADR-0009) uses
-`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` and splits/trims
-the identity extent index. Fiemap is filesystem-block granular, so a
-sub-block punch zeroes but may not deallocate; a reopened index may be
-fatter than the pre-restart one, with identical reads because punched
-blocks read back as zeroes.
+On reopen, the sidecar zero-mask coverage overlays the fiemap live
+coverage. That preserves correct reads across filesystem-block granularity
+differences: a sub-block punch may recover as a fatter live extent, but
+the recorded zero mask still wins over that live range and lower-only
+discards remain top-layer zero masks.
 
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 
@@ -711,7 +747,7 @@ public:
     std::string_view label() const noexcept override;  // "merged-writable(N layers)"
 
     WritableLayer& writable_top() const noexcept;
-    const std::vector<bytes::segment_mapping>& merged_index() const noexcept;
+    std::vector<bytes::segment_mapping> merged_index() const;
 };
 ```
 
@@ -721,19 +757,24 @@ plus a writable top layer, as one block source.
 - `open` throws `obd::error(EINVAL)` on a null `top`. The device virtual
   size is `max(top vsize, lowers vsize)`. Internally the stack is topmost
   first, tag 0 = writable top.
-- `pread` walks the merged index exactly like `MergedLsmt::pread`
-  (sector-aligned or `-EINVAL`; top wins; holes zero; short layer read
-  retried once then zero-filled; clamped at `size()`).
+- `pread` walks an immutable merged-index snapshot exactly like
+  `MergedLsmt::pread` (sector-aligned or `-EINVAL`; top wins; holes zero;
+  short layer read retried once then zero-filled; clamped at `size()`). The
+  snapshot is shared and immutable, so hot reads do not copy the full
+  merged index on every request.
 - `pwrite` validates alignment and bounds, delegates to
   `top_->pwrite` — **RO lowers are never modified** — and then rebuilds the
   merged index (`rebuild_index()`). Write-heavy workloads should batch,
   since the rebuild is O(index size) per write.
 - `flush()` delegates to the top layer's `flush()`.
+- `grow()` widens the writable top before publishing the merged view size;
+  direct overlap with `pwrite()`/`discard()`/`flush()` returns `-EBUSY` so
+  a resize cannot overtake a top mutation or durability boundary.
 - `discard()` (ADR-0009) delegates to the top layer and rebuilds the index.
   With an LSMT-RW top, discarded ranges stay covered by zeroed segments and
   mask lower-layer data (matching upstream LSMT trim). With a sparse top,
-  discard punches holes in the top file; #85 tracks the remaining
-  merged-view lower-mask gap.
+  discarded ranges publish a sidecar zero map before best-effort top-file
+  hole punching, preserving the same lower-layer mask semantics.
 - As a `source::WritableBlobSource`, this is the device root the ublk bridge
   dispatches WRITE/FLUSH/DISCARD/WRITE_ZEROES to; a read-only image root
   simply does not implement the interface and writes/discards get `-EROFS`.
@@ -930,18 +971,23 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
   after `open` returns; concurrent `pread`s on one instance are safe (the
   `source::BlobSource` contract), including from multiple coroutines and
   ublk queue threads. Accessor-returned references (`header()`,
-  `segments()`, `merged_index()`, `jump_table()`) borrow the instance —
-  they are invalidated by destruction.
+  `segments()`, `MergedLsmt::merged_index()`, `jump_table()`) borrow the
+  instance — they are invalidated by destruction. `MergedWritable::pread()`
+  uses an immutable shared index snapshot; `MergedWritable::merged_index()`
+  returns a copy because writes can rebuild that index.
 - **Writers (layers).** `SparseRwLayer`, `LsmtRwLayer`, and
   `MergedWritable` hold mutable state (segment index, append position,
-  seals). Concurrent `pread`s are safe, but `pwrite` / `flush` / `seal`
-  must be **externally serialized** against each other and against reads of
-  the affected range — the layers do not lock (the ublk bridge serializes
-  WRITE/FLUSH; `MergedWritable` rebuilds its index synchronously inside each
-  `pwrite`, so overlapping `pwrite` coroutines on one instance are not
-  supported). `LsmtRwLayer` deliberately exposes appended data through its
-  atomic-sized `data_source()` view so the merged view can read freshly
-  written data.
+  seals). Concurrent `pread`s are safe. `SparseRwLayer` internally
+  serializes `pwrite` / `discard` / `flush` metadata publication, and
+  `MergedWritable` serializes top-layer mutations with merged-index rebuilds
+  and publishes immutable merged-index snapshots for reads. Direct
+  `MergedWritable::grow()` overlap with `pwrite()`/`discard()`/`flush()`
+  returns `-EBUSY`, so a resize cannot overtake a top mutation or
+  durability boundary. Callers that
+  require application-level read-after-write ordering must still order reads
+  of the affected range after the write/discard completion. `LsmtRwLayer`
+  deliberately exposes appended data through its atomic-sized
+  `data_source()` view so the merged view can read freshly written data.
 - **Ownership.** `open`/`create` take ownership of the source chain
   (`BlobSourcePtr`, layers vector). Buffers passed to `pread`/`pwrite` are
   caller-owned and only accessed until the task completes.
@@ -1145,7 +1191,8 @@ writers and readers agree on the same bytes.
   extents sub-sector could mark unwritten sectors covered (harmless: they
   read back as the on-disk zeros).
 - **Merged index rebuild is O(index) per write.** `MergedWritable` rebuilds
-  after every `pwrite`; write-heavy workloads should batch writes.
+  after every `pwrite`; read requests reuse the published immutable snapshot
+  instead of copying the full index. Write-heavy workloads should batch writes.
 - **Trace packaging is external.** The trace codec (`trace.hpp`) is
   implemented and tested; replay is wired into device bring-up
   (`trace_replay.hpp`, ADR-0013) and recording into the supervisor's

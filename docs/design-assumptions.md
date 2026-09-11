@@ -77,8 +77,10 @@ uppers never seal.
 Discard's intended device contract is mask-with-zeroes semantics
 (ADR-0009): a discarded range should read back as zeroes rather than fall
 through to the lowers. LSMT-RW satisfies this by recording zeroed segments;
-sparse performs a real punch-hole, and #85 tracks its current merged-view
-lower-mask gap.
+sparse satisfies it by first publishing sidecar zero-mask metadata for
+lower-layer masking, then punching holes as a best-effort space reclamation.
+`flush()`/`checkpoint()` sync the sparse data file and republish dirty sidecar
+state after later writes or grows.
 
 ## A9. DART is never on the required path
 

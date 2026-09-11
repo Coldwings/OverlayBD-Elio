@@ -114,8 +114,9 @@ docs/adr/         Architecture Decision Records
 Implemented and tested: read path (local + registry + layer store with
 background fill + DART), ZFile/LSMT formats, multi-layer merge, writable uppers (sparse and
 in-place-edit LSMT-RW with seal), discard/write-zeroes plumbing
-(LSMT-RW masks with zeroed segments; sparse lower-mask coverage is tracked
-in #85), ublk data plane, supervisor process model with ublk
+(LSMT-RW masks with zeroed segments; sparse masks with a sidecar zero map
+persisted at flush/checkpoint),
+ublk data plane, supervisor process model with ublk
 USER_RECOVERY crash recovery (ADR-0010), structural warm-up, trace replay,
 and supervisor-driven trace recording (ADR-0012/0013). Deferred by design:
 TurboOCI and the upstream dynamic prefetch file-list mode.

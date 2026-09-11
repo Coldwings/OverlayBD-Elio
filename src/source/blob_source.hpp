@@ -52,8 +52,10 @@ public:
 using BlobSourcePtr = std::unique_ptr<BlobSource>;
 
 /// Writable block source (ADR-0008): the device root of an image with a
-/// writable upper layer. Reads follow the BlobSource contract; writes are
-/// sector-aligned like reads and follow the same return convention.
+/// writable upper layer. Reads follow the BlobSource contract, except that
+/// a grow-capable writable root may report a larger size() after a successful
+/// resize. Writes are sector-aligned like reads and follow the same return
+/// convention.
 /// The ublk bridge dispatches WRITE/FLUSH through this interface and
 /// answers -EROFS when the root does not implement it.
 class WritableBlobSource : public BlobSource {

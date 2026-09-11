@@ -2,23 +2,324 @@
 #include "format/sparse_rw.hpp"
 
 #include "common/errors.hpp"
+#include "format/lsmt_format.hpp"
 
 #include <elio/io/io_awaitables.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <limits>
+#include <optional>
+#include <utility>
+#include <vector>
 
 namespace obd::format {
 
 namespace {
 
 constexpr uint64_t kSector = 512;
+constexpr uint64_t kMaxSegLen = bytes::segment_mapping::kMaxLength;
+constexpr uint64_t kMaxZeroMaskVsize =
+    bytes::segment_mapping::kInvalidOffset * kSector;
+constexpr size_t kZeroMaskHeaderSize = 32;
+constexpr char kZeroMaskMagic[8] = {'O', 'B', 'D', 'S', 'P', 'Z', 'M', '1'};
+
+struct SyncMutexGuard {
+    elio::sync::mutex* mu = nullptr;
+
+    explicit SyncMutexGuard(elio::sync::mutex& m) : mu(&m) {}
+    ~SyncMutexGuard() {
+        if (mu != nullptr) mu->unlock();
+    }
+
+    SyncMutexGuard(const SyncMutexGuard&) = delete;
+    SyncMutexGuard& operator=(const SyncMutexGuard&) = delete;
+};
+
+struct AdoptActiveOp {};
+
+struct ActiveOpGuard {
+    std::atomic<uint32_t>& active;
+
+    explicit ActiveOpGuard(std::atomic<uint32_t>& a, AdoptActiveOp)
+        : active(a) {}
+    ~ActiveOpGuard() { active.fetch_sub(1, std::memory_order_acq_rel); }
+
+    ActiveOpGuard(const ActiveOpGuard&) = delete;
+    ActiveOpGuard& operator=(const ActiveOpGuard&) = delete;
+};
+
+struct FdGuard {
+    int fd = -1;
+    const std::string* unlink_path = nullptr;
+
+    explicit FdGuard(int value, const std::string* path = nullptr)
+        : fd(value), unlink_path(path) {}
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    int release() {
+        unlink_path = nullptr;
+        const int value = fd;
+        fd = -1;
+        return value;
+    }
+    ~FdGuard() {
+        if (fd >= 0) ::close(fd);
+        if (unlink_path != nullptr) ::unlink(unlink_path->c_str());
+    }
+    int close() {
+        if (fd < 0) return 0;
+        const int value = fd;
+        fd = -1;
+        if (::close(value) != 0) return errno;
+        return 0;
+    }
+    void dismiss_unlink() { unlink_path = nullptr; }
+};
+
+std::string parent_dir_of(const std::string& path) {
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos) return ".";
+    if (slash == 0) return "/";
+    return path.substr(0, slash);
+}
+
+int fsync_parent_dir(const std::string& path) {
+    const std::string dir = parent_dir_of(path);
+    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return errno;
+    int rc = 0;
+    if (::fsync(fd) != 0) rc = errno;
+    if (::close(fd) != 0 && rc == 0) rc = errno;
+    return rc;
+}
+
+int pwrite_all_sync(int fd, const void* buf, size_t count, uint64_t offset) {
+    const uint8_t* p = static_cast<const uint8_t*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const ssize_t r = ::pwrite(fd, p + done, count - done,
+                                  static_cast<off_t>(offset + done));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return errno;
+        }
+        if (r == 0) return EIO;
+        done += static_cast<size_t>(r);
+    }
+    return 0;
+}
+
+int pread_all_sync(int fd, void* buf, size_t count, uint64_t offset) {
+    uint8_t* p = static_cast<uint8_t*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const ssize_t r = ::pread(fd, p + done, count - done,
+                                 static_cast<off_t>(offset + done));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return errno;
+        }
+        if (r == 0) return EIO;
+        done += static_cast<size_t>(r);
+    }
+    return 0;
+}
+
+std::optional<uint64_t> read_zero_mask_vsize(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return std::nullopt;
+        throw_errno(errno, "cannot open sparse zero mask " + path);
+    }
+    FdGuard guard(fd);
+
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        const int e = errno;
+        throw_errno(e, "cannot stat sparse zero mask " + path);
+    }
+    if (st.st_size < static_cast<off_t>(kZeroMaskHeaderSize)) {
+        throw format_error("sparse zero mask is truncated: " + path);
+    }
+
+    std::array<uint8_t, kZeroMaskHeaderSize> hdr {};
+    const int rc = pread_all_sync(fd, hdr.data(), hdr.size(), 0);
+    if (rc != 0) {
+        throw_errno(rc, "cannot read sparse zero mask " + path);
+    }
+    const int close_rc = guard.close();
+    if (close_rc != 0) {
+        throw_errno(close_rc, "cannot close sparse zero mask " + path);
+    }
+    if (std::memcmp(hdr.data(), kZeroMaskMagic, sizeof(kZeroMaskMagic)) != 0) {
+        throw format_error("sparse zero mask has bad magic: " + path);
+    }
+
+    const uint64_t stored_vsize = bytes::load_u64_le(hdr.data() + 8);
+    if (stored_vsize == 0 || stored_vsize % kSector != 0 ||
+        stored_vsize > kMaxZeroMaskVsize) {
+        throw format_error("sparse zero mask vsize mismatch: " + path);
+    }
+    return stored_vsize;
+}
+
+bool can_coalesce(const bytes::segment_mapping& a,
+                  const bytes::segment_mapping& b) {
+    if (a.zeroed != b.zeroed || b.offset > a.end()) return false;
+    const uint64_t merged_end = std::max(a.end(), b.end());
+    const uint64_t merged_len = merged_end - a.offset;
+    if (merged_len > kMaxSegLen) return false;
+    if (a.zeroed) return true;
+    return a.moffset + (b.offset - a.offset) == b.moffset;
+}
+
+void coalesce_with_next(std::vector<bytes::segment_mapping>& v,
+                        std::vector<bytes::segment_mapping>::iterator it) {
+    while (it + 1 != v.end() && can_coalesce(*it, *(it + 1))) {
+        auto next = it + 1;
+        it->length =
+            static_cast<uint32_t>(std::max(it->end(), next->end()) -
+                                  it->offset);
+        v.erase(next);
+    }
+}
+
+void insert_sorted(std::vector<bytes::segment_mapping>& v,
+                   const bytes::segment_mapping& m) {
+    auto it = v.begin();
+    while (it != v.end() && it->offset < m.offset) ++it;
+    it = v.insert(it, m);
+    if (it != v.begin()) {
+        auto prev = it - 1;
+        if (can_coalesce(*prev, *it)) {
+            prev->length =
+                static_cast<uint32_t>(std::max(prev->end(), it->end()) -
+                                      prev->offset);
+            it = v.erase(it);
+            it = prev;
+        }
+    }
+    coalesce_with_next(v, it);
+}
+
+void push_coalesced(std::vector<bytes::segment_mapping>& v,
+                    bytes::segment_mapping m) {
+    if (m.length == 0) return;
+    if (!v.empty() && can_coalesce(v.back(), m)) {
+        v.back().length = static_cast<uint32_t>(
+            std::max(v.back().end(), m.end()) - v.back().offset);
+        return;
+    }
+    v.push_back(m);
+}
+
+void push_zero_range(std::vector<bytes::segment_mapping>& v, uint64_t lo,
+                     uint64_t hi) {
+    uint64_t cur = lo;
+    while (cur < hi) {
+        const uint64_t n = std::min(hi - cur, kMaxSegLen);
+        bytes::segment_mapping m;
+        m.offset = cur;
+        m.length = static_cast<uint32_t>(n);
+        m.moffset = 0;
+        m.zeroed = true;
+        m.tag = 0;
+        push_coalesced(v, m);
+        cur += n;
+    }
+}
+
+std::vector<bytes::segment_mapping> zero_mask_segments_from(
+    const std::vector<bytes::segment_mapping>& segments) {
+    std::vector<bytes::segment_mapping> zeroes;
+    for (const auto& s : segments) {
+        if (s.zeroed) zeroes.push_back(s);
+    }
+    return zeroes;
+}
+
+std::vector<bytes::segment_mapping> overlay_zero_masks(
+    std::vector<bytes::segment_mapping> live,
+    const std::vector<bytes::segment_mapping>& zeroes) {
+    std::vector<bytes::segment_mapping> out;
+    out.reserve(live.size() + zeroes.size());
+    size_t i = 0;
+    for (const auto& z : zeroes) {
+        const uint64_t z_lo = z.offset;
+        const uint64_t z_hi = z.end();
+        while (i < live.size() && live[i].end() <= z_lo) {
+            push_coalesced(out, live[i++]);
+        }
+        while (i < live.size() && live[i].offset < z_hi) {
+            const auto s = live[i];
+            const uint64_t s_end = s.end();
+            if (s.offset < z_lo) {
+                auto head = s;
+                const uint64_t head_end = std::min(z_lo, s_end);
+                head.length = static_cast<uint32_t>(head_end - s.offset);
+                push_coalesced(out, head);
+            }
+            if (s_end <= z_hi) {
+                ++i;
+                continue;
+            }
+            auto tail = s;
+            tail.offset = z_hi;
+            if (!tail.zeroed) tail.moffset += z_hi - s.offset;
+            tail.length = static_cast<uint32_t>(s_end - z_hi);
+            live[i] = tail;
+            break;
+        }
+        push_zero_range(out, z_lo, z_hi);
+    }
+    while (i < live.size()) push_coalesced(out, live[i++]);
+    return out;
+}
 
 }  // namespace
+
+class SparseRwLayer::View final : public source::BlobSource {
+public:
+    View(int fd, const std::atomic<uint64_t>& size, std::string label)
+        : fd_(fd), size_(&size), label_(std::move(label)) {}
+
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                    uint64_t offset) override {
+        const uint64_t bound = size_->load(std::memory_order_acquire);
+        if (offset >= bound) co_return 0;
+        if (count > bound - offset) count = static_cast<size_t>(bound - offset);
+        uint8_t* p = static_cast<uint8_t*>(buf);
+        size_t done = 0;
+        while (done < count) {
+            const auto r = co_await elio::io::async_read(
+                fd_, p + done, count - done,
+                static_cast<int64_t>(offset + done));
+            if (r.result < 0) co_return r.result;
+            if (r.result == 0) break;
+            done += static_cast<size_t>(r.result);
+        }
+        co_return static_cast<ssize_t>(done);
+    }
+
+    uint64_t size() const noexcept override {
+        return size_->load(std::memory_order_acquire);
+    }
+
+    std::string_view label() const noexcept override { return label_; }
+
+private:
+    int fd_;
+    const std::atomic<uint64_t>* size_;
+    std::string label_;
+};
 
 elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
     const std::string& path, uint64_t vsize) {
@@ -27,28 +328,59 @@ elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
     }
     const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) throw_errno(errno, "cannot open sparse layer " + path);
+    FdGuard opened(fd);
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
         const int e = errno;
-        ::close(fd);
         throw_errno(e, "cannot stat sparse layer " + path);
     }
     const bool fresh = st.st_size == 0;
-    if (::ftruncate(fd, static_cast<off_t>(vsize)) != 0) {
-        const int e = errno;
-        ::close(fd);
-        throw_errno(e, "cannot size sparse layer " + path);
+    uint64_t effective_vsize = vsize;
+    const std::string zero_mask_path = path + ".zeroes";
+    if (!fresh) {
+        if (st.st_size < 0 ||
+            static_cast<uint64_t>(st.st_size) % kSector != 0) {
+            throw format_error("sparse layer size is not sector aligned: " +
+                               path);
+        }
+        effective_vsize =
+            std::max(effective_vsize, static_cast<uint64_t>(st.st_size));
+        try {
+            const auto sidecar_vsize = read_zero_mask_vsize(zero_mask_path);
+            if (sidecar_vsize) {
+                if (*sidecar_vsize > effective_vsize) {
+                    throw format_error("sparse zero mask vsize mismatch: " +
+                                       zero_mask_path);
+                }
+                effective_vsize = std::max(effective_vsize, *sidecar_vsize);
+            }
+        } catch (...) {
+            throw;
+        }
     }
-
     auto layer = std::unique_ptr<SparseRwLayer>(new SparseRwLayer);
-    layer->fd_ = fd;
-    layer->vsize_.store(vsize, std::memory_order_release);
-    layer->ro_ = co_await source::LocalFileSource::open(path);
+    layer->vsize_.store(effective_vsize, std::memory_order_release);
+    layer->zero_mask_path_ = zero_mask_path;
+    layer->fd_ = opened.release();
+
+    if (fresh) {
+        if (::unlink(layer->zero_mask_path_.c_str()) == 0) {
+            const int drc = fsync_parent_dir(layer->zero_mask_path_);
+            if (drc != 0) {
+                throw_errno(drc, "cannot sync sparse zero mask directory " +
+                                     layer->zero_mask_path_);
+            }
+        } else if (errno != ENOENT) {
+            const int e = errno;
+            throw_errno(e, "cannot remove stale sparse zero mask " +
+                           layer->zero_mask_path_);
+        }
+    }
 
     if (!fresh) {
         // Recover written extents from the kernel fiemap.
         uint64_t pos = 0;
-        while (pos < vsize) {
+        while (pos < effective_vsize) {
             const off_t data =
                 ::lseek(fd, static_cast<off_t>(pos), SEEK_DATA);
             if (data < 0) {
@@ -62,46 +394,359 @@ elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
                 throw_errno(e, "SEEK_HOLE failed on " + path);
             }
             const uint64_t d = static_cast<uint64_t>(data);
-            const uint64_t h = std::min(static_cast<uint64_t>(hole), vsize);
-            // Extent boundaries are not necessarily sector aligned on
-            // every filesystem; round outward to whole sectors (we only
-            // ever write whole sectors).
+            const uint64_t h =
+                std::min(static_cast<uint64_t>(hole), effective_vsize);
+            // Extent boundaries are not necessarily sector aligned on every
+            // filesystem; round outward to whole sectors (we only ever write
+            // whole sectors).
             const uint64_t so = d / kSector;
             const uint64_t se = (h + kSector - 1) / kSector;
-            if (se > so) layer->insert_extent(so, se - so);
+            if (se > so) layer->insert_live_extent(so, se - so);
             pos = h;
         }
     }
+    layer->load_zero_masks();
+    if (::ftruncate(fd, static_cast<off_t>(effective_vsize)) != 0) {
+        const int e = errno;
+        throw_errno(e, "cannot size sparse layer " + path);
+    }
+    layer->ro_ = std::make_unique<SparseRwLayer::View>(
+        fd, layer->vsize_, "sparse-rw:" + path);
     co_return layer;
 }
 
-void SparseRwLayer::insert_extent(uint64_t off, uint64_t len) {
-    if (len == 0) return;
-    // Identity mapping: any covered range is one segment {off, len, off}.
-    // Merge with all overlapping or directly adjacent segments.
-    uint64_t lo = off, hi = off + len;
-    std::vector<bytes::segment_mapping> out;
-    out.reserve(segments_.size() + 1);
+SparseRwLayer::~SparseRwLayer() {
+    if (fd_ >= 0) elio::io::close_fd_for_destructor(fd_);
+}
+
+std::vector<bytes::segment_mapping> SparseRwLayer::segments_snapshot() const {
+    std::lock_guard lock(meta_mu_);
+    return segments_;
+}
+
+source::BlobSource& SparseRwLayer::data_source() {
+    return *ro_;
+}
+
+int SparseRwLayer::begin_data_op(uint64_t offset, uint64_t len) {
+    std::lock_guard lock(state_gate_mu_);
+    const Lifecycle state = lifecycle_.load(std::memory_order_acquire);
+    if (state != Lifecycle::kOpen) {
+        return state == Lifecycle::kCheckpointed ? -EROFS : -EBUSY;
+    }
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (offset > cur_vsize || len > cur_vsize - offset) return -EINVAL;
+    active_ops_.fetch_add(1, std::memory_order_acq_rel);
+    return 0;
+}
+
+int SparseRwLayer::begin_flush_op(bool* already_checkpointed) {
+    *already_checkpointed = false;
+    std::lock_guard lock(state_gate_mu_);
+    const Lifecycle state = lifecycle_.load(std::memory_order_acquire);
+    if (state == Lifecycle::kCheckpointed) {
+        *already_checkpointed = true;
+        return 0;
+    }
+    if (state != Lifecycle::kOpen) return -EBUSY;
+    active_ops_.fetch_add(1, std::memory_order_acq_rel);
+    return 0;
+}
+
+int SparseRwLayer::begin_grow_op() {
+    std::lock_guard lock(state_gate_mu_);
+    const Lifecycle state = lifecycle_.load(std::memory_order_acquire);
+    if (state != Lifecycle::kOpen) {
+        return state == Lifecycle::kCheckpointed ? -EROFS : -EBUSY;
+    }
+    if (active_ops_.load(std::memory_order_acquire) != 0) return -EBUSY;
+    lifecycle_.store(Lifecycle::kGrowing, std::memory_order_release);
+    return 0;
+}
+
+int SparseRwLayer::begin_checkpoint_op() {
+    std::lock_guard lock(state_gate_mu_);
+    const Lifecycle state = lifecycle_.load(std::memory_order_acquire);
+    if (state != Lifecycle::kOpen) {
+        return state == Lifecycle::kCheckpointed ? -EROFS : -EBUSY;
+    }
+    if (active_ops_.load(std::memory_order_acquire) != 0) return -EBUSY;
+    lifecycle_.store(Lifecycle::kCheckpointing, std::memory_order_release);
+    return 0;
+}
+
+void SparseRwLayer::end_data_op() {
+    active_ops_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void SparseRwLayer::end_grow_op() {
+    std::lock_guard lock(state_gate_mu_);
+    lifecycle_.store(Lifecycle::kOpen, std::memory_order_release);
+}
+
+void SparseRwLayer::end_checkpoint_op(Lifecycle next) {
+    std::lock_guard lock(state_gate_mu_);
+    lifecycle_.store(next, std::memory_order_release);
+}
+
+bool SparseRwLayer::dirty_zero_masks_need_data_first() const {
+    std::lock_guard lock(meta_mu_);
+    return zero_masks_dirty_ && zero_masks_data_first_;
+}
+
+bool SparseRwLayer::has_zero_masks_locked() const {
+    return std::any_of(segments_.begin(), segments_.end(),
+                       [](const auto& s) { return s.zeroed; });
+}
+
+bool SparseRwLayer::range_intersects_zero_mask_locked(uint64_t lo,
+                                                      uint64_t hi) const {
+    return std::any_of(segments_.begin(), segments_.end(),
+                       [lo, hi](const auto& s) {
+                           return s.zeroed && s.offset < hi && s.end() > lo;
+                       });
+}
+
+std::vector<bytes::segment_mapping>
+SparseRwLayer::zero_mask_segments_locked() const {
+    return zero_mask_segments_from(segments_);
+}
+
+void SparseRwLayer::erase_range(uint64_t lo, uint64_t hi) {
+    if (lo >= hi) return;
+    std::vector<bytes::segment_mapping> next;
+    next.reserve(segments_.size());
     for (const auto& s : segments_) {
         const uint64_t s_end = s.end();
-        if (s_end < lo || s.offset > hi) {
-            out.push_back(s);  // disjoint (with a gap), keep
-        } else {
-            lo = std::min(lo, s.offset);
-            hi = std::max(hi, s_end);
+        if (s_end <= lo || s.offset >= hi) {
+            next.push_back(s);
+            continue;
+        }
+        if (s.offset < lo) {
+            auto head = s;
+            head.length = static_cast<uint32_t>(lo - s.offset);
+            next.push_back(head);
+        }
+        if (s_end > hi) {
+            auto tail = s;
+            tail.offset = hi;
+            if (!tail.zeroed) tail.moffset += hi - s.offset;
+            tail.length = static_cast<uint32_t>(s_end - hi);
+            next.push_back(tail);
         }
     }
-    bytes::segment_mapping m;
-    m.offset = lo;
-    m.length = static_cast<uint32_t>(hi - lo);
-    m.moffset = lo;  // identity
-    m.zeroed = false;
-    m.tag = 0;
-    // Insert sorted.
-    auto it = out.begin();
-    while (it != out.end() && it->offset < m.offset) ++it;
-    out.insert(it, m);
-    segments_.swap(out);
+    segments_.swap(next);
+}
+
+void SparseRwLayer::insert_live_extent(uint64_t off, uint64_t len) {
+    uint64_t cur = off;
+    const uint64_t hi = off + len;
+    while (cur < hi) {
+        const uint64_t n = std::min(hi - cur, kMaxSegLen);
+        bytes::segment_mapping m;
+        m.offset = cur;
+        m.length = static_cast<uint32_t>(n);
+        m.moffset = cur;
+        m.zeroed = false;
+        m.tag = 0;
+        insert_sorted(segments_, m);
+        cur += n;
+    }
+}
+
+SparseRwLayer::ZeroMaskPersistResult SparseRwLayer::persist_zero_masks(
+    const std::vector<bytes::segment_mapping>& zeroes,
+    uint64_t vsize) const {
+    if (zeroes.size() > lsmt::kMaxRoIndexSize) return {-EFBIG, false};
+    if (!zeroes.empty() && vsize > kMaxZeroMaskVsize) {
+        return {-EFBIG, false};
+    }
+    if (zeroes.empty()) {
+        bool namespace_committed = false;
+        if (::unlink(zero_mask_path_.c_str()) == 0) {
+            namespace_committed = true;
+            const int drc = fsync_parent_dir(zero_mask_path_);
+            if (drc != 0) return {-drc, namespace_committed};
+        } else if (errno != ENOENT) {
+            return {-errno, namespace_committed};
+        } else {
+            namespace_committed = true;
+            const int drc = fsync_parent_dir(zero_mask_path_);
+            if (drc != 0) return {-drc, namespace_committed};
+        }
+        return {0, namespace_committed};
+    }
+
+    const std::string tmp = zero_mask_path_ + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                          0644);
+    if (fd < 0) return {-errno, false};
+    FdGuard guard(fd, &tmp);
+
+    std::vector<uint8_t> raw(
+        kZeroMaskHeaderSize +
+            zeroes.size() * bytes::segment_mapping::kEncodedSize,
+        0);
+    std::memcpy(raw.data(), kZeroMaskMagic, sizeof(kZeroMaskMagic));
+    bytes::store_u64_le(raw.data() + 8, vsize);
+    bytes::store_u64_le(raw.data() + 16, zeroes.size());
+    for (size_t i = 0; i < zeroes.size(); ++i) {
+        auto z = zeroes[i];
+        z.zeroed = true;
+        z.moffset = 0;
+        z.tag = 0;
+        bytes::store_segment_le(
+            raw.data() + kZeroMaskHeaderSize +
+                i * bytes::segment_mapping::kEncodedSize,
+            z);
+    }
+
+    int rc = pwrite_all_sync(fd, raw.data(), raw.size(), 0);
+    if (rc == 0 && ::fsync(fd) != 0) rc = errno;
+    const int close_rc = guard.close();
+    if (close_rc != 0 && rc == 0) rc = close_rc;
+    if (rc != 0) {
+        return {-rc, false};
+    }
+    if (::rename(tmp.c_str(), zero_mask_path_.c_str()) != 0) {
+        const int e = errno;
+        return {-e, false};
+    }
+    guard.dismiss_unlink();
+    const bool namespace_committed = true;
+    const int drc = fsync_parent_dir(zero_mask_path_);
+    if (drc != 0) return {-drc, namespace_committed};
+    return {0, namespace_committed};
+}
+
+int SparseRwLayer::sync_data_file() const {
+    if (::fdatasync(fd_) != 0) return -errno;
+    return 0;
+}
+
+elio::coro::task<int> SparseRwLayer::publish_data_first_zero_masks_locked() {
+    std::vector<bytes::segment_mapping> zeroes;
+    uint64_t generation = 0;
+    uint64_t publish_vsize = 0;
+    {
+        std::lock_guard lock(meta_mu_);
+        if (!zero_masks_dirty_ || !zero_masks_data_first_) co_return 0;
+        zeroes = zero_mask_segments_locked();
+        generation = zero_masks_generation_;
+        publish_vsize = vsize_.load(std::memory_order_acquire);
+    }
+    struct ZeroMaskSnapshot {
+        std::vector<bytes::segment_mapping> zeroes;
+        uint64_t vsize;
+    } snapshot{std::move(zeroes), publish_vsize};
+    const int rc = co_await elio::spawn_blocking(
+        [self = this, snapshot = &snapshot] {
+            const int sync_rc = self->sync_data_file();
+            if (sync_rc != 0) return sync_rc;
+            return self->persist_zero_masks(snapshot->zeroes, snapshot->vsize)
+                .rc;
+        });
+    if (rc != 0) co_return rc;
+    {
+        std::lock_guard lock(meta_mu_);
+        if (zero_masks_generation_ == generation) {
+            zero_masks_dirty_ = false;
+            zero_masks_data_first_ = false;
+        }
+    }
+    co_return 0;
+}
+
+void SparseRwLayer::load_zero_masks() {
+    const int fd = ::open(zero_mask_path_.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return;
+        throw_errno(errno, "cannot open sparse zero mask " + zero_mask_path_);
+    }
+    FdGuard guard(fd);
+
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        const int e = errno;
+        throw_errno(e, "cannot stat sparse zero mask " + zero_mask_path_);
+    }
+    if (st.st_size < static_cast<off_t>(kZeroMaskHeaderSize)) {
+        throw format_error("sparse zero mask is truncated: " + zero_mask_path_);
+    }
+
+    std::array<uint8_t, kZeroMaskHeaderSize> hdr {};
+    int rc = pread_all_sync(fd, hdr.data(), hdr.size(), 0);
+    if (rc != 0) {
+        throw_errno(rc, "cannot read sparse zero mask " + zero_mask_path_);
+    }
+    if (std::memcmp(hdr.data(), kZeroMaskMagic, sizeof(kZeroMaskMagic)) != 0) {
+        throw format_error("sparse zero mask has bad magic: " + zero_mask_path_);
+    }
+
+    const uint64_t stored_vsize = bytes::load_u64_le(hdr.data() + 8);
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    if (stored_vsize == 0 || stored_vsize % kSector != 0 ||
+        stored_vsize > kMaxZeroMaskVsize ||
+        stored_vsize > cur_vsize) {
+        throw format_error("sparse zero mask vsize mismatch: " +
+                           zero_mask_path_);
+    }
+    if (stored_vsize != cur_vsize) zero_masks_dirty_ = true;
+
+    const uint64_t count = bytes::load_u64_le(hdr.data() + 16);
+    if (count > lsmt::kMaxRoIndexSize) {
+        throw format_error("sparse zero mask size exceeds maximum: " +
+                           zero_mask_path_);
+    }
+    const uint64_t max_count =
+        (std::numeric_limits<uint64_t>::max() - kZeroMaskHeaderSize) /
+        bytes::segment_mapping::kEncodedSize;
+    if (count > max_count) {
+        throw format_error("sparse zero mask size mismatch: " + zero_mask_path_);
+    }
+    const uint64_t entry_bytes =
+        count * bytes::segment_mapping::kEncodedSize;
+    if (static_cast<uint64_t>(st.st_size) != kZeroMaskHeaderSize + entry_bytes) {
+        throw format_error("sparse zero mask size mismatch: " + zero_mask_path_);
+    }
+
+    std::vector<uint8_t> raw(entry_bytes);
+    if (entry_bytes != 0) {
+        rc = pread_all_sync(fd, raw.data(), raw.size(), kZeroMaskHeaderSize);
+        if (rc != 0) {
+            throw_errno(rc, "cannot read sparse zero mask entries " +
+                                zero_mask_path_);
+        }
+    }
+    (void)guard.close();
+
+    const uint64_t stored_max_sector = stored_vsize / kSector;
+    const uint64_t cur_max_sector = cur_vsize / kSector;
+    std::vector<bytes::segment_mapping> zeroes;
+    zeroes.reserve(static_cast<size_t>(count));
+    uint64_t prev_end = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        auto z = bytes::load_segment_le(
+            raw.data() + i * bytes::segment_mapping::kEncodedSize);
+        if (!z.zeroed || z.length == 0 ||
+            z.offset == bytes::segment_mapping::kInvalidOffset ||
+            z.offset < prev_end || z.offset > stored_max_sector ||
+            z.length > stored_max_sector - z.offset) {
+            throw format_error("sparse zero mask has invalid segment: " +
+                               zero_mask_path_);
+        }
+        const uint64_t z_end = z.offset + z.length;
+        if (z.offset < cur_max_sector) {
+            const uint64_t clipped_end = std::min(z_end, cur_max_sector);
+            z.length = static_cast<uint32_t>(clipped_end - z.offset);
+            z.moffset = 0;
+            z.zeroed = true;
+            z.tag = 0;
+            zeroes.push_back(z);
+        }
+        prev_end = z_end;
+    }
+    segments_ = overlay_zero_masks(std::move(segments_), zeroes);
 }
 
 int SparseRwLayer::grow(uint64_t vsize) {
@@ -109,36 +754,159 @@ int SparseRwLayer::grow(uint64_t vsize) {
     // run this off an Elio worker via elio::spawn_blocking — the device
     // resize executor does. Equal is an idempotent no-op (retried grows);
     // smaller is a shrink and is rejected.
-    if (vsize == 0 || vsize % kSector != 0) return -EINVAL;
+    const int gate = begin_grow_op();
+    if (gate != 0) return gate;
+    struct GrowResetGuard {
+        SparseRwLayer* self;
+        bool armed = true;
+        ~GrowResetGuard() {
+            if (armed) self->end_grow_op();
+        }
+    } reset{this};
+    int rc = 0;
+    if (vsize == 0 || vsize % kSector != 0) rc = -EINVAL;
     const uint64_t cur = vsize_.load(std::memory_order_acquire);
-    if (vsize < cur) return -EINVAL;  // grow-only (equal = no-op)
-    if (vsize == cur) return 0;
-    if (::ftruncate(fd_, static_cast<off_t>(vsize)) != 0) return -errno;
-    vsize_.store(vsize, std::memory_order_release);
-    return 0;
+    if (rc == 0 && vsize < cur) {
+        rc = -EINVAL;  // grow-only (equal = no-op)
+    } else if (rc == 0 && vsize > cur) {
+        std::vector<bytes::segment_mapping> zeroes;
+        uint64_t generation = 0;
+        bool dirty = false;
+        bool data_first = false;
+        bool has_zero_masks = false;
+        {
+            std::lock_guard lock(meta_mu_);
+            dirty = zero_masks_dirty_;
+            data_first = zero_masks_data_first_;
+            has_zero_masks = has_zero_masks_locked();
+            if (dirty) {
+                zeroes = zero_mask_segments_locked();
+                generation = zero_masks_generation_;
+            }
+        }
+        if (vsize > kMaxZeroMaskVsize && has_zero_masks) {
+            rc = -EFBIG;
+        }
+        if (rc == 0 && dirty) {
+            if (data_first) rc = sync_data_file();
+            if (rc == 0) rc = persist_zero_masks(zeroes, cur).rc;
+            if (rc == 0 && !data_first) rc = sync_data_file();
+            if (rc == 0) {
+                std::lock_guard lock(meta_mu_);
+                if (zero_masks_generation_ == generation) {
+                    zero_masks_dirty_ = false;
+                    zero_masks_data_first_ = false;
+                }
+            }
+        }
+    }
+    if (rc == 0 && vsize > cur) {
+        if (::ftruncate(fd_, static_cast<off_t>(vsize)) != 0) {
+            rc = -errno;
+        } else if (::fdatasync(fd_) != 0) {
+            const int sync_errno = errno;
+            if (::ftruncate(fd_, static_cast<off_t>(cur)) != 0) {
+                rc = -errno;
+            } else {
+                (void)::fdatasync(fd_);
+                rc = -sync_errno;
+            }
+        }
+    }
+    if (rc == 0 && vsize > cur) {
+        vsize_.store(vsize, std::memory_order_release);
+        std::lock_guard lock(meta_mu_);
+        if (has_zero_masks_locked() || zero_masks_dirty_) {
+            zero_masks_dirty_ = true;
+            zero_masks_data_first_ = false;
+            ++zero_masks_generation_;
+        }
+    }
+    reset.armed = false;
+    end_grow_op();
+    return rc;
 }
 
 elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
                                                 uint64_t offset) {
+    const int gate = begin_data_op(offset, count);
+    if (gate != 0) co_return gate;
+    ActiveOpGuard active(active_ops_, AdoptActiveOp{});
     if (offset % kSector != 0 || count % kSector != 0 || count == 0) {
         co_return -EINVAL;
     }
-    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
-    if (offset + count > cur_vsize) co_return -EINVAL;
+    co_await op_mu_.lock();
+    SyncMutexGuard op_guard(op_mu_);
+    const uint64_t request_lo = offset / kSector;
+    const uint64_t request_hi = request_lo + count / kSector;
+    bool flush_before_write = false;
+    {
+        std::lock_guard lock(meta_mu_);
+        flush_before_write =
+            zero_masks_dirty_ &&
+            (zero_masks_data_first_ ||
+             range_intersects_zero_mask_locked(request_lo, request_hi));
+    }
+    if (flush_before_write) {
+        const int rc = co_await flush_locked();
+        if (rc != 0) co_return rc;
+    }
     const uint8_t* p = static_cast<const uint8_t*>(buf);
     size_t done = 0;
-    while (done < count) {
+    bool removed_zero_mask = false;
+    int write_error = 0;
+    while (done < count && write_error == 0) {
         const size_t piece = std::min(
             count - done,
             static_cast<size_t>(bytes::segment_mapping::kMaxLength) * kSector);
         // elio io backend: positional write, never blocks the worker.
-        const auto r = co_await elio::io::async_write(
-            fd_, p + done, piece, static_cast<off_t>(offset + done));
-        if (r.result < 0) co_return r.result;
-        if (r.result != static_cast<ssize_t>(piece)) co_return -EIO;
+        // Publish full-sector prefixes as they land so an error after a
+        // positive short write cannot leave the sparse index behind the file.
+        size_t written = 0;
+        size_t indexed = 0;
+        while (written < piece) {
+            const auto r = co_await elio::io::async_write(
+                fd_, p + done + written, piece - written,
+                static_cast<off_t>(offset + done + written));
+            if (r.result < 0) {
+                write_error = static_cast<int>(r.result);
+                break;
+            }
+            if (r.result == 0) {
+                write_error = -EIO;
+                break;
+            }
+            written += static_cast<size_t>(r.result);
+            if (written > piece) {
+                write_error = -EIO;
+                break;
+            }
+
+            const size_t indexable = (written / kSector) * kSector;
+            if (indexable > indexed) {
+                const uint64_t lo = (offset + done + indexed) / kSector;
+                const uint64_t hi = (offset + done + indexable) / kSector;
+                std::lock_guard lock(meta_mu_);
+                const bool erased_zero =
+                    range_intersects_zero_mask_locked(lo, hi);
+                erase_range(lo, hi);
+                insert_live_extent(lo, hi - lo);
+                if (erased_zero) {
+                    removed_zero_mask = true;
+                    zero_masks_dirty_ = true;
+                    zero_masks_data_first_ = true;
+                    ++zero_masks_generation_;
+                }
+                indexed = indexable;
+            }
+        }
         done += piece;
     }
-    insert_extent(offset / kSector, count / kSector);
+    if (removed_zero_mask) {
+        const int rc = co_await publish_data_first_zero_masks_locked();
+        if (rc != 0) co_return rc;
+    }
+    if (write_error != 0) co_return write_error;
     co_return static_cast<ssize_t>(count);
 }
 
@@ -147,40 +915,47 @@ elio::coro::task<ssize_t> SparseRwLayer::pread(void* buf, size_t count,
     if (offset % kSector != 0 || count % kSector != 0) co_return -EINVAL;
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
     if (offset >= cur_vsize) co_return 0;
-    if (count > cur_vsize - offset) count = static_cast<size_t>(cur_vsize - offset);
+    if (count > cur_vsize - offset) {
+        count = static_cast<size_t>(cur_vsize - offset);
+    }
     uint8_t* out = static_cast<uint8_t*>(buf);
     size_t done = 0;
     while (done < count) {
         const uint64_t pos = offset + done;
         // Find coverage of pos in the (sorted, merged) extents.
+        bytes::segment_mapping hit {};
+        bool has_hit = false;
         uint64_t covered_end = pos;
-        bool covered = false;
-        for (const auto& s : segments_) {
-            if (s.offset > pos) break;
-            if (s.end() * kSector > pos) {
-                covered = true;
-                covered_end = s.end() * kSector;
-                break;
-            }
-        }
-        if (covered) {
-            const size_t n =
-                static_cast<size_t>(std::min<uint64_t>(covered_end - pos,
-                                                       count - done));
-            const auto r = co_await elio::io::async_read(
-                fd_, out + done, n, static_cast<off_t>(pos));
-            if (r.result < 0) co_return r.result;
-            if (r.result != static_cast<ssize_t>(n)) co_return -EIO;
-            done += n;
-        } else {
-            // Zero-fill up to the next extent or the request end.
-            uint64_t next = offset + count;
+        uint64_t next = offset + count;
+        {
+            std::lock_guard lock(meta_mu_);
             for (const auto& s : segments_) {
                 if (s.offset * kSector > pos) {
                     next = std::min(next, s.offset * kSector);
                     break;
                 }
+                if (s.end() * kSector > pos) {
+                    hit = s;
+                    has_hit = true;
+                    covered_end = s.end() * kSector;
+                    break;
+                }
             }
+        }
+        if (has_hit) {
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(
+                covered_end - pos, count - done));
+            if (hit.zeroed) {
+                std::memset(out + done, 0, n);
+            } else {
+                const auto r = co_await elio::io::async_read(
+                    fd_, out + done, n, static_cast<off_t>(pos));
+                if (r.result < 0) co_return r.result;
+                if (r.result != static_cast<ssize_t>(n)) co_return -EIO;
+            }
+            done += n;
+        } else {
+            // Zero-fill up to the next extent or the request end.
             const size_t n = static_cast<size_t>(next - pos);
             std::memset(out + done, 0, n);
             done += n;
@@ -190,53 +965,152 @@ elio::coro::task<ssize_t> SparseRwLayer::pread(void* buf, size_t count,
 }
 
 elio::coro::task<int> SparseRwLayer::discard(uint64_t offset, uint64_t len) {
+    const int gate = begin_data_op(offset, len);
+    if (gate != 0) co_return gate;
+    ActiveOpGuard active(active_ops_, AdoptActiveOp{});
     if (offset % kSector != 0 || len % kSector != 0 || len == 0) {
         co_return -EINVAL;
     }
-    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
-    if (offset + len > cur_vsize) co_return -EINVAL;
-    // Real deallocation: the blocks return to the filesystem and the range
-    // reads back as zeroes. Metadata-only syscall (same duration class as
-    // the fdatasync in flush()).
-    if (::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                    static_cast<off_t>(offset),
-                    static_cast<off_t>(len)) != 0) {
-        co_return -errno;
+    co_await op_mu_.lock();
+    SyncMutexGuard op_guard(op_mu_);
+    if (dirty_zero_masks_need_data_first()) {
+        const int rc = co_await flush_locked();
+        if (rc != 0) co_return rc;
     }
-    // Drop coverage of [lo,hi) from the extent index (split/trim).
     const uint64_t lo = offset / kSector;
     const uint64_t hi = lo + len / kSector;
-    std::vector<bytes::segment_mapping> next;
-    next.reserve(segments_.size());
-    for (const auto& s : segments_) {
-        if (s.end() <= lo || s.offset >= hi) {
-            next.push_back(s);
-            continue;
-        }
-        if (s.offset < lo) {
-            auto head = s;
-            head.length = static_cast<uint32_t>(lo - s.offset);
-            next.push_back(head);
-        }
-        if (s.end() > hi) {
-            auto tail = s;
-            tail.offset = hi;
-            tail.moffset += hi - s.offset;
-            tail.length = static_cast<uint32_t>(s.end() - hi);
-            next.push_back(tail);
-        }
+    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+
+    // Publish the protective zero-mask sidecar before punching the sparse
+    // file. If a crash makes the later hole durable before a flush completes,
+    // recovery still sees top-layer coverage and cannot fall through to the
+    // lower layer. The dirty flag remains set so the next flush syncs the
+    // punched data file and republishes the already-protective snapshot.
+    std::vector<bytes::segment_mapping> next_segments;
+    std::vector<bytes::segment_mapping> next_zeroes;
+    {
+        std::lock_guard lock(meta_mu_);
+        std::vector<bytes::segment_mapping> added_zero;
+        push_zero_range(added_zero, lo, hi);
+        next_segments = overlay_zero_masks(segments_, added_zero);
+        next_zeroes = zero_mask_segments_from(next_segments);
     }
-    segments_.swap(next);
+    struct ZeroMaskSnapshot {
+        std::vector<bytes::segment_mapping> zeroes;
+        uint64_t vsize;
+    } snapshot{next_zeroes, cur_vsize};
+    const ZeroMaskPersistResult prc = co_await elio::spawn_blocking(
+        [self = this, snapshot = &snapshot] {
+            return self->persist_zero_masks(snapshot->zeroes, snapshot->vsize);
+        });
+    // If rename/unlink changed the sidecar namespace but the following
+    // directory fsync failed, keep the live view aligned with reopen recovery.
+    if (prc.namespace_committed) {
+        std::lock_guard lock(meta_mu_);
+        segments_ = std::move(next_segments);
+        zero_masks_dirty_ = true;
+        zero_masks_data_first_ = false;
+        ++zero_masks_generation_;
+    }
+    if (prc.rc != 0) co_return prc.rc;
+
+    // Real deallocation: the blocks return to the filesystem and the range
+    // reads back as zeroes from this layer. The sidecar already carries the
+    // semantic mask, so the punch is no longer the first durable state change.
+    // If punch-hole is unsupported or otherwise fails after the mask commit,
+    // discard still succeeded semantically; only physical space reclamation is
+    // skipped for this request.
+    const int frc = co_await elio::spawn_blocking([this, offset, len] {
+        if (::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                        static_cast<off_t>(offset),
+                        static_cast<off_t>(len)) != 0) {
+            return -errno;
+        }
+        return 0;
+    });
+    (void)frc;
     co_return 0;
 }
 
 elio::coro::task<int> SparseRwLayer::flush() {
-    if (::fdatasync(fd_) != 0) co_return -errno;
+    bool already_checkpointed = false;
+    const int gate = begin_flush_op(&already_checkpointed);
+    if (gate != 0) co_return gate;
+    if (already_checkpointed) co_return 0;
+    ActiveOpGuard active(active_ops_, AdoptActiveOp{});
+    co_await op_mu_.lock();
+    SyncMutexGuard op_guard(op_mu_);
+    co_return co_await flush_locked();
+}
+
+elio::coro::task<int> SparseRwLayer::flush_locked() {
+    std::vector<bytes::segment_mapping> zeroes;
+    uint64_t generation = 0;
+    uint64_t flush_vsize = 0;
+    bool dirty = false;
+    bool data_first = false;
+    {
+        std::lock_guard lock(meta_mu_);
+        dirty = zero_masks_dirty_;
+        data_first = zero_masks_data_first_;
+        if (dirty) {
+            zeroes = zero_mask_segments_locked();
+            generation = zero_masks_generation_;
+            flush_vsize = vsize_.load(std::memory_order_acquire);
+        }
+    }
+    if (dirty) {
+        struct ZeroMaskSnapshot {
+            std::vector<bytes::segment_mapping> zeroes;
+            uint64_t vsize;
+        } snapshot{std::move(zeroes), flush_vsize};
+        const int rc = co_await elio::spawn_blocking(
+            [self = this, snapshot = &snapshot, data_first] {
+                if (data_first) {
+                    const int sync_rc = self->sync_data_file();
+                    if (sync_rc != 0) return sync_rc;
+                }
+                const ZeroMaskPersistResult mask_rc =
+                    self->persist_zero_masks(snapshot->zeroes,
+                                             snapshot->vsize);
+                if (mask_rc.rc != 0) return mask_rc.rc;
+                if (!data_first) return self->sync_data_file();
+                return 0;
+            });
+        if (rc != 0) co_return rc;
+        {
+            std::lock_guard lock(meta_mu_);
+            if (zero_masks_generation_ == generation) {
+                zero_masks_dirty_ = false;
+                zero_masks_data_first_ = false;
+            }
+        }
+    } else {
+        const int rc = co_await elio::spawn_blocking(
+            [this] { return sync_data_file(); });
+        if (rc != 0) co_return rc;
+    }
     co_return 0;
 }
 
 elio::coro::task<int> SparseRwLayer::checkpoint() {
-    co_return 0;  // extents are durable via the fiemap already
+    const int gate = begin_checkpoint_op();
+    if (gate != 0) co_return gate;
+    struct ResetGuard {
+        SparseRwLayer* self;
+        bool armed = true;
+        ~ResetGuard() {
+            if (armed) {
+                self->end_checkpoint_op(Lifecycle::kOpen);
+            }
+        }
+    } reset{this};
+    co_await op_mu_.lock();
+    SyncMutexGuard op_guard(op_mu_);
+    const int rc = co_await flush_locked();
+    end_checkpoint_op(rc == 0 ? Lifecycle::kCheckpointed : Lifecycle::kOpen);
+    reset.armed = false;
+    co_return rc;
 }
 
 }  // namespace obd::format

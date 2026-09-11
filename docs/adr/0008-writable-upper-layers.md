@@ -41,9 +41,10 @@ a standard sealed LSMT file at seal time.
 
 - Two implementations are bound to one sector-aligned `WritableLayer`
   contract (pwrite/pread/flush plus a segment view for the merger):
-  - **sparse**: a sparse file whose written extents are the coverage index
-    (identity mapping), rebuilt from the kernel fiemap
-    (`SEEK_DATA`/`SEEK_HOLE`) on open — so it survives restarts;
+  - **sparse**: a sparse file whose live written extents are rebuilt from
+    the kernel fiemap (`SEEK_DATA`/`SEEK_HOLE`) on open, paired with a
+    small `<path>.zeroes` sidecar for discard zero masks — so live writes
+    and lower-layer masks survive restarts;
   - **lsmt**: an unsealed single-file LSMT with in-place edit as decided
     above. Its segment index is memory-only until `seal()`; an unsealed
     file is **not** recoverable across process restarts (creation
@@ -57,7 +58,8 @@ a standard sealed LSMT file at seal time.
 - The ublk data plane forwards `WRITE`/`FLUSH` to the writable root when
   present and keeps answering `-EROFS` otherwise; the device advertises
   `UBLK_ATTR_READ_ONLY` only for read-only images. `DISCARD`/punch-hole
-  remain unsupported (`EOPNOTSUPP`) in this revision.
+  reaches the writable root when advertised and masks lower layers with
+  zeroes.
 - Config compatibility: unknown `upper` types are rejected with `EINVAL`;
   an absent or empty `upper` keeps the read-only behavior. The `upper`
   field name and `dir` semantics follow overlaybd-snapshotter convention;

@@ -383,13 +383,75 @@ Every test, grouped by area, with the property it guards.
   valid through checkpoint/offline seal; reopened virtual reads preserve
   the patch, an unrelated live range and all remaining zeroes. Also covers
   a rewrite crossing the maximum segment/write-piece length (issue #13).
-- `format: sparse layer discard punches holes and recovers` — discard
-  is a real punch-hole; reads stay correct across a reopen even though
-  fiemap recovery is filesystem-block granular (ADR-0009).
+- `format: sparse layer discard keeps a durable zero mask` — discard
+  publishes protective sidecar zero-mask coverage before punching sparse
+  file blocks, so reads stay correct across reopen and lower layers remain
+  masked (ADR-0009).
+- `format: sparse layer checkpoint persists a dirty zero mask` — sparse
+  `checkpoint()` uses the same durability path as `flush()`: after a
+  discard followed by grow, it republishes the sidecar at the grown virtual
+  size before making the checkpoint terminal.
+- `format: sparse layer checkpoint failure can retry` — if checkpoint sidecar
+  publication fails, the sparse upper leaves checkpointing state, continues to
+  admit writes, and can checkpoint successfully after the sidecar failure is
+  cleared.
+- `format: sparse layer checkpoint is terminal` — after sparse
+  `checkpoint()` succeeds, later writes, discards, grows and repeated
+  checkpoints fail with `-EROFS`.
+- `format: sparse layer grow republishes zero mask size` — after an online
+  sparse grow, existing protective zero-mask coverage stays recoverable at
+  the old sidecar size until the next `flush()` republishes the sidecar
+  with the grown virtual size.
+- `format: sparse grow rejects oversized zero-mask window` — a sparse layer
+  with active zero masks rejects growth past the sidecar segment-offset limit
+  before entering a size that cannot later reach `flush()` or `checkpoint()`.
+- `format: sparse grow preserves an unflushed discard mask on reopen` —
+  a sparse grow after discard but before `flush()` keeps the protective
+  zero-mask sidecar recoverable, so a reopened merged view still masks
+  lower-layer bytes.
+- `format: sparse zero mask sidecar overrides live fiemap coverage` — a
+  recovered sidecar zero range overlays an overlapping live extent from
+  fiemap, preserving sub-block discard masks across filesystems with
+  coarse extent reporting.
+- `format: sparse layer reopen accepts a published grown zero mask` —
+  recovery accepts a sidecar recorded at a larger online-grow size than
+  the supplied configuration and keeps that larger sparse write window.
+- `format: sparse zero mask sidecar preserves grown size` — recovery
+  reopens an online-grown sparse upper with the original configured size,
+  preserves the grown window and zero masks, and keeps the sidecar
+  consistent after flush.
+- `format: sparse zero mask writer rejects oversized vsize` — sidecar
+  publication rejects vsize fields beyond the reader's segment-encoding
+  limit before writing a sidecar that future reopen would reject.
+- `format: sparse zero mask sidecar rejects malformed metadata` — reopen
+  rejects truncated sidecars, bad magic, mismatched sizes, excessive entry
+  counts, oversized recovered vsize fields, reserved sentinel offsets and
+  overlapping or out-of-range zero segments.
+- `format: fresh sparse layer ignores stale zero mask sidecar` — a newly
+  created sparse upper removes any stale sidecar instead of inheriting old
+  discard masks from a previous file at the same path.
 - `format: merged writable discard masks the lower layer` — with an
   LSMT-RW top, discarding a range covered only by the lower reads back
-  zeroes, not the lower's data (mask semantics, ADR-0009). Sparse top
-  lower-mask coverage is tracked in #85.
+  zeroes, not the lower's data (mask semantics, ADR-0009).
+- `format: merged writable sparse discard masks the lower layer` — the
+  same lower-mask regression with a sparse top; the zero mask survives
+  flush and reopen.
+- `format: merged writable sparse discard survives reopen without flush` —
+  a sparse top publishes lower-mask sidecar coverage before flush, so a
+  close/reopen without an explicit flush still reads the discarded lower-only
+  range as zeroes.
+- `format: sparse write retries pending zero-mask removal before later writes` —
+  if publishing a write's zero-mask removal fails after data reaches the
+  sparse file, later writes first retry that pending data-first transition
+  instead of returning success while the stale sidecar still masks data.
+- `format: merged writable sparse write over discard survives reopen without flush` —
+  after a sparse discard publishes lower-mask coverage, a later write into
+  part of that range syncs the data file and republishes the sidecar removal
+  before returning, so reopen without flush preserves the new data.
+- `format: merged writable invalid index fails closed after sparse discard` —
+  after a sparse top has published lower-mask coverage, an invalidated merged
+  index makes reads fail closed with `-EIO` instead of reusing stale lower
+  coverage.
 - `format: trace crc32c golden vectors match the spec` — the trace blob's
   raw-chaining CRC-32C matches the trace-format.md §4 golden vectors,
   including the chaining property (ADR-0013).
@@ -433,11 +495,25 @@ Every test, grouped by area, with the property it guards.
 - `format: sparse layer grow extends the write window` — the D3 grow for
   the sparse upper (ftruncate): pwrite/pread accept the new range and
   shrink is rejected (ADR-0014).
+- `format: sparse layer direct grow gates reject overlaps` — direct test
+  access holds sparse pwrite/flush/checkpoint admissions open so a concurrent
+  grow returns `-EBUSY`, then verifies a later retry succeeds.
+- `format: sparse layer grow rejects direct operation overlaps` —
+  deterministic gate coverage for direct overlap between sparse grow and
+  pwrite/discard/flush/checkpoint, including successful retry after the
+  overlap ends.
 - `format: merged writable grows with its writable top` — the D3 merged-
   view grow: `MergedWritable::grow` extends the writable top first and
   then the merged view; pwrite/discard accept the grown range, an
   unwritten headroom gap reads as zeroes, and shrink is rejected
   (ADR-0014).
+- `format: merged writable grow rejects direct operation overlaps` —
+  direct merged grow rejects already-admitted pwrite/discard/flush work,
+  those operations reject while a direct grow is active, and a later grow
+  retry succeeds after the gate is released.
+- `format: merged writable sparse grow reads new top data` — the same
+  merged grow path with a sparse upper, covering the sparse data-source
+  size refresh needed for reads from newly grown live extents.
 - `image: writable assembly grows to the virtual_size headroom override` —
   `open_image(..., override)` on the real writable assembly path sizes
   the writable top — and hence the merged data plane — at the override:
