@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -73,6 +74,16 @@ constexpr uint64_t kMaxTraceBlobBytes = uint64_t{64} << 20;
 /// envelope before replay even starts.
 constexpr std::chrono::milliseconds kTraceBlobLoadBudget{30000};
 constexpr std::chrono::milliseconds kTraceBlobLoadPoll{5};
+constexpr std::chrono::milliseconds kFillParkTimeout{5000};
+
+elio::coro::task<void> park_layer_store_fills(
+    const std::vector<source::LayerStore*>& stores) {
+    for (auto* store : stores) store->stop_fill();
+    for (auto* store : stores) {
+        co_await store->park_fill(kFillParkTimeout);
+    }
+    co_return;
+}
 
 #ifdef OBD_TEST_HOOKS
 std::atomic<int64_t> g_trace_blob_load_budget_ms{
@@ -308,6 +319,8 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     std::vector<source::BlobSource*> warm_targets;
     warm_targets.reserve(data_lowers.size());
     std::vector<source::LayerStore*> stores;
+    std::exception_ptr assembly_failure;
+    try {
     // The trace recorder (ADR-0013, record path): created idle; the
     // supervisor's trace_start arms it. Every REMOTE lower's registry
     // source is wrapped in a record tap (trace_record.hpp — a pread on
@@ -319,7 +332,11 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
          ++layer_index) {
         const auto& lower = data_lowers[layer_index];
         source::BlobSourcePtr raw;
+        source::BlobSourcePtr untarred;
+        source::BlobSourcePtr view;
         TraceRecordSource* tap = nullptr;
+        std::exception_ptr layer_failure;
+        try {
         const LocalProbe local = probe_local_blob(lower);
         if (!local.path.empty()) {
             if (local.layer_store_commit) {
@@ -452,7 +469,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             }
         }
 
-        auto untarred = co_await source::TarOffsetSource::open(std::move(raw));
+        untarred = co_await source::TarOffsetSource::open(std::move(raw));
         if (tap != nullptr) {
             // Recorded offsets address the payload space (the replay
             // contract); the tar base is known only after this probe and
@@ -464,7 +481,6 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             }
         }
         warm_targets.push_back(untarred.get());
-        source::BlobSourcePtr view;
         if (co_await format::is_zfile(*untarred)) {
             view = co_await format::ZFileSource::open(std::move(untarred),
                                                       /*caller_verify=*/true);
@@ -473,6 +489,13 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         }
         layers.push_back(
             co_await format::LsmtLayer::open(std::move(view)));
+        } catch (...) {
+            layer_failure = std::current_exception();
+        }
+        if (layer_failure) {
+            co_await park_layer_store_fills(stores);
+            std::rethrow_exception(layer_failure);
+        }
     }
 
     // Structural warm-up (ADR-0012's cold-start floor): populate the
@@ -578,6 +601,14 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                   "size {} bytes",
                   n, cfg.upper.type, out.virtual_size);
     co_return out;
+    } catch (...) {
+        assembly_failure = std::current_exception();
+    }
+    if (assembly_failure) {
+        co_await park_layer_store_fills(stores);
+        std::rethrow_exception(assembly_failure);
+    }
+    co_return OpenedImage{};
 }
 
 elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
@@ -641,27 +672,7 @@ elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
 }
 
 elio::coro::task<void> park_image_fills(const OpenedImage& opened) {
-    for (auto* store : opened.layer_stores) store->stop_fill();
-    for (auto* store : opened.layer_stores) {
-        bool parked = false;
-        for (int i = 0; i < 5000 && !parked; ++i) {
-            using FillStatus = source::LayerStore::FillStatus;
-            const FillStatus s = store->fill_status();
-            parked = s == FillStatus::kDisabled || s == FillStatus::kDone ||
-                     s == FillStatus::kStopped;
-            if (!parked) {
-                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-        if (!parked) {
-            // Still in its start delay or stuck on the remote: the caller
-            // is on a teardown path that ends in process exit, which
-            // reaps the coroutine before it can resume (see the
-            // LayerStore lifetime contract).
-            ELIO_LOG_WARNING("layer store fill did not park within the "
-                             "bounded wait; relying on process exit");
-        }
-    }
+    co_await park_layer_store_fills(opened.layer_stores);
     co_return;
 }
 

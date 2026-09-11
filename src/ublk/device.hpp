@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -25,6 +26,8 @@ namespace obd::ublk {
 
 class Device {
 public:
+    using FailureCleanup = std::function<elio::coro::task<void>()>;
+
     /// Creates and starts the device over `src` (the merged block view):
     /// opens queues, launches queue threads (which park their FETCH
     /// commands), issues SET_PARAMS, spawns the bridge coroutines, then
@@ -32,7 +35,8 @@ public:
     /// awaited on the Elio scheduler (bridges spawn with elio::go()).
     /// Throws obd::error on failure.
     static elio::coro::task<std::unique_ptr<Device>> create(
-        const DeviceParams& params, source::BlobSourcePtr src);
+        const DeviceParams& params, source::BlobSourcePtr src,
+        FailureCleanup failure_cleanup = {});
 
     /// ADR-0010: attaches to an EXISTING device created with
     /// UBLK_F_USER_RECOVERY after the previous server process died.
@@ -47,7 +51,7 @@ public:
     /// silently shrink the gendisk.
     static elio::coro::task<std::unique_ptr<Device>> attach(
         uint32_t dev_id, const DeviceParams& params,
-        source::BlobSourcePtr src);
+        source::BlobSourcePtr src, FailureCleanup failure_cleanup = {});
 
     ~Device();
     Device(const Device&) = delete;
@@ -97,7 +101,8 @@ private:
     Device() = default;
     void request_stop() noexcept;
     static elio::coro::task<void> cleanup_failed(
-        std::unique_ptr<Device> dev, std::exception_ptr failure);
+        std::unique_ptr<Device> dev, std::exception_ptr failure,
+        FailureCleanup failure_cleanup = {});
 
     DeviceParams params_;
     source::BlobSourcePtr src_;

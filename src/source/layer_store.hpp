@@ -33,7 +33,7 @@
 // coroutines or a background fill are in flight on it — a suspended fetch,
 // joiner, or fill step touches members on resume (unlike LocalFileSource,
 // whose destructor orders the fd close against the io_uring backend). Park
-// an active fill first: stop_fill() + fill_status() reaching kDone/kStopped.
+// an active fill first with park_fill(), which joins the fill coroutine.
 #pragma once
 
 #include "source/admission.hpp"
@@ -53,6 +53,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -171,13 +172,19 @@ public:
             fill_status_.load(std::memory_order_acquire));
     }
 
-    /// Asks the background fill to stop; it exits at the next step (a sleep
-    /// or queue wait, within ~1s once past the start delay). Idempotent.
-    /// Tests and teardown should poll fill_status() for kDone/kStopped
-    /// before destroying the store (see the lifetime contract above).
+    /// Asks the background fill to stop; it exits at the next stop-aware
+    /// step. Idempotent. stop_fill() alone is only a request: callers that
+    /// may destroy the store must await park_fill() so the coroutine frame is
+    /// released first (see the lifetime contract above).
     void stop_fill() noexcept {
         fill_stop_.store(true, std::memory_order_release);
     }
+
+    /// Requests fill stop and joins the fill coroutine before returning.
+    /// `timeout` is a warning threshold only: if a non-interruptible remote
+    /// await runs longer, this keeps waiting rather than returning while the
+    /// coroutine still owns a raw LayerStore pointer.
+    elio::coro::task<void> park_fill(std::chrono::milliseconds timeout);
 
     /// Test-only hook: invoked by the writer thread before persisting each
     /// queued entry; a non-zero return is treated as a pwrite failure with
@@ -254,6 +261,8 @@ private:
 
     // Background fill (one coroutine, spawned by open when fill.enable).
     elio::coro::task<void> run_fill();
+    elio::coro::task<bool> sleep_fill_stop_aware(
+        std::chrono::milliseconds duration);
     // Waits until the write-behind queue has room for `len` more bytes;
     // false when the fill must stop (bypass, teardown, stop_fill).
     elio::coro::task<bool> wait_queue_room(size_t len);
@@ -328,9 +337,17 @@ private:
     uint32_t attempts_ = 0;        // completion-verify attempts (writer only)
     bool kick_completion_check_ = false;  // set before the writer starts
 
-    // Background fill (one elio::go coroutine; see the lifetime contract).
+    // Background fill (one joinable coroutine; see the lifetime contract).
+    std::optional<elio::coro::join_handle<void>> fill_task_;
     std::atomic<int> fill_status_{static_cast<int>(FillStatus::kDisabled)};
     std::atomic<bool> fill_stop_{false};
 };
+
+#ifdef OBD_TEST_HOOKS
+namespace test_hooks {
+void reset_unparked_layer_store_destructions_for_test();
+uint64_t unparked_layer_store_destructions_for_test();
+}  // namespace test_hooks
+#endif
 
 }  // namespace obd::source

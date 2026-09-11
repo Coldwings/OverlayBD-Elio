@@ -1051,12 +1051,9 @@ TEST_CASE("source: layer store fill resumes from the sidecar across a restart",
             const bool warm = co_await poll_until(
                 [&] { return store->extents_present() >= 1; });
             REQUIRE(warm);
-            store->stop_fill();
-            const bool parked = co_await poll_until([&] {
-                return store->fill_status() ==
-                       source::LayerStore::FillStatus::kStopped;
-            });
-            REQUIRE(parked);
+            co_await store->park_fill(std::chrono::milliseconds(500));
+            REQUIRE(store->fill_status() ==
+                    source::LayerStore::FillStatus::kStopped);
             store->set_test_write_hook(nullptr);
             persisted_phase1 = store->extents_present();
             REQUIRE(persisted_phase1 >= 1);
@@ -1283,6 +1280,40 @@ TEST_CASE("source: layer store fill honors the throughput throttle",
     REQUIRE(elapsed >= std::chrono::milliseconds(1500));
 }
 
+TEST_CASE("source: layer store fill stop interrupts error backoff",
+          "[source]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(2 * kExtent, 211);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto* vec = new VectorSource(blob);
+        vec->fail_with(EIO);
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), "", cfg);
+
+        const bool attempted = co_await poll_until([&] {
+            return vec->reads() > 0 &&
+                   store->fill_status() ==
+                       source::LayerStore::FillStatus::kFilling;
+        });
+        store->stop_fill();
+        const bool stopped = co_await poll_until([&] {
+            return store->fill_status() ==
+                   source::LayerStore::FillStatus::kStopped;
+        }, 500);
+        co_await store->park_fill(std::chrono::milliseconds(500));
+
+        REQUIRE(attempted);
+        REQUIRE(stopped);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("source: layer store fill stays off in bypass", "[source]") {
     test::TempDir dir;
     auto blob = test::pattern_bytes(4 * kExtent, 25);
@@ -1417,14 +1448,10 @@ TEST_CASE("source: layer store fill does not starve readers", "[source]") {
             REQUIRE(buf == slice(blob, e * kExtent, kExtent));
             REQUIRE(b - a < std::chrono::seconds(1));
         }
-        store->stop_fill();
-        const bool parked = co_await poll_until([&] {
-            return store->fill_status() ==
-                       source::LayerStore::FillStatus::kStopped ||
-                   store->fill_status() ==
-                       source::LayerStore::FillStatus::kDone;
-        });
-        REQUIRE(parked);
+        co_await store->park_fill(std::chrono::milliseconds(500));
+        const auto parked_status = store->fill_status();
+        REQUIRE((parked_status == source::LayerStore::FillStatus::kStopped ||
+                 parked_status == source::LayerStore::FillStatus::kDone));
         store->set_test_write_hook(nullptr);
         co_return 0;
     });

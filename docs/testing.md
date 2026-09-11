@@ -644,6 +644,9 @@ Every test, grouped by area, with the property it guards.
 - `source: layer store fill honors the throughput throttle` — a 1 MiB/s
   budget makes a 3 MiB fill take measurable seconds instead of
   milliseconds.
+- `source: layer store fill stop interrupts error backoff` — a transient
+  remote read failure enters the exponential fill backoff; `stop_fill()`
+  interrupts that sleep promptly and `park_fill()` releases the task.
 - `source: layer store fill stays off in bypass` — an injected `ENOSPC`
   mid-fill flips the store to `Bypass`: fill stops (`kStopped`), reads
   continue remotely, nothing persists, no commit appears.
@@ -1186,6 +1189,10 @@ Every test, grouped by area, with the property it guards.
   with `download.enable` set, the first open reads a prefix while the
   background fill warms every remaining extent to `overlaybd.commit`; the
   second open binds the commit with zero additional remote reads.
+- `integration: open_image parks fills when later lower fails assembly` —
+  a first remote lower opens with background fill enabled, then a later
+  malformed lower fails assembly; `open_image` stops and parks the partial
+  chain before unwinding it.
 - `integration: admission funnel bounds on-demand latency under scavenger load` —
   a serialized, latency-injected mock registry (capacity 1, 25 ms
   service) under a six-coroutine populate storm plus the background

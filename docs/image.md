@@ -534,12 +534,14 @@ Throws `obd::error` on an invalid spec (size not a positive multiple of
   The taps in the chain share it; idle, it costs one atomic load per
   remote read.
 - `src/image/image_file.hpp::park_image_fills` — stops every background
-  fill in the chain (`stop_fill` + a bounded wait for a terminal
-  `fill_status`). Must be called before `root` is destroyed on any path
-  other than process exit: destroying a store with a fill in flight is a
-  use-after-free (the fill coroutine touches members on resume). The
-  device server calls it during shutdown; fills still in their start
-  delay exit within one 100 ms sleep slice.
+  fill in the chain and joins each fill task before returning. The timeout
+  is a warning threshold, not permission to destroy a store still owned by
+  a fill frame. Must be called before `root` is destroyed on any path other
+  than process exit: destroying a store with a fill in flight is a
+  use-after-free (the fill coroutine touches members on resume).
+  `open_image` uses the same parking path before unwinding a partially
+  assembled chain, and the device server uses it during normal shutdown and
+  post-open boot-failure cleanup.
 
 `open_image(cfg, global)` — assembles the merged view. Cold path; runs on
 the calling Elio coroutine during device setup.
@@ -787,7 +789,9 @@ Concepts → "The trace layer → Recording".
   a `LayerStore` touches members on
   resume of a suspended `pread`/`populate`/fill step (its lifetime
   contract, see `docs/source.md`). `park_image_fills` is the sanctioned
-  pre-destroy step (the device server calls it during shutdown).
+  pre-destroy step; `open_image` calls it before unwinding a partial
+  chain, and the device server calls it during shutdown and post-open
+  boot-failure cleanup.
 - **No global state** — all per-image state (registry client, layer
   stores) hangs off the returned `OpenedImage` ownership tree.
 
@@ -1059,6 +1063,10 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   prefix while the `LayerStore` background fill warms every remaining
   extent to `overlaybd.commit`; a second open binds the commit with zero
   additional remote reads.
+- `integration: open_image parks fills when later lower fails assembly` —
+  a first remote lower opens with background fill enabled, then a later
+  malformed lower fails assembly; `open_image` stops and parks the partial
+  chain before unwinding it.
 - `integration: admission funnel bounds on-demand latency under scavenger load` —
   through `open_image` against a serialized, latency-injected mock: a
   populate storm plus the background fill cannot push any of twelve

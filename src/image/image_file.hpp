@@ -114,11 +114,11 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
 /// Throws obd::error on an invalid spec or IO failure.
 elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec);
 
-/// Parks every background fill in the assembled chain: stop_fill() on
-/// each store, then a bounded wait for a terminal fill_status. Call before
-/// destroying `opened.root` on any path other than process exit (device
-/// shutdown, tests) — destroying a store with a fill in flight is a
-/// use-after-free (the fill coroutine touches members on resume).
+/// Parks every background fill in the assembled chain by requesting stop and
+/// joining each fill coroutine. Call before destroying `opened.root` on any
+/// path other than process exit (device shutdown, tests) — destroying a store
+/// with a fill in flight is a use-after-free (the fill coroutine touches
+/// members on resume).
 elio::coro::task<void> park_image_fills(const OpenedImage& opened);
 
 /// D3 create-time headroom rule (ADR-0014 dev_size model): the device
