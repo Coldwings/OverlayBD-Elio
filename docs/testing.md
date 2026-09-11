@@ -391,6 +391,9 @@ Every test, grouped by area, with the property it guards.
   `checkpoint()` uses the same durability path as `flush()`, so graceful
   shutdown persists pending discard masks even though sparse uppers never
   seal.
+- `format: sparse layer grow republishes zero mask size` — after an online
+  sparse grow, the next `flush()` republishes the dirty zero-mask sidecar
+  with the grown virtual size before recovery with the old configuration.
 - `format: sparse zero mask sidecar overrides live fiemap coverage` — a
   recovered sidecar zero range overlays an overlapping live extent from
   fiemap, preserving sub-block discard masks across filesystems with
@@ -403,8 +406,9 @@ Every test, grouped by area, with the property it guards.
   preserves the grown window and zero masks, and keeps the sidecar
   consistent after flush.
 - `format: sparse zero mask sidecar rejects malformed metadata` — reopen
-  rejects truncated sidecars, bad magic, mismatched sizes, invalid vsize
-  fields and overlapping or out-of-range zero segments.
+  rejects truncated sidecars, bad magic, mismatched sizes, excessive entry
+  counts, invalid vsize fields and overlapping or out-of-range zero
+  segments.
 - `format: fresh sparse layer ignores stale zero mask sidecar` — a newly
   created sparse upper removes any stale sidecar instead of inheriting old
   discard masks from a previous file at the same path.

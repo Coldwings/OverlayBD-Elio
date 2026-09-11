@@ -95,6 +95,20 @@ void write_sparse_zero_mask(const std::string& path, uint64_t vsize,
     REQUIRE(::close(fd) == 0);
 }
 
+uint64_t sparse_zero_mask_vsize(const std::string& path) {
+    constexpr size_t kHeaderSize = 32;
+    constexpr char kMagic[8] = {'O', 'B', 'D', 'S', 'P', 'Z', 'M', '1'};
+    const std::string sidecar = path + ".zeroes";
+    const int fd = ::open(sidecar.c_str(), O_RDONLY | O_CLOEXEC);
+    REQUIRE(fd >= 0);
+    std::vector<uint8_t> hdr(kHeaderSize);
+    REQUIRE(::pread(fd, hdr.data(), hdr.size(), 0) ==
+            static_cast<ssize_t>(hdr.size()));
+    REQUIRE(::close(fd) == 0);
+    REQUIRE(std::memcmp(hdr.data(), kMagic, sizeof(kMagic)) == 0);
+    return bytes::load_u64_le(hdr.data() + 8);
+}
+
 elio::coro::task<int> expect_sparse_zero_mask_reject(
     std::string path, std::vector<uint8_t> raw, std::string needle) {
     test::write_file(path + ".zeroes", raw);
@@ -1285,6 +1299,41 @@ TEST_CASE("format: sparse layer checkpoint persists a dirty zero mask",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("format: sparse layer grow republishes zero mask size",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer =
+                co_await format::SparseRwLayer::open(path, 512 * 32);
+            const int dr = co_await layer->discard(8 * 512, 4 * 512);
+            REQUIRE(dr == 0);
+            int frc = co_await layer->flush();
+            REQUIRE(frc == 0);
+            REQUIRE(sparse_zero_mask_vsize(path) == 512 * 32);
+
+            const int gr = co_await elio::spawn_blocking(
+                [&] { return layer->grow(512 * 96); });
+            REQUIRE(gr == 0);
+            frc = co_await layer->flush();
+            REQUIRE(frc == 0);
+            REQUIRE(layer->virtual_size() == 512 * 96);
+        }
+
+        REQUIRE(sparse_zero_mask_vsize(path) == 512 * 96);
+        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 32);
+        REQUIRE(reopened->virtual_size() == 512 * 96);
+        REQUIRE(reopened->segments().size() == 1);
+        REQUIRE(reopened->segments()[0].offset == 8);
+        REQUIRE(reopened->segments()[0].length == 4);
+        REQUIRE(reopened->segments()[0].zeroed);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("format: sparse zero mask sidecar overrides live fiemap coverage",
           "[format]") {
     TempDir dir;
@@ -1404,6 +1453,9 @@ TEST_CASE("format: sparse zero mask sidecar rejects malformed metadata",
     bytes::store_u64_le(bad_vsize_seed.data() + 8, 123);
     auto bad_size_seed = make_sparse_zero_mask(512 * 64, {{10, 4}});
     bytes::store_u64_le(bad_size_seed.data() + 16, 2);
+    auto huge_count_seed = make_sparse_zero_mask(512 * 64, {});
+    bytes::store_u64_le(huge_count_seed.data() + 16,
+                        format::lsmt::kMaxRoIndexSize + 1);
     auto overlapping_seed =
         make_sparse_zero_mask(512 * 64, {{10, 4}, {12, 1}});
     auto overflow_seed = make_sparse_zero_mask(512 * 64, {{63, 2}});
@@ -1412,6 +1464,7 @@ TEST_CASE("format: sparse zero mask sidecar rejects malformed metadata",
                                    truncated = std::move(truncated_seed),
                                    bad_vsize = std::move(bad_vsize_seed),
                                    bad_size = std::move(bad_size_seed),
+                                   huge_count = std::move(huge_count_seed),
                                    overlapping = std::move(overlapping_seed),
                                    overflow = std::move(overflow_seed)]()
                                       mutable -> elio::coro::task<int> {
@@ -1435,6 +1488,10 @@ TEST_CASE("format: sparse zero mask sidecar rejects malformed metadata",
 
         rejected = co_await expect_sparse_zero_mask_reject(
             path, std::move(bad_size), std::string("size mismatch"));
+        REQUIRE(rejected == 0);
+
+        rejected = co_await expect_sparse_zero_mask_reject(
+            path, std::move(huge_count), std::string("exceeds maximum"));
         REQUIRE(rejected == 0);
 
         rejected = co_await expect_sparse_zero_mask_reject(

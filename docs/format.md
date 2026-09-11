@@ -531,9 +531,10 @@ For a pre-existing file, `open` rebuilds live coverage from the kernel
 fiemap (`SEEK_DATA`/`SEEK_HOLE`) before loading discard masks from the
 sidecar. Fiemap boundaries are rounded outward to whole sectors (only
 whole sectors are ever written). Filesystem or malformed sidecar errors
-throw `obd::error`; a sidecar recorded at an older, smaller vsize marks
-the sidecar dirty so the next durability boundary rewrites it at the
-current effective size.
+throw `obd::error`; sidecars also reject entry counts above the read-only
+LSMT index maximum before allocating the encoded segment array. A sidecar
+recorded at an older, smaller vsize marks the sidecar dirty so the next
+durability boundary rewrites it at the current effective size.
 
 `pwrite`/`pread` return `-EINVAL` on unaligned or out-of-`vsize` requests;
 writes are split at the 14-bit segment-length cap, replace any overlapping
@@ -542,10 +543,14 @@ and adjacent live extents coalesce). `discard` performs a real
 `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`, records zeroed
 segments for the discarded range, and marks the sidecar dirty so a
 reopened sparse upper still masks lower layers in `MergedWritable` after
-the next durability boundary. `flush()` offloads the blocking durability
+the next durability boundary. `pwrite`, `discard`, and `flush` serialize
+their sparse metadata updates so a durability publication cannot overtake
+an earlier write or discard. `flush()` offloads the blocking durability
 work, first `fdatasync`ing the sparse data file, then atomically rewriting
 and fsyncing `<path>.zeroes` when the zero mask changed; it returns 0 or
-`-errno`. `checkpoint()` delegates to the same flush path.
+`-errno`. `checkpoint()` uses the same flush core, then marks the sparse
+upper terminal: later `pwrite()`, `discard()`, `grow()`, and a second
+`checkpoint()` return `-EROFS`.
 
 On reopen, the sidecar zero-mask coverage overlays the fiemap live
 coverage. That preserves correct reads across filesystem-block granularity
@@ -724,7 +729,7 @@ public:
     std::string_view label() const noexcept override;  // "merged-writable(N layers)"
 
     WritableLayer& writable_top() const noexcept;
-    const std::vector<bytes::segment_mapping>& merged_index() const noexcept;
+    std::vector<bytes::segment_mapping> merged_index() const;
 };
 ```
 
@@ -943,18 +948,19 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
   after `open` returns; concurrent `pread`s on one instance are safe (the
   `source::BlobSource` contract), including from multiple coroutines and
   ublk queue threads. Accessor-returned references (`header()`,
-  `segments()`, `merged_index()`, `jump_table()`) borrow the instance —
-  they are invalidated by destruction.
+  `segments()`, `MergedLsmt::merged_index()`, `jump_table()`) borrow the
+  instance — they are invalidated by destruction. `MergedWritable::merged_index()`
+  returns a copy because writes can rebuild that index.
 - **Writers (layers).** `SparseRwLayer`, `LsmtRwLayer`, and
   `MergedWritable` hold mutable state (segment index, append position,
-  seals). Concurrent `pread`s are safe, but `pwrite` / `flush` / `seal`
-  must be **externally serialized** against each other and against reads of
-  the affected range — the layers do not lock (the ublk bridge serializes
-  WRITE/FLUSH; `MergedWritable` rebuilds its index synchronously inside each
-  `pwrite`, so overlapping `pwrite` coroutines on one instance are not
-  supported). `LsmtRwLayer` deliberately exposes appended data through its
-  atomic-sized `data_source()` view so the merged view can read freshly
-  written data.
+  seals). Concurrent `pread`s are safe. `SparseRwLayer` internally
+  serializes `pwrite` / `discard` / `flush` metadata publication, and
+  `MergedWritable` serializes top-layer mutations with merged-index rebuilds
+  so an older rebuild cannot overtake a newer write or discard. Callers that
+  require application-level read-after-write ordering must still order reads
+  of the affected range after the write/discard completion. `LsmtRwLayer`
+  deliberately exposes appended data through its atomic-sized
+  `data_source()` view so the merged view can read freshly written data.
 - **Ownership.** `open`/`create` take ownership of the source chain
   (`BlobSourcePtr`, layers vector). Buffers passed to `pread`/`pwrite` are
   caller-owned and only accessed until the task completes.

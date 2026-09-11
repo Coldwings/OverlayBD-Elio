@@ -5,11 +5,24 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 namespace obd::format {
 
 namespace {
 constexpr uint64_t kSector = lsmt::kAlignment;
+
+struct SyncMutexGuard {
+    elio::sync::mutex* mu = nullptr;
+
+    explicit SyncMutexGuard(elio::sync::mutex& m) : mu(&m) {}
+    ~SyncMutexGuard() {
+        if (mu != nullptr) mu->unlock();
+    }
+
+    SyncMutexGuard(const SyncMutexGuard&) = delete;
+    SyncMutexGuard& operator=(const SyncMutexGuard&) = delete;
+};
 }
 
 elio::coro::task<std::unique_ptr<MergedWritable>> MergedWritable::open(
@@ -35,12 +48,15 @@ elio::coro::task<std::unique_ptr<MergedWritable>> MergedWritable::open(
 }
 
 void MergedWritable::rebuild_index() {
+    std::lock_guard lock(index_mu_);
+    auto top_snapshot = top_->segments_snapshot();
     std::vector<const std::vector<bytes::segment_mapping>*> stack;
     stack.reserve(layers_.size() + 1);
-    stack.push_back(&top_->segments());  // tag 0 = writable top
+    stack.push_back(&top_snapshot);  // tag 0 = writable top
     for (const auto& l : layers_) stack.push_back(&l->segments());
-    index_.clear();
-    MergedLsmt::merge_indexes(stack, index_);
+    std::vector<bytes::segment_mapping> next;
+    MergedLsmt::merge_indexes(stack, next);
+    index_ = std::move(next);
 }
 
 elio::coro::task<ssize_t> MergedWritable::pread(void* buf, size_t count,
@@ -57,15 +73,20 @@ elio::coro::task<ssize_t> MergedWritable::pread(void* buf, size_t count,
     const uint64_t end_sec = (offset + count) / kSector;
     uint8_t* out = static_cast<uint8_t*>(buf);
 
+    std::vector<bytes::segment_mapping> index_snapshot;
+    {
+        std::lock_guard lock(index_mu_);
+        index_snapshot = index_;
+    }
     auto it = std::upper_bound(
-        index_.begin(), index_.end(), start_sec,
+        index_snapshot.begin(), index_snapshot.end(), start_sec,
         [](uint64_t x, const bytes::segment_mapping& s) {
             return x < s.end();
         });
 
     uint64_t cur = start_sec;
     while (cur < end_sec) {
-        if (it == index_.end() || it->offset >= end_sec) {
+        if (it == index_snapshot.end() || it->offset >= end_sec) {
             std::memset(out + (cur - start_sec) * kSector, 0,
                         static_cast<size_t>(end_sec - cur) * kSector);
             break;
@@ -117,8 +138,10 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
     if ((offset % kSector) != 0 || (count % kSector) != 0) {
         co_return -EINVAL;
     }
+    co_await op_mu_.lock();
+    SyncMutexGuard op_guard(op_mu_);
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
-    if (offset + count > cur_vsize) co_return -EINVAL;
+    if (offset > cur_vsize || count > cur_vsize - offset) co_return -EINVAL;
     const ssize_t r = co_await top_->pwrite(buf, count, offset);
     rebuild_index();
     if (r < 0) co_return r;
@@ -128,8 +151,10 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
 elio::coro::task<int> MergedWritable::discard(uint64_t offset,
                                               uint64_t len) {
     if ((offset % kSector) != 0 || (len % kSector) != 0) co_return -EINVAL;
+    co_await op_mu_.lock();
+    SyncMutexGuard op_guard(op_mu_);
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
-    if (offset + len > cur_vsize) co_return -EINVAL;
+    if (offset > cur_vsize || len > cur_vsize - offset) co_return -EINVAL;
     const int r = co_await top_->discard(offset, len);
     rebuild_index();
     if (r != 0) co_return r;
@@ -137,6 +162,8 @@ elio::coro::task<int> MergedWritable::discard(uint64_t offset,
 }
 
 elio::coro::task<int> MergedWritable::flush() {
+    co_await op_mu_.lock();
+    SyncMutexGuard op_guard(op_mu_);
     co_return co_await top_->flush();
 }
 

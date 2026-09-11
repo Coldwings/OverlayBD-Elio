@@ -9,7 +9,10 @@
 #include "format/writable.hpp"
 #include "source/blob_source.hpp"
 
+#include <elio/sync/mutex.hpp>
+
 #include <atomic>
+#include <mutex>
 
 namespace obd::format {
 
@@ -49,7 +52,8 @@ public:
 
     WritableLayer& writable_top() const noexcept { return *top_; }
 
-    const std::vector<bytes::segment_mapping>& merged_index() const noexcept {
+    std::vector<bytes::segment_mapping> merged_index() const {
+        std::lock_guard lock(index_mu_);
         return index_;
     }
 
@@ -59,7 +63,11 @@ private:
 
     std::vector<std::unique_ptr<LsmtLayer>> layers_;  // topmost first (RO)
     std::unique_ptr<WritableLayer> top_;
+    /// Serializes top-layer mutations and their merged-index rebuilds so an
+    /// older rebuild cannot publish after a newer write/discard.
+    elio::sync::mutex op_mu_;
     std::vector<bytes::segment_mapping> index_;       // tag 0 = writable top
+    mutable std::mutex index_mu_;
     /// Device virtual size in bytes. Atomic: the device resize executor
     /// (a spawn_blocking pool thread) grows the merged view while bridge
     /// coroutines on Elio workers read/write through it.

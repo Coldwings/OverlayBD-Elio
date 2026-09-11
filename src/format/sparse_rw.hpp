@@ -8,9 +8,11 @@
 #pragma once
 
 #include "format/writable.hpp"
-#include "source/local_file.hpp"
+
+#include <elio/sync/mutex.hpp>
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -48,12 +50,16 @@ public:
     const std::vector<bytes::segment_mapping>& segments() const override {
         return segments_;
     }
-    source::BlobSource& data_source() override { return *ro_; }
+    std::vector<bytes::segment_mapping> segments_snapshot() const override;
+    source::BlobSource& data_source() override;
 
 private:
+    class View;
+
     SparseRwLayer() = default;
     bool has_zero_masks() const;
     bool has_zero_masks_locked() const;
+    bool range_intersects_zero_mask_locked(uint64_t lo, uint64_t hi) const;
     std::vector<bytes::segment_mapping> zero_mask_segments() const;
     std::vector<bytes::segment_mapping> zero_mask_segments_locked() const;
     void insert_live_extent(uint64_t off, uint64_t len);
@@ -65,13 +71,16 @@ private:
     void load_zero_masks();
 
     int fd_ = -1;                    // RW fd (writes + flushes)
-    std::unique_ptr<source::LocalFileSource> ro_;  // RO view for data_source()
+    std::unique_ptr<View> ro_;       // RO view for data_source()
     /// Declared size in bytes. Atomic: the device resize executor (a
     /// spawn_blocking pool thread) grows the layer while bridge
     /// coroutines on Elio workers read/write through it.
     std::atomic<uint64_t> vsize_{0}; // bytes
     std::string zero_mask_path_;
     std::vector<bytes::segment_mapping> segments_;
+    /// Serializes pwrite/discard/flush durability ordering without
+    /// blocking an Elio worker while disk work is offloaded.
+    elio::sync::mutex op_mu_;
     mutable std::mutex meta_mu_;
     uint64_t zero_masks_generation_ = 0;
     bool zero_masks_dirty_ = false;

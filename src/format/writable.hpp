@@ -69,6 +69,12 @@ public:
     /// Current segment index: sorted, disjoint, 512B sector units, tag 0.
     virtual const std::vector<bytes::segment_mapping>& segments() const = 0;
 
+    /// Stable copy of the current segment index for callers that must not
+    /// borrow across concurrent writable-layer mutations.
+    virtual std::vector<bytes::segment_mapping> segments_snapshot() const {
+        return segments();
+    }
+
     /// The file view segment data is read from (identity for sparse).
     virtual source::BlobSource& data_source() = 0;
 };
