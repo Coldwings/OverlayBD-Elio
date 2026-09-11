@@ -173,6 +173,22 @@ public:
         timer_awake_hook_ = std::move(hook);
     }
 
+    /// Test-only: when set, the first caller draining a duration timer
+    /// co_awaits this hook after claiming that timer's handle.
+    void set_timer_drain_claim_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        timer_drain_claim_hook_ = std::move(hook);
+    }
+
+    /// Test-only: when set, callers waiting for another drain owner
+    /// co_await this hook after observing that owner.
+    void set_timer_drain_wait_hook_for_test(
+        std::function<elio::coro::task<void>()> hook) {
+        std::lock_guard<std::mutex> lk(mu_);
+        timer_drain_wait_hook_ = std::move(hook);
+    }
+
     /// Test-only: when set, the duration timer co_awaits this hook after
     /// the expiry callback and before its coroutine returns.
     void set_timer_exit_hook_for_test(
@@ -203,7 +219,8 @@ private:
 
     elio::coro::task<FinalizeResult> stop_impl(std::string reason,
                                                bool from_timer);
-    elio::coro::task<void> drain_timer_task();
+    elio::coro::task<void> drain_timer_task(
+        std::shared_ptr<TimerDrain> drain);
 
     /// Shared finalize: drain + write + fsync + digest. Caller holds
     /// state transition; returns the filled result (reason set by caller).
@@ -231,6 +248,8 @@ private:
     std::function<elio::coro::task<void>()> start_hook_;         // test-only
     std::function<elio::coro::task<void>()> stop_claim_hook_;    // test-only
     std::function<elio::coro::task<void>()> timer_awake_hook_;   // test-only
+    std::function<elio::coro::task<void>()> timer_drain_claim_hook_;
+    std::function<elio::coro::task<void>()> timer_drain_wait_hook_;
     std::function<elio::coro::task<void>()> timer_exit_hook_;    // test-only
 };
 

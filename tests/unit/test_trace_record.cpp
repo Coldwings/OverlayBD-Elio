@@ -662,6 +662,153 @@ TEST_CASE("image: trace recording late stop waits for expiry callback completion
     REQUIRE(records.size() == 1);
 }
 
+TEST_CASE("image: trace recording stale stop never drains a restarted timer",
+          "[image]") {
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(64 * 1024, 79);
+    const std::string first_out = dir / "first.trace";
+    const std::string second_out = dir / "second.trace";
+    std::atomic<bool> timer_exit_entered{false};
+    std::atomic<bool> timer_exit_release{false};
+    std::atomic<bool> drain_claimed{false};
+    std::atomic<bool> drain_claim_release{false};
+    std::atomic<bool> drain_waiting{false};
+    std::atomic<bool> drain_wait_release{false};
+    std::atomic<bool> first_stop_entered{false};
+    std::atomic<bool> stale_stop_entered{false};
+    std::optional<image::TraceRecorder::FinalizeResult> first_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> stale_stop;
+    std::optional<image::TraceRecorder::FinalizeResult> cleanup_stop;
+    bool second_started = false;
+    bool recording_after_stale_stop = false;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        rec->set_timer_exit_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                timer_exit_entered.store(true, std::memory_order_release);
+                while (!timer_exit_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        rec->set_timer_drain_claim_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                drain_claimed.store(true, std::memory_order_release);
+                while (!drain_claim_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        rec->set_timer_drain_wait_hook_for_test(
+            [&]() -> elio::coro::task<void> {
+                drain_waiting.store(true, std::memory_order_release);
+                while (!drain_wait_release.load(std::memory_order_acquire)) {
+                    co_await elio::time::sleep_for(1ms);
+                }
+            });
+        auto release_all = [&] {
+            timer_exit_release.store(true, std::memory_order_release);
+            drain_claim_release.store(true, std::memory_order_release);
+            drain_wait_release.store(true, std::memory_order_release);
+        };
+
+        image::TraceRecordSource first_tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        std::string error;
+        const bool started = co_await rec->start(
+            first_out, 1,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!started) co_return 1;
+        const ssize_t r1 = co_await read_at(first_tap, 0, 4096);
+        if (r1 != 4096) {
+            release_all();
+            const auto ignored = co_await rec->stop("cleanup");
+            (void)ignored;
+            co_return 2;
+        }
+        const bool exit_held = co_await wait_until([&] {
+            return timer_exit_entered.load(std::memory_order_acquire);
+        });
+        if (!exit_held) {
+            release_all();
+            stale_stop = co_await rec->stop("cleanup");
+            co_return 3;
+        }
+
+        auto first_task = elio::spawn(marked_stop, rec, &first_stop_entered,
+                                     std::string("shutdown"));
+        const bool claimed = co_await wait_until([&] {
+            return first_stop_entered.load(std::memory_order_acquire) &&
+                   drain_claimed.load(std::memory_order_acquire);
+        });
+        if (!claimed) {
+            release_all();
+            first_stop = co_await await_stop_handle(first_task);
+            co_return 4;
+        }
+
+        auto stale_task = elio::spawn(marked_stop, rec, &stale_stop_entered,
+                                     std::string("shutdown"));
+        const bool waiting = co_await wait_until([&] {
+            return stale_stop_entered.load(std::memory_order_acquire) &&
+                   drain_waiting.load(std::memory_order_acquire);
+        });
+        if (!waiting) {
+            release_all();
+            first_stop = co_await await_stop_handle(first_task);
+            stale_stop = co_await await_stop_handle(stale_task);
+            co_return 5;
+        }
+
+        timer_exit_release.store(true, std::memory_order_release);
+        drain_claim_release.store(true, std::memory_order_release);
+        first_stop = co_await await_stop_handle(first_task);
+        rec->set_timer_exit_hook_for_test(nullptr);
+        rec->set_timer_drain_claim_hook_for_test(nullptr);
+
+        image::TraceRecordSource second_tap(
+            std::make_unique<test::VectorSource>(data), rec, 0);
+        second_started = co_await rec->start(
+            second_out, 300,
+            [](const image::TraceRecorder::FinalizeResult&) {}, error);
+        if (!second_started) {
+            release_all();
+            stale_stop = co_await await_stop_handle(stale_task);
+            co_return 6;
+        }
+
+        drain_wait_release.store(true, std::memory_order_release);
+        const bool stale_ready = co_await wait_until([&] {
+            return stale_task.is_ready() || stale_task.is_destroyed();
+        }, 200);
+        if (!stale_ready) {
+            cleanup_stop = co_await rec->stop("cleanup");
+            stale_stop = co_await await_stop_handle(stale_task);
+            rec->set_timer_drain_wait_hook_for_test(nullptr);
+            co_return 7;
+        }
+        stale_stop = co_await await_stop_handle(stale_task);
+        recording_after_stale_stop = rec->recording();
+        cleanup_stop = co_await rec->stop("cleanup");
+        rec->set_timer_drain_wait_hook_for_test(nullptr);
+        co_return recording_after_stale_stop ? 0 : 8;
+    });
+    REQUIRE(rc == 0);
+
+    REQUIRE(second_started);
+    REQUIRE(recording_after_stale_stop);
+    REQUIRE(first_stop.has_value());
+    REQUIRE(first_stop->ok);
+    REQUIRE(first_stop->reason == "expired");
+    REQUIRE(stale_stop.has_value());
+    REQUIRE(stale_stop->ok);
+    REQUIRE(stale_stop->reason == "expired");
+    REQUIRE(cleanup_stop.has_value());
+    REQUIRE(cleanup_stop->ok);
+    REQUIRE(cleanup_stop->reason == "cleanup");
+    REQUIRE(parse_file(first_out).size() == 1);
+    REQUIRE(parse_file(second_out).empty());
+}
+
 TEST_CASE("image: concurrent trace stops join the winning finalize",
           "[image]") {
     test::TempDir dir;

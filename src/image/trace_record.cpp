@@ -94,14 +94,14 @@ elio::coro::task<bool> TraceRecorder::start(
     // that timer handle, so a start from Idle first drains any stale timer.
     auto drain_stale_idle_timer = [&]() -> elio::coro::task<bool> {
         for (;;) {
-            bool needs_drain = false;
+            std::shared_ptr<TimerDrain> drain;
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 if (state_ != State::Idle) co_return false;
-                needs_drain = timer_drain_ && !timer_drain_->drained;
+                drain = timer_drain_;
+                if (!drain || drain->drained) co_return true;
             }
-            if (!needs_drain) co_return true;
-            co_await drain_timer_task();
+            co_await drain_timer_task(std::move(drain));
         }
     };
 
@@ -251,22 +251,25 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
     co_return co_await stop_impl(std::move(reason), /*from_timer=*/false);
 }
 
-elio::coro::task<void> TraceRecorder::drain_timer_task() {
+elio::coro::task<void> TraceRecorder::drain_timer_task(
+    std::shared_ptr<TimerDrain> drain) {
     std::optional<elio::coro::join_handle<void>> timer_task;
-    std::shared_ptr<TimerDrain> drain;
     for (;;) {
         bool wait_for_other_drain = false;
+        std::function<elio::coro::task<void>()> claim_hook;
+        std::function<elio::coro::task<void>()> wait_hook;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            drain = timer_drain_;
             if (!drain || drain->drained) co_return;
             if (drain->draining) {
                 wait_for_other_drain = true;
+                wait_hook = timer_drain_wait_hook_;
             } else {
                 drain->draining = true;
-                if (timer_task_) {
+                if (timer_drain_ == drain && timer_task_) {
                     timer_task.emplace(std::move(*timer_task_));
                     timer_task_.reset();
+                    claim_hook = timer_drain_claim_hook_;
                 } else {
                     drain->drained = true;
                     if (timer_drain_ == drain) timer_drain_.reset();
@@ -274,7 +277,11 @@ elio::coro::task<void> TraceRecorder::drain_timer_task() {
                 }
             }
         }
-        if (!wait_for_other_drain) break;
+        if (!wait_for_other_drain) {
+            if (claim_hook) co_await claim_hook();
+            break;
+        }
+        if (wait_hook) co_await wait_hook();
         co_await elio::time::sleep_for(std::chrono::milliseconds(1));
     }
 
@@ -310,6 +317,7 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
     std::shared_ptr<FinalizeCompletion> joined_finalize;
     std::shared_ptr<FinalizeCompletion> owned_finalize;
     bool stop_claim_hook_ran = false;
+    std::shared_ptr<TimerDrain> drain_to_join;
     FinalizeResult res;
     bool have_result = false;
     bool owns_finalize = false;
@@ -327,8 +335,10 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
                 wait_for_finalizer = true;
             } else if (state_ == State::Finalizing) {
                 joined_finalize = finalizing_;
+                drain_to_join = timer_drain_;
                 wait_for_finalizer = true;
             } else if (state_ != State::Recording) {
+                drain_to_join = timer_drain_;
                 // Idempotent stop: report the cached finalize when there was
                 // one (a stop racing the expiry gets the expiry's stats).
                 if (last_.has_value()) {
@@ -342,6 +352,7 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
                 stop_claim_hook = stop_claim_hook_;
                 stop_claim_hook_ran = true;
             } else {
+                drain_to_join = timer_drain_;
                 state_ = State::Finalizing;
                 ++generation_;  // invalidate the duration timer
                 owned_finalize = std::make_shared<FinalizeCompletion>();
@@ -382,8 +393,8 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
     if (!have_result) {
         res.error = "no trace recording in progress";
     }
-    if (!from_timer) {
-        co_await drain_timer_task();
+    if (!from_timer && drain_to_join) {
+        co_await drain_timer_task(std::move(drain_to_join));
     }
     co_return res;
 }

@@ -912,6 +912,9 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   already false;
   `image: trace recording late stop waits for expiry callback completion` —
   a cached late stop waits for the timer's callback tail to finish;
+  `image: trace recording stale stop never drains a restarted timer` —
+  a late stop waiting on an old timer drain stays bound to that old
+  timer after a new recording starts;
   `image: concurrent trace stops join the winning finalize` — an
   expiry stop and explicit stop are held after both observe Recording;
   the loser joins and returns the winner's result;

@@ -609,6 +609,9 @@ Every test, grouped by area, with the property it guards.
 - `image: trace recording late stop waits for expiry callback completion` —
   a cached late stop waits for the timer's expiry callback tail to
   finish before returning.
+- `image: trace recording stale stop never drains a restarted timer` —
+  a late stop waiting on an old timer drain stays bound to that old
+  timer after a new recording starts.
 - `image: concurrent trace stops join the winning finalize` — an
   expiry stop and explicit stop are held after both observe Recording;
   the losing stop waits for and returns the winner's finalized path,
