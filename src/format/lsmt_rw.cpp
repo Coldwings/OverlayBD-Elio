@@ -875,6 +875,7 @@ elio::coro::task<int> create_empty_lsmt_layer(const std::string& path,
     const int fd =
         ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) co_return -errno;
+    FdGuard output(fd, &path);
 
     // ADR-0014 content-digest rule (see seal()): sha256(vsize as LE u64 ||
     // packed data || packed index). An empty layer has no data and no
@@ -894,13 +895,6 @@ elio::coro::task<int> create_empty_lsmt_layer(const std::string& path,
     // check (LsmtLayer::open) satisfiable and byte-matches seal()'s output
     // for an upper that never received a write (index_sector = 8).
     constexpr uint64_t index_offset = kHeaderSectors * kSector;  // 4096
-    struct UnlinkOnError {
-        const std::string& path;
-        bool ok = true;
-        ~UnlinkOnError() {
-            if (!ok) ::unlink(path.c_str());
-        }
-    } cleanup{path};
     uint8_t region[4096];
     std::memset(region, 0, sizeof(region));
     const auto header =
@@ -909,8 +903,6 @@ elio::coro::task<int> create_empty_lsmt_layer(const std::string& path,
     header.serialize(region);
     int rc = co_await write_all(fd, region, sizeof(region), 0);
     if (rc != 0) {
-        cleanup.ok = false;
-        ::close(fd);
         co_return rc;
     }
 
@@ -921,17 +913,13 @@ elio::coro::task<int> create_empty_lsmt_layer(const std::string& path,
     trailer.serialize(region);
     rc = co_await write_all(fd, region, sizeof(region), index_offset);
     if (rc != 0) {
-        cleanup.ok = false;
-        ::close(fd);
         co_return rc;
     }
     if (::fdatasync(fd) != 0) {
-        cleanup.ok = false;
         const int e = -errno;
-        ::close(fd);
         co_return e;
     }
-    ::close(fd);
+    output.unlink_path = nullptr;
     co_return 0;
 }
 
