@@ -1085,12 +1085,12 @@ single Range-capable blob. No external golden files.
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically** — a
   sparse upper can recover written extents from the file/fiemap across
-  reopen, while an unsealed LSMT-RW upper is not recoverable after a
-  crash or restart until graceful shutdown writes its checkpoint (fresh
-  create truncates the file). Committing/sealing an upper into a new
-  lower is an explicit, offline operation (the supervisor's `commit`
-  command, ADR-0014); TurboOCI and registry write-back remain out of
-  scope (ADR-0007).
+  reopen, while an unsealed LSMT-RW upper is not recovered by a later
+  image open even after graceful shutdown writes its checkpoint; that
+  checkpoint is consumed only by the supervisor's offline `commit`, and a
+  fresh open truncates the unsealed file. Committing/sealing an upper into
+  a new lower is an explicit, offline operation (ADR-0014); TurboOCI and
+  registry write-back remain out of scope (ADR-0007).
 - **Sparse uppers depend on filesystem fiemap support** for extent recovery
   after reopen (see `docs/format.md`); exotic filesystems without
   `SEEK_HOLE`/fiemap semantics are unsupported for `upper.type = "sparse"`.

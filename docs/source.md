@@ -1262,9 +1262,11 @@ directly.
   structural head/tail warm-up (ADR-0012's cold-start floor) and the
   upstream-compatible trace blob (ADR-0013 — the trace layer
   is recognized in image assembly; see `docs/image.md`) both ride
-  `populate` at the ADR-0012 Prefetch scavenger class; trace recording,
-  the dynamic file-list fallback, and detaching warm-up/replay off the
-  bring-up path (now safe under the funnel) remain open.
+  `populate` at the ADR-0012 Prefetch scavenger class. Supervisor-driven
+  trace recording is implemented and observes remote reads below the
+  LayerStore; issue #33 tracks narrowing recordings to OnDemand traffic
+  only. The dynamic file-list fallback and detaching warm-up/replay off
+  the bring-up path (now safe under the funnel) remain open.
 - **credentialConfig mode=file only** — inline/secret credential modes are
   ignored (see `docs/image.md` / `docs/config.md`).
 - **Fill teardown goes through `park_image_fills`** — destroying a store

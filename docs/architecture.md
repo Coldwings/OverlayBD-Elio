@@ -316,19 +316,22 @@ contracts above:
 - **TurboOCI** (the third upstream on-disk format) is not supported;
   deferred.
 - **Crash recovery is bounded, not transparent persistence.** Devices are
-  created with ublk `USER_RECOVERY` where the kernel supports it; the
-  supervisor respawns a crashed child in recovery mode up to
-  `max_recovery_attempts` (ADR-0010). Older kernels that reject the
-  recovery flags degrade to a non-recoverable device at create time.
-  Recovery reassembles the image from durable inputs: unsealed LSMT-RW
-  writes that never reached a graceful shutdown checkpoint are lost.
-- **Prefetch** covers the structural head/tail warm-up (ADR-0012),
+  created with ublk `USER_RECOVERY` when `ublkConfig.enableRecovery` is
+  true (the default) and the kernel supports it; the supervisor respawns
+  a crashed child in recovery mode up to `max_recovery_attempts`
+  (ADR-0010). Older kernels that reject the recovery flags degrade to a
+  non-recoverable device at create time. Recovery reassembles the image
+  from durable inputs: unsealed LSMT-RW writes that never reached a
+  graceful shutdown checkpoint are lost.
+- **Prefetch** covers the structural head/tail warm-up (ADR-0012) and
   trace replay (the upstream trace blob IS replayed through `populate`
   when the image config marks an `accelerationLayer`, ADR-0013 — see
-  `docs/image.md`), and LayerStore fill. These scavenger paths are
-  admitted at the device's ADR-0012 funnel, and the `prefetch` config
+  `docs/image.md`). These paths are admitted at the device's ADR-0012
+  funnel as the Prefetch scavenger class, and the `prefetch` config
   section's `enable` switch is honored for structural warm-up and trace
-  replay. Trace recording is a supervisor command path (ADR-0013; see
+  replay. LayerStore background fill is a separate ADR-0012 Fill
+  scavenger class behind Prefetch and is governed by the `download`
+  config. Trace recording is a supervisor command path (ADR-0013; see
   `docs/supervisor.md`) that observes remote reads; it does not create a
   separate Prefetch traffic class, and issue #33 tracks filtering
   recordings down to OnDemand reads only.
@@ -338,8 +341,9 @@ contracts above:
   uppers punch holes and writable LSMT-RW uppers mask with zeroed
   segments.
 - **LSMT-RW durability:** an unsealed `overlaybd.rw` upper keeps its
-  segment index in memory only; unsealed data is **not crash-durable**
-  and the file is not recoverable across process restarts until a
-  graceful obd-device shutdown checkpoints the index (ADR-0014) or
-  `seal()` compacts it into a standard sealed LSMT layer. The
-  supervisor's offline `commit` consumes that checkpoint.
+  segment index in memory only; unsealed data is **not restart-recoverable**
+  as a writable upper. A graceful obd-device shutdown checkpoint is the
+  input to the supervisor's offline `commit` (ADR-0014), not a reopen path;
+  a later image open creates/truncates a fresh unsealed LSMT-RW file. Only
+  `seal()` / offline commit compacts the data into a standard sealed LSMT
+  layer.

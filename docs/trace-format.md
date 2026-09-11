@@ -3,10 +3,11 @@
 Byte-exact specification of the **prefetch trace blob** produced and
 consumed by upstream OverlayBD's static trace prefetcher. This is a
 *specification of an upstream format*: overlaybd-elio implements the
-dependency-free codec (`src/format/trace.hpp`); record/replay against
-live devices is not wired yet — the governing decision is the proposed
+dependency-free codec (`src/format/trace.hpp`), replays trace layers during
+image bring-up, and records live-device traces through the supervisor
+protocol. The governing decision is the accepted
 [ADR-0013](./adr/0013-trace-prefetch.md) (record/replay prefetch traces in
-the upstream format with a dependency-free codec; this document is its
+the upstream format with a dependency-free codec; this document was its
 step 0, "specification before code"). Shape: `policy` (see
 `docs/README.md`).
 

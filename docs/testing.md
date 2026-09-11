@@ -941,7 +941,7 @@ Every test, grouped by area, with the property it guards.
   TarOffsetSource::populate → LayerStore::populate — the tar-header
   translation is pinned by attributing fetched extents only the replay can
   reach — and the device serves the data layer byte-exactly (ADR-0013,
-  proposed).
+  accepted).
 - `integration: trace replay warms the lower addressed by layer index` —
   two remote dir-configured data layers: a `layer_index` 1 record warms
   an otherwise-untouched extent of layer 1's blob only, pinning the

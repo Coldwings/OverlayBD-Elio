@@ -183,7 +183,7 @@ exists as a regular file, in this order (`src/image/image_file.cpp::probe_local_
 
 Otherwise the lower is fetched remotely through `repoBlobUrl`.
 
-### `accelerationLayer` (optional; trace prefetch, ADR-0013 proposed)
+### `accelerationLayer` (optional; trace prefetch, ADR-0013 accepted)
 
 Boolean, default `false`. The snapshotter's signal that the **uppermost
 lower is the acceleration (trace) layer**, not a data layer — the same
@@ -194,8 +194,9 @@ the last lower aside from the merge and replays its trace blob as
 layer"). Setting it requires at least one data lower beneath the trace
 layer (`EINVAL` otherwise); a missing or malformed trace blob only
 disables prefetch, never device bring-up. `recordTracePath` (upstream's
-recording trigger) is parsed-tolerated but ignored: trace **recording**
-is not implemented.
+config-file recording trigger) is parsed-tolerated but ignored; live
+recording is controlled by the supervisor `trace_start` / `trace_stop`
+protocol instead.
 
 ### `upper` (optional; writable mode, ADR-0008)
 
