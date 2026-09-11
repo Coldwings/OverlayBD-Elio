@@ -216,6 +216,18 @@ private:
         bool drained = false;
     };
 
+    class TimerCallbackScope {
+    public:
+        TimerCallbackScope(TraceRecorder& recorder, FinalizeResult result);
+        ~TimerCallbackScope();
+
+        TimerCallbackScope(const TimerCallbackScope&) = delete;
+        TimerCallbackScope& operator=(const TimerCallbackScope&) = delete;
+
+    private:
+        TraceRecorder& recorder_;
+    };
+
     elio::coro::task<bool> start_impl(
         std::string path, uint32_t duration_sec,
         std::function<void(const FinalizeResult&)> on_expire,
@@ -255,6 +267,7 @@ private:
     std::shared_ptr<elio::coro::cancel_source> timer_cancel_;
     std::optional<elio::coro::join_handle<void>> timer_task_;
     std::shared_ptr<TimerDrain> timer_drain_;
+    std::optional<FinalizeResult> timer_callback_result_;
     std::function<elio::coro::task<void>()> finalize_hook_;      // test-only
     std::function<elio::coro::task<void>()> start_hook_;         // test-only
     std::function<elio::coro::task<void>()> stop_claim_hook_;    // test-only

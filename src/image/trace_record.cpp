@@ -13,68 +13,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <iterator>
 #include <vector>
 
 namespace obd::image {
 
 namespace {
-
-struct TimerCallbackFrame {
-    const TraceRecorder* recorder;
-    TraceRecorder::FinalizeResult result;
-};
-
-thread_local std::vector<TimerCallbackFrame> timer_callback_stack;
-
-class TimerCallbackScope {
-public:
-    TimerCallbackScope(const TraceRecorder* recorder,
-                       TraceRecorder::FinalizeResult result)
-        : recorder_(recorder) {
-        timer_callback_stack.push_back(
-            TimerCallbackFrame{recorder_, std::move(result)});
-    }
-
-    ~TimerCallbackScope() {
-        auto it = std::find_if(timer_callback_stack.rbegin(),
-                               timer_callback_stack.rend(),
-                               [&](const TimerCallbackFrame& frame) {
-                                   return frame.recorder == recorder_;
-                               });
-        if (it != timer_callback_stack.rend()) {
-            timer_callback_stack.erase(std::next(it).base());
-        }
-    }
-
-    TimerCallbackScope(const TimerCallbackScope&) = delete;
-    TimerCallbackScope& operator=(const TimerCallbackScope&) = delete;
-
-private:
-    const TraceRecorder* recorder_;
-};
-
-bool in_timer_callback(const TraceRecorder* recorder) {
-    return std::find_if(timer_callback_stack.begin(), timer_callback_stack.end(),
-                        [&](const TimerCallbackFrame& frame) {
-                            return frame.recorder == recorder;
-                        }) != timer_callback_stack.end();
-}
-
-bool timer_callback_result(const TraceRecorder* recorder,
-                           TraceRecorder::FinalizeResult& result) {
-    auto it = std::find_if(timer_callback_stack.rbegin(),
-                           timer_callback_stack.rend(),
-                           [&](const TimerCallbackFrame& frame) {
-                               return frame.recorder == recorder;
-                           });
-    if (it == timer_callback_stack.rend()) return false;
-    result = it->result;
-    return true;
-}
 
 elio::coro::task<TraceRecorder::FinalizeResult> ready_finalize_result(
     TraceRecorder::FinalizeResult result) {
@@ -84,6 +29,18 @@ elio::coro::task<TraceRecorder::FinalizeResult> ready_finalize_result(
 }  // namespace
 
 TraceRecorder::TraceRecorder(size_t max_pending) : max_pending_(max_pending) {}
+
+TraceRecorder::TimerCallbackScope::TimerCallbackScope(
+    TraceRecorder& recorder, FinalizeResult result)
+    : recorder_(recorder) {
+    std::lock_guard<std::mutex> lk(recorder_.mu_);
+    recorder_.timer_callback_result_ = std::move(result);
+}
+
+TraceRecorder::TimerCallbackScope::~TimerCallbackScope() {
+    std::lock_guard<std::mutex> lk(recorder_.mu_);
+    recorder_.timer_callback_result_.reset();
+}
 
 void TraceRecorder::record(uint32_t layer_index, uint64_t offset,
                            uint64_t count) noexcept {
@@ -142,8 +99,13 @@ elio::coro::task<bool> TraceRecorder::start(
     std::string path, uint32_t duration_sec,
     std::function<void(const FinalizeResult&)> on_expire,
     std::string& error) {
+    bool from_timer_callback = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        from_timer_callback = timer_callback_result_.has_value();
+    }
     return start_impl(std::move(path), duration_sec, std::move(on_expire),
-                      error, in_timer_callback(this));
+                      error, from_timer_callback);
 }
 
 elio::coro::task<bool> TraceRecorder::start_impl(
@@ -315,7 +277,7 @@ elio::coro::task<void> TraceRecorder::run_timer(
     FinalizeResult res = co_await stop_impl(
         "expired", /*from_timer=*/true, &owns_expiry_finalize);
     if (owns_expiry_finalize && cb) {
-        TimerCallbackScope callback_scope(this, res);
+        TimerCallbackScope callback_scope(*this, res);
         cb(res);
     }
     std::function<elio::coro::task<void>()> exit_hook;
@@ -330,8 +292,12 @@ elio::coro::task<void> TraceRecorder::run_timer(
 elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
     std::string reason) {
     FinalizeResult result;
-    if (timer_callback_result(this, result)) {
-        return ready_finalize_result(std::move(result));
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (timer_callback_result_.has_value()) {
+            result = *timer_callback_result_;
+            return ready_finalize_result(std::move(result));
+        }
     }
     return stop_impl(std::move(reason), /*from_timer=*/false);
 }
