@@ -855,9 +855,9 @@ present from construction with checksum 0 and rewritten in place by
 `finalize()` (mirroring upstream's `PrefetcherImpl::dump`). `append`
 enforces §10 rule 4 — `op == 'R'`, `1 <= count <= kMaxRecordCount`,
 `offset >= 0` — and returns false (record rejected, blob unchanged) on a
-violation. The `finalize()` span borrows the writer; a memory buffer is
-the whole deliverable here, file writing lands with the record/replay
-features (not yet implemented).
+violation. The `finalize()` span borrows the writer; this codec stays
+purely in-memory, while live-device recording writes the finalized blob to
+an output file in `src/image/trace_record.hpp` / `.cpp`.
 
 ## Invariants & Guarantees
 

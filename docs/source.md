@@ -1263,10 +1263,13 @@ directly.
   upstream-compatible trace blob (ADR-0013 — the trace layer
   is recognized in image assembly; see `docs/image.md`) both ride
   `populate` at the ADR-0012 Prefetch scavenger class. Supervisor-driven
-  trace recording is implemented and observes remote reads below the
-  LayerStore; issue #33 tracks narrowing recordings to OnDemand traffic
-  only. The dynamic file-list fallback and detaching warm-up/replay off
-  the bring-up path (now safe under the funnel) remain open.
+  trace recording is implemented by a `TraceRecordSource` tap around the
+  remote source path: with a configured `dir` it observes reads below the
+  `LayerStore`, while no-`dir` remote lowers are tapped around the direct
+  remote/admission source. Issue #33 tracks narrowing recordings to
+  OnDemand traffic only. The dynamic file-list fallback is unsupported by
+  design; detaching warm-up/replay off the bring-up path (now safe under
+  the funnel) remains the open follow-up.
 - **credentialConfig mode=file only** — inline/secret credential modes are
   ignored (see `docs/image.md` / `docs/config.md`).
 - **Fill teardown goes through `park_image_fills`** — destroying a store

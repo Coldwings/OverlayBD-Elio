@@ -202,13 +202,15 @@ A per-image config may add a writable upper:
   (`<dir>/overlaybd.rw`). **Durability rule: LSMT-RW data is not durable as
   a standard layer until it is sealed.** `seal()` compacts the writable
   layer into a standard sealed LSMT that ordinary OverlayBD tooling can
-  consume; before sealing, the file is an intermediate format that only
-  this stack reopens. A device destroyed without sealing keeps its data for
-  reopen by this stack, but do not ship the file elsewhere. On a **graceful
-  shutdown** (SIGTERM, e.g. via `destroy` or `commit`) obd-device
-  checkpoints the upper's in-memory index into the file; that checkpoint is
-  what the offline `commit` seal consumes. A crashed or SIGKILLed device
-  leaves no checkpoint and its unsealed upper is unsealable.
+  consume; before sealing, the file is an intermediate format for the live
+  device plus the offline `commit` path, not a normal reopen target. A
+  later `create`/recovery open truncates a fresh unsealed LSMT-RW upper.
+  On a **graceful shutdown** (SIGTERM, e.g. via `destroy` or `commit`)
+  obd-device checkpoints the upper's in-memory index into the file; that
+  checkpoint is what the offline `commit` seal consumes. A crashed or
+  SIGKILLed device leaves no checkpoint and its unsealed upper is
+  unsealable. Use `commit` before relying on LSMT-RW writes after device
+  teardown.
 - `type: "sparse"` → a sparse file (`<dir>/overlaybd.sparse`); after an
   unclean shutdown the written extents are recovered via fiemap scanning.
   Sparse uppers never seal (ADR-0014 upstream parity).

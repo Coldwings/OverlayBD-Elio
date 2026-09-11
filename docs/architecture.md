@@ -98,10 +98,13 @@ previously-uncovered ranges are copy-on-write — new data lands in the
 upper and shadows the sealed lowers, which are never mutated. The upper
 is either an in-place-edit unsealed LSMT file (`<dir>/overlaybd.rw`) or
 a fiemap sparse file (`<dir>/overlaybd.sparse`); see `docs/config.md`.
-On a read-only device the root does not implement `WritableBlobSource`
-and writes are rejected with `-EROFS`. Operations the device does not
-advertise (write-same, write-zeroes, discard) are rejected with
-`-EOPNOTSUPP`.
+On a read-only device the root does not implement `WritableBlobSource`:
+`WRITE`, direct `DISCARD`, and direct `WRITE_ZEROES` return `-EROFS`, while
+read-only ublk params do not advertise discard/write-zeroes limits so the
+kernel normally never issues them. On a writable device `DISCARD` and
+`WRITE_ZEROES` are advertised and dispatched to the writable root (ADR-0009).
+`WRITE_SAME` and unknown operations are never advertised and are rejected
+defensively with `-EOPNOTSUPP`.
 
 ## Process Model
 
