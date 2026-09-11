@@ -37,6 +37,10 @@ TEST_CASE("image: global config parses overlaybd.json fields", "[image]") {
     // Absent prefetch section: the default is enabled.
     const auto g2 = image::GlobalConfig::from_json_text("{}");
     REQUIRE(g2.prefetch_enable);
+
+    const auto default_try =
+        image::GlobalConfig::from_json_text(R"({"download": {"enable": true}})");
+    REQUIRE(default_try.download.try_count == 5);
 }
 
 TEST_CASE("image: per-image download overrides merge over global defaults",
