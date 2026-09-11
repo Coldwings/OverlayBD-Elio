@@ -181,11 +181,12 @@ is being sealed. Contract:
   (docs/format.md, seal determinism invariant).
 - **Concurrency.** One commit per device at a time: a second commit of
   the same device while one is in flight is rejected ("commit already in
-  progress"). The stop-and-seal critical section is serialized against a
-  crash-recovery respawn (ADR-0010) by a per-entry mutex: either the
-  respawn completes first and commit stops the recovery child too, or the
-  respawn aborts on the `destroying` flag — a seal never runs while a
-  device child is booting or alive.
+  progress"), and `destroy` of the same device is rejected with the same
+  busy reason while commit admission is held. The stop-and-seal critical
+  section is serialized against a crash-recovery respawn (ADR-0010) by a
+  per-entry mutex: either the respawn completes first and commit stops the
+  recovery child too, or the respawn aborts on the `destroying` flag — a
+  seal never runs while a device child is booting or alive.
 - **Re-baseline (D3).** An optional `virtual_size` (bytes, 0 = keep the
   checkpointed size) overrides the virtual size written into the sealed
   header/trailer — and therefore the size a next `create` from this
@@ -198,10 +199,11 @@ is being sealed. Contract:
   unknown id ("no such device"), a config without `upper` ("no writable
   upper"), a sparse upper ("sparse uppers cannot be sealed" — upstream
   parity, ADR-0014), a concurrent commit ("commit already in progress"),
-  a config unreadable at create time, a missing upper file, an
-  already-sealed upper, a missing or invalid shutdown checkpoint (device
-  crashed), a rejected `virtual_size` re-baseline (grow-only or
-  misaligned), and stop-timeout.
+  a destroy already in progress ("device is being destroyed"), a config
+  unreadable at create time, a missing upper file, an already-sealed
+  upper, a missing or invalid shutdown checkpoint (device crashed), a
+  rejected `virtual_size` re-baseline (grow-only or misaligned), and
+  stop-timeout.
 
 ### Online resize (D3, ADR-0014 dev_size model)
 
@@ -863,6 +865,25 @@ needing a real ublk device or root.
   `path`/`sha256`/`size`; a second commit fails with "already sealed";
   the sealed file re-opens as a valid LSMT RO layer with the
   checkpointed content (ADR-0014). Runs without privileges.
+- `supervisor: successful commit disables recovery respawn` (integration,
+  `tests/integration/test_commit.cpp`) — with recovery attempts enabled, a
+  successful commit stops and seals the child without publishing a recovery
+  replacement; this pins the no-respawn `destroying` transition after
+  pre-stop commit checks pass.
+- `supervisor: rejected commits preserve crash recovery` (integration,
+  `tests/integration/test_commit.cpp`) — commit refusals that happen before
+  any intentional stop (sparse upper, upper-less/read-only config, and
+  mode-3 host-mkfs upper) leave the live child running and do not set the
+  no-respawn teardown flag; a later controlled child crash still consumes
+  the remaining ADR-0010 recovery attempt.
+- `supervisor: destroy is rejected while commit is admitted` (integration,
+  `tests/integration/test_commit.cpp`) — a paused admitted commit rejects a
+  concurrent `destroy` with the same busy reason used for concurrent commit,
+  then the commit is allowed to finish and the device can be destroyed.
+- `supervisor: commit is rejected while destroy is admitted` (integration,
+  `tests/integration/test_commit.cpp`) — a paused admitted destroy rejects a
+  concurrent `commit` with the destroy-in-progress reason, then the destroy
+  is allowed to finish and removes the entry.
 - `supervisor: blank create serves a writable zero base and commit seals its upper` (integration, `tests/integration/test_commit.cpp`) — the
   ADR-0014 mode-2 path end to end with the fake device: `create` with
   `blank` (no config) builds the workspace (`overlaybd.zero` + the

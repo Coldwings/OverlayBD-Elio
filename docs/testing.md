@@ -970,6 +970,26 @@ Every test, grouped by area, with the property it guards.
   upper, replying `path`/`sha256`/`size`; a second commit fails with
   "already sealed"; the sealed file re-opens as a valid LSMT RO layer
   with the fake's payload (ADR-0014). Runs without privileges.
+- `supervisor: successful commit disables recovery respawn` — with
+  `max_recovery_attempts` positive, a successful commit leaves the stopped
+  child exited with the original PID and zero recoveries instead of
+  publishing a replacement, while still producing a valid sealed layer.
+  Runs without privileges.
+- `supervisor: rejected commits preserve crash recovery` — pre-stop
+  commit refusals for sparse uppers, upper-less/read-only configs, and
+  mode-3 host-mkfs uppers leave the fake child running, keep the
+  recovery counter unchanged, and still allow a later controlled child
+  crash to consume the remaining ADR-0010 recovery attempt. Runs without
+  privileges.
+- `supervisor: destroy is rejected while commit is admitted` — a
+  test-gated admitted commit rejects a concurrent `destroy` of the same
+  device with the precise busy error, then the commit is released to
+  finish and a later destroy can clean up the entry. Runs without
+  privileges.
+- `supervisor: commit is rejected while destroy is admitted` — a
+  test-gated admitted destroy rejects a concurrent `commit` of the same
+  device with the precise destroy-in-progress error, then the destroy is
+  released to finish and the entry disappears. Runs without privileges.
 - `supervisor: concurrent commits are serialized and reject the loser` —
   two barrier-synchronized commits of the same device: exactly one
   succeeds, the loser gets a precise error ("commit already in progress"

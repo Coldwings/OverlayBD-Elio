@@ -390,7 +390,10 @@ class Daemon {
     /// ADR-0014 commit bookkeeping: `upper_path`/`upper_type` are recorded
     /// from the image config at create time (provenance — later edits to
     /// the config file must not redirect commit). `committing` (guarded by
-    /// `mu_`, like `destroying`) rejects concurrent commits. `op_mu`
+    /// `mu_`, like `destroying`) rejects concurrent commit/destroy
+    /// admission for the same entry; `destroy_op_in_progress` distinguishes
+    /// a destroy that is actively erasing the entry from the long-lived
+    /// no-respawn `destroying` state left by a successful commit. `op_mu`
     /// serializes a commit's stop-and-seal (and destroy's stop) against a
     /// recovery respawn in supervise_entry, so a seal never runs while a
     /// recovery child is booting or alive. Lock order: `mu_` is never held
@@ -425,6 +428,7 @@ class Daemon {
         bool blank = false;
         bool mkfs_requested = false;
         bool committing = false;      // a commit is in flight
+        bool destroy_op_in_progress = false;  // destroy is stopping/erasing
         elio::sync::mutex op_mu;      // commit/destroy vs recovery respawn
 
         // ADR-0013 trace recording (protocol v3). control owns the
@@ -1464,13 +1468,26 @@ private:
             auto it = children_.find(id);
             if (it != children_.end()) {
                 entry = it->second;
+                if (entry->committing) {
+                    mu_.unlock();
+                    co_return reply_error("commit already in progress: " +
+                                          id);
+                }
+                if (entry->destroy_op_in_progress) {
+                    mu_.unlock();
+                    co_return reply_error("device is being destroyed: " + id);
+                }
                 // Intentional: supervise_entry must not respawn. Written
                 // under mu_ — supervise_entry reads it under mu_ too.
                 entry->destroying = true;
+                entry->destroy_op_in_progress = true;
             }
             mu_.unlock();
         }
         if (!entry) co_return reply_error("no such device: " + id);
+        if (test_gate_) {
+            co_await test_gate_->observe("destroy_admitted", entry->child);
+        }
 
         // op_mu serializes the stop against a recovery respawn in flight.
         co_await entry->op_mu.lock();
@@ -1542,13 +1559,18 @@ private:
                     co_return reply_error("commit already in progress: " +
                                           id);
                 }
+                if (entry->destroy_op_in_progress) {
+                    mu_.unlock();
+                    co_return reply_error("device is being destroyed: " + id);
+                }
                 entry->committing = true;
-                // Intentional stop: supervise_entry must not respawn.
-                entry->destroying = true;
             }
             mu_.unlock();
         }
         if (!entry) co_return reply_error("no such device: " + id);
+        if (test_gate_) {
+            co_await test_gate_->observe("commit_admitted", entry->child);
+        }
 
         std::string reply;
         try {
@@ -1598,6 +1620,15 @@ private:
                 "non-deterministic upper cannot be sealed: " + id);
         }
         const std::string& upper = entry->upper_path;
+
+        {
+            co_await mu_.lock();
+            // From this point commit is intentionally stopping the live
+            // device. Pre-stop refusals above must leave crash recovery
+            // enabled for the still-running child.
+            entry->destroying = true;
+            mu_.unlock();
+        }
 
         co_await entry->op_mu.lock();
         SyncMutexGuard op_guard{entry->op_mu};
