@@ -980,6 +980,10 @@ Every test, grouped by area, with the property it guards.
   "host mkfs ... cannot be sealed" boundary error; a failing mkfs is a
   clean create error and the half-created device entry is removed. Runs
   without privileges.
+- `integration: trace mock range parsing retains numeric storage` — directly
+  exercises the registry fixture handler with long numeric tokens, closed and
+  open-ended ranges, malformed/overflowing values, empty blobs and bounds.
+  No background server tasks are active when assertions run.
 - `integration: trace recording captures remote reads end to end` — a
   real daemon with the extended fake obd-device (opens a REAL image
   against the mock registry, speaks the real device-side trace protocol,
