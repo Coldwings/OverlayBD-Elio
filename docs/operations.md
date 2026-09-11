@@ -444,9 +444,11 @@ correlate by device id and by the supervisor's spawn logs.
   image from disk; a sparse upper recovers via fiemap, an unsealed LSMT-RW
   upper does not (ADR-0008, ADR-0010). Choose the sparse upper when write
   durability across crashes matters.
-- **Discard masks, it does not punch through.** A discarded range reads
-  back as zeroes even if lower layers have data there (ADR-0009); this is
-  the upstream LSMT trim semantics, intentional.
+- **LSMT-RW discard masks, it does not punch through.** A discarded range
+  on an LSMT-RW upper reads back as zeroes even if lower layers have data
+  there (ADR-0009); this is the upstream LSMT trim semantics,
+  intentional. Sparse uppers punch holes in the top file; #85 tracks the
+  remaining sparse merged-view lower-mask gap.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
   or mutate registry content (ADR-0007). Writable uppers are local-only;
   `commit` (ADR-0014) seals an upper into a local layer file —

@@ -726,9 +726,11 @@ plus a writable top layer, as one block source.
   merged index (`rebuild_index()`). Write-heavy workloads should batch,
   since the rebuild is O(index size) per write.
 - `flush()` delegates to the top layer's `flush()`.
-- `discard()` (ADR-0009) delegates to the top layer and rebuilds the index;
-  the discarded range then reads as zeroes even when lower layers have data
-  there (mask semantics, matching upstream LSMT trim).
+- `discard()` (ADR-0009) delegates to the top layer and rebuilds the index.
+  With an LSMT-RW top, discarded ranges stay covered by zeroed segments and
+  mask lower-layer data (matching upstream LSMT trim). With a sparse top,
+  discard punches holes in the top file; #85 tracks the remaining
+  merged-view lower-mask gap.
 - As a `source::WritableBlobSource`, this is the device root the ublk bridge
   dispatches WRITE/FLUSH/DISCARD/WRITE_ZEROES to; a read-only image root
   simply does not implement the interface and writes/discards get `-EROFS`.

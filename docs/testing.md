@@ -299,9 +299,10 @@ Every test, grouped by area, with the property it guards.
 - `format: sparse layer discard punches holes and recovers` — discard
   is a real punch-hole; reads stay correct across a reopen even though
   fiemap recovery is filesystem-block granular (ADR-0009).
-- `format: merged writable discard masks the lower layer` — discarding
-  a range covered only by the lower reads back zeroes, not the lower's
-  data (mask semantics, ADR-0009).
+- `format: merged writable discard masks the lower layer` — with an
+  LSMT-RW top, discarding a range covered only by the lower reads back
+  zeroes, not the lower's data (mask semantics, ADR-0009). Sparse top
+  lower-mask coverage is tracked in #85.
 - `format: trace crc32c golden vectors match the spec` — the trace blob's
   raw-chaining CRC-32C matches the trace-format.md §4 golden vectors,
   including the chaining property (ADR-0013).
@@ -1095,7 +1096,8 @@ Every test, grouped by area, with the property it guards.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with
-  mask-with-zeroes read-back (ADR-0009; self-skips without ublk).
+  mask-with-zeroes read-back through that test root (ADR-0009;
+  self-skips without ublk).
 - `integration: ublk device survives server death via USER_RECOVERY` —
   a forked server is SIGKILLed; the block device survives QUIESCED and
   a replacement server completes the real
