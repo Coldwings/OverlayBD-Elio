@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -79,6 +80,45 @@ elio::coro::task<bool> wait_until(Pred pred, int attempts = 5000) {
     }
     co_return pred();
 }
+
+class BlockingVectorSource final : public source::BlobSource {
+public:
+    BlockingVectorSource(std::vector<uint8_t> data, uint64_t block_offset)
+        : data_(std::move(data)), block_offset_(block_offset) {}
+
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                    uint64_t offset) override {
+        reads_.fetch_add(1, std::memory_order_relaxed);
+        if (offset == block_offset_ &&
+            !released_.load(std::memory_order_acquire)) {
+            blocked_reads_.fetch_add(1, std::memory_order_release);
+            while (!released_.load(std::memory_order_acquire)) {
+                co_await elio::time::sleep_for(1ms);
+            }
+        }
+        if (offset >= data_.size()) co_return 0;
+        const size_t n =
+            std::min(count, static_cast<size_t>(data_.size() - offset));
+        std::memcpy(buf, data_.data() + offset, n);
+        co_return static_cast<ssize_t>(n);
+    }
+
+    uint64_t size() const noexcept override { return data_.size(); }
+    std::string_view label() const noexcept override { return "blocked-mem"; }
+
+    bool blocked() const {
+        return blocked_reads_.load(std::memory_order_acquire) != 0;
+    }
+    void release() { released_.store(true, std::memory_order_release); }
+    uint64_t reads() const { return reads_.load(std::memory_order_relaxed); }
+
+private:
+    std::vector<uint8_t> data_;
+    uint64_t block_offset_ = 0;
+    std::atomic<bool> released_{false};
+    std::atomic<uint64_t> reads_{0};
+    std::atomic<uint64_t> blocked_reads_{0};
+};
 
 /// Starts the recorder, runs `body` (a coroutine lambda), and ALWAYS
 /// stops — even when the body throws — so the duration timer never
@@ -1535,6 +1575,106 @@ TEST_CASE("image: trace recording captures only remote fetches through the layer
     REQUIRE(records[0] == format::trace::TraceRecord{'R', 0, 65536, 0});
     REQUIRE(records[1] ==
             format::trace::TraceRecord{'R', 0, 65536, 3 * 65536});
+}
+
+TEST_CASE("image: trace recording filters fill and prefetch layer-store reads",
+          "[image]") {
+    // Issue #33: the tap sits below the LayerStore, so it must use the
+    // caller's ReadClass and record only guest-driven OnDemand misses.
+    // Structural warm-up and trace replay both reach this path as
+    // populate() / Prefetch; background fill uses Fill.
+    static constexpr uint64_t kExtent = 65536;
+    test::TempDir dir;
+    const auto data = test::pattern_bytes(4 * kExtent, 91);
+    const std::string layer_dir = dir / "layer";
+    REQUIRE(std::filesystem::create_directories(layer_dir));
+    const std::string out = dir / "out.trace";
+    image::TraceRecorder::FinalizeResult res;
+    bool fill_entered = false;
+    bool fill_terminal = false;
+    ssize_t prefetch_result = -1;
+    ssize_t guest_result = -1;
+    uint64_t remote_reads = 0;
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto rec = std::make_shared<image::TraceRecorder>();
+        auto remote =
+            std::make_unique<BlockingVectorSource>(data, /*block_offset=*/0);
+        BlockingVectorSource* remote_raw = remote.get();
+        auto tap = std::make_unique<image::TraceRecordSource>(
+            std::move(remote), rec, 0);
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.fill.max_mbps = 1000;
+        cfg.fill.block_size = static_cast<uint32_t>(kExtent);
+        auto store = co_await source::LayerStore::open(std::move(tap),
+                                                       layer_dir, "", cfg);
+
+        auto park = [&]() -> elio::coro::task<void> {
+            remote_raw->release();
+            store->stop_fill();
+            using FillStatus = source::LayerStore::FillStatus;
+            for (int i = 0; i < 5000; ++i) {
+                const FillStatus s = store->fill_status();
+                if (s == FillStatus::kDisabled || s == FillStatus::kDone ||
+                    s == FillStatus::kStopped) {
+                    break;
+                }
+                co_await elio::time::sleep_for(1ms);
+            }
+            remote_reads = remote_raw->reads();
+            store.reset();
+        };
+
+        std::exception_ptr err;
+        try {
+            fill_entered =
+                co_await wait_until([&] { return remote_raw->blocked(); });
+            if (!fill_entered) {
+                throw std::runtime_error("background fill did not start");
+            }
+            res = co_await with_recording(
+                *rec, out, [&]() -> elio::coro::task<void> {
+                    // Prefetch-class populate (the path used by
+                    // structural warm-up and trace replay) must not
+                    // record even though it fetches from the remote.
+                    prefetch_result =
+                        co_await store->populate(kExtent, 4096);
+                    // A guest miss remains record-worthy: LayerStore
+                    // fetches the whole extent, then serves the slice.
+                    guest_result =
+                        co_await read_at(*store, 2 * kExtent, 4096);
+                    remote_raw->release();
+
+                    using FillStatus = source::LayerStore::FillStatus;
+                    fill_terminal = co_await wait_until([&] {
+                        const FillStatus s = store->fill_status();
+                        return s == FillStatus::kDone ||
+                               s == FillStatus::kStopped;
+                    });
+                });
+        } catch (...) {
+            err = std::current_exception();
+        }
+        co_await park();
+        if (err) std::rethrow_exception(err);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(fill_entered);
+    REQUIRE(fill_terminal);
+    REQUIRE(prefetch_result == 0);
+    REQUIRE(guest_result == 4096);
+    REQUIRE(remote_reads >= 3);
+
+    REQUIRE(res.ok);
+    REQUIRE(res.records == 1);
+    const auto records = parse_file(out);
+    REQUIRE(records.size() == 1);
+    REQUIRE(records[0] ==
+            format::trace::TraceRecord{'R', 0, kExtent, 2 * kExtent});
 }
 
 TEST_CASE("image: trace recording translates offsets out of the tar wrapper",

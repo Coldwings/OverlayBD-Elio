@@ -549,11 +549,18 @@ TraceRecordSource::TraceRecordSource(source::BlobSourcePtr inner,
 
 elio::coro::task<ssize_t> TraceRecordSource::pread(void* buf, size_t count,
                                                    uint64_t offset) {
+    co_return co_await pread_with_class(source::ReadClass::OnDemand, buf,
+                                        count, offset);
+}
+
+elio::coro::task<ssize_t> TraceRecordSource::pread_with_class(
+    source::ReadClass cls, void* buf, size_t count, uint64_t offset) {
     const ssize_t r = co_await inner_->pread(buf, count, offset);
-    // Only FULLY-satisfied remote reads record (ADR-0013): a partial
-    // EOF read or an error carries no usable range.
+    // Only FULLY-satisfied OnDemand remote reads record (ADR-0013):
+    // Prefetch/Fill traffic is synthetic warm-up/fill traffic, while a
+    // partial EOF read or an error carries no usable range.
     if (r == static_cast<ssize_t>(count) && count > 0 &&
-        recorder_->recording()) {
+        cls == source::ReadClass::OnDemand && recorder_->recording()) {
         // The read range is raw-blob space; the tar header occupies
         // [0, base_). Extent-granular fetches can span the header, so
         // clamp to the payload overlap and record in payload space.

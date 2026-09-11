@@ -232,21 +232,25 @@ docs/operations.md. Design:
 
 - **Tap placement.** Assembly wraps each remote lower's `RegistrySource`
   in a `TraceRecordSource` — BEFORE the `LayerStore` (and before the
-  no-dir `AdmissionSource` wrapper). Every pread on a lower's
-  `RegistrySource` IS a remote read by construction (the store touches
-  its remote only on a local miss), so local cache hits can never be
-  recorded and the tap needs no miss-detection of its own. The tap is
-  the narrowest common point of both remote chain shapes (dir-cached and
-  no-dir); the `layer_index` it stamps is the open_image loop index
-  threaded in at construction (data lowers only — local lowers occupy
-  index slots but carry no remote source, hence no tap).
+  no-dir `AdmissionSource` wrapper). The `LayerStore` and
+  `AdmissionSource` pass the ADR-0012 read class down to the tap, so a
+  recording appends only fully satisfied guest OnDemand reads. Local
+  cache hits never reach the tap, and Prefetch/Fill traffic from
+  structural warm-up, trace replay, or background fill is filtered out.
+  The tap is the narrowest common point of both remote chain shapes
+  (dir-cached and no-dir); the `layer_index` it stamps is the
+  open_image loop index threaded in at construction (data lowers only —
+  local lowers occupy index slots but carry no remote source, hence no
+  tap).
 - **Payload offsets.** Records carry PAYLOAD offsets (the tar wrapper is
   translated out: the tap subtracts the `TarOffsetSource` base once
   assembly probes it, and an extent fetch spanning the 512-byte tar
   header clamps to its payload overlap) — the same byte space replay
   consumes, so a recorded blob feeds the replay path verbatim.
-- **Only fully-satisfied reads record** (a short or failed pread appends
-  nothing): a partial read would record bytes the device never received.
+- **Only fully-satisfied OnDemand reads record** (a short or failed
+  pread, or a Prefetch/Fill read, appends nothing): a partial read would
+  record bytes the device never received, while synthetic scavenger
+  traffic is not guest demand.
 - **Hot path.** Recording disabled costs one atomic load per remote
   read; enabled, an append is a mutex + bounded-deque push (no IO, no
   allocation growth, no syscall) — nanoseconds against the millisecond
@@ -696,9 +700,12 @@ class TraceRecorder {  // one per opened image (OpenedImage::recorder)
     std::optional<FinalizeResult> last_result() const;
 };
 
-class TraceRecordSource : public source::BlobSource {
-    // pread: passes through, records only fully-satisfied reads with
-    // the base subtracted; set_base() threads the tar payload offset.
+class TraceRecordSource : public source::BlobSource,
+                          public source::ReadClassAwareSource {
+    // pread: OnDemand pass-through for direct callers.
+    // pread_with_class: records only fully-satisfied OnDemand reads
+    // with the base subtracted; Prefetch/Fill pass through unrecorded.
+    // set_base() threads the tar payload offset.
 };
 ```
 
@@ -953,6 +960,9 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   `image: trace recording captures only remote fetches through the layer store`
   — local hits record nothing, misses record exactly the fetched
   extents;
+  `image: trace recording filters fill and prefetch layer-store reads`
+  — with background fill active and a Prefetch populate issued during
+  the recording window, only the guest OnDemand extent is recorded;
   `image: trace recording translates offsets out of the tar wrapper` —
   records address payload space, with header-spanning fetches clamped
   to their payload overlap;
@@ -1089,12 +1099,11 @@ single Range-capable blob. No external golden files.
   the config flag plus the blob magic; remote lowers without `dir` are
   not warmed (populate is a no-op on the bare `RegistrySource`); both
   replay and the structural warm-up are still awaited inline during
-  bring-up; and supervisor-driven trace recording currently records only
-  fully satisfied remote `pread`s at the `TraceRecordSource` tap. When
-  `LayerStore` is active that tap sits below it; no-`dir` and ADR-0016
-  degraded remote-only chains are tapped before the direct
-  `AdmissionSource` wrapper. Issue #33 tracks narrowing the default
-  recording set to OnDemand traffic.
+  bring-up. Supervisor-driven trace recording records only fully
+  satisfied OnDemand remote `pread`s at the `TraceRecordSource` tap.
+  When `LayerStore` is active that tap sits below it; no-`dir` and
+  ADR-0016 degraded remote-only chains are tapped before the direct
+  `AdmissionSource` wrapper.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically** — a

@@ -565,7 +565,7 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
     // local skip is never inherited by a same-extent OnDemand miss.
     ssize_t r;
     remote_fetches_.fetch_add(1, std::memory_order_relaxed);
-    r = co_await remote_->pread(buf->data(), elen, ebase);
+    r = co_await pread_with_class(*remote_, cls, buf->data(), elen, ebase);
     // The permit covers the remote fetch alone — its lifetime is the
     // latency sample (the same contract as run_fill's): release the
     // window slot before the completion bookkeeping below, so a queued
@@ -838,8 +838,8 @@ elio::coro::task<void> LayerStore::run_fill() {
         if (cfg_.funnel) {
             permit = co_await cfg_.funnel->acquire(ReadClass::Fill);
         }
-        const ssize_t r =
-            co_await remote_->pread(buf->data(), buf->size(), e * es);
+        const ssize_t r = co_await pread_with_class(
+            *remote_, ReadClass::Fill, buf->data(), buf->size(), e * es);
         // The permit's lifetime is the remote fetch alone (the latency
         // sample): release the window slot BEFORE the write-behind
         // back-pressure, the error backoff, and the max_mbps throttle

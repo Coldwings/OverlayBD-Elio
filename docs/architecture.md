@@ -338,9 +338,9 @@ contracts above:
   scavenger class behind Prefetch and is governed by the `download`
   config. Trace recording is a supervisor command path (ADR-0013; see
   `docs/supervisor.md`) that passively records fully satisfied remote
-  reads at the trace tap; it does not call `populate` or use the Prefetch
-  class, and issue #33 tracks filtering recordings down to OnDemand reads
-  only.
+  OnDemand reads at the trace tap; it filters out Prefetch and Fill
+  traffic, so structural warm-up, trace replay, and background fill do
+  not pollute recorded traces.
 - **Discard / punch-hole** reaches only writable devices (ADR-0009).
   Read-only images do not advertise discard limits, so the kernel never
   issues discard/write-zeroes to them. Writable LSMT-RW uppers satisfy the
