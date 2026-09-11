@@ -263,9 +263,11 @@ ADR-0011 bulk path already assembles contiguous missing extents into
 larger reads). The cap bounds the head-of-line delay an arriving
 on-demand read can suffer behind an already-issued scavenger request.
 Extent-granular dedup is NOT the funnel's job: it lives one layer down in
-the LayerStore's in-flight map — a scavenger request for an extent
-already being fetched joins that fetch (whatever class started it) and
-never reaches the funnel.
+the LayerStore's in-flight map. Only issued remote work is published
+there: a request for an extent already being fetched joins that fetch
+(whatever class started it) and never reaches the funnel, while a
+Prefetch still queued for scavenger admission is not a join target for a
+later OnDemand miss.
 
 The structural warm-up itself (ADR-0012's cold-start floor) is driven
 from image assembly (`src/image/structural_warmup.hpp`, documented in
@@ -801,8 +803,10 @@ remote bytes into a sparse local staging file with a sidecar extent map
   issue #35), an extent whose fetch cannot be admitted within that bound
   is SKIPPED: populate fails with `-EAGAIN` (warm-up and replay count the
   window/record skipped and move on) instead of waiting at a storm-closed
-  gate indefinitely; in-flight joiners of the same extent see the same
-  `-EAGAIN`. Returns 0 or a negative `-errno`. No-op (0) in `Complete` and
+  gate indefinitely. This local skip is not published as same-extent
+  in-flight work, so OnDemand never inherits a queued Prefetch wait or its
+  `-EAGAIN`; already-issued fetches still deduplicate across classes.
+  Returns 0 or a negative `-errno`. No-op (0) in `Complete` and
   `Bypass`.
 - Background fill (`Config::fill`) — one scavenger coroutine walking the
   extent map and fetching contiguous missing runs as coalesced range reads
@@ -1159,6 +1163,14 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   issue #35: with `populate_admit_timeout` set and the gate held closed,
   `populate` fails the extent with `-EAGAIN` within the bound and
   succeeds once the gate opens.
+- `source: on-demand bypasses queued prefetch with populate timeout` —
+  issue #22: a same-extent OnDemand read completes with bytes while a
+  Prefetch is still queued behind an unrelated gate holder, and it does
+  not inherit the Prefetch-only `-EAGAIN` timeout.
+- `source: on-demand bypasses queued prefetch with unbounded populate wait` —
+  issue #22: with the default unbounded populate wait, a same-extent
+  OnDemand read still completes before the unrelated gate holder is
+  released.
 - `source: admission funnel re-checks the gate when queueing a scavenger` —
   lost-wakeup regression: the scavenger slow path pushes its waiter and
   re-runs admission in one critical section, so a release landing in the

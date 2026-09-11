@@ -254,6 +254,156 @@ TEST_CASE("source: layer store populate skips the extent when the funnel gate st
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("source: on-demand bypasses queued prefetch with populate timeout",
+          "[source]") {
+    // Issue #22: a Prefetch waiting at the funnel gate must not publish an
+    // in-flight extent that a later OnDemand miss joins. With a positive
+    // populate timeout, the OnDemand read must complete with bytes before
+    // the unrelated gate holder is released and must not inherit Prefetch's
+    // local -EAGAIN skip.
+    test::TempDir dir;
+    constexpr size_t kExtent = 64 * 1024;
+    auto blob = test::pattern_bytes(3 * kExtent, 41);
+    const std::string digest = common::Sha256::hex(blob.data(), blob.size());
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto funnel = std::make_shared<AdmissionFunnel>();
+        auto* vec = new test::VectorSource(blob);
+        source::LayerStore::Config lsc;
+        lsc.funnel = funnel;
+        lsc.populate_admit_timeout = milliseconds(500);
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest, lsc);
+
+        auto held = co_await funnel->acquire(ReadClass::OnDemand);
+        std::atomic<bool> populate_done{false};
+        std::atomic<ssize_t> populate_rc{-999};
+        elio::go([&]() -> elio::coro::task<void> {
+            const ssize_t pr = co_await store->populate(kExtent, kExtent);
+            populate_rc.store(pr, std::memory_order_relaxed);
+            populate_done.store(true, std::memory_order_release);
+        });
+
+        const bool queued = co_await poll_until([&] {
+            return funnel->scavenger_waits() == 1 &&
+                   !populate_done.load(std::memory_order_acquire);
+        });
+        REQUIRE(queued);
+
+        std::vector<uint8_t> buf(4096);
+        std::atomic<bool> read_done{false};
+        std::atomic<ssize_t> read_rc{-999};
+        elio::go([&]() -> elio::coro::task<void> {
+            const ssize_t r =
+                co_await store->pread(buf.data(), buf.size(), kExtent);
+            read_rc.store(r, std::memory_order_relaxed);
+            read_done.store(true, std::memory_order_release);
+        });
+
+        const bool read_before_release = co_await poll_until(
+            [&] { return read_done.load(std::memory_order_acquire); }, 100);
+        if (!read_before_release) {
+            held.reset();
+            const bool drained = co_await poll_until([&] {
+                return read_done.load(std::memory_order_acquire) &&
+                       populate_done.load(std::memory_order_acquire);
+            });
+            REQUIRE(drained);
+        }
+        REQUIRE(read_before_release);
+        REQUIRE(read_rc.load(std::memory_order_relaxed) ==
+                static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == slice(blob, kExtent, buf.size()));
+        REQUIRE(vec->reads() == 1);
+
+        const bool populate_timed_out = co_await poll_until(
+            [&] { return populate_done.load(std::memory_order_acquire); },
+            2000);
+        held.reset();
+        if (!populate_timed_out) {
+            const bool drained = co_await poll_until([&] {
+                return populate_done.load(std::memory_order_acquire);
+            });
+            REQUIRE(drained);
+        }
+        REQUIRE(populate_timed_out);
+        REQUIRE(populate_rc.load(std::memory_order_relaxed) == -EAGAIN);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: on-demand bypasses queued prefetch with unbounded populate wait",
+          "[source]") {
+    // Issue #22's default-timeout shape: an unbounded Prefetch waiter must
+    // not make a later same-extent OnDemand read wait for an unrelated gate
+    // holder to release.
+    test::TempDir dir;
+    constexpr size_t kExtent = 64 * 1024;
+    auto blob = test::pattern_bytes(3 * kExtent, 43);
+    const std::string digest = common::Sha256::hex(blob.data(), blob.size());
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto funnel = std::make_shared<AdmissionFunnel>();
+        auto* vec = new test::VectorSource(blob);
+        source::LayerStore::Config lsc;
+        lsc.funnel = funnel;  // populate_admit_timeout remains 0: unbounded
+        auto store = co_await source::LayerStore::open(
+            source::BlobSourcePtr(vec), dir.str(), digest, lsc);
+
+        auto held = co_await funnel->acquire(ReadClass::OnDemand);
+        std::atomic<bool> populate_done{false};
+        std::atomic<ssize_t> populate_rc{-999};
+        elio::go([&]() -> elio::coro::task<void> {
+            const ssize_t pr = co_await store->populate(kExtent, kExtent);
+            populate_rc.store(pr, std::memory_order_relaxed);
+            populate_done.store(true, std::memory_order_release);
+        });
+
+        const bool queued = co_await poll_until([&] {
+            return funnel->scavenger_waits() == 1 &&
+                   !populate_done.load(std::memory_order_acquire);
+        });
+        REQUIRE(queued);
+
+        std::vector<uint8_t> buf(4096);
+        std::atomic<bool> read_done{false};
+        std::atomic<ssize_t> read_rc{-999};
+        elio::go([&]() -> elio::coro::task<void> {
+            const ssize_t r =
+                co_await store->pread(buf.data(), buf.size(), kExtent);
+            read_rc.store(r, std::memory_order_relaxed);
+            read_done.store(true, std::memory_order_release);
+        });
+
+        const bool read_before_release = co_await poll_until(
+            [&] { return read_done.load(std::memory_order_acquire); }, 100);
+        if (!read_before_release) {
+            held.reset();
+            const bool drained = co_await poll_until([&] {
+                return read_done.load(std::memory_order_acquire) &&
+                       populate_done.load(std::memory_order_acquire);
+            });
+            REQUIRE(drained);
+        }
+        REQUIRE(read_before_release);
+        REQUIRE(read_rc.load(std::memory_order_relaxed) ==
+                static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == slice(blob, kExtent, buf.size()));
+        REQUIRE(vec->reads() == 1);
+        REQUIRE(!populate_done.load(std::memory_order_acquire));
+
+        held.reset();
+        const bool populated = co_await poll_until(
+            [&] { return populate_done.load(std::memory_order_acquire); });
+        REQUIRE(populated);
+        REQUIRE(populate_rc.load(std::memory_order_relaxed) == 0);
+        REQUIRE(vec->reads() == 1);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("source: admission funnel grows additively on flat latency and halves on rise",
           "[source]") {
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {

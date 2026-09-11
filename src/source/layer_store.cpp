@@ -482,17 +482,72 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
     auto it = inflight_.find(extent_id);
     if (it != inflight_.end()) {
         f = it->second;
-    } else {
+    } else if (cls == ReadClass::OnDemand) {
+        // OnDemand admission is unconditional and cannot queue. Publish
+        // before acquiring its permit so concurrent same-extent readers
+        // still coalesce behind one remote fetch.
         f = std::make_shared<InFlight>();
         inflight_.emplace(extent_id, f);
         starter = true;
     }
     inflight_mu_.unlock();
 
-    if (!starter) {
+    if (f && !starter) {
         coalesced_joins_.fetch_add(1, std::memory_order_relaxed);
         co_await f->done.wait();
         co_return FetchResult{f->data, f->error};
+    }
+
+    AdmissionFunnel::Permit permit;
+    if (cls != ReadClass::OnDemand) {
+        // A scavenger request that has not yet passed admission is not
+        // published in the in-flight map. That keeps same-extent OnDemand
+        // misses unconditional: they may issue their own fetch instead of
+        // joining a queued warm-up and inheriting its wait or EAGAIN skip.
+        if (cfg_.funnel && cls == ReadClass::Prefetch &&
+            cfg_.populate_admit_timeout.count() > 0) {
+            auto bounded = co_await cfg_.funnel->acquire_scavenger_bounded(
+                cls, cfg_.populate_admit_timeout);
+            if (!bounded) {
+                co_return FetchResult{nullptr, EAGAIN};
+            }
+            permit = std::move(*bounded);
+        } else if (cfg_.funnel) {
+            permit = co_await cfg_.funnel->acquire(cls);
+        }
+
+        // Another class may have issued and persisted this extent while
+        // Prefetch waited. Re-check the local bitmap after admission, before
+        // publishing new remote work, so a queued scavenger does not fetch
+        // bytes OnDemand already made present.
+        if (state() != State::Filling ||
+            (records_[extent_id].load(std::memory_order_acquire) &
+             kFlagPresent)) {
+            co_return FetchResult{nullptr, 0};
+        }
+
+        // Another class may have issued this extent while Prefetch waited but
+        // not yet made it present. Join that already-issued work and give back
+        // the scavenger slot instead of starting a duplicate remote request.
+        co_await inflight_mu_.lock();
+        it = inflight_.find(extent_id);
+        if (it != inflight_.end()) {
+            f = it->second;
+        } else {
+            f = std::make_shared<InFlight>();
+            inflight_.emplace(extent_id, f);
+            starter = true;
+        }
+        inflight_mu_.unlock();
+
+        if (!starter) {
+            permit.reset();
+            coalesced_joins_.fetch_add(1, std::memory_order_relaxed);
+            co_await f->done.wait();
+            co_return FetchResult{f->data, f->error};
+        }
+    } else if (cfg_.funnel) {
+        permit = co_await cfg_.funnel->acquire(cls);
     }
 
     const uint64_t ebase = extent_id * cfg_.extent_size;
@@ -505,31 +560,12 @@ elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
     // OnDemand). One extent is 64 KiB, under the scavenger size cap.
     // A populate (Prefetch) fetch additionally honors
     // populate_admit_timeout (issue #35): a gate closed for longer than
-    // that skips the extent with EAGAIN instead of waiting — a blocked
-    // warm-up window is skipped, never awaited, so device bring-up
-    // cannot stall behind sustained on-demand contention. The skip
-    // flows through the normal completion bookkeeping below so in-flight
-    // joiners are released with the same EAGAIN, never left hanging.
-    AdmissionFunnel::Permit permit;
+    // that skips the extent with EAGAIN instead of waiting. Because
+    // Prefetch publishes no in-flight entry until after admission, that
+    // local skip is never inherited by a same-extent OnDemand miss.
     ssize_t r;
-    if (cfg_.funnel && cls == ReadClass::Prefetch &&
-        cfg_.populate_admit_timeout.count() > 0) {
-        auto bounded = co_await cfg_.funnel->acquire_scavenger_bounded(
-            cls, cfg_.populate_admit_timeout);
-        if (!bounded) {
-            r = -EAGAIN;
-        } else {
-            permit = std::move(*bounded);
-            remote_fetches_.fetch_add(1, std::memory_order_relaxed);
-            r = co_await remote_->pread(buf->data(), elen, ebase);
-        }
-    } else {
-        if (cfg_.funnel) {
-            permit = co_await cfg_.funnel->acquire(cls);
-        }
-        remote_fetches_.fetch_add(1, std::memory_order_relaxed);
-        r = co_await remote_->pread(buf->data(), elen, ebase);
-    }
+    remote_fetches_.fetch_add(1, std::memory_order_relaxed);
+    r = co_await remote_->pread(buf->data(), elen, ebase);
     // The permit covers the remote fetch alone — its lifetime is the
     // latency sample (the same contract as run_fill's): release the
     // window slot before the completion bookkeeping below, so a queued

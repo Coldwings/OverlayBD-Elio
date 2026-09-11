@@ -234,9 +234,10 @@ private:
     elio::coro::task<ssize_t> read_fd_loop(int fd, void* buf, size_t count,
                                            uint64_t offset);
     // Joins-or-starts the fetch of one extent. `cls` is the ADR-0012
-    // traffic class the starter admits at the funnel with (only the
-    // starter issues a remote request; joiners wait on the in-flight
-    // fetch, whatever class started it — extent-granular dedup).
+    // traffic class the starter admits at the funnel with. The in-flight
+    // map publishes issued remote work only: an already-issued fetch may
+    // be joined across classes, but a queued Prefetch admission is not
+    // visible to OnDemand and cannot impose scavenger wait/skip semantics.
     elio::coro::task<FetchResult> join_or_fetch(uint64_t extent_id,
                                                 ReadClass cls);
     void enqueue_write(uint64_t extent_id,

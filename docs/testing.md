@@ -704,6 +704,15 @@ Every test, grouped by area, with the property it guards.
   by an on-demand permit, `populate` fails the extent with `-EAGAIN`
   within the bound (nothing reaches the remote) and succeeds once the
   gate opens.
+- `source: on-demand bypasses queued prefetch with populate timeout` —
+  issue #22: while a Prefetch of the same extent is queued behind an
+  unrelated on-demand gate holder, a later OnDemand read returns the
+  correct bytes before that holder releases and never observes the
+  Prefetch-only `-EAGAIN` timeout.
+- `source: on-demand bypasses queued prefetch with unbounded populate wait` —
+  issue #22: with the default unbounded populate wait, the same queued
+  Prefetch shape still cannot make OnDemand wait for the unrelated gate
+  holder to release.
 - `source: admission funnel re-checks the gate when queueing a scavenger` —
   lost-wakeup regression: with the check-then-queue gap injected by the
   test hook (a slot freed against empty queues inside it), the
