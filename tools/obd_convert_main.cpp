@@ -41,6 +41,12 @@ constexpr uint32_t kFirstDynamicInode = 11;
 constexpr uint64_t kMaxBuiltInDirectoryBlocks = 12;
 constexpr uint64_t kMaxBuiltInFileBlocks = 12 + kBlockSize / 4;
 constexpr uint64_t kMaxBuiltInFileBytes = kMaxBuiltInFileBlocks * kBlockSize;
+constexpr uint32_t kMinBuiltInInodes = 128;
+constexpr uint32_t kInodeTableBlock = 4;
+constexpr uint64_t kMinDataStartBlock =
+    kInodeTableBlock +
+    (static_cast<uint64_t>(kMinBuiltInInodes) * kInodeSize + kBlockSize - 1) /
+        kBlockSize;
 
 constexpr uint16_t kExt2SIfReg = 0100000;
 constexpr uint16_t kExt2SIfDir = 0040000;
@@ -241,10 +247,10 @@ void usage(const char* argv0) {
                  "Builds <out-dir>/<name>.lsmt from a ustar rootfs stream using\n"
                  "the deterministic built-in ext2 backend. No device, mount, or\n"
                  "mkfs subprocess is used. JSON manifest metadata is printed to\n"
-                 "stdout. The built-in backend supports regular files,\n"
-                 "directories up to 12 data blocks, short symlinks,\n"
-                 "uid/gid <= 65535, at most 32768 inodes, and images\n"
-                 "up to 128 MiB.\n",
+                 "stdout. The built-in backend supports regular files up\n"
+                 "to 4,243,456 bytes, directories up to 12 data blocks,\n"
+                 "short symlinks, uid/gid <= 65535,\n"
+                 "at most 32768 inodes, and images up to 128 MiB.\n",
                  argv0);
 }
 
@@ -263,6 +269,25 @@ uint64_t parse_size_arg(const std::string& s, const char* what) {
         throw UsageError(std::string(what) + " must be a positive integer");
     }
     return static_cast<uint64_t>(value);
+}
+
+uint64_t validate_explicit_image_blocks(uint64_t requested_size) {
+    if (requested_size == 0) return 0;
+    if (requested_size % kBlockSize != 0) {
+        throw std::runtime_error(
+            "--size must be a multiple of 4096 for the built-in ext2 backend");
+    }
+    const uint64_t blocks = requested_size / kBlockSize;
+    if (blocks == 0 || blocks > kMaxBlocks) {
+        throw std::runtime_error("built-in ext2 backend supports images up to 128 MiB");
+    }
+    return blocks;
+}
+
+uint64_t payload_block_budget_for(uint64_t requested_size) {
+    const uint64_t explicit_blocks = validate_explicit_image_blocks(requested_size);
+    const uint64_t image_blocks = explicit_blocks == 0 ? kMaxBlocks : explicit_blocks;
+    return image_blocks > kMinDataStartBlock ? image_blocks - kMinDataStartBlock : 0;
 }
 
 void validate_output_name(const std::string& name) {
@@ -404,16 +429,27 @@ void verify_ustar_header(const std::array<uint8_t, 512>& header) {
     }
 }
 
+uint64_t regular_file_payload_blocks(uint64_t size) {
+    const uint64_t data_blocks = div_ceil(size, kBlockSize);
+    return data_blocks + (data_blocks > 12 ? 1 : 0);
+}
+
 struct TarReader {
     int fd;
     std::string work_dir;
     std::string stem;
+    uint64_t max_payload_blocks = kMaxBlocks;
     std::vector<std::string> spool_paths;
     uint64_t next_spool = 0;
+    uint64_t reserved_payload_blocks = 0;
     uint32_t node_count = 1;
 
-    TarReader(int input_fd, std::string workspace_dir, std::string output_stem)
-        : fd(input_fd), work_dir(std::move(workspace_dir)), stem(std::move(output_stem)) {}
+    TarReader(int input_fd, std::string workspace_dir, std::string output_stem,
+              uint64_t payload_block_budget)
+        : fd(input_fd),
+          work_dir(std::move(workspace_dir)),
+          stem(std::move(output_stem)),
+          max_payload_blocks(payload_block_budget) {}
 
     ~TarReader() {
         for (const auto& path : spool_paths) ::unlink(path.c_str());
@@ -447,11 +483,35 @@ struct TarReader {
         return path;
     }
 
+    void reserve_regular_file_payload(uint64_t size, const std::string& name) {
+        const uint64_t blocks = regular_file_payload_blocks(size);
+        if (blocks > max_payload_blocks ||
+            reserved_payload_blocks > max_payload_blocks - blocks) {
+            throw std::runtime_error(
+                "built-in ext2 backend payloads exceed image budget: " + name);
+        }
+        reserved_payload_blocks += blocks;
+    }
+
     void load_into(Node& root) {
+        bool saw_entry = false;
         for (;;) {
             std::array<uint8_t, 512> header {};
-            if (!read_exact(fd, header.data(), header.size(), true)) break;
-            if (all_zero(header)) break;
+            if (!read_exact(fd, header.data(), header.size(), true)) {
+                if (!saw_entry) throw std::runtime_error("empty tar stream");
+                throw std::runtime_error("tar stream missing end-of-archive marker");
+            }
+            if (all_zero(header)) {
+                std::array<uint8_t, 512> second {};
+                if (!read_exact(fd, second.data(), second.size(), true) ||
+                    !all_zero(second)) {
+                    throw std::runtime_error(
+                        "tar end-of-archive requires two zero blocks");
+                }
+                if (!saw_entry) throw std::runtime_error("empty tar stream");
+                break;
+            }
+            saw_entry = true;
             verify_tar_checksum(header);
             verify_ustar_header(header);
 
@@ -500,6 +560,7 @@ struct TarReader {
                 if (size > kMaxBuiltInFileBytes) {
                     throw std::runtime_error("built-in ext2 backend file is too large: " + name);
                 }
+                reserve_regular_file_payload(size, name);
                 node->size = size;
                 if (size != 0) node->spool_path = spool_payload(size);
                 skip_padding(size);
@@ -730,23 +791,20 @@ void write_ext2_image(Node& root, const std::string& path, uint64_t requested_si
     if (used_inodes > kMaxBuiltInInodes) {
         throw_too_many_inodes();
     }
-    uint32_t desired_inodes = std::max<uint32_t>(used_inodes + 32, 128);
+    uint32_t desired_inodes = std::max<uint32_t>(used_inodes + 32, kMinBuiltInInodes);
     desired_inodes = std::min<uint32_t>(desired_inodes, kMaxBuiltInInodes);
     const uint32_t inode_count =
         static_cast<uint32_t>(round_up(desired_inodes, 128));
     const uint32_t inode_table_blocks = static_cast<uint32_t>(div_ceil(
         static_cast<uint64_t>(inode_count) * kInodeSize, kBlockSize));
-    const uint32_t inode_table_block = 4;
+    const uint32_t inode_table_block = kInodeTableBlock;
     const uint32_t first_data_block = inode_table_block + inode_table_blocks;
     const uint64_t payload_blocks = count_payload_blocks(root);
     const uint64_t required_blocks = first_data_block + payload_blocks;
 
     uint64_t total_blocks = 0;
     if (requested_size != 0) {
-        if (requested_size % kBlockSize != 0) {
-            throw std::runtime_error("--size must be a multiple of 4096 for the built-in ext2 backend");
-        }
-        total_blocks = requested_size / kBlockSize;
+        total_blocks = validate_explicit_image_blocks(requested_size);
         if (total_blocks < required_blocks) {
             throw std::runtime_error("--size is too small for tar contents and ext2 metadata");
         }
@@ -881,7 +939,9 @@ int main(int argc, char** argv) {
 
         Node root("", NodeKind::Dir, nullptr);
         TempWorkspace workspace(opts.out_dir, opts.name);
-        TarReader reader{input.fd, workspace.path(), opts.name};
+        const uint64_t payload_block_budget = payload_block_budget_for(opts.size);
+        TarReader reader{input.fd, workspace.path(), opts.name,
+                         payload_block_budget};
         reader.load_into(root);
         if (opts.input == "-") input.release();
 

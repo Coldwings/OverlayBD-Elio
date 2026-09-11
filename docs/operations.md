@@ -482,10 +482,11 @@ correlate by device id and by the supervisor's spawn logs.
   place, so failed conversions do not truncate an existing layer path.
 - **Built-in converter bounds.** The default `obd-convert` backend is
   deterministic and unprivileged, but intentionally small: ext2-compatible
-  output only, 4 KiB blocks, images up to 128 MiB, uid/gid values up to 65535,
-  at most 32768 inodes, regular files, directories up to 12 data blocks and
-  short symlinks. PAX/xattrs/devices/hardlinks/sparse tar entries require a
-  future backend.
+  output only, 4 KiB blocks, images up to 128 MiB or an explicit aligned
+  `--size` budget, uid/gid values up to 65535, at most 32768 inodes, regular
+  files up to 4,243,456 bytes, directories up to 12 data blocks and short
+  symlinks. PAX/xattrs/devices/hardlinks/sparse tar entries require a future
+  backend.
 - **Credentials**: only `credentialConfig` `mode=file` is honored; other
   modes are ignored with a warning (see [config.md](./config.md)).
 - **One supervisor per node** is the expected topology; multiple

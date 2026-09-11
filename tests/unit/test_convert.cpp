@@ -36,6 +36,8 @@ namespace {
 
 constexpr size_t kExt2BlockSize = 4096;
 constexpr size_t kIndirectToolSize = 13 * kExt2BlockSize + 123;
+constexpr uint64_t kMaxBuiltInFileBytes =
+    static_cast<uint64_t>(12 + kExt2BlockSize / 4) * kExt2BlockSize;
 
 struct CommandResult {
     int exit_code = -1;
@@ -129,17 +131,17 @@ void fill_octal(uint8_t* out, size_t width, uint64_t value) {
                   static_cast<unsigned long>(value));
 }
 
-void append_tar_entry(std::vector<uint8_t>& tar, const std::string& name,
-                      char typeflag, uint64_t mode, uint64_t uid,
-                      uint64_t gid, const std::vector<uint8_t>& payload = {},
-                      const std::string& link_target = {}) {
+std::array<uint8_t, 512> make_tar_header(const std::string& name, char typeflag,
+                                          uint64_t mode, uint64_t uid,
+                                          uint64_t gid, uint64_t payload_size,
+                                          const std::string& link_target = {}) {
     std::array<uint8_t, 512> h {};
     REQUIRE(name.size() <= 100);
     std::memcpy(h.data(), name.data(), name.size());
     fill_octal(h.data() + 100, 8, mode);
     fill_octal(h.data() + 108, 8, uid);
     fill_octal(h.data() + 116, 8, gid);
-    fill_octal(h.data() + 124, 12, payload.size());
+    fill_octal(h.data() + 124, 12, payload_size);
     fill_octal(h.data() + 136, 12, 0);
     h[156] = static_cast<uint8_t>(typeflag);
     if (!link_target.empty()) {
@@ -154,6 +156,15 @@ void append_tar_entry(std::vector<uint8_t>& tar, const std::string& name,
     std::snprintf(reinterpret_cast<char*>(h.data() + 148), 8, "%06o", sum);
     h[154] = '\0';
     h[155] = ' ';
+    return h;
+}
+
+void append_tar_entry(std::vector<uint8_t>& tar, const std::string& name,
+                      char typeflag, uint64_t mode, uint64_t uid,
+                      uint64_t gid, const std::vector<uint8_t>& payload = {},
+                      const std::string& link_target = {}) {
+    const auto h = make_tar_header(name, typeflag, mode, uid, gid,
+                                   payload.size(), link_target);
     tar.insert(tar.end(), h.begin(), h.end());
     tar.insert(tar.end(), payload.begin(), payload.end());
     tar.resize(static_cast<size_t>(((tar.size() + 511) / 512) * 512), 0);
@@ -186,6 +197,13 @@ std::vector<uint8_t> make_rootfs_tar() {
     return tar;
 }
 
+std::vector<uint8_t> make_tiny_file_tar() {
+    std::vector<uint8_t> tar;
+    append_tar_entry(tar, "tiny", '0', 0644, 0, 0, {'x'});
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
 std::vector<uint8_t> make_many_root_files_tar(size_t count) {
     std::vector<uint8_t> tar;
     tar.reserve((count + 2) * 512);
@@ -210,6 +228,23 @@ std::vector<uint8_t> make_many_inode_tar() {
     }
     tar.resize(tar.size() + 1024, 0);
     return tar;
+}
+
+std::string write_sparse_regular_files_tar(const std::string& path, size_t count,
+                                           uint64_t payload_size) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    REQUIRE(fd >= 0);
+    const uint64_t padded_payload = ((payload_size + 511) / 512) * 512;
+    for (size_t i = 0; i < count; ++i) {
+        const auto h = make_tar_header("big" + std::to_string(i), '0', 0644,
+                                       0, 0, payload_size);
+        write_all_fd(fd, h.data(), h.size());
+        REQUIRE(::lseek(fd, static_cast<off_t>(padded_payload), SEEK_CUR) >= 0);
+    }
+    std::array<uint8_t, 1024> end_blocks {};
+    write_all_fd(fd, end_blocks.data(), end_blocks.size());
+    REQUIRE(::close(fd) == 0);
+    return path;
 }
 
 std::string file_sha256(const std::string& path) {
@@ -502,6 +537,25 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
     struct stat st {};
     REQUIRE(::stat((out_dir + "/bad.lsmt").c_str(), &st) != 0);
 
+    const std::string empty_path = test::write_file(dir / "empty.tar", {});
+    const std::string empty_dir = dir / "empty";
+    const auto empty_result = run_convert({"--input", empty_path, "--out-dir",
+                                           empty_dir, "--name", "empty"});
+    REQUIRE(empty_result.exit_code == 1);
+    REQUIRE(empty_result.err.find("empty tar stream") != std::string::npos);
+    REQUIRE(::stat((empty_dir + "/empty.lsmt").c_str(), &st) != 0);
+
+    std::vector<uint8_t> empty_end_marker(1024, 0);
+    const std::string empty_end_path =
+        test::write_file(dir / "empty-end-marker.tar", empty_end_marker);
+    const std::string empty_end_dir = dir / "empty-end";
+    const auto empty_end_result =
+        run_convert({"--input", empty_end_path, "--out-dir", empty_end_dir,
+                     "--name", "empty"});
+    REQUIRE(empty_end_result.exit_code == 1);
+    REQUIRE(empty_end_result.err.find("empty tar stream") != std::string::npos);
+    REQUIRE(::stat((empty_end_dir + "/empty.lsmt").c_str(), &st) != 0);
+
     std::vector<uint8_t> legacy_tar;
     append_tar_entry(legacy_tar, "legacy-file", '0', 0644, 0, 0);
     std::fill(legacy_tar.begin() + 257, legacy_tar.begin() + 265, 0);
@@ -516,15 +570,83 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
             std::string::npos);
     REQUIRE(::stat((legacy_dir + "/legacy.lsmt").c_str(), &st) != 0);
 
-    const auto valid_tar = make_rootfs_tar();
-    const std::string valid_tar_path = test::write_file(dir / "rootfs.tar", valid_tar);
+    std::vector<uint8_t> single_zero(512, 0);
+    const std::string single_zero_path =
+        test::write_file(dir / "single-zero.tar", single_zero);
+    const std::string single_zero_dir = dir / "single-zero";
+    const auto single_zero_result =
+        run_convert({"--input", single_zero_path, "--out-dir", single_zero_dir,
+                     "--name", "bad"});
+    REQUIRE(single_zero_result.exit_code == 1);
+    REQUIRE(single_zero_result.err.find("two zero blocks") != std::string::npos);
+    REQUIRE(::stat((single_zero_dir + "/bad.lsmt").c_str(), &st) != 0);
+
+    std::vector<uint8_t> zero_then_junk(1024, 0);
+    zero_then_junk[512] = 1;
+    const std::string zero_junk_path =
+        test::write_file(dir / "zero-junk.tar", zero_then_junk);
+    const std::string zero_junk_dir = dir / "zero-junk";
+    const auto zero_junk_result =
+        run_convert({"--input", zero_junk_path, "--out-dir", zero_junk_dir,
+                     "--name", "bad"});
+    REQUIRE(zero_junk_result.exit_code == 1);
+    REQUIRE(zero_junk_result.err.find("two zero blocks") != std::string::npos);
+    REQUIRE(::stat((zero_junk_dir + "/bad.lsmt").c_str(), &st) != 0);
+
+    const auto tiny_tar = make_tiny_file_tar();
+    const std::string tiny_tar_path = test::write_file(dir / "tiny.tar", tiny_tar);
     const std::string too_small_dir = dir / "too-small";
-    const auto too_small = run_convert({"--input", valid_tar_path, "--out-dir",
+    const auto too_small = run_convert({"--input", tiny_tar_path, "--out-dir",
                                         too_small_dir, "--name", "small",
-                                        "--size", "4096"});
+                                        "--size", "36864"});
     REQUIRE(too_small.exit_code == 1);
     REQUIRE(too_small.err.find("--size is too small") != std::string::npos);
     REQUIRE(::stat((too_small_dir + "/small.lsmt").c_str(), &st) != 0);
+
+    const std::vector<uint8_t> missing_end_tar(tiny_tar.begin(),
+                                               tiny_tar.end() - 1024);
+    const std::string missing_end_path =
+        test::write_file(dir / "missing-end.tar", missing_end_tar);
+    const std::string missing_end_dir = dir / "missing-end";
+    const auto missing_end =
+        run_convert({"--input", missing_end_path, "--out-dir", missing_end_dir,
+                     "--name", "missing"});
+    REQUIRE(missing_end.exit_code == 1);
+    REQUIRE(missing_end.err.find("missing end-of-archive marker") !=
+            std::string::npos);
+    REQUIRE(::stat((missing_end_dir + "/missing.lsmt").c_str(), &st) != 0);
+
+    const std::string oversized_tar = write_sparse_regular_files_tar(
+        dir / "oversized.tar", 1, kMaxBuiltInFileBytes + 1);
+    const std::string oversized_dir = dir / "oversized";
+    const auto oversized = run_convert({"--input", oversized_tar, "--out-dir",
+                                        oversized_dir, "--name", "oversized"});
+    REQUIRE(oversized.exit_code == 1);
+    REQUIRE(oversized.err.find("file is too large") != std::string::npos);
+    REQUIRE(::stat((oversized_dir + "/oversized.lsmt").c_str(), &st) != 0);
+
+    const std::string explicit_budget_tar = write_sparse_regular_files_tar(
+        dir / "explicit-budget.tar", 2, 4ull * 1024 * 1024);
+    const std::string explicit_budget_dir = dir / "explicit-budget";
+    const auto explicit_budget =
+        run_convert({"--input", explicit_budget_tar, "--out-dir",
+                     explicit_budget_dir, "--name", "explicit-budget",
+                     "--size", "8388608"});
+    REQUIRE(explicit_budget.exit_code == 1);
+    REQUIRE(explicit_budget.err.find("payloads exceed image budget") !=
+            std::string::npos);
+    REQUIRE(::stat((explicit_budget_dir + "/explicit-budget.lsmt").c_str(),
+                   &st) != 0);
+
+    const std::string aggregate_tar = write_sparse_regular_files_tar(
+        dir / "aggregate.tar", 32, 4ull * 1024 * 1024);
+    const std::string aggregate_dir = dir / "aggregate";
+    const auto aggregate = run_convert({"--input", aggregate_tar, "--out-dir",
+                                        aggregate_dir, "--name", "aggregate"});
+    REQUIRE(aggregate.exit_code == 1);
+    REQUIRE(aggregate.err.find("payloads exceed image budget") !=
+            std::string::npos);
+    REQUIRE(::stat((aggregate_dir + "/aggregate.lsmt").c_str(), &st) != 0);
 
     const std::string many_dir = dir / "many-dir";
     const auto many = make_many_root_files_tar(4100);

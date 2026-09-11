@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-09-08
 - Supersedes: none
+- Updated by: ADR-0019 (converter backend scope)
 - Binds: docs/supervisor.md, docs/operations.md, docs/binaries.md,
   docs/format.md, docs/design-assumptions.md, src/supervisor/protocol.hpp
 
@@ -63,13 +64,14 @@ upstream findings bound the design:
   image building because it is non-deterministic). The zero base beneath
   a blank disk is an empty LSMT layer.
 - **The streaming converter lives in this repository**, beside the
-  format writers it must share, built as an optional target on a pinned
-  e2fsprogs-fork FetchContent dependency; the main data plane does not
-  gain the dependency. The external CLI repository owns everything that
-  merely talks to a registry: reference resolution UX, digest and
-  manifest construction, blob upload, artifact push, and trace-layer
-  packaging. The C++ side's only obligation is that the supervisor
-  protocol can express every capability the CLI needs.
+  format writers it must share. ADR-0019 narrows the first accepted
+  implementation to a dependency-free built-in ext2 backend for default
+  builds and CI; a pinned e2fsprogs/libe2fs backend may still be added
+  later as a converter-local extension. The external CLI repository owns
+  everything that merely talks to a registry: reference resolution UX,
+  digest and manifest construction, blob upload, artifact push, and
+  trace-layer packaging. The C++ side's only obligation is that the
+  supervisor protocol can express every capability the CLI needs.
 - **The supervisor protocol evolves additively, with a version
   handshake.** New commands and fields may be added; existing field
   meanings never change; a hello exchange lets non-C++ clients detect

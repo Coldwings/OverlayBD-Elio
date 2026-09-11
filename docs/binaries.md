@@ -174,7 +174,7 @@ obd-convert --input <rootfs.tar|-> --out-dir <dir> [--name base]
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--input PATH|-` | required | Rootfs ustar archive. `-` reads stdin. |
+| `--input PATH|-` | required | Rootfs ustar archive with the standard two-zero-block end marker. `-` reads stdin. |
 | `--out-dir DIR` | required | Output directory; it is created if missing. |
 | `--name STR` | `layer` | Basename of the produced layer. The value must be a plain file stem using letters, digits, `.`, `_`, or `-`. |
 | `--size BYTES` | auto | Raw filesystem size. When omitted, the built-in backend picks the smallest 4 KiB-aligned size with room for the archive, rounded with slack. When provided, it must be a 4 KiB multiple and large enough for the contents. |
@@ -199,10 +199,12 @@ compatible with a `lowers[]` entry plus converter metadata:
 }
 ```
 
-The built-in backend supports regular files, directories up to 12 data blocks,
+The built-in backend supports regular files up to 4,243,456 bytes (12 direct
+data blocks plus one single-indirect block), directories up to 12 data blocks,
 and short inline symlinks. It uses 4 KiB ext2 blocks, uid/gid values up to
-65535, at most 32768 inodes, single-indirect regular file data, and images up
-to 128 MiB. It rejects unsupported tar entries before publishing an LSMT layer.
+65535, at most 32768 inodes, and images up to 128 MiB, or the explicit aligned
+`--size` budget when smaller. It rejects malformed archives and unsupported tar
+entries before publishing an LSMT layer.
 
 ## Behavior & guarantees
 
@@ -322,10 +324,12 @@ output).
   uid/gid, explicit zero modes and symlink target. It also covers an explicit
   aligned `--size` value.
 - `cli: obd-convert rejects unsupported tar entries before writing a layer` —
-  proves unsupported tar entry types, non-ustar headers, too-small explicit
-  `--size` values, directories beyond the direct-block backend limit, and inode
-  counts beyond the bitmap capacity fail with exit 1 and do not publish an LSMT
-  output file.
+  proves unsupported tar entry types, non-ustar headers, empty streams,
+  malformed end-of-archive markers, regular files beyond the single-indirect
+  backend limit, too-small explicit `--size` values, aggregate payloads beyond
+  the image budget, directories beyond the direct-block
+  backend limit, and inode counts beyond the bitmap capacity fail with exit 1 and
+  do not publish an LSMT output file.
 - `cli: obd-convert atomically replaces existing output symlinks` — verifies
   converter outputs are completed in a private temporary workspace and published
   by rename instead of following or truncating an existing output symlink.
@@ -351,10 +355,11 @@ ctest --test-dir build --output-on-failure
   it is a fixture generator, not a replacement for the upstream
   `overlaybd-*` image toolchain.
 - obd-convert's built-in backend is intentionally bounded: ext2-compatible
-  output only, 4 KiB blocks, images up to 128 MiB, uid/gid up to 65535, at
-  most 32768 inodes, regular files, directories up to 12 data blocks and short
-  inline symlinks. It rejects PAX/GNU long names, hardlinks, device nodes,
-  FIFOs, sparse tar files, xattrs and wider ext4 features until a pinned
+  output only, 4 KiB blocks, images up to 128 MiB or an explicit aligned
+  `--size` budget, uid/gid up to 65535, at most 32768 inodes, regular files up
+  to 4,243,456 bytes, directories up to 12 data blocks and short inline
+  symlinks. It rejects PAX/GNU long names, hardlinks, device nodes, FIFOs,
+  sparse tar files, xattrs and wider ext4 features until a pinned
   converter-local backend implements them.
 - obd-supervisor runs host `mkfs.<type>` for mode-3 blank creates only;
   the mkfs binaries are host prerequisites for that mode, never bundled
