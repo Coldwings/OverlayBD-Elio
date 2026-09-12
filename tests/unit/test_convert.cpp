@@ -37,6 +37,7 @@ using obd::test::TempDir;
 namespace {
 
 constexpr size_t kExt2BlockSize = 4096;
+constexpr uint64_t kExt2BlocksPerGroup = kExt2BlockSize * 8;
 constexpr size_t kIndirectToolSize = 13 * kExt2BlockSize + 123;
 constexpr size_t kExt2PointersPerBlock = kExt2BlockSize / 4;
 constexpr uint32_t kExt2FeatureRoCompatLargeFile = 0x0002;
@@ -227,6 +228,16 @@ std::vector<uint8_t> make_many_root_files_tar(size_t count) {
     tar.reserve((count + 2) * 512);
     for (size_t i = 0; i < count; ++i) {
         append_tar_entry(tar, "f" + std::to_string(i), '0', 0644, 0, 0);
+    }
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
+[[maybe_unused]] std::vector<uint8_t> make_many_root_directories_tar(size_t count) {
+    std::vector<uint8_t> tar;
+    tar.reserve((count + 2) * 512);
+    for (size_t i = 0; i < count; ++i) {
+        append_tar_entry(tar, "d" + std::to_string(i) + "/", '5', 0755, 0, 0);
     }
     tar.resize(tar.size() + 1024, 0);
     return tar;
@@ -669,6 +680,26 @@ TEST_CASE("cli: obd-convert libe2fs expands built-in file and directory limits",
     REQUIRE(min_group_too_small.exit_code == 1);
     REQUIRE(min_group_too_small.err.find("contents and ext2 metadata exceed image budget") !=
             std::string::npos);
+
+    const uint64_t multi_group_short_tail_size =
+        (kExt2BlocksPerGroup + 1) * kExt2BlockSize;
+    const auto multi_group_short_tail =
+        run_convert({"--input", tiny_path, "--out-dir", dir / "multi-group-short-tail",
+                     "--name", "tiny", "--size", std::to_string(multi_group_short_tail_size)},
+                    nullptr, false);
+    REQUIRE(multi_group_short_tail.exit_code == 0);
+    const auto multi_group_manifest = nlohmann::json::parse(multi_group_short_tail.out);
+    REQUIRE(multi_group_manifest["converter"]["virtual_size"].get<uint64_t>() ==
+            multi_group_short_tail_size);
+
+    const auto too_many_child_dirs_tar = make_many_root_directories_tar(65534);
+    const std::string too_many_child_dirs_path =
+        test::write_file(dir / "too-many-child-dirs.tar", too_many_child_dirs_tar);
+    const auto too_many_child_dirs =
+        run_convert({"--input", too_many_child_dirs_path, "--out-dir", dir / "too-many-child-dirs",
+                     "--name", "dirs"}, nullptr, false);
+    REQUIRE(too_many_child_dirs.exit_code == 1);
+    REQUIRE(too_many_child_dirs.err.find("too many child directories") != std::string::npos);
 
     const auto many = make_many_root_files_tar(4100);
     const std::string many_tar = test::write_file(dir / "many.tar", many);

@@ -57,11 +57,54 @@ constexpr uint64_t kExt2BlocksPerGroup = kBlockSize * 8;
 constexpr uint64_t kExt2MaxInodesPerGroup = kBlockSize * 8;
 constexpr uint64_t kExt2GroupDescriptorSize = 32;
 constexpr uint64_t kLibE2fsLastGroupSlackBlocks = 50;
+constexpr uint64_t kExt2SectorsPerBlock = kBlockSize / 512;
+constexpr uint64_t kMaxExt2IBlocksAllocationBlocks =
+    std::numeric_limits<uint32_t>::max() / kExt2SectorsPerBlock;
+constexpr uint32_t kExt2MaxLinks = 65535;
+constexpr uint32_t kExt2MaxSubdirectories = kExt2MaxLinks - 2;
 constexpr uint64_t kMaxExt2FileBlocks = 12 + kExt2PointersPerBlock +
                                        kExt2PointersPerBlock * kExt2PointersPerBlock +
                                        kExt2PointersPerBlock * kExt2PointersPerBlock *
                                            kExt2PointersPerBlock;
-constexpr uint64_t kMaxLibE2fsFileBytes = kMaxExt2FileBlocks * kBlockSize;
+constexpr uint64_t regular_file_payload_blocks_for_data_blocks(uint64_t data_blocks) {
+    uint64_t total = data_blocks;
+    if (data_blocks <= 12) return total;
+
+    data_blocks -= 12;
+    ++total;
+    if (data_blocks <= kExt2PointersPerBlock) return total;
+
+    data_blocks -= kExt2PointersPerBlock;
+    ++total;
+    const uint64_t double_data_capacity = kExt2PointersPerBlock * kExt2PointersPerBlock;
+    const uint64_t double_covered =
+        data_blocks < double_data_capacity ? data_blocks : double_data_capacity;
+    total += (double_covered + kExt2PointersPerBlock - 1) / kExt2PointersPerBlock;
+    if (data_blocks <= double_data_capacity) return total;
+
+    data_blocks -= double_data_capacity;
+    ++total;
+    total += (data_blocks + double_data_capacity - 1) / double_data_capacity;
+    total += (data_blocks + kExt2PointersPerBlock - 1) / kExt2PointersPerBlock;
+    return total;
+}
+
+constexpr uint64_t max_ext2_i_blocks_data_blocks() {
+    uint64_t lo = 0;
+    uint64_t hi = kMaxExt2FileBlocks;
+    while (lo < hi) {
+        const uint64_t mid = lo + (hi - lo + 1) / 2;
+        if (regular_file_payload_blocks_for_data_blocks(mid) <=
+            kMaxExt2IBlocksAllocationBlocks) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+constexpr uint64_t kMaxLibE2fsFileBytes = max_ext2_i_blocks_data_blocks() * kBlockSize;
 constexpr uint64_t kMaxLibE2fsDirectoryBlocks = 1024;
 constexpr uint32_t kMaxLibE2fsNodes = 65536;
 
@@ -352,6 +395,7 @@ struct Node {
     std::string spool_path;
     std::string symlink_target;
     uint32_t inode = 0;
+    uint32_t child_directory_count = 0;
     std::vector<uint32_t> blocks;
     uint32_t indirect_block = 0;
     uint64_t dir_blocks = 0;
@@ -472,26 +516,7 @@ void verify_ustar_header(const std::array<uint8_t, 512>& header) {
 }
 
 uint64_t regular_file_payload_blocks(uint64_t size) {
-    uint64_t data_blocks = div_ceil(size, kBlockSize);
-    uint64_t total = data_blocks;
-    if (data_blocks <= 12) return total;
-
-    data_blocks -= 12;
-    ++total;  // single-indirect block
-    if (data_blocks <= kExt2PointersPerBlock) return total;
-
-    data_blocks -= kExt2PointersPerBlock;
-    ++total;  // double-indirect root block
-    const uint64_t double_data_capacity = kExt2PointersPerBlock * kExt2PointersPerBlock;
-    const uint64_t double_covered = std::min<uint64_t>(data_blocks, double_data_capacity);
-    total += div_ceil(double_covered, kExt2PointersPerBlock);
-    if (data_blocks <= double_data_capacity) return total;
-
-    data_blocks -= double_data_capacity;
-    ++total;  // triple-indirect root block
-    total += div_ceil(data_blocks, double_data_capacity);   // double-indirect blocks
-    total += div_ceil(data_blocks, kExt2PointersPerBlock);  // single-indirect blocks
-    return total;
+    return regular_file_payload_blocks_for_data_blocks(div_ceil(size, kBlockSize));
 }
 
 uint32_t rounded_inode_count_for_nodes(uint32_t nodes, ConverterBackend backend) {
@@ -537,30 +562,56 @@ LibE2fsGeometry libe2fs_geometry_for(uint32_t inode_count, uint64_t image_blocks
 struct LibE2fsMetadataBudget {
     uint64_t metadata_blocks = 0;
     uint64_t minimum_image_blocks = 0;
+    uint64_t effective_image_blocks = 0;
 };
+
+uint64_t libe2fs_last_group_minimum_blocks(const LibE2fsGeometry& geometry) {
+    return 3 + geometry.group_descriptor_blocks + geometry.inode_table_blocks_per_group +
+           kLibE2fsLastGroupSlackBlocks;
+}
+
+uint64_t libe2fs_effective_image_blocks(uint32_t inode_count, uint64_t image_blocks) {
+    if (image_blocks == 0) return 0;
+    uint64_t effective_blocks = image_blocks;
+    for (int i = 0; i < 16; ++i) {
+        const auto geometry = libe2fs_geometry_for(inode_count, effective_blocks);
+        const uint64_t tail_blocks = effective_blocks % geometry.blocks_per_group;
+        if (tail_blocks == 0) return effective_blocks;
+        if (tail_blocks >= libe2fs_last_group_minimum_blocks(geometry)) {
+            return effective_blocks;
+        }
+        if (tail_blocks == effective_blocks) return 0;
+        effective_blocks -= tail_blocks;
+    }
+    return effective_blocks;
+}
 
 LibE2fsMetadataBudget libe2fs_metadata_budget(uint32_t inode_count,
                                               uint64_t image_blocks) {
-    const auto geometry = libe2fs_geometry_for(inode_count, image_blocks);
+    const uint64_t effective_image_blocks =
+        libe2fs_effective_image_blocks(inode_count, image_blocks);
+    const uint64_t geometry_image_blocks =
+        effective_image_blocks == 0 ? image_blocks : effective_image_blocks;
+    const auto geometry = libe2fs_geometry_for(inode_count, geometry_image_blocks);
 
     LibE2fsMetadataBudget budget;
+    budget.effective_image_blocks = effective_image_blocks;
     budget.metadata_blocks =
         geometry.groups *
         (3 + geometry.group_descriptor_blocks + geometry.inode_table_blocks_per_group);
 
-    // ext2fs_initialize() discards a short final group and returns EXT2_ET_TOOSMALL
-    // if a one-group image is shorter than the last-group overhead plus 50 blocks.
-    // Model that geometry in the parser-side budget so explicit --size failures are
-    // reported before the tar payload is spooled and before image construction starts.
-    const uint64_t last_group_minimum =
-        3 + geometry.group_descriptor_blocks + geometry.inode_table_blocks_per_group +
-        kLibE2fsLastGroupSlackBlocks;
+    // ext2fs_initialize() drops a short final group and fails only when that
+    // leaves no usable group. Explicit --size preflight compares content with
+    // effective_image_blocks; auto sizing uses minimum_image_blocks to grow
+    // away from sizes that libe2fs would otherwise shorten.
+    const uint64_t last_group_minimum = libe2fs_last_group_minimum_blocks(geometry);
     if (image_blocks == 0) {
         budget.minimum_image_blocks = last_group_minimum;
     } else {
         const uint64_t tail_blocks = image_blocks % geometry.blocks_per_group;
-        if (tail_blocks != 0) {
-            budget.minimum_image_blocks = image_blocks - tail_blocks + last_group_minimum;
+        if (tail_blocks != 0 && tail_blocks < last_group_minimum) {
+            budget.minimum_image_blocks =
+                image_blocks - tail_blocks + last_group_minimum;
         }
     }
     return budget;
@@ -575,10 +626,17 @@ uint64_t metadata_blocks_for_nodes(uint32_t nodes, ConverterBackend backend,
     return libe2fs_metadata_budget(inode_count, image_blocks).metadata_blocks;
 }
 
-uint64_t minimum_libe2fs_image_blocks_for_nodes(uint32_t nodes, uint64_t image_blocks) {
+[[maybe_unused]] uint64_t minimum_libe2fs_image_blocks_for_nodes(uint32_t nodes,
+                                                                 uint64_t image_blocks) {
     return libe2fs_metadata_budget(rounded_inode_count_for_nodes(nodes, ConverterBackend::LibE2fs),
                                    image_blocks)
         .minimum_image_blocks;
+}
+
+uint64_t effective_libe2fs_image_blocks_for_nodes(uint32_t nodes, uint64_t image_blocks) {
+    return libe2fs_metadata_budget(rounded_inode_count_for_nodes(nodes, ConverterBackend::LibE2fs),
+                                   image_blocks)
+        .effective_image_blocks;
 }
 
 uint64_t directory_payload_blocks_for_data_blocks(uint64_t data_blocks) {
@@ -673,12 +731,19 @@ struct TarReader {
     uint64_t required_image_blocks(uint64_t payload_blocks) const {
         const uint64_t image_blocks =
             max_image_blocks == std::numeric_limits<uint64_t>::max() ? 0 : max_image_blocks;
+        if (backend == ConverterBackend::LibE2fs && image_blocks != 0) {
+            const uint64_t effective_blocks =
+                effective_libe2fs_image_blocks_for_nodes(node_count, image_blocks);
+            if (effective_blocks == 0) return max_image_blocks + 1;
+            const uint64_t content_blocks =
+                metadata_blocks_for_nodes(node_count, backend, effective_blocks) +
+                reserved_directory_blocks + payload_blocks;
+            return content_blocks > effective_blocks ? max_image_blocks + 1 : content_blocks;
+        }
         const uint64_t content_blocks =
             metadata_blocks_for_nodes(node_count, backend, image_blocks) +
             reserved_directory_blocks + payload_blocks;
-        if (backend != ConverterBackend::LibE2fs || image_blocks == 0) return content_blocks;
-        return std::max(content_blocks,
-                        minimum_libe2fs_image_blocks_for_nodes(node_count, image_blocks));
+        return content_blocks;
     }
 
     void ensure_image_budget(const std::string& name) const {
@@ -688,7 +753,14 @@ struct TarReader {
         }
     }
 
-    void reserve_directory_child(Node& parent, const std::string& leaf) {
+    void reserve_directory_child(Node& parent, const std::string& leaf,
+                                 bool child_is_directory) {
+        if (child_is_directory && parent.child_directory_count >= kExt2MaxSubdirectories) {
+            throw std::runtime_error(
+                std::string(backend_name(backend)) +
+                " backend directory has too many child directories for ext2 link count: " +
+                (parent.name.empty() ? std::string("/") : parent.name));
+        }
         const uint64_t next_blocks = directory_blocks_with_pending_child(parent, leaf);
         if (next_blocks > limits.max_directory_blocks) {
             if (backend == ConverterBackend::BuiltinExt2) {
@@ -704,6 +776,7 @@ struct TarReader {
         reserved_directory_blocks += directory_payload_blocks_for_data_blocks(next_blocks) -
                                      directory_payload_blocks_for_data_blocks(parent.dir_blocks);
         parent.dir_blocks = next_blocks;
+        if (child_is_directory) ++parent.child_directory_count;
     }
 
     Node& ensure_dir(Node& root, const std::vector<std::string>& parts) {
@@ -713,7 +786,7 @@ struct TarReader {
             if (it == cur->children.end()) {
                 if (node_count >= limits.max_nodes) throw_too_many_inodes(backend);
                 ++node_count;
-                reserve_directory_child(*cur, part);
+                reserve_directory_child(*cur, part, true);
                 auto dir = std::make_unique<Node>(part, NodeKind::Dir, cur);
                 reserved_directory_blocks += directory_payload_blocks_for_data_blocks(dir->dir_blocks);
                 ensure_image_budget(part);
@@ -812,7 +885,7 @@ struct TarReader {
             }
             if (node_count >= limits.max_nodes) throw_too_many_inodes(backend);
             ++node_count;
-            reserve_directory_child(parent, leaf);
+            reserve_directory_child(parent, leaf, kind == NodeKind::Dir);
             ensure_image_budget(name);
             auto node = std::make_unique<Node>(leaf, kind, &parent);
             node->perm = perm;
