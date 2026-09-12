@@ -4,6 +4,7 @@
 #include <elio/log/macros.hpp>
 
 #include <algorithm>
+#include <set>
 
 namespace obd::image {
 
@@ -46,17 +47,31 @@ std::vector<WarmWindow> structural_windows(uint64_t blob_size,
 elio::coro::task<StructuralWarmupStats> warmup_structural(
     const std::vector<source::BlobSource*>& warm_targets,
     const StructuralWarmupOptions& opts) {
+    std::vector<StructuralWarmupTarget> grouped;
+    grouped.reserve(warm_targets.size());
+    for (size_t i = 0; i < warm_targets.size(); ++i) {
+        grouped.push_back({warm_targets[i], i});
+    }
+    co_return co_await warmup_structural_grouped(grouped, opts);
+}
+
+elio::coro::task<StructuralWarmupStats> warmup_structural_grouped(
+    const std::vector<StructuralWarmupTarget>& warm_targets,
+    const StructuralWarmupOptions& opts) {
     StructuralWarmupStats stats;
+    std::set<size_t> visited_layers;
+    std::set<size_t> warmed_layers;
     const auto deadline =
         std::chrono::steady_clock::now() + opts.max_wall_time;
 
-    for (auto* target : warm_targets) {
+    for (const auto& entry : warm_targets) {
+        auto* target = entry.source;
         if (std::chrono::steady_clock::now() >= deadline) {
             stats.budget_exhausted = true;
             break;
         }
         if (target == nullptr) continue;
-        ++stats.layers_total;
+        if (visited_layers.insert(entry.layer_index).second) ++stats.layers_total;
         bool warmed = false;
         bool stop = false;
         for (const auto& win :
@@ -138,7 +153,7 @@ elio::coro::task<StructuralWarmupStats> warmup_structural(
             }
             ++stats.windows_populated;
         }
-        if (warmed) ++stats.layers_warmed;
+        if (warmed && warmed_layers.insert(entry.layer_index).second) ++stats.layers_warmed;
         if (stats.budget_exhausted) break;
     }
 

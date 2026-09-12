@@ -107,6 +107,18 @@ struct StructuralWarmupStats {
     bool budget_exhausted = false; ///< stopped early on the wall budget
 };
 
+/// Distinct stored blobs may belong to the same logical lower (TurboOCI
+/// metadata and original target). Windows address source bytes; layer counters
+/// count each layer_index once, including when only one blob warms successfully.
+struct StructuralWarmupTarget {
+    source::BlobSource* source = nullptr;
+    size_t layer_index = 0;
+};
+
+elio::coro::task<StructuralWarmupStats> warmup_structural_grouped(
+    const std::vector<StructuralWarmupTarget>& warm_targets,
+    const StructuralWarmupOptions& opts = {});
+
 /// Function warmup_structural populates the head/tail windows of every
 /// target: warm_targets[i] is the stored-blob-level source of data lower
 /// i (the TarOffsetSource view; a nullptr entry is skipped). Per layer

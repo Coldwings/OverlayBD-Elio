@@ -10,6 +10,7 @@
 #include "format/zfile.hpp"
 #include "source/admission.hpp"
 #include "source/dart.hpp"
+#include "source/gzip_index_source.hpp"
 #include "source/layer_store.hpp"
 #include "source/local_file.hpp"
 #include "source/registry.hpp"
@@ -40,6 +41,50 @@ bool is_regular_file(const std::string& path) {
     struct stat st {};
     return !path.empty() && ::stat(path.c_str(), &st) == 0 &&
            S_ISREG(st.st_mode);
+}
+
+// Keep a store alive across consuming format opens: malformed metadata/indexes
+// can destroy their input before image assembly gets a chance to park fills.
+class SharedLayerStore final : public source::BlobSource {
+public:
+    explicit SharedLayerStore(std::shared_ptr<source::LayerStore> store)
+        : store_(std::move(store)) {}
+    elio::coro::task<ssize_t> pread(void* buf, size_t count, uint64_t offset) override {
+        co_return co_await store_->pread(buf, count, offset);
+    }
+    elio::coro::task<ssize_t> populate(uint64_t offset, size_t len) override {
+        co_return co_await store_->populate(offset, len);
+    }
+    uint64_t size() const noexcept override { return store_->size(); }
+    std::string_view label() const noexcept override { return store_->label(); }
+private:
+    std::shared_ptr<source::LayerStore> store_;
+};
+
+elio::coro::task<size_t> sweep_committed_store(const std::string& dir) {
+    const size_t sweep_dir_len = dir.size();
+    auto sweep_dir_owner =
+        std::make_unique<char[]>(sweep_dir_len + 1);
+    std::copy_n(dir.data(), sweep_dir_len,
+                sweep_dir_owner.get());
+    sweep_dir_owner[sweep_dir_len] = '\0';
+    char* const sweep_dir_data = sweep_dir_owner.release();
+    size_t swept = 0;
+    try {
+        swept = co_await elio::spawn_blocking(
+            [sweep_dir_data, sweep_dir_len]() noexcept -> size_t {
+                std::unique_ptr<char[]> owned_dir(sweep_dir_data);
+                try {
+                    return source::sweep_stale_layer_store_pairs(
+                        std::string(owned_dir.get(), sweep_dir_len));
+                } catch (...) {
+                    return 0;
+                }
+            });
+    } catch (...) {
+        delete[] sweep_dir_data;
+    }
+    co_return swept;
 }
 
 struct LocalProbe {
@@ -318,7 +363,11 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     // the objects are owned by the layer chain built below.
     std::vector<source::BlobSource*> warm_targets;
     warm_targets.reserve(data_lowers.size());
+    // Structural warming includes original TurboOCI blobs; trace indexes remain
+    // exactly one metadata byte space per lower, as in upstream.
+    std::vector<StructuralWarmupTarget> structural_targets;
     std::vector<source::LayerStore*> stores;
+    std::vector<std::shared_ptr<source::LayerStore>> store_guards;
     std::exception_ptr assembly_failure;
     try {
     // The trace recorder (ADR-0013, record path): created idle; the
@@ -340,28 +389,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         const LocalProbe local = probe_local_blob(lower);
         if (!local.path.empty()) {
             if (local.layer_store_commit) {
-                const size_t sweep_dir_len = lower.dir.size();
-                auto sweep_dir_owner =
-                    std::make_unique<char[]>(sweep_dir_len + 1);
-                std::copy_n(lower.dir.data(), sweep_dir_len,
-                            sweep_dir_owner.get());
-                sweep_dir_owner[sweep_dir_len] = '\0';
-                char* const sweep_dir_data = sweep_dir_owner.release();
-                size_t swept = 0;
-                try {
-                    swept = co_await elio::spawn_blocking(
-                        [sweep_dir_data, sweep_dir_len]() noexcept -> size_t {
-                            std::unique_ptr<char[]> owned_dir(sweep_dir_data);
-                            try {
-                                return source::sweep_stale_layer_store_pairs(
-                                    std::string(owned_dir.get(), sweep_dir_len));
-                            } catch (...) {
-                                return 0;
-                            }
-                        });
-                } catch (...) {
-                    delete[] sweep_dir_data;
-                }
+                const size_t swept = co_await sweep_committed_store(lower.dir);
                 if (swept != 0) {
                     ELIO_LOG_INFO(
                         "layer {} swept {} stale layer-store files beside "
@@ -439,10 +467,12 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 lsc.populate_admit_timeout = kWarmupAdmitTimeout;
                 bool store_opened = false;
                 try {
-                    raw = co_await source::LayerStore::open(
+                    auto opened_store = co_await source::LayerStore::open(
                         std::move(tapped), lower.dir, sha, std::move(lsc));
-                    stores.push_back(
-                        static_cast<source::LayerStore*>(raw.get()));
+                    auto held = std::shared_ptr<source::LayerStore>(std::move(opened_store));
+                    store_guards.push_back(held);
+                    stores.push_back(held.get());
+                    raw = std::make_unique<SharedLayerStore>(std::move(held));
                     store_opened = true;
                 } catch (const error& e) {
                     // ADR-0016: persistence is best-effort. An unwritable,
@@ -481,14 +511,110 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             }
         }
         warm_targets.push_back(untarred.get());
+        structural_targets.push_back({untarred.get(), layer_index});
         if (co_await format::is_zfile(*untarred)) {
             view = co_await format::ZFileSource::open(std::move(untarred),
                                                       /*caller_verify=*/true);
         } else {
             view = std::move(untarred);
         }
-        layers.push_back(
-            co_await format::LsmtLayer::open(std::move(view)));
+        if (!lower.target_file.empty() || !lower.target_digest.empty()) {
+            source::BlobSourcePtr target;
+            if (!lower.target_file.empty()) {
+                target = co_await source::LocalFileSource::open(lower.target_file);
+            } else {
+                auto sha = ImageConfig::digest_sha256_hex(lower.target_digest);
+                if (sha.size() != 64 ||
+                    !std::all_of(sha.begin(), sha.end(), [](unsigned char c) {
+                        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                    })) {
+                    throw error(EINVAL, "malformed TurboOCI target digest");
+                }
+                // Target bytes and metadata bytes have independent identities
+                // and must never share a commit file or extent bitmap.
+                const auto target_dir = lower.dir.empty() ? std::string{} :
+                    lower.dir + "/targets/" + sha;
+                const auto committed = target_dir + "/overlaybd.commit";
+                if (!target_dir.empty() && is_regular_file(committed)) {
+                    co_await sweep_committed_store(target_dir);
+                    target = co_await source::LocalFileSource::open(committed);
+                } else {
+                    if (cfg.repo_blob_url.empty()) {
+                        throw error(EINVAL, "TurboOCI targetDigest requires repoBlobUrl");
+                    }
+                    const auto url = cfg.repo_blob_url + "/" + lower.target_digest;
+                    auto remote = co_await source::RegistrySource::open(client, url);
+                    if (!target_dir.empty()) {
+                        std::error_code ec;
+                        std::filesystem::create_directories(target_dir, ec);
+                        source::LayerStore::Config lsc;
+                        lsc.try_count = cfg.download.try_count;
+                        lsc.fill.enable = cfg.download.enable;
+                        lsc.fill.delay_sec = cfg.download.delay_sec;
+                        lsc.fill.delay_extra_sec = cfg.download.delay_extra_sec;
+                        lsc.fill.max_mbps = cfg.download.max_mbps;
+                        lsc.fill.block_size = cfg.download.block_size;
+                        lsc.funnel = funnel;
+                        lsc.populate_admit_timeout = kWarmupAdmitTimeout;
+                        try {
+                            auto opened_store = co_await source::LayerStore::open(
+                                std::move(remote), target_dir, sha, std::move(lsc));
+                            auto held = std::shared_ptr<source::LayerStore>(
+                                std::move(opened_store));
+                            store_guards.push_back(held);
+                            stores.push_back(held.get());
+                            target = std::make_unique<SharedLayerStore>(std::move(held));
+                        } catch (const error& e) {
+                            ELIO_LOG_WARNING("TurboOCI target {}: persistence "
+                                "unavailable ({}); serving remotely", lower.target_digest,
+                                e.what());
+                        }
+                        if (!target) {
+                            remote = co_await source::RegistrySource::open(client, url);
+                        }
+                    }
+                    if (!target) {
+                        target = std::make_unique<source::AdmissionSource>(
+                            std::move(remote), funnel);
+                    }
+                }
+            }
+            // The index is required by the target encoding, not an optional
+            // hint: treating compressed bytes as tar offsets can return wrong
+            // data even when every warp mapping is within the blob's bounds.
+            uint8_t signature[2]{};
+            const size_t signature_size = static_cast<size_t>(
+                std::min<uint64_t>(target->size(), sizeof(signature)));
+            const auto signature_read = co_await target->pread(
+                signature, signature_size, 0);
+            if (signature_read < 0) {
+                throw error(static_cast<int>(-signature_read),
+                            "read TurboOCI target signature");
+            }
+            if (signature_read != static_cast<ssize_t>(signature_size)) {
+                throw error(EIO, "short TurboOCI target signature");
+            }
+            const bool gzip_target = signature_size == 2 &&
+                signature[0] == 0x1f && signature[1] == 0x8b;
+            if (gzip_target && lower.gzip_index.empty()) {
+                throw format_error("TurboOCI gzip target requires gzipIndex");
+            }
+            if (!gzip_target && !lower.gzip_index.empty()) {
+                throw format_error("TurboOCI gzipIndex requires a gzip target");
+            }
+            structural_targets.push_back({target.get(), layer_index});
+            // The target is the original archive byte space. Do not strip a
+            // tar header or apply the metadata layer's ZFile adapter to it.
+            if (!lower.gzip_index.empty()) {
+                auto index = co_await source::LocalFileSource::open(lower.gzip_index);
+                target = co_await source::GzipIndexSource::open(
+                    std::move(target), std::move(index));
+            }
+            layers.push_back(co_await format::LsmtLayer::open_warp(
+                std::move(view), std::move(target)));
+        } else {
+            layers.push_back(co_await format::LsmtLayer::open(std::move(view)));
+        }
         } catch (...) {
             layer_failure = std::current_exception();
         }
@@ -517,7 +643,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             static_cast<uint64_t>(global.prefetch_head_kb) << 10;
         wopts.tail_bytes =
             static_cast<uint64_t>(global.prefetch_tail_kb) << 10;
-        warmup_stats = co_await warmup_structural(warm_targets, wopts);
+        warmup_stats = co_await warmup_structural_grouped(structural_targets, wopts);
     }
 
     // Trace replay (ADR-0013): with the floor warmed, load the

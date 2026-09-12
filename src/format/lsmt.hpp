@@ -36,6 +36,14 @@ public:
     static elio::coro::task<std::unique_ptr<LsmtLayer>> open(
         source::BlobSourcePtr src);
 
+    /// Opens sealed native warp metadata with its uncompressed target byte
+    /// source. Surviving wire tags are normalized by their minimum, as in
+    /// upstream mode 3; only normalized tags 0 (metadata) and 1 (target)
+    /// are accepted. Mapped extents must fit their source. Remote offsets
+    /// are translated in memory, leaving merge tags reserved for layers.
+    static elio::coro::task<std::unique_ptr<LsmtLayer>> open_warp(
+        source::BlobSourcePtr metadata, source::BlobSourcePtr target);
+
     /// Sorted, disjoint segment index (512B sector units, tag = 0).
     const std::vector<bytes::segment_mapping>& segments() const noexcept {
         return segments_;
@@ -51,6 +59,8 @@ public:
 
 private:
     LsmtLayer() = default;
+    static elio::coro::task<std::unique_ptr<LsmtLayer>> open_impl(
+        source::BlobSourcePtr src, source::BlobSourcePtr target);
 
     source::BlobSourcePtr src_;
     lsmt::HeaderTrailer ht_;  // trailer-authoritative

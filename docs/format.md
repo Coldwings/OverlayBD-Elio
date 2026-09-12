@@ -1210,3 +1210,27 @@ writers and readers agree on the same bytes.
 - **Writers are single-shot fixtures.** `write_lsmt_single_layer` covers the
   whole input contiguously (no sparse/zero segments); general-purpose image
   authoring belongs to upstream tools.
+
+### TurboOCI warp mappings (ADR-0020)
+
+`LsmtLayer::open_warp(metadata, target)` opens a committed warp layer with two
+byte sources. Upstream normalization subtracts the minimum surviving mapping
+tag: normalized tag 0 addresses filesystem metadata, and tag 1 addresses the
+original tar payload. Invalid-offset padding does not participate. A singleton
+tag therefore normalizes to metadata; writers must retain a metadata anchor
+when emitting remote mappings.
+
+The reader validates nonempty, ordered logical extents against virtual size,
+metadata offsets against the metadata data region, and target offsets against
+the original tar size. It translates target addresses into a private composite
+source space before ordinary layer merging. Merged-layer tags retain their
+existing priority meaning. Zero mappings do not fetch payload bytes.
+
+Gzip targets use `GzipIndexSource`: explicit little-endian decoding of the
+333-byte `ddgzidx` v1.0 header and 29-byte entries, header CRC32C verification,
+32 KiB restart dictionaries, and raw/zlib dictionary and entry-table encodings.
+The encoded and decoded entry tables are each limited to 64 MiB. Dictionary
+payloads are validated when read; malformed compressed dictionaries return an
+I/O error. Every read owns its inflater and restores both the partial-byte
+DEFLATE state and dictionary. Index checks do not replace verification of the
+original OCI blob's digest.

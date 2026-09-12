@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <fcntl.h>
 #include <sys/stat.h>
 
@@ -289,4 +290,75 @@ TEST_CASE("image: device capacity honors the virtual_size headroom override grow
     REQUIRE(rejected == 0);
     REQUIRE(err.find("grow-only") != std::string::npos);
     REQUIRE(err.find("smaller than the image") != std::string::npos);
+}
+
+TEST_CASE("image: TurboOCI configuration retains target identity and index", "[image][turboci]") {
+    nlohmann::json lower = {
+        {"file", "ext4.fs.meta"}, {"targetFile", "original.tar.gz"},
+        {"targetDigest", "sha256:" + std::string(64, 'a')},
+        {"gzipIndex", "gzip.meta"}
+    };
+    const auto cfg = image::ImageConfig::from_json_text(
+        nlohmann::json{{"lowers", nlohmann::json::array({lower})}}.dump(), {});
+    REQUIRE(cfg.lowers.size() == 1);
+    REQUIRE(cfg.lowers[0].target_file == "original.tar.gz");
+    REQUIRE(cfg.lowers[0].target_digest == "sha256:" + std::string(64, 'a'));
+    REQUIRE(cfg.lowers[0].gzip_index == "gzip.meta");
+}
+
+TEST_CASE("image: TurboOCI configuration rejects orphan index and bad digest", "[image][turboci]") {
+    REQUIRE_THROWS_AS(image::ImageConfig::from_json_text(
+        R"({"lowers":[{"file":"ext4.fs.meta","gzipIndex":"gzip.meta"}]})", {}),
+        format_error);
+    REQUIRE_THROWS_AS(image::ImageConfig::from_json_text(
+        R"({"lowers":[{"targetDigest":"sha256:bad"}]})", {}), format_error);
+    for (const auto& hex : {std::string(64, 'A'), std::string(63, 'a') + "B"}) {
+        const nlohmann::json config = {{"lowers", nlohmann::json::array({
+            {{"targetDigest", "sha256:" + hex}}})}};
+        REQUIRE_THROWS_AS(image::ImageConfig::from_json_text(config.dump(), {}),
+                          format_error);
+    }
+}
+
+TEST_CASE("image: TurboOCI assembly retains original tar byte offsets", "[image][turboci]") {
+    TempDir dir;
+    // Independent warp header/index words: logical sector0 is metadata;
+    // logical sector1 comes from target sector1 (not tar-stripped sector0).
+    constexpr size_t index_offset = 4608;
+    std::vector<uint8_t> meta(index_offset + 32 + 4096, 0);
+    const uint8_t magic[] = {0x4c,0x53,0x4d,0x54,0,1,2,0,
+        0x65,0x7e,0x63,0xd2,0x94,0x44,8,0x4c,0xa2,0xd2,0xc8,0xec,0x4f,0xcf,0xae,0x8a};
+    for (const auto base : {size_t(0), meta.size() - 4096}) {
+        std::copy(std::begin(magic), std::end(magic), meta.begin() + base);
+        bytes::store_u32_le(meta.data() + base + 24, 390);
+        bytes::store_u32_le(meta.data() + base + 28, base == 0 ? 3 : 6);
+        bytes::store_u64_le(meta.data() + base + 32, index_offset);
+        bytes::store_u64_le(meta.data() + base + 40, 2);
+        bytes::store_u64_le(meta.data() + base + 48, 1024);
+        meta[base + 132] = meta[base + 133] = 1;
+    }
+    std::fill(meta.begin() + 4096, meta.begin() + index_offset, 0x4d);
+    bytes::store_u64_le(meta.data() + index_offset, 0x0004000000000000ULL);
+    bytes::store_u64_le(meta.data() + index_offset + 8, 8);
+    bytes::store_u64_le(meta.data() + index_offset + 16, 0x0004000000000001ULL);
+    bytes::store_u64_le(meta.data() + index_offset + 24, 0x0100000000000001ULL);
+    auto target = std::vector<uint8_t>(1536, 0x48);
+    std::fill(target.begin() + 512, target.begin() + 1024, 0x54);
+    const auto metadata_path = test::write_file(dir / "ext4.fs.meta", meta);
+    const auto target_path = test::write_file(dir / "original.tar", target);
+    nlohmann::json j = {{"lowers", nlohmann::json::array({
+        {{"file", metadata_path}, {"targetFile", target_path}}})}};
+    auto cfg = image::ImageConfig::from_json_text(j.dump(), {});
+    const auto rc = test::run_coro([&]() -> elio::coro::task<int> {
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+        auto opened = co_await image::open_image(cfg, global);
+        std::vector<uint8_t> data(1024);
+        const auto n = co_await opened.root->pread(data.data(), data.size(), 0);
+        REQUIRE(n == 1024);
+        REQUIRE(std::all_of(data.begin(), data.begin() + 512, [](auto c) { return c == 0x4d; }));
+        REQUIRE(std::all_of(data.begin() + 512, data.end(), [](auto c) { return c == 0x54; }));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
 }

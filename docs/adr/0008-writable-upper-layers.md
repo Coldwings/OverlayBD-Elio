@@ -1,6 +1,6 @@
 # ADR-0008: Writable upper layers: sparse file and in-place-edit LSMT-RW
 
-- Status: accepted
+- Status: superseded by ADR-0020
 - Date: 2026-09-07
 - Supersedes: ADR-0007
 - Binds: src/format/writable.hpp, src/format/sparse_rw.cpp,

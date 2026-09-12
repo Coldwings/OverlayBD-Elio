@@ -5,6 +5,9 @@
 #include "common/errors.hpp"
 #include "common/sha256.hpp"
 #include "format/writer.hpp"
+#include "turbo_import.hpp"
+#include "turbo_layered.hpp"
+#include "format/lsmt_format.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -318,6 +321,9 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --input <rootfs.tar|-> --out-dir <dir> [--name base]\n"
                  "          [--backend builtin-ext2|libe2fs] [--size bytes] [--keep-raw]\n"
+                 "          [--turboOCI] (local tar or gzip, libe2fs required)\n"
+                 "          [--import-turboOCI package --descriptor descriptor.json [--parent-config config.json]]\n"
+                 "          [--max-import-metadata-size bytes (default 1073741824)]\n"
                  "\n"
                  "Builds <out-dir>/<name>.lsmt from a ustar rootfs stream. Builds\n"
                  "with the pinned libe2fs backend use it by default; dependency-free\n"
@@ -400,6 +406,7 @@ struct Node {
     uint32_t gid = 0;
     uint64_t size = 0;
     std::string spool_path;
+    uint64_t tar_payload_offset = 0;
     std::string symlink_target;
     uint32_t inode = 0;
     uint32_t child_directory_count = 0;
@@ -704,6 +711,7 @@ struct TarReader {
     uint64_t max_image_blocks = kMaxBlocks;
     std::vector<std::string> spool_paths;
     uint64_t next_spool = 0;
+    uint64_t stream_offset = 0;
     uint64_t reserved_payload_blocks = 0;
     uint64_t reserved_directory_blocks = directory_payload_blocks_for_data_blocks(1);
     uint32_t node_count = 1;
@@ -725,10 +733,18 @@ struct TarReader {
         return work_dir + "/" + stem + ".entry-" + std::to_string(next_spool++) + ".tmp";
     }
 
+    bool read_tar_exact(void* buf, size_t count, bool allow_eof) {
+        if (count > std::numeric_limits<uint64_t>::max() - stream_offset)
+            throw std::runtime_error("tar offset overflow");
+        if (!read_exact(fd, buf, count, allow_eof)) return false;
+        stream_offset += count;
+        return true;
+    }
+
     void skip_padding(uint64_t payload_size) {
         const uint64_t pad = (512 - (payload_size % 512)) % 512;
         std::array<uint8_t, 512> discard {};
-        if (pad != 0) read_exact(fd, discard.data(), static_cast<size_t>(pad), false);
+        if (pad != 0) read_tar_exact(discard.data(), static_cast<size_t>(pad), false);
     }
 
     std::string spool_payload(uint64_t payload_size) {
@@ -741,7 +757,7 @@ struct TarReader {
         std::vector<uint8_t> buf(1 << 20);
         for (uint64_t left = payload_size; left > 0;) {
             const size_t chunk = static_cast<size_t>(std::min<uint64_t>(buf.size(), left));
-            read_exact(fd, buf.data(), chunk, false);
+            read_tar_exact(buf.data(), chunk, false);
             full_write(out, buf.data(), chunk);
             left -= chunk;
         }
@@ -912,13 +928,13 @@ struct TarReader {
         bool saw_entry = false;
         for (;;) {
             std::array<uint8_t, 512> header {};
-            if (!read_exact(fd, header.data(), header.size(), true)) {
+            if (!read_tar_exact(header.data(), header.size(), true)) {
                 if (!saw_entry) throw std::runtime_error("empty tar stream");
                 throw std::runtime_error("tar stream missing end-of-archive marker");
             }
             if (all_zero(header)) {
                 std::array<uint8_t, 512> second {};
-                if (!read_exact(fd, second.data(), second.size(), true) ||
+                if (!read_tar_exact(second.data(), second.size(), true) ||
                     !all_zero(second)) {
                     throw std::runtime_error(
                         "tar end-of-archive requires two zero blocks");
@@ -986,6 +1002,7 @@ struct TarReader {
                 // final image sizing.
                 reserve_regular_file_payload(size, name);
                 node->size = size;
+                node->tar_payload_offset = stream_offset;
                 if (size != 0) node->spool_path = spool_payload(size);
                 skip_padding(size);
             } else {
@@ -1660,6 +1677,12 @@ void write_libe2fs_image(Node&, const std::string&, uint64_t) {
 #endif
 
 struct Options {
+    std::vector<std::string> inputs;
+    std::string import_package;
+    std::string descriptor;
+    std::string parent_config;
+    uint64_t import_metadata_budget = obd::convert::kDefaultTurboMetadataBudget;
+    bool import_budget_set = false;
     std::string input;
     std::string out_dir;
     std::string name = "layer";
@@ -1670,6 +1693,7 @@ struct Options {
 #endif
     uint64_t size = 0;
     bool keep_raw = false;
+    bool turbo_oci = false;
 };
 
 Options parse_args(int argc, char** argv) {
@@ -1680,7 +1704,17 @@ Options parse_args(int argc, char** argv) {
             if (++i >= argc) throw UsageError(std::string("missing value for ") + what);
             return argv[i];
         };
-        if (a == "--input") opts.input = next("--input");
+        if (a == "--input") {
+            opts.input = next("--input");
+            opts.inputs.push_back(opts.input);
+        }
+        else if (a == "--import-turboOCI") opts.import_package = next("--import-turboOCI");
+        else if (a == "--max-import-metadata-size") {
+            opts.import_metadata_budget = parse_size_arg(next("--max-import-metadata-size"), "--max-import-metadata-size");
+            opts.import_budget_set = true;
+        }
+        else if (a == "--parent-config") opts.parent_config = next("--parent-config");
+        else if (a == "--descriptor") opts.descriptor = next("--descriptor");
         else if (a == "--out-dir") opts.out_dir = next("--out-dir");
         else if (a == "--name") opts.name = next("--name");
         else if (a == "--backend") {
@@ -1691,6 +1725,7 @@ Options parse_args(int argc, char** argv) {
         }
         else if (a == "--size") opts.size = parse_size_arg(next("--size"), "--size");
         else if (a == "--keep-raw") opts.keep_raw = true;
+        else if (a == "--turboOCI") opts.turbo_oci = true;
         else if (a == "--help" || a == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -1703,11 +1738,21 @@ Options parse_args(int argc, char** argv) {
         std::exit(2);
     }
     validate_output_name(opts.name);
+    if (opts.inputs.size() > 1 && (!opts.turbo_oci || !opts.import_package.empty()))
+        throw UsageError("repeated --input requires --turboOCI conversion");
+    if (!opts.import_package.empty()) {
+        if (opts.descriptor.empty() || opts.input == "-" || opts.turbo_oci || opts.size != 0 || opts.keep_raw)
+            throw UsageError("--import-turboOCI requires --descriptor and a local --input; conversion options cannot be combined");
+    } else if (!opts.descriptor.empty() || !opts.parent_config.empty() || opts.import_budget_set) {
+        throw UsageError("--descriptor, --parent-config and --max-import-metadata-size require --import-turboOCI");
+    }
 #if !OBD_HAVE_LIBE2FS
     if (opts.backend == ConverterBackend::LibE2fs) {
         throw UsageError("--backend libe2fs requires a build with OBD_ENABLE_LIBE2FS_BACKEND=ON");
     }
 #endif
+    if (opts.turbo_oci && (opts.backend != ConverterBackend::LibE2fs || opts.input == "-"))
+        throw UsageError("--turboOCI requires libe2fs and a local seekable tar or gzip input file");
     std::filesystem::create_directories(opts.out_dir);
     return opts;
 }
@@ -1717,6 +1762,18 @@ Options parse_args(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const Options opts = parse_args(argc, argv);
+        if (!opts.import_package.empty()) {
+            const auto imported = obd::convert::import_turbo_image(
+                opts.import_package, opts.descriptor, opts.input, opts.out_dir + "/" + opts.name, opts.parent_config, opts.import_metadata_budget);
+            std::puts(imported.dump(2).c_str());
+            return 0;
+        }
+        if (opts.turbo_oci) {
+            auto converted = obd::convert::convert_turbo_layers(
+                opts.inputs, opts.out_dir + "/" + opts.name, opts.size, opts.keep_raw);
+            std::puts(converted.dump(2).c_str());
+            return 0;
+        }
         FdGuard input;
         if (opts.input == "-") {
             input.fd = STDIN_FILENO;

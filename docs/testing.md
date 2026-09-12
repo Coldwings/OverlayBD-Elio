@@ -900,6 +900,8 @@ Every test, grouped by area, with the property it guards.
 - `image: writable image with a trace layer assembles and replays` — a
   writable (`upper`) image with `accelerationLayer` still sets the trace
   layer aside, replays it, and serves copy-on-write reads/writes.
+- `image: structural warm-up counts TurboOCI blobs as one lower` — metadata
+  and target warm independently while logical lower counters remain deduplicated.
 - `image: structural warm-up windows clamp and merge on small blobs` —
   the pure window computation: disjoint head/tail windows at the exact
   edges, per-side clamping, a single merged full window for any blob
@@ -1481,3 +1483,100 @@ delivery: its case observes a real command event completion during handler
 drain and requires the daemon to return, without requiring a reply to reach
 the canceled client. Peer threads and the independently owned child are
 cleaned up before assertions, including exceptions during C's setup.
+
+### TurboOCI conversion and runtime (ADR-0020)
+
+The following cases extend the inventory with native readers, project-owned
+conversion and import. Backend-specific conversion cases skip when libe2fs is
+disabled; CTest recognizes Catch2 all-skipped exit code 4.
+
+Remote target persistence, encoding checks and failed-open cleanup.
+
+- `integration: TurboOCI target persists separately and reopens offline`
+- `integration: malformed remote TurboOCI metadata parks its store`
+- `integration: TurboOCI target encoding requires matching gzip index`
+
+Real CLI conversion and import, full filesystem equality, layered semantics and metadata fidelity.
+
+- `cli: obd-convert TurboOCI tar preserves complete filesystem bytes`
+- `cli: TurboOCI rejects corrupt gzip and existing destinations`
+- `cli: TurboOCI layered whiteouts preserve hardlinks and current additions`
+- `cli: TurboOCI replaces explicit directory xattrs and preserves nanosecond mtime`
+
+Deterministic gzip index generation, corruption handling and output identity.
+
+- `format: gzip index builder is deterministic and readable`
+- `format: invalid gzip never publishes partial index`
+- `format: gzip index output cannot replace its input`
+- `format: gzip index records the initial checkpoint for one final block` —
+  uses a handwritten single-final-block gzip stream and checks complete recovery
+  from the checkpoint immediately after its gzip header.
+
+Independent restart-index layouts, bounds and concurrent random access.
+
+- `source: ddgzidx golden raw and zlib random reads`
+- `source: ddgzidx rejects malformed header and entry boundaries`
+- `source: ddgzidx primes partial-byte checkpoint with dictionary`
+
+Native image assembly using original tar and gzip targets.
+
+- `image: TurboOCI configuration retains target identity and index`
+- `image: TurboOCI configuration rejects orphan index and bad digest`
+- `image: TurboOCI assembly retains original tar byte offsets`
+
+Warp mapping dispatch, clipping, normalization, zero masks and malformed bounds.
+
+- `format: native warp golden tags dispatch metadata and target`
+- `format: native warp offsets survive layer merge clipping`
+- `format: native warp singleton tags normalize to metadata`
+- `format: native warp rejects malformed tags and extents`
+- `format: native warp zero extents mask target bytes`
+- `format: native warp rejects combined source size overflow`
+
+Warp serialization, retained remote offsets and output safety.
+
+- `format: warp writer compacts metadata with golden wire words`
+- `format: warp writer validates before output mutation`
+- `format: warp writer rejects metadata output aliases`
+- `format: warp writer zero metadata anchors remote normalization`
+
+OCI tar extensions, sparse maps, attributes, timestamps and rejection boundaries.
+
+- `format: OCI plan preserves payload positions and whiteout operations`
+- `format: OCI plan handles PAX scope and binary xattrs`
+- `format: OCI plan retains hardlinks symlinks and special node kinds`
+- `format: OCI plan applies GNU long names and links once`
+- `format: OCI plan maps GNU sparse 0.1 original payload offsets`
+- `format: OCI plan maps GNU sparse 1.0 past embedded map padding`
+- `format: OCI plan rejects malformed sparse encodings`
+- `format: OCI plan rejects unsafe paths and malformed records`
+- `format: OCI plan validates archive termination and extension bounds`
+- `format: OCI plan preserves exact extended mtimes and rejects unrepresentable values`
+- `format: OCI plan honors scoped SCHILY device overrides` — checks extension
+  precedence, local/global scope, deletion and Linux device-number bounds.
+
+Descriptor validation, parent chains, empty archives and publication-time identity checks.
+
+- `format: TurboOCI descriptor import returns validated runnable config`
+- `format: TurboOCI descriptor and native validation fail before publication`
+- `format: TurboOCI importer rejects malformed lazy gzip dictionary`
+- `format: TurboOCI importer accepts upstream ZFile wrapped warp metadata`
+- `format: TurboOCI differential import rejects missing and mismatched parent chains`
+- `format: TurboOCI differential import rejects incompatible parent geometry`
+- `format: TurboOCI empty tar requires two complete zero terminator blocks`
+- `format: TurboOCI import revalidates every input immediately before publication`
+- `format: TurboOCI parent targets require valid tar prefixes` — checks raw
+  and gzip parents, malformed prefixes and terminators, and valid empty targets.
+
+Deterministic packaging and strict archive extraction.
+
+- `format: TurboOCI package has deterministic upstream tar layout`
+- `format: TurboOCI package errors preserve outputs and reject aliases`
+- `format: TurboOCI importer publishes validated metadata and optional index`
+- `format: TurboOCI importer rejects malformed archives without publication`
+- `format: TurboOCI extraction budget covers metadata and index cumulatively`
+- `format: TurboOCI importer bounds extraction before reading member payload`: Declared sizes, budget override and cleanup.
+
+Unmodified upstream-produced metadata and gzip fixture compatibility.
+
+- `image: upstream TurboOCI gzip fixture reads original payload`
