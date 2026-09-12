@@ -1,0 +1,40 @@
+name: Feature or enhancement
+description: Request a new capability or broaden an existing supported workflow.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What user workflow, compatibility target, or operational gap should be addressed?
+    validations:
+      required: true
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired capability
+      description: Describe the behavior, command, API, format, or compatibility target.
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Design constraints and contracts
+      description: List determinism, compatibility, data-plane, build, packaging, ADR, or operational constraints that must hold.
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Acceptance tests / validation
+      description: What tests, fixtures, CI matrix entries, docs, or runtime checks should prove completion?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Out of scope / follow-ups
+      description: Identify intentionally deferred behavior so the issue cannot be closed by an accidental narrower subset.
+    validations:
+      required: true
