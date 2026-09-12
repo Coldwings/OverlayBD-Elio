@@ -52,7 +52,8 @@ target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
 # so the test target depends on it and is told its path.
 target_compile_definitions(obd_unit_tests
     PRIVATE OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>"
-            OBD_TEST_OBD_CONVERT_BIN="$<TARGET_FILE:obd-convert>")
+            OBD_TEST_OBD_CONVERT_BIN="$<TARGET_FILE:obd-convert>"
+            OBD_TEST_HAVE_LIBE2FS=$<BOOL:${OBD_ENABLE_LIBE2FS_BACKEND}>)
 add_dependencies(obd_unit_tests obdctl obd-convert)
 catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
     PROPERTIES TIMEOUT 60)
@@ -132,3 +133,13 @@ add_test(NAME ctest-timeout-coverage
         --build-dir ${CMAKE_BINARY_DIR}
         --ctest ${CMAKE_CTEST_COMMAND})
 set_tests_properties(ctest-timeout-coverage PROPERTIES TIMEOUT 30)
+
+if(OBD_ENABLE_LIBE2FS_BACKEND)
+    add_test(NAME obd-convert-libe2fs-install-runtime-path
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILD_DIR=${CMAKE_BINARY_DIR}
+            -DINSTALL_PREFIX=${CMAKE_BINARY_DIR}/install-libe2fs-check
+            -DLIBE2FS_INSTALL_SUBDIR=${OBD_LIBE2FS_INSTALL_SUBDIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_libe2fs_install_runtime_path.cmake)
+    set_tests_properties(obd-convert-libe2fs-install-runtime-path PROPERTIES TIMEOUT 120)
+endif()

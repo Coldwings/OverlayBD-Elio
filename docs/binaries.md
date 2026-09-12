@@ -169,7 +169,7 @@ which can be dropped into a per-image `config.json` for tests (see
 
 ```
 obd-convert --input <rootfs.tar|-> --out-dir <dir> [--name base]
-            [--size bytes] [--keep-raw]
+            [--backend builtin-ext2|libe2fs] [--size bytes] [--keep-raw]
 ```
 
 | Option | Default | Meaning |
@@ -177,12 +177,14 @@ obd-convert --input <rootfs.tar|-> --out-dir <dir> [--name base]
 | `--input PATH|-` | required | Rootfs ustar archive with the standard two-zero-block end marker. `-` reads stdin. |
 | `--out-dir DIR` | required | Output directory; it is created if missing. |
 | `--name STR` | `layer` | Basename of the produced layer. The value must be a plain file stem using letters, digits, `.`, `_`, or `-`. |
-| `--size BYTES` | auto | Raw filesystem size. When omitted, the built-in backend picks a 4 KiB-aligned size with room for the archive, applies a 4 MiB minimum image size, and rounds with slack. When provided, it must be a 4 KiB multiple and large enough for the contents. |
+| `--backend builtin-ext2\|libe2fs` | `libe2fs` when built with `OBD_ENABLE_LIBE2FS_BACKEND=ON`; otherwise `builtin-ext2` | Select the filesystem-image writer. The `libe2fs` backend uses the pinned e2fsprogs/libext2fs build and is the default in normal builds. Dependency-free builds keep the built-in backend available, and `--backend builtin-ext2` forces that path explicitly. |
+| `--size BYTES` | auto | Raw filesystem size. When omitted, `libe2fs` estimates a 4 KiB-aligned size from the tar contents and metadata; the built-in backend picks a bounded 4 KiB-aligned size with room for the archive, applies a 4 MiB minimum image size, and rounds with slack. When provided, it must be a 4 KiB multiple and large enough for the contents. |
 | `--keep-raw` | off | Keep the intermediate `<out-dir>/.<name>.ext2.tmp` filesystem image for inspection. It is first written in the private staging directory and then atomically renamed to this path. By default it is removed after the LSMT layer is written. |
 
 On success, `obd-convert` writes `<out-dir>/<name>.lsmt` by atomically
 renaming a completed temporary file into place, then prints a JSON snippet
-compatible with a `lowers[]` entry plus converter metadata:
+compatible with a `lowers[]` entry plus converter metadata. In a libe2fs-enabled
+build the default backend output looks like:
 
 ```json
 {
@@ -191,7 +193,7 @@ compatible with a `lowers[]` entry plus converter metadata:
   ],
   "repoBlobUrl": "",
   "converter": {
-    "backend": "builtin-ext2",
+    "backend": "libe2fs",
     "filesystem": "ext2",
     "raw_digest": "sha256:<hex>",
     "virtual_size": <bytes>
@@ -199,12 +201,34 @@ compatible with a `lowers[]` entry plus converter metadata:
 }
 ```
 
-The built-in backend supports regular files up to 4,243,456 bytes (12 direct
-data blocks plus one single-indirect block), directories up to 12 data blocks,
-and short inline symlinks. It uses 4 KiB ext2 blocks, uid/gid values up to
-65535, at most 32768 inodes, and images up to 128 MiB, or the explicit aligned
-`--size` budget when smaller. It rejects malformed archives and unsupported tar
-entries before publishing an LSMT layer.
+The `libe2fs` backend supports the same regular-file, directory and symlink tar
+entry classes as the built-in backend, but delegates filesystem construction to
+the pinned e2fsprogs/libext2fs implementation. It raises the built-in backend's
+small image, single-indirect-file, direct-directory-block and 16-bit uid/gid
+limits, while preserving deterministic timestamps, stable ordering and the
+no-device/no-mount/no-host-`mkfs` boundary. The current libe2fs path still keeps
+converter-local guardrails: at most 65536 in-memory tar nodes and at most 1024
+data blocks in any one directory, because it does not create htree-indexed ext2
+directories yet. It still rejects malformed archives and tar features outside
+the current converter contract, including PAX/GNU long names, hardlinks, device
+nodes, FIFOs, sparse tar entries and xattrs.
+
+The built-in backend remains available for dependency-free builds and explicit
+`--backend builtin-ext2` runs. It supports regular files up to 4,243,456 bytes
+(12 direct data blocks plus one single-indirect block), directories up to 12
+data blocks, and short inline symlinks. It uses 4 KiB ext2 blocks, uid/gid
+values up to 65535, at most 32768 inodes, and images up to 128 MiB, or the
+explicit aligned `--size` budget when smaller. It rejects malformed archives and
+unsupported tar entries before publishing an LSMT layer.
+
+When `OBD_ENABLE_LIBE2FS_BACKEND=ON`, the install tree places the pinned
+`libext2fs.so*` files under `lib/overlaybd-elio` and gives `obd-convert` an
+`$ORIGIN/../lib/overlaybd-elio` runtime search path so the bundled libext2fs is
+preferred relative to the binary. `libcom_err.so.2` is intentionally not bundled;
+it is resolved as a normal system runtime library. Operators may intentionally
+omit the bundled libext2fs and rely on a system libext2fs-compatible library;
+that is a performance and deployment-control tradeoff, especially for images
+with many files, rather than a known output-correctness incompatibility.
 
 ## Behavior & guarantees
 
@@ -318,17 +342,35 @@ output).
   `format: zfile round-trip reads back the original content` (the ZFile
   writer output decompresses byte-identically).
 - `cli: obd-convert builds a deterministic ext2 layer from tar` — executes the
-  real converter twice, once from a tar file and once from stdin, requires
-  byte-identical LSMT sha256 output, verifies the printed digest/metadata, and
-  reads the produced layer back as an ext2 image to check file content, mode,
-  uid/gid, explicit zero modes and symlink target. It also covers an explicit
-  aligned `--size` value.
+  real converter's built-in backend twice, once from a tar file and once from
+  stdin, requires byte-identical LSMT sha256 output, verifies the printed
+  digest/metadata, and reads the produced layer back as an ext2 image to check
+  file content, mode, uid/gid, explicit zero modes and symlink target. It also
+  covers an explicit aligned `--size` value.
+- `cli: obd-convert defaults to libe2fs when the backend is enabled` — executes
+  the converter without `--backend`; `OBD_ENABLE_LIBE2FS_BACKEND=ON` builds must
+  report `libe2fs`, while dependency-free builds report `builtin-ext2`. The
+  output is run twice to verify deterministic layer bytes and read back through
+  the ext2 test view, including the same metadata assertions as the built-in
+  backend test.
+- `cli: obd-convert libe2fs expands built-in file and directory limits` — in
+  libe2fs-enabled builds, converts a regular file that requires double-indirect
+  ext2 metadata, verifies finite explicit `--size` values that cannot hold
+  metadata or the libe2fs minimum-group boundary fail before publishing output,
+  proves the built-in backend rejects that file, verifies a directory that exceeds
+  the built-in 12-data-block limit is present in the libe2fs output, and checks
+  libe2fs-only coverage for the large-file ro-compat feature, slow symlink
+  payloads and uid/gid values above 65535.
+- `obd-convert-libe2fs-install-runtime-path` — installs the build tree, checks
+  that the installed binary advertises `$ORIGIN/../lib/overlaybd-elio`, verifies
+  that `libext2fs.so.2` resolves from that relative bundled directory, and
+  verifies that `libcom_err.so.2` is not bundled there.
 - `cli: obd-convert rejects unsupported tar entries before writing a layer` —
   proves unsupported tar entry types, non-ustar headers, empty streams,
-  malformed end-of-archive markers, regular files beyond the single-indirect
-  backend limit, too-small explicit `--size` values, tar contents plus ext2 metadata beyond
-  the image budget, directories beyond the direct-block
-  backend limit, and inode counts beyond the bitmap capacity fail with exit 1 and
+  malformed end-of-archive markers, regular files beyond the built-in
+  single-indirect backend limit, too-small explicit `--size` values, tar contents
+  plus ext2 metadata beyond the image budget, directories beyond the built-in
+  direct-block backend limit, and inode counts beyond the bitmap capacity fail with exit 1 and
   do not publish an LSMT output file.
 - `cli: obd-convert atomically replaces existing output symlinks` — verifies
   converter outputs are completed in a private temporary workspace and published
@@ -354,13 +396,16 @@ ctest --test-dir build --output-on-failure
 - obd-mkimage builds single-layer images only, on a synchronous cold path;
   it is a fixture generator, not a replacement for the upstream
   `overlaybd-*` image toolchain.
-- obd-convert's built-in backend is intentionally bounded: ext2-compatible
-  output only, 4 KiB blocks, images up to 128 MiB or an explicit aligned
-  `--size` budget, uid/gid up to 65535, at most 32768 inodes, regular files up
-  to 4,243,456 bytes, directories up to 12 data blocks and short inline
-  symlinks. It rejects PAX/GNU long names, hardlinks, device nodes, FIFOs,
-  sparse tar files, xattrs and wider ext4 features until a pinned
-  converter-local backend implements them.
+- obd-convert currently supports regular files, directories and symlinks from
+  ustar input. The default `libe2fs` backend raises the built-in backend's small
+  ext2 writer limits but still caps the current unindexed directory path at
+  65536 in-memory tar nodes and 1024 data blocks per directory; it does not yet
+  implement PAX/GNU long names, hardlinks, device nodes, FIFOs, sparse tar files,
+  xattrs or wider ext4 feature selection. The explicit `builtin-ext2` backend is
+  intentionally bounded: ext2-compatible output only, 4 KiB blocks, images up to
+  128 MiB or an explicit aligned `--size` budget, uid/gid up to 65535, at most
+  32768 inodes, regular files up to 4,243,456 bytes, directories up to 12 data
+  blocks and short inline symlinks.
 - obd-supervisor runs host `mkfs.<type>` for mode-3 blank creates only;
   the mkfs binaries are host prerequisites for that mode, never bundled
   (ADR-0014).

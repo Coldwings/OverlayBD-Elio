@@ -1,5 +1,5 @@
 // obd-convert: build a deterministic filesystem layer from a tar stream.
-// The built-in backend writes a bounded ext2 image directly (no mount, no
+// The selected backend writes an ext2-compatible image directly (no mount, no
 // device, no mkfs subprocess), then seals it through the LSMT writer.
 #include "common/bytes.hpp"
 #include "common/errors.hpp"
@@ -11,6 +11,15 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#if OBD_HAVE_LIBE2FS
+extern "C" {
+#include <et/com_err.h>
+#include <ext2fs/ext2_fs.h>
+#include <ext2fs/ext2_io.h>
+#include <ext2fs/ext2fs.h>
+}
+#endif
 
 #include <algorithm>
 #include <array>
@@ -43,11 +52,81 @@ constexpr uint64_t kMaxBuiltInFileBlocks = 12 + kBlockSize / 4;
 constexpr uint64_t kMaxBuiltInFileBytes = kMaxBuiltInFileBlocks * kBlockSize;
 constexpr uint32_t kMinBuiltInInodes = 128;
 constexpr uint32_t kInodeTableBlock = 4;
+constexpr uint64_t kExt2PointersPerBlock = kBlockSize / 4;
+constexpr uint64_t kExt2BlocksPerGroup = kBlockSize * 8;
+constexpr uint64_t kExt2MaxInodesPerGroup = kBlockSize * 8;
+constexpr uint64_t kExt2GroupDescriptorSize = 32;
+constexpr uint64_t kLibE2fsLastGroupSlackBlocks = 50;
+constexpr uint64_t kExt2SectorsPerBlock = kBlockSize / 512;
+constexpr uint64_t kMaxExt2IBlocksAllocationBlocks =
+    std::numeric_limits<uint32_t>::max() / kExt2SectorsPerBlock;
+constexpr uint32_t kExt2MaxLinks = 65535;
+constexpr uint32_t kExt2MaxSubdirectories = kExt2MaxLinks - 2;
+constexpr uint64_t kMaxExt2FileBlocks = 12 + kExt2PointersPerBlock +
+                                       kExt2PointersPerBlock * kExt2PointersPerBlock +
+                                       kExt2PointersPerBlock * kExt2PointersPerBlock *
+                                           kExt2PointersPerBlock;
+constexpr uint64_t regular_file_payload_blocks_for_data_blocks(uint64_t data_blocks) {
+    uint64_t total = data_blocks;
+    if (data_blocks <= 12) return total;
+
+    data_blocks -= 12;
+    ++total;
+    if (data_blocks <= kExt2PointersPerBlock) return total;
+
+    data_blocks -= kExt2PointersPerBlock;
+    ++total;
+    const uint64_t double_data_capacity = kExt2PointersPerBlock * kExt2PointersPerBlock;
+    const uint64_t double_covered =
+        data_blocks < double_data_capacity ? data_blocks : double_data_capacity;
+    total += (double_covered + kExt2PointersPerBlock - 1) / kExt2PointersPerBlock;
+    if (data_blocks <= double_data_capacity) return total;
+
+    data_blocks -= double_data_capacity;
+    ++total;
+    total += (data_blocks + double_data_capacity - 1) / double_data_capacity;
+    total += (data_blocks + kExt2PointersPerBlock - 1) / kExt2PointersPerBlock;
+    return total;
+}
+
+constexpr uint64_t max_ext2_i_blocks_data_blocks() {
+    uint64_t lo = 0;
+    uint64_t hi = kMaxExt2FileBlocks;
+    while (lo < hi) {
+        const uint64_t mid = lo + (hi - lo + 1) / 2;
+        if (regular_file_payload_blocks_for_data_blocks(mid) <=
+            kMaxExt2IBlocksAllocationBlocks) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+constexpr uint64_t kMaxLibE2fsFileBytes = max_ext2_i_blocks_data_blocks() * kBlockSize;
+constexpr uint64_t kMaxLibE2fsDirectoryBlocks = 1024;
+constexpr uint32_t kMaxLibE2fsNodes = 65536;
+constexpr uint64_t kExt2DirectoryBaseEntryBytes = 24;
+constexpr uint64_t kExt2DirectoryBaseMaxEntryBytes = 12;
 
 constexpr uint16_t kExt2SIfReg = 0100000;
 constexpr uint16_t kExt2SIfDir = 0040000;
 constexpr uint16_t kExt2SIfLnk = 0120000;
 constexpr uint32_t kExt2FeatureIncompatFiletype = 0x0002;
+constexpr uint64_t kLibE2fsDefaultMinBytes = 4ull * 1024 * 1024;
+constexpr uint64_t kLibE2fsPerNodeSlackBytes = 8192;
+constexpr uint64_t kLibE2fsPerDirSlackBytes = 4096;
+
+enum class ConverterBackend { BuiltinExt2, LibE2fs };
+
+std::string_view backend_name(ConverterBackend backend) {
+    switch (backend) {
+    case ConverterBackend::BuiltinExt2: return "builtin-ext2";
+    case ConverterBackend::LibE2fs: return "libe2fs";
+    }
+    return "unknown";
+}
 
 struct UsageError : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -238,12 +317,13 @@ std::string uuid_from_digest(const std::string& digest_hex) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --input <rootfs.tar|-> --out-dir <dir> [--name base]\n"
-                 "          [--size bytes] [--keep-raw]\n"
+                 "          [--backend builtin-ext2|libe2fs] [--size bytes] [--keep-raw]\n"
                  "\n"
-                 "Builds <out-dir>/<name>.lsmt from a ustar rootfs stream using\n"
-                 "the deterministic built-in ext2 backend. No device, mount, or\n"
-                 "mkfs subprocess is used. JSON manifest metadata is printed to\n"
-                 "stdout. The built-in backend supports regular files up\n"
+                 "Builds <out-dir>/<name>.lsmt from a ustar rootfs stream. Builds\n"
+                 "with the pinned libe2fs backend use it by default; dependency-free\n"
+                 "builds default to builtin-ext2. No device, mount, or mkfs subprocess\n"
+                 "is used. JSON manifest metadata is printed to stdout. The built-in\n"
+                 "backend supports regular files up\n"
                  "to 4,243,456 bytes, directories up to 12 data blocks,\n"
                  "short symlinks, uid/gid <= 65535,\n"
                  "at most 32768 inodes, and images up to 128 MiB.\n",
@@ -267,21 +347,25 @@ uint64_t parse_size_arg(const std::string& s, const char* what) {
     return static_cast<uint64_t>(value);
 }
 
-uint64_t validate_explicit_image_blocks(uint64_t requested_size) {
+uint64_t validate_explicit_image_blocks(uint64_t requested_size,
+                                        ConverterBackend backend) {
     if (requested_size == 0) return 0;
     if (requested_size % kBlockSize != 0) {
-        throw std::runtime_error(
-            "--size must be a multiple of 4096 for the built-in ext2 backend");
+        throw std::runtime_error("--size must be a multiple of 4096");
     }
     const uint64_t blocks = requested_size / kBlockSize;
-    if (blocks == 0 || blocks > kMaxBlocks) {
+    if (blocks == 0) throw std::runtime_error("--size must be non-zero");
+    if (backend == ConverterBackend::BuiltinExt2 && blocks > kMaxBlocks) {
         throw std::runtime_error("built-in ext2 backend supports images up to 128 MiB");
     }
     return blocks;
 }
 
-uint64_t image_block_budget_for(uint64_t requested_size) {
-    const uint64_t explicit_blocks = validate_explicit_image_blocks(requested_size);
+uint64_t image_block_budget_for(uint64_t requested_size, ConverterBackend backend) {
+    const uint64_t explicit_blocks = validate_explicit_image_blocks(requested_size, backend);
+    if (backend == ConverterBackend::LibE2fs) {
+        return explicit_blocks == 0 ? std::numeric_limits<uint64_t>::max() : explicit_blocks;
+    }
     return explicit_blocks == 0 ? kMaxBlocks : explicit_blocks;
 }
 
@@ -300,7 +384,12 @@ enum class NodeKind { Dir, File, Symlink };
 
 struct Node {
     explicit Node(std::string n, NodeKind k, Node* p = nullptr)
-        : name(std::move(n)), kind(k), parent(p), dir_blocks(k == NodeKind::Dir ? 1 : 0) {}
+        : name(std::move(n)),
+          kind(k),
+          parent(p),
+          dir_blocks(k == NodeKind::Dir ? 1 : 0),
+          dir_entry_bytes(k == NodeKind::Dir ? kExt2DirectoryBaseEntryBytes : 0),
+          dir_entry_max_bytes(k == NodeKind::Dir ? kExt2DirectoryBaseMaxEntryBytes : 0) {}
 
     std::string name;
     NodeKind kind;
@@ -313,11 +402,37 @@ struct Node {
     std::string spool_path;
     std::string symlink_target;
     uint32_t inode = 0;
+    uint32_t child_directory_count = 0;
     std::vector<uint32_t> blocks;
     uint32_t indirect_block = 0;
     uint64_t dir_blocks = 0;
+    uint64_t dir_entry_bytes = 0;
+    uint64_t dir_entry_max_bytes = 0;
     std::vector<uint8_t> dir_data;
 };
+
+struct BackendLimits {
+    uint64_t max_file_bytes = kMaxBuiltInFileBytes;
+    uint64_t max_directory_blocks = kMaxBuiltInDirectoryBlocks;
+    uint64_t max_symlink_bytes = 60;
+    uint64_t max_uid_gid = 65535;
+    uint32_t max_nodes = kMaxBuiltInNodes;
+    bool enforce_image_budget = true;
+};
+
+BackendLimits limits_for(ConverterBackend backend) {
+    if (backend == ConverterBackend::LibE2fs) {
+        return BackendLimits{
+            kMaxLibE2fsFileBytes,
+            kMaxLibE2fsDirectoryBlocks,
+            4096,
+            std::numeric_limits<uint32_t>::max(),
+            kMaxLibE2fsNodes,
+            true,
+        };
+    }
+    return BackendLimits{};
+}
 
 uint8_t ext2_file_type(NodeKind kind) {
     switch (kind) {
@@ -356,8 +471,11 @@ std::vector<std::string> split_tar_path(std::string path, NodeKind kind) {
 
 size_t min_dirent_len(size_t name_len) { return static_cast<size_t>(round_up(8 + name_len, 4)); }
 
-void throw_too_many_inodes() {
-    throw std::runtime_error("built-in ext2 backend supports at most 32768 inodes");
+void throw_too_many_inodes(ConverterBackend backend) {
+    if (backend == ConverterBackend::BuiltinExt2) {
+        throw std::runtime_error("built-in ext2 backend supports at most 32768 inodes");
+    }
+    throw std::runtime_error("libe2fs backend supports at most 65536 in-memory tar nodes");
 }
 
 uint64_t parse_octal_field(const uint8_t* data, size_t size, const char* name) {
@@ -407,23 +525,143 @@ void verify_ustar_header(const std::array<uint8_t, 512>& header) {
 }
 
 uint64_t regular_file_payload_blocks(uint64_t size) {
-    const uint64_t data_blocks = div_ceil(size, kBlockSize);
-    return data_blocks + (data_blocks > 12 ? 1 : 0);
+    return regular_file_payload_blocks_for_data_blocks(div_ceil(size, kBlockSize));
 }
 
-uint64_t metadata_blocks_for_nodes(uint32_t nodes) {
+uint32_t rounded_inode_count_for_nodes(uint32_t nodes, ConverterBackend backend) {
+    if (backend == ConverterBackend::LibE2fs) {
+        return static_cast<uint32_t>(
+            round_up(std::max<uint32_t>(nodes + 32, kMinBuiltInInodes), 128));
+    }
     const uint32_t used_inodes = 10 + (nodes - 1);
     uint32_t desired_inodes = std::max<uint32_t>(used_inodes + 32, kMinBuiltInInodes);
     desired_inodes = std::min<uint32_t>(desired_inodes, kMaxBuiltInInodes);
-    const uint32_t inode_count =
-        static_cast<uint32_t>(round_up(desired_inodes, 128));
-    const uint64_t inode_table_blocks =
-        div_ceil(static_cast<uint64_t>(inode_count) * kInodeSize, kBlockSize);
-    return kInodeTableBlock + inode_table_blocks;
+    return static_cast<uint32_t>(round_up(desired_inodes, 128));
 }
 
-uint64_t directory_blocks_with_pending_child(const Node& dir,
-                                             std::string_view pending_name) {
+struct LibE2fsGeometry {
+    uint64_t groups = 1;
+    uint64_t blocks_per_group = kExt2BlocksPerGroup;
+    uint64_t group_descriptor_blocks = 1;
+    uint64_t inode_table_blocks_per_group = 1;
+};
+
+LibE2fsGeometry libe2fs_geometry_for(uint32_t inode_count, uint64_t image_blocks) {
+    const uint64_t blocks = std::max<uint64_t>(image_blocks, 1);
+    uint64_t blocks_per_group = kExt2BlocksPerGroup;
+    for (;;) {
+        const uint64_t groups = std::max<uint64_t>(1, div_ceil(blocks, blocks_per_group));
+        const uint64_t inodes_per_group = div_ceil(inode_count, groups);
+        if (inodes_per_group <= kExt2MaxInodesPerGroup || blocks_per_group < 256) {
+            const uint64_t inode_table_blocks_per_group = std::max<uint64_t>(
+                1, div_ceil(inodes_per_group * kInodeSize, kBlockSize));
+            const uint64_t group_descriptor_blocks = std::max<uint64_t>(
+                1, div_ceil(groups * kExt2GroupDescriptorSize, kBlockSize));
+            return LibE2fsGeometry{
+                groups,
+                blocks_per_group,
+                group_descriptor_blocks,
+                inode_table_blocks_per_group,
+            };
+        }
+        blocks_per_group -= 8;
+    }
+}
+
+struct LibE2fsMetadataBudget {
+    uint64_t metadata_blocks = 0;
+    uint64_t minimum_image_blocks = 0;
+    uint64_t effective_image_blocks = 0;
+};
+
+uint64_t libe2fs_last_group_minimum_blocks(const LibE2fsGeometry& geometry) {
+    return 3 + geometry.group_descriptor_blocks + geometry.inode_table_blocks_per_group +
+           kLibE2fsLastGroupSlackBlocks;
+}
+
+uint64_t libe2fs_effective_image_blocks(uint32_t inode_count, uint64_t image_blocks) {
+    if (image_blocks == 0) return 0;
+    uint64_t effective_blocks = image_blocks;
+    for (int i = 0; i < 16; ++i) {
+        const auto geometry = libe2fs_geometry_for(inode_count, effective_blocks);
+        const uint64_t tail_blocks = effective_blocks % geometry.blocks_per_group;
+        if (tail_blocks == 0) return effective_blocks;
+        if (tail_blocks >= libe2fs_last_group_minimum_blocks(geometry)) {
+            return effective_blocks;
+        }
+        if (tail_blocks == effective_blocks) return 0;
+        effective_blocks -= tail_blocks;
+    }
+    return effective_blocks;
+}
+
+LibE2fsMetadataBudget libe2fs_metadata_budget(uint32_t inode_count,
+                                              uint64_t image_blocks) {
+    const uint64_t effective_image_blocks =
+        libe2fs_effective_image_blocks(inode_count, image_blocks);
+    const uint64_t geometry_image_blocks =
+        effective_image_blocks == 0 ? image_blocks : effective_image_blocks;
+    const auto geometry = libe2fs_geometry_for(inode_count, geometry_image_blocks);
+
+    LibE2fsMetadataBudget budget;
+    budget.effective_image_blocks = effective_image_blocks;
+    budget.metadata_blocks =
+        geometry.groups *
+        (3 + geometry.group_descriptor_blocks + geometry.inode_table_blocks_per_group);
+
+    // ext2fs_initialize() drops a short final group and fails only when that
+    // leaves no usable group. Explicit --size preflight compares content with
+    // effective_image_blocks; auto sizing uses minimum_image_blocks to grow
+    // away from sizes that libe2fs would otherwise shorten.
+    const uint64_t last_group_minimum = libe2fs_last_group_minimum_blocks(geometry);
+    if (image_blocks == 0) {
+        budget.minimum_image_blocks = last_group_minimum;
+    } else {
+        const uint64_t tail_blocks = image_blocks % geometry.blocks_per_group;
+        if (tail_blocks != 0 && tail_blocks < last_group_minimum) {
+            budget.minimum_image_blocks =
+                image_blocks - tail_blocks + last_group_minimum;
+        }
+    }
+    return budget;
+}
+
+uint64_t metadata_blocks_for_nodes(uint32_t nodes, ConverterBackend backend,
+                                   uint64_t image_blocks = 0) {
+    const uint32_t inode_count = rounded_inode_count_for_nodes(nodes, backend);
+    const uint64_t inode_table_blocks =
+        div_ceil(static_cast<uint64_t>(inode_count) * kInodeSize, kBlockSize);
+    if (backend == ConverterBackend::BuiltinExt2) return kInodeTableBlock + inode_table_blocks;
+    return libe2fs_metadata_budget(inode_count, image_blocks).metadata_blocks;
+}
+
+[[maybe_unused]] uint64_t minimum_libe2fs_image_blocks_for_nodes(uint32_t nodes,
+                                                                 uint64_t image_blocks) {
+    return libe2fs_metadata_budget(rounded_inode_count_for_nodes(nodes, ConverterBackend::LibE2fs),
+                                   image_blocks)
+        .minimum_image_blocks;
+}
+
+uint64_t effective_libe2fs_image_blocks_for_nodes(uint32_t nodes, uint64_t image_blocks) {
+    return libe2fs_metadata_budget(rounded_inode_count_for_nodes(nodes, ConverterBackend::LibE2fs),
+                                   image_blocks)
+        .effective_image_blocks;
+}
+
+uint64_t directory_payload_blocks_for_data_blocks(uint64_t data_blocks) {
+    return regular_file_payload_blocks(data_blocks * kBlockSize);
+}
+
+uint64_t directory_blocks_for_entry_summary(uint64_t entry_bytes,
+                                            uint64_t max_entry_bytes) {
+    if (entry_bytes == 0) return 0;
+    const uint64_t guaranteed_payload_per_block =
+        kBlockSize - std::min<uint64_t>(max_entry_bytes - 1, kBlockSize - 1);
+    return div_ceil(entry_bytes, guaranteed_payload_per_block);
+}
+
+uint64_t directory_blocks_sorted(const Node& dir, std::string_view pending_name,
+                                 bool has_pending) {
     uint64_t blocks = 1;
     size_t used = 0;
     auto add_entry = [&](size_t name_len) {
@@ -438,32 +676,45 @@ uint64_t directory_blocks_with_pending_child(const Node& dir,
     add_entry(2);  // ".."
     bool inserted_pending = false;
     for (const auto& [name, _] : dir.children) {
-        if (!inserted_pending && pending_name < std::string_view(name)) {
+        if (has_pending && !inserted_pending && pending_name < std::string_view(name)) {
             add_entry(pending_name.size());
             inserted_pending = true;
         }
         add_entry(name.size());
     }
-    if (!inserted_pending) add_entry(pending_name.size());
+    if (has_pending && !inserted_pending) add_entry(pending_name.size());
     return blocks;
+}
+
+uint64_t directory_blocks_with_pending_child(const Node& dir,
+                                             std::string_view pending_name) {
+    return directory_blocks_sorted(dir, pending_name, true);
+}
+
+uint64_t exact_directory_blocks(const Node& dir) {
+    return directory_blocks_sorted(dir, {}, false);
 }
 
 struct TarReader {
     int fd;
     std::string work_dir;
     std::string stem;
+    ConverterBackend backend = ConverterBackend::BuiltinExt2;
+    BackendLimits limits;
     uint64_t max_image_blocks = kMaxBlocks;
     std::vector<std::string> spool_paths;
     uint64_t next_spool = 0;
     uint64_t reserved_payload_blocks = 0;
-    uint64_t reserved_directory_blocks = 1;
+    uint64_t reserved_directory_blocks = directory_payload_blocks_for_data_blocks(1);
     uint32_t node_count = 1;
 
     TarReader(int input_fd, std::string workspace_dir, std::string output_stem,
-              uint64_t image_block_budget)
+              ConverterBackend selected_backend, uint64_t image_block_budget)
         : fd(input_fd),
           work_dir(std::move(workspace_dir)),
           stem(std::move(output_stem)),
+          backend(selected_backend),
+          limits(limits_for(selected_backend)),
           max_image_blocks(image_block_budget) {}
 
     ~TarReader() {
@@ -499,30 +750,118 @@ struct TarReader {
 
     std::runtime_error image_budget_error(const std::string& name) const {
         return std::runtime_error(
-            "built-in ext2 backend tar contents and ext2 metadata exceed image budget: " +
-            name);
+            std::string(backend_name(backend)) +
+            " backend tar contents and ext2 metadata exceed image budget: " + name);
     }
 
     uint64_t required_image_blocks(uint64_t payload_blocks) const {
-        return metadata_blocks_for_nodes(node_count) + reserved_directory_blocks +
-               payload_blocks;
+        const uint64_t image_blocks =
+            max_image_blocks == std::numeric_limits<uint64_t>::max() ? 0 : max_image_blocks;
+        if (backend == ConverterBackend::LibE2fs && image_blocks != 0) {
+            const uint64_t effective_blocks =
+                effective_libe2fs_image_blocks_for_nodes(node_count, image_blocks);
+            if (effective_blocks == 0) return max_image_blocks + 1;
+            const uint64_t content_blocks =
+                metadata_blocks_for_nodes(node_count, backend, effective_blocks) +
+                reserved_directory_blocks + payload_blocks;
+            return content_blocks > effective_blocks ? max_image_blocks + 1 : content_blocks;
+        }
+        const uint64_t content_blocks =
+            metadata_blocks_for_nodes(node_count, backend, image_blocks) +
+            reserved_directory_blocks + payload_blocks;
+        return content_blocks;
     }
 
     void ensure_image_budget(const std::string& name) const {
-        if (required_image_blocks(reserved_payload_blocks) > max_image_blocks) {
+        if (limits.enforce_image_budget &&
+            required_image_blocks(reserved_payload_blocks) > max_image_blocks) {
             throw image_budget_error(name);
         }
     }
 
-    void reserve_directory_child(Node& parent, const std::string& leaf) {
-        const uint64_t next_blocks = directory_blocks_with_pending_child(parent, leaf);
-        if (next_blocks > kMaxBuiltInDirectoryBlocks) {
+    std::string directory_display_name(const Node& dir) const {
+        return dir.name.empty() ? std::string("/") : dir.name;
+    }
+
+    void throw_directory_too_large(const Node& dir) const {
+        if (backend == ConverterBackend::BuiltinExt2) {
             throw std::runtime_error(
                 "built-in ext2 backend supports directories up to 12 data blocks: " +
-                (parent.name.empty() ? std::string("/") : parent.name));
+                directory_display_name(dir));
         }
-        reserved_directory_blocks += next_blocks - parent.dir_blocks;
-        parent.dir_blocks = next_blocks;
+        throw std::runtime_error(
+            std::string(backend_name(backend)) +
+            " backend directory exceeds supported size: " + directory_display_name(dir));
+    }
+
+    void adjust_reserved_directory_blocks(uint64_t old_blocks, uint64_t new_blocks) {
+        const uint64_t old_payload = directory_payload_blocks_for_data_blocks(old_blocks);
+        const uint64_t new_payload = directory_payload_blocks_for_data_blocks(new_blocks);
+        if (new_payload >= old_payload) {
+            reserved_directory_blocks += new_payload - old_payload;
+        } else {
+            reserved_directory_blocks -= old_payload - new_payload;
+        }
+    }
+
+    void set_directory_blocks(Node& dir, uint64_t next_blocks) {
+        adjust_reserved_directory_blocks(dir.dir_blocks, next_blocks);
+        dir.dir_blocks = next_blocks;
+    }
+
+    uint64_t exact_reserved_directory_blocks(Node& dir) const {
+        if (dir.kind != NodeKind::Dir) return 0;
+        const uint64_t blocks = exact_directory_blocks(dir);
+        if (blocks > limits.max_directory_blocks) throw_directory_too_large(dir);
+        dir.dir_blocks = blocks;
+        uint64_t reserved = directory_payload_blocks_for_data_blocks(blocks);
+        for (const auto& [_, child] : dir.children) {
+            reserved += exact_reserved_directory_blocks(*child);
+        }
+        return reserved;
+    }
+
+    void finalize_directory_accounting(Node& root) {
+        reserved_directory_blocks = exact_reserved_directory_blocks(root);
+        ensure_image_budget("/");
+    }
+
+    void reserve_directory_child(Node& parent, const std::string& leaf,
+                                 bool child_is_directory) {
+        if (child_is_directory && parent.child_directory_count >= kExt2MaxSubdirectories) {
+            throw std::runtime_error(
+                std::string(backend_name(backend)) +
+                " backend directory has too many child directories for ext2 link count: " +
+                directory_display_name(parent));
+        }
+
+        const uint64_t entry_bytes = min_dirent_len(leaf.size());
+        const uint64_t next_entry_bytes = parent.dir_entry_bytes + entry_bytes;
+        const uint64_t next_max_entry_bytes =
+            std::max<uint64_t>(parent.dir_entry_max_bytes, entry_bytes);
+        uint64_t next_blocks =
+            directory_blocks_for_entry_summary(next_entry_bytes, next_max_entry_bytes);
+        bool exact = false;
+        if (next_blocks > limits.max_directory_blocks) {
+            next_blocks = directory_blocks_with_pending_child(parent, leaf);
+            exact = true;
+            if (next_blocks > limits.max_directory_blocks) throw_directory_too_large(parent);
+        }
+
+        set_directory_blocks(parent, next_blocks);
+        parent.dir_entry_bytes = next_entry_bytes;
+        parent.dir_entry_max_bytes = next_max_entry_bytes;
+        if (child_is_directory) {
+            ++parent.child_directory_count;
+            reserved_directory_blocks += directory_payload_blocks_for_data_blocks(1);
+        }
+
+        if (!exact && limits.enforce_image_budget &&
+            required_image_blocks(reserved_payload_blocks) > max_image_blocks) {
+            const uint64_t exact_blocks = directory_blocks_with_pending_child(parent, leaf);
+            if (exact_blocks > limits.max_directory_blocks) throw_directory_too_large(parent);
+            set_directory_blocks(parent, exact_blocks);
+        }
     }
 
     Node& ensure_dir(Node& root, const std::vector<std::string>& parts) {
@@ -530,11 +869,10 @@ struct TarReader {
         for (const auto& part : parts) {
             auto it = cur->children.find(part);
             if (it == cur->children.end()) {
-                if (node_count >= kMaxBuiltInNodes) throw_too_many_inodes();
+                if (node_count >= limits.max_nodes) throw_too_many_inodes(backend);
                 ++node_count;
-                reserve_directory_child(*cur, part);
+                reserve_directory_child(*cur, part, true);
                 auto dir = std::make_unique<Node>(part, NodeKind::Dir, cur);
-                reserved_directory_blocks += dir->dir_blocks;
                 ensure_image_budget(part);
                 it = cur->children.emplace(part, std::move(dir)).first;
             }
@@ -546,10 +884,9 @@ struct TarReader {
         return *cur;
     }
 
-    void reserve_regular_file_payload(uint64_t size, const std::string& name) {
-        const uint64_t blocks = regular_file_payload_blocks(size);
-        if (blocks > max_image_blocks ||
-            reserved_payload_blocks > max_image_blocks - blocks) {
+    void reserve_payload_blocks(uint64_t blocks, const std::string& name) {
+        if (!limits.enforce_image_budget || blocks == 0) return;
+        if (blocks > max_image_blocks || reserved_payload_blocks > max_image_blocks - blocks) {
             throw image_budget_error(name);
         }
         const uint64_t reserved_after = reserved_payload_blocks + blocks;
@@ -558,6 +895,17 @@ struct TarReader {
             throw image_budget_error(name);
         }
         reserved_payload_blocks = reserved_after;
+    }
+
+    void reserve_regular_file_payload(uint64_t size, const std::string& name) {
+        reserve_payload_blocks(regular_file_payload_blocks(size), name);
+    }
+
+    void reserve_symlink_payload(uint64_t target_size, const std::string& name) {
+        const bool needs_data_block =
+            backend == ConverterBackend::LibE2fs ? target_size >= 60 : target_size > 60;
+        if (!needs_data_block) return;
+        reserve_payload_blocks(div_ceil(target_size, kBlockSize), name);
     }
 
     void load_into(Node& root) {
@@ -590,8 +938,10 @@ struct TarReader {
             const uint64_t uid = parse_octal_field(header.data() + 108, 8, "uid");
             const uint64_t gid = parse_octal_field(header.data() + 116, 8, "gid");
             const uint64_t size = parse_octal_field(header.data() + 124, 12, "size");
-            if (uid > 65535 || gid > 65535) {
-                throw std::runtime_error("built-in ext2 backend supports uid/gid <= 65535");
+            if (uid > limits.max_uid_gid || gid > limits.max_uid_gid) {
+                throw std::runtime_error(
+                    std::string(backend_name(backend)) +
+                    " backend uid/gid exceeds supported range");
             }
             const uint16_t perm = static_cast<uint16_t>(mode & 07777);
 
@@ -617,17 +967,18 @@ struct TarReader {
             if (parent.children.count(leaf) != 0) {
                 throw std::runtime_error("duplicate tar entry: " + name);
             }
-            if (node_count >= kMaxBuiltInNodes) throw_too_many_inodes();
+            if (node_count >= limits.max_nodes) throw_too_many_inodes(backend);
             ++node_count;
-            reserve_directory_child(parent, leaf);
+            reserve_directory_child(parent, leaf, kind == NodeKind::Dir);
             ensure_image_budget(name);
             auto node = std::make_unique<Node>(leaf, kind, &parent);
             node->perm = perm;
             node->uid = static_cast<uint32_t>(uid);
             node->gid = static_cast<uint32_t>(gid);
             if (kind == NodeKind::File) {
-                if (size > kMaxBuiltInFileBytes) {
-                    throw std::runtime_error("built-in ext2 backend file is too large: " + name);
+                if (size > limits.max_file_bytes) {
+                    throw std::runtime_error(std::string(backend_name(backend)) +
+                                             " backend file is too large: " + name);
                 }
                 // Reserve declared ext2 payload blocks, directory blocks, and
                 // inode metadata before reading bytes so an oversized archive
@@ -643,13 +994,16 @@ struct TarReader {
                 if (node->symlink_target.empty()) {
                     throw std::runtime_error("symlink tar entry has an empty target");
                 }
-                if (node->symlink_target.size() > 60) {
-                    throw std::runtime_error("built-in ext2 backend supports symlink targets <= 60 bytes");
+                if (node->symlink_target.size() > limits.max_symlink_bytes) {
+                    throw std::runtime_error(std::string(backend_name(backend)) +
+                                             " backend symlink target is too long");
                 }
+                reserve_symlink_payload(node->symlink_target.size(), name);
                 node->size = node->symlink_target.size();
             }
             parent.children.emplace(leaf, std::move(node));
         }
+        finalize_directory_accounting(root);
     }
 };
 
@@ -853,6 +1207,45 @@ void write_file_payload(int out_fd, const Node& node) {
     for (const auto& [_, child] : node.children) write_file_payload(out_fd, *child);
 }
 
+#if OBD_HAVE_LIBE2FS
+uint64_t count_libe2fs_payload_blocks(const Node& node) {
+    uint64_t total = 0;
+    if (node.kind == NodeKind::File) total += regular_file_payload_blocks(node.size);
+    if (node.kind == NodeKind::Symlink && node.size >= 60) {
+        total += div_ceil(node.size, kBlockSize);
+    }
+    for (const auto& [_, child] : node.children) total += count_libe2fs_payload_blocks(*child);
+    return total;
+}
+
+uint64_t auto_libe2fs_size_bytes(const Node& root) {
+    const uint64_t payload_blocks = count_libe2fs_payload_blocks(root);
+    const uint64_t nodes = count_nodes(root);
+    const uint64_t dirs = count_dirs(root);
+    const uint64_t slack = nodes * kLibE2fsPerNodeSlackBytes + dirs * kLibE2fsPerDirSlackBytes +
+                           kLibE2fsDefaultMinBytes;
+    uint64_t estimate = round_up(
+        std::max<uint64_t>(payload_blocks * kBlockSize + slack, kLibE2fsDefaultMinBytes),
+        kBlockSize);
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t estimate_blocks = estimate / kBlockSize;
+        const uint64_t metadata_blocks =
+            metadata_blocks_for_nodes(static_cast<uint32_t>(nodes), ConverterBackend::LibE2fs,
+                                      estimate_blocks);
+        const uint64_t content_required_blocks = payload_blocks + metadata_blocks;
+        const uint64_t required_blocks = std::max(
+            content_required_blocks,
+            minimum_libe2fs_image_blocks_for_nodes(static_cast<uint32_t>(nodes), estimate_blocks));
+        const uint64_t next = round_up(std::max<uint64_t>(required_blocks * kBlockSize + slack,
+                                                          kLibE2fsDefaultMinBytes),
+                                       kBlockSize);
+        if (next == estimate) break;
+        estimate = next;
+    }
+    return estimate;
+}
+#endif
+
 void write_ext2_image(Node& root, const std::string& path, uint64_t requested_size) {
     assign_inodes(root);
     build_directory_payloads(root);
@@ -860,7 +1253,7 @@ void write_ext2_image(Node& root, const std::string& path, uint64_t requested_si
     const uint32_t nodes = count_nodes(root);
     const uint32_t used_inodes = 10 + (nodes - 1);
     if (used_inodes > kMaxBuiltInInodes) {
-        throw_too_many_inodes();
+        throw_too_many_inodes(ConverterBackend::BuiltinExt2);
     }
     uint32_t desired_inodes = std::max<uint32_t>(used_inodes + 32, kMinBuiltInInodes);
     desired_inodes = std::min<uint32_t>(desired_inodes, kMaxBuiltInInodes);
@@ -875,7 +1268,7 @@ void write_ext2_image(Node& root, const std::string& path, uint64_t requested_si
 
     uint64_t total_blocks = 0;
     if (requested_size != 0) {
-        total_blocks = validate_explicit_image_blocks(requested_size);
+        total_blocks = validate_explicit_image_blocks(requested_size, ConverterBackend::BuiltinExt2);
         if (total_blocks < required_blocks) {
             throw std::runtime_error("--size is too small for tar contents and ext2 metadata");
         }
@@ -957,10 +1350,324 @@ void write_ext2_image(Node& root, const std::string& path, uint64_t requested_si
     if (::fsync(fd) != 0) obd::throw_errno(errno, "fsync failed for raw filesystem");
 }
 
+#if OBD_HAVE_LIBE2FS
+
+class Ext2FsGuard {
+public:
+    explicit Ext2FsGuard(ext2_filsys fs = nullptr) : fs_(fs) {}
+    Ext2FsGuard(const Ext2FsGuard&) = delete;
+    Ext2FsGuard& operator=(const Ext2FsGuard&) = delete;
+    ~Ext2FsGuard() {
+        if (fs_ != nullptr) ext2fs_close_free(&fs_);
+    }
+    ext2_filsys get() const { return fs_; }
+    ext2_filsys release() {
+        ext2_filsys out = fs_;
+        fs_ = nullptr;
+        return out;
+    }
+    void reset(ext2_filsys fs = nullptr) {
+        if (fs_ != nullptr) ext2fs_close_free(&fs_);
+        fs_ = fs;
+    }
+
+private:
+    ext2_filsys fs_ = nullptr;
+};
+
+class Ext2FileGuard {
+public:
+    explicit Ext2FileGuard(ext2_file_t file = nullptr) : file_(file) {}
+    Ext2FileGuard(const Ext2FileGuard&) = delete;
+    Ext2FileGuard& operator=(const Ext2FileGuard&) = delete;
+    ~Ext2FileGuard() {
+        if (file_ != nullptr) ext2fs_file_close(file_);
+    }
+    ext2_file_t get() const { return file_; }
+    errcode_t close() {
+        if (file_ == nullptr) return 0;
+        ext2_file_t file = file_;
+        file_ = nullptr;
+        return ext2fs_file_close(file);
+    }
+    void reset(ext2_file_t file = nullptr) {
+        if (file_ != nullptr) ext2fs_file_close(file_);
+        file_ = file;
+    }
+
+private:
+    ext2_file_t file_ = nullptr;
+};
+
+[[noreturn]] void throw_libe2fs_error(errcode_t err, const std::string& what) {
+    throw std::runtime_error(what + ": " + error_message(err));
+}
+
+void check_libe2fs(errcode_t err, const std::string& what) {
+    if (err != 0) throw_libe2fs_error(err, what);
+}
+
+void pin_libe2fs_superblock_fields(struct ext2_super_block& super) {
+    static constexpr __u8 kUuid[16] = {
+        0x4f, 0x42, 0x44, 0x45, 0x4c, 0x49, 0x4f, 0x2d,
+        0x43, 0x4f, 0x4e, 0x56, 0x45, 0x52, 0x54, 0x00,
+    };
+    std::memcpy(super.s_uuid, kUuid, sizeof(kUuid));
+    std::memset(super.s_volume_name, 0, sizeof(super.s_volume_name));
+    const char volume[] = "obd-convert";
+    std::memcpy(super.s_volume_name, volume,
+                std::min(sizeof(super.s_volume_name), sizeof(volume) - 1));
+    super.s_mtime = 0;
+    super.s_wtime = 0;
+    super.s_lastcheck = 0;
+    super.s_mkfs_time = 0;
+    super.s_mtime_hi = 0;
+    super.s_wtime_hi = 0;
+    super.s_lastcheck_hi = 0;
+    super.s_mkfs_time_hi = 0;
+}
+
+void pin_libe2fs_superblock(ext2_filsys fs) {
+    pin_libe2fs_superblock_fields(*fs->super);
+}
+
+bool ext2_group_has_super(const struct ext2_super_block& super, uint64_t group) {
+    if (group == 0) return true;
+    if ((super.s_feature_ro_compat & EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER) == 0) return true;
+    if (group == 1) return true;
+    if ((group & 1u) == 0) return false;
+    auto test_root = [](uint64_t value, uint64_t root) {
+        while (value > root && value % root == 0) value /= root;
+        return value == root;
+    };
+    return test_root(group, 3) || test_root(group, 5) || test_root(group, 7);
+}
+
+void pin_libe2fs_superblock_file(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) obd::throw_errno(errno, "cannot reopen raw filesystem " + path);
+    FdGuard guard(fd);
+    struct ext2_super_block primary {};
+    full_pread(fd, &primary, sizeof(primary), 1024);
+    const uint64_t block_size = 1024ull << primary.s_log_block_size;
+    const uint64_t total_blocks = primary.s_blocks_count;
+    const uint64_t first_data_block = primary.s_first_data_block;
+    const uint64_t blocks_per_group = primary.s_blocks_per_group;
+    if (block_size == 0 || blocks_per_group == 0 || total_blocks < first_data_block) {
+        throw std::runtime_error("invalid libe2fs superblock geometry");
+    }
+    const uint64_t groups = div_ceil(total_blocks - first_data_block, blocks_per_group);
+    for (uint64_t group = 0; group < groups; ++group) {
+        if (!ext2_group_has_super(primary, group)) continue;
+        const uint64_t offset = group == 0 ? 1024 :
+            (first_data_block + group * blocks_per_group) * block_size;
+        struct ext2_super_block super {};
+        full_pread(fd, &super, sizeof(super), offset);
+        pin_libe2fs_superblock_fields(super);
+        full_pwrite(fd, &super, sizeof(super), offset);
+    }
+    if (::fsync(fd) != 0) obd::throw_errno(errno, "fsync failed for raw filesystem");
+}
+
+void set_inode_owner(struct ext2_inode& inode, uint32_t uid, uint32_t gid) {
+    inode.i_uid = static_cast<__u16>(uid & 0xffffu);
+    ext2fs_set_i_uid_high(inode, static_cast<__u16>(uid >> 16));
+    inode.i_gid = static_cast<__u16>(gid & 0xffffu);
+    ext2fs_set_i_gid_high(inode, static_cast<__u16>(gid >> 16));
+}
+
+void set_inode_common(ext2_filsys fs, ext2_ino_t ino, uint16_t type,
+                      uint16_t perm, uint32_t uid, uint32_t gid) {
+    struct ext2_inode inode {};
+    check_libe2fs(ext2fs_read_inode(fs, ino, &inode), "libe2fs read inode");
+    inode.i_mode = static_cast<__u16>(type | perm);
+    set_inode_owner(inode, uid, gid);
+    inode.i_atime = 0;
+    inode.i_ctime = 0;
+    inode.i_mtime = 0;
+    check_libe2fs(ext2fs_write_inode(fs, ino, &inode), "libe2fs write inode");
+}
+
+void link_with_expand(ext2_filsys fs, ext2_ino_t parent, const std::string& name,
+                      ext2_ino_t ino, int file_type) {
+    errcode_t err = ext2fs_link(fs, parent, name.c_str(), ino, file_type);
+    if (err == EXT2_ET_DIR_NO_SPACE) {
+        check_libe2fs(ext2fs_expand_dir(fs, parent), "libe2fs expand directory");
+        err = ext2fs_link(fs, parent, name.c_str(), ino, file_type);
+    }
+    check_libe2fs(err, "libe2fs link " + name);
+}
+
+ext2_ino_t lookup_child(ext2_filsys fs, ext2_ino_t parent, const std::string& name) {
+    ext2_ino_t ino = 0;
+    check_libe2fs(ext2fs_lookup(fs, parent, name.c_str(), static_cast<int>(name.size()),
+                                nullptr, &ino),
+                  "libe2fs lookup " + name);
+    return ino;
+}
+
+void write_libe2fs_file_payload(ext2_filsys fs, ext2_ino_t ino, const Node& node) {
+    if (node.size == 0) return;
+    ext2_file_t raw_file = nullptr;
+    check_libe2fs(ext2fs_file_open(fs, ino, EXT2_FILE_WRITE, &raw_file),
+                  "libe2fs open file " + node.name);
+    Ext2FileGuard file(raw_file);
+
+    const int in = ::open(node.spool_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (in < 0) obd::throw_errno(errno, "cannot open payload spool " + node.spool_path);
+    FdGuard guard(in);
+    std::vector<uint8_t> buf(1 << 20);
+    for (uint64_t left = node.size; left > 0;) {
+        const size_t chunk = static_cast<size_t>(std::min<uint64_t>(buf.size(), left));
+        read_exact(in, buf.data(), chunk, false);
+        const uint8_t* p = buf.data();
+        size_t remaining = chunk;
+        while (remaining > 0) {
+            unsigned int written = 0;
+            check_libe2fs(ext2fs_file_write(file.get(), p,
+                                            static_cast<unsigned int>(remaining),
+                                            &written),
+                          "libe2fs write file " + node.name);
+            if (written == 0) throw std::runtime_error("libe2fs short file write");
+            p += written;
+            remaining -= written;
+        }
+        left -= chunk;
+    }
+    check_libe2fs(file.close(), "libe2fs close file " + node.name);
+}
+
+void reserve_libe2fs_fixed_inodes(ext2_filsys fs) {
+    const ext2_ino_t first_dynamic = EXT2_FIRST_INODE(fs->super);
+    for (ext2_ino_t ino = 1; ino < first_dynamic; ++ino) {
+        if (ino == EXT2_ROOT_INO) continue;
+        ext2fs_inode_alloc_stats2(fs, ino, +1, 0);
+    }
+}
+
+void write_libe2fs_node(ext2_filsys fs, ext2_ino_t parent, const Node& node) {
+    if (node.kind == NodeKind::Dir) {
+        ext2_ino_t ino = 0;
+        errcode_t err = ext2fs_mkdir(fs, parent, 0, node.name.c_str());
+        if (err == EXT2_ET_DIR_NO_SPACE) {
+            check_libe2fs(ext2fs_expand_dir(fs, parent), "libe2fs expand directory");
+            err = ext2fs_mkdir(fs, parent, 0, node.name.c_str());
+        }
+        check_libe2fs(err, "libe2fs mkdir " + node.name);
+        ino = lookup_child(fs, parent, node.name);
+        for (const auto& [_, child] : node.children) write_libe2fs_node(fs, ino, *child);
+        set_inode_common(fs, ino, LINUX_S_IFDIR, node.perm, node.uid, node.gid);
+        return;
+    }
+
+    if (node.kind == NodeKind::Symlink) {
+        errcode_t err = ext2fs_symlink(fs, parent, 0, node.name.c_str(),
+                                       node.symlink_target.c_str());
+        if (err == EXT2_ET_DIR_NO_SPACE) {
+            check_libe2fs(ext2fs_expand_dir(fs, parent), "libe2fs expand directory");
+            err = ext2fs_symlink(fs, parent, 0, node.name.c_str(),
+                                 node.symlink_target.c_str());
+        }
+        check_libe2fs(err, "libe2fs symlink " + node.name);
+        const ext2_ino_t ino = lookup_child(fs, parent, node.name);
+        set_inode_common(fs, ino, LINUX_S_IFLNK, node.perm, node.uid, node.gid);
+        return;
+    }
+
+    ext2_ino_t ino = 0;
+    check_libe2fs(ext2fs_new_inode(fs, parent, LINUX_S_IFREG | node.perm, nullptr, &ino),
+                  "libe2fs allocate inode " + node.name);
+    link_with_expand(fs, parent, node.name, ino, EXT2_FT_REG_FILE);
+    ext2fs_inode_alloc_stats2(fs, ino, +1, 0);
+
+    struct ext2_inode inode {};
+    inode.i_mode = static_cast<__u16>(LINUX_S_IFREG | node.perm);
+    inode.i_links_count = 1;
+    set_inode_owner(inode, node.uid, node.gid);
+    inode.i_atime = 0;
+    inode.i_ctime = 0;
+    inode.i_mtime = 0;
+    check_libe2fs(ext2fs_inode_size_set(fs, &inode, node.size),
+                  "libe2fs set file size " + node.name);
+    check_libe2fs(ext2fs_write_new_inode(fs, ino, &inode),
+                  "libe2fs write file inode " + node.name);
+    write_libe2fs_file_payload(fs, ino, node);
+    set_inode_common(fs, ino, LINUX_S_IFREG, node.perm, node.uid, node.gid);
+}
+
+void write_libe2fs_image(Node& root, const std::string& path, uint64_t requested_size) {
+    const uint64_t raw_size = requested_size == 0 ? auto_libe2fs_size_bytes(root) : requested_size;
+    validate_explicit_image_blocks(raw_size, ConverterBackend::LibE2fs);
+    const uint64_t total_blocks = raw_size / kBlockSize;
+    if (total_blocks > std::numeric_limits<__u32>::max()) {
+        throw std::runtime_error("libe2fs backend currently supports images up to 2^32-1 blocks");
+    }
+    const uint32_t nodes = count_nodes(root);
+    const uint32_t inode_count = static_cast<uint32_t>(round_up(
+        std::max<uint32_t>(nodes + 32, kMinBuiltInInodes), 128));
+
+    const int fd =
+        ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0) obd::throw_errno(errno, "cannot create raw filesystem " + path);
+    FdGuard file(fd);
+    if (::ftruncate(fd, static_cast<off_t>(raw_size)) != 0) {
+        obd::throw_errno(errno, "cannot size raw filesystem " + path);
+    }
+    file.reset();
+
+    struct ext2_super_block param {};
+    param.s_rev_level = EXT2_DYNAMIC_REV;
+    param.s_log_block_size = 2;
+    param.s_log_cluster_size = 2;
+    param.s_blocks_count = static_cast<__u32>(total_blocks);
+    param.s_inodes_count = inode_count;
+    param.s_inode_size = EXT2_GOOD_OLD_INODE_SIZE;
+    param.s_first_ino = EXT2_GOOD_OLD_FIRST_INO;
+    param.s_feature_incompat = EXT2_FEATURE_INCOMPAT_FILETYPE;
+    param.s_feature_ro_compat = EXT2_FEATURE_RO_COMPAT_LARGE_FILE;
+    param.s_errors = EXT2_ERRORS_DEFAULT;
+    pin_libe2fs_superblock_fields(param);
+
+    if (::setenv("E2FSPROGS_FAKE_TIME", "1", 1) != 0) {
+        obd::throw_errno(errno, "cannot set deterministic libe2fs time");
+    }
+
+    ext2_filsys raw_fs = nullptr;
+    check_libe2fs(ext2fs_initialize(path.c_str(), EXT2_FLAG_RW | EXT2_FLAG_EXCLUSIVE,
+                                    &param, unix_io_manager, &raw_fs),
+                  "libe2fs initialize filesystem");
+    Ext2FsGuard fs(raw_fs);
+    fs.get()->now = 1;
+    pin_libe2fs_superblock(fs.get());
+    check_libe2fs(ext2fs_allocate_tables(fs.get()), "libe2fs allocate tables");
+    reserve_libe2fs_fixed_inodes(fs.get());
+    check_libe2fs(ext2fs_mkdir(fs.get(), EXT2_ROOT_INO, EXT2_ROOT_INO, nullptr),
+                  "libe2fs create root directory");
+    for (const auto& [_, child] : root.children) write_libe2fs_node(fs.get(), EXT2_ROOT_INO, *child);
+    set_inode_common(fs.get(), EXT2_ROOT_INO, LINUX_S_IFDIR, root.perm, root.uid, root.gid);
+    check_libe2fs(ext2fs_write_bitmaps(fs.get()), "libe2fs write bitmaps");
+    ext2_filsys closing = fs.release();
+    check_libe2fs(ext2fs_close(closing), "libe2fs close filesystem");
+    pin_libe2fs_superblock_file(path);
+}
+
+#else
+
+void write_libe2fs_image(Node&, const std::string&, uint64_t) {
+    throw std::runtime_error("libe2fs backend was not enabled at build time");
+}
+
+#endif
+
 struct Options {
     std::string input;
     std::string out_dir;
     std::string name = "layer";
+#if OBD_HAVE_LIBE2FS
+    ConverterBackend backend = ConverterBackend::LibE2fs;
+#else
+    ConverterBackend backend = ConverterBackend::BuiltinExt2;
+#endif
     uint64_t size = 0;
     bool keep_raw = false;
 };
@@ -976,6 +1683,12 @@ Options parse_args(int argc, char** argv) {
         if (a == "--input") opts.input = next("--input");
         else if (a == "--out-dir") opts.out_dir = next("--out-dir");
         else if (a == "--name") opts.name = next("--name");
+        else if (a == "--backend") {
+            const std::string value = next("--backend");
+            if (value == "builtin-ext2") opts.backend = ConverterBackend::BuiltinExt2;
+            else if (value == "libe2fs") opts.backend = ConverterBackend::LibE2fs;
+            else throw UsageError("--backend must be builtin-ext2 or libe2fs");
+        }
         else if (a == "--size") opts.size = parse_size_arg(next("--size"), "--size");
         else if (a == "--keep-raw") opts.keep_raw = true;
         else if (a == "--help" || a == "-h") {
@@ -990,6 +1703,11 @@ Options parse_args(int argc, char** argv) {
         std::exit(2);
     }
     validate_output_name(opts.name);
+#if !OBD_HAVE_LIBE2FS
+    if (opts.backend == ConverterBackend::LibE2fs) {
+        throw UsageError("--backend libe2fs requires a build with OBD_ENABLE_LIBE2FS_BACKEND=ON");
+    }
+#endif
     std::filesystem::create_directories(opts.out_dir);
     return opts;
 }
@@ -1010,9 +1728,9 @@ int main(int argc, char** argv) {
 
         Node root("", NodeKind::Dir, nullptr);
         TempWorkspace workspace(opts.out_dir, opts.name);
-        const uint64_t image_block_budget = image_block_budget_for(opts.size);
+        const uint64_t image_block_budget = image_block_budget_for(opts.size, opts.backend);
         TarReader reader{input.fd, workspace.path(), opts.name,
-                         image_block_budget};
+                         opts.backend, image_block_budget};
         reader.load_into(root);
         if (opts.input == "-") input.release();
 
@@ -1020,7 +1738,11 @@ int main(int argc, char** argv) {
         const std::string lsmt_tmp_path = workspace.path() + "/layer.lsmt";
         const std::string lsmt_path = opts.out_dir + "/" + opts.name + ".lsmt";
         const std::string keep_raw_path = opts.out_dir + "/." + opts.name + ".ext2.tmp";
-        write_ext2_image(root, raw_path, opts.size);
+        if (opts.backend == ConverterBackend::LibE2fs) {
+            write_libe2fs_image(root, raw_path, opts.size);
+        } else {
+            write_ext2_image(root, raw_path, opts.size);
+        }
 
         const int raw_fd = ::open(raw_path.c_str(), O_RDONLY | O_CLOEXEC);
         if (raw_fd < 0) obd::throw_errno(errno, "cannot open raw filesystem " + raw_path);
@@ -1029,7 +1751,7 @@ int main(int argc, char** argv) {
         const std::string raw_digest = sha256_of_fd(raw_fd, raw_size);
         obd::format::LsmtWriteOptions lopts;
         lopts.uuid = uuid_from_digest(raw_digest);
-        lopts.user_tag = "obd-convert builtin-ext2";
+        lopts.user_tag = std::string("obd-convert ") + std::string(backend_name(opts.backend));
         obd::format::write_lsmt_single_layer(raw_fd, raw_size, lsmt_tmp_path, lopts);
         raw.reset();
         fsync_file(lsmt_tmp_path, "LSMT layer");
@@ -1050,7 +1772,7 @@ int main(int argc, char** argv) {
         snippet["repoBlobUrl"] = "";
         snippet["lowers"] = nlohmann::json::array({lower});
         snippet["converter"] = {
-            {"backend", "builtin-ext2"},
+            {"backend", std::string(backend_name(opts.backend))},
             {"filesystem", "ext2"},
             {"raw_digest", "sha256:" + raw_digest},
             {"virtual_size", raw_size},

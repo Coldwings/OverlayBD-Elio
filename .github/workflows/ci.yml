@@ -1,9 +1,12 @@
 # CI for overlaybd-elio.
 #
-# Three jobs mirroring the local verify-trio (AGENTS.md):
-#   build-test      — configure, build, ctest. The ublk end-to-end tests
-#                     self-skip without privileges and a loaded ublk_drv;
-#                     that skip is by design, so no sudo anywhere here.
+# Four jobs mirroring the local verify-trio (AGENTS.md):
+#   build-test      — default configure, build, ctest. The default converter
+#                     build enables the pinned libe2fs backend and includes the
+#                     install-time runtime-library path check.
+#   build-test-builtin-converter — dependency-free converter build with
+#                     OBD_ENABLE_LIBE2FS_BACKEND=OFF, covering the explicit
+#                     builtin-ext2 fallback path.
 #   build-test-ublk-privileged — loads ublk_drv (GitHub-hosted runners are
 #                     full VMs; module loading works) and runs ONLY the
 #                     [ublk]-tagged E2E tests under sudo. Everything else
@@ -47,13 +50,14 @@ jobs:
             /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            liburing-dev zlib1g-dev libssl-dev cmake ninja-build g++
+            liburing-dev zlib1g-dev libssl-dev cmake ninja-build build-essential
 
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja
           -DOBD_BUILD_TESTS=ON
           -DOBD_ENABLE_UBLK=ON
+          -DOBD_ENABLE_LIBE2FS_BACKEND=ON
           -DOBD_WARNINGS_AS_ERRORS=ON
 
       - name: Build
@@ -63,6 +67,46 @@ jobs:
         # Privileged ublk E2E tests self-skip on unprivileged runners —
         # intentionally not run under sudo (AGENTS.md).
         run: ctest --test-dir build --output-on-failure
+
+  build-test-builtin-converter:
+    name: build-test (builtin converter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          # The GitHub runner image ships a google-chrome apt source whose index
+          # intermittently Hash-mismatches on dl.google.com (issue #37); the
+          # build never needs Chrome, so drop the source before updating.
+          # rm the known file names AND delete any dl.google.com line from
+          # every apt source (the exact path varies across runner images).
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* \
+            /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          # .list AND deb822 .sources variants; the runner path varies.
+          sudo sed -i '/dl\.google\.com/d' \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/*.list \
+            /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            liburing-dev zlib1g-dev libssl-dev cmake ninja-build g++
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-builtin -G Ninja
+          -DOBD_BUILD_TESTS=ON
+          -DOBD_ENABLE_UBLK=OFF
+          -DOBD_ENABLE_LIBE2FS_BACKEND=OFF
+          -DOBD_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-builtin -j"$(nproc)"
+
+      - name: Test converter and source guards
+        run: >
+          ctest --test-dir build-builtin --output-on-failure
+          -R 'obd-convert|test-await|ctest-timeout|build-warning-coverage'
 
   build-test-ublk-privileged:
     name: build-test (ublk E2E, privileged)
@@ -127,6 +171,7 @@ jobs:
           cmake -S . -B build -G Ninja
           -DOBD_BUILD_TESTS=ON
           -DOBD_ENABLE_UBLK=ON
+          -DOBD_ENABLE_LIBE2FS_BACKEND=OFF
 
       - name: Build
         run: cmake --build build -j"$(nproc)"

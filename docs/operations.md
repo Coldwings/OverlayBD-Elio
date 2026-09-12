@@ -16,10 +16,13 @@ Requirements (from AGENTS.md, "Build & test environment"):
   without io_uring is not a supported deployment target).
 - System packages: `liburing-dev`, `zlib1g-dev`, OpenSSL dev headers
   (pulled in via Elio TLS/HTTP), and kernel headers ≥ 6.0 providing
-  `<linux/ublk_cmd.h>`.
+  `<linux/ublk_cmd.h>`. The default converter build also needs ordinary C build
+  tools (`make`, a C compiler and binutils) to build the pinned e2fsprogs
+  libext2fs backend.
 - Network access on first configure: CMake FetchContent downloads Elio
   (pinned by commit in the top-level `CMakeLists.txt`), nlohmann/json, lz4,
-  zstd and Catch2.
+  zstd, Catch2, and, when `OBD_ENABLE_LIBE2FS_BACKEND=ON`, the pinned
+  e2fsprogs/libext2fs source used by `obd-convert`.
 
 CMake options (all declared in the top-level `CMakeLists.txt`):
 
@@ -27,6 +30,7 @@ CMake options (all declared in the top-level `CMakeLists.txt`):
 |---|---|---|
 | `OBD_BUILD_TESTS` | `ON` | Build the Catch2 unit and integration tests. |
 | `OBD_ENABLE_UBLK` | `ON` | Build the ublk backend. Fails at configure time when `<linux/ublk_cmd.h>` is missing; obd-device cannot be built without it. |
+| `OBD_ENABLE_LIBE2FS_BACKEND` | `ON` | Build `obd-convert` with the pinned e2fsprogs/libext2fs backend. Enabled builds default `obd-convert` to `--backend libe2fs`; disabled builds keep only the dependency-free `builtin-ext2` backend. |
 | `OBD_ENABLE_ZSTD` | `ON` | Zstd compression support in ZFile (OverlayBD algo 2). |
 | `OBD_WARNINGS_AS_ERRORS` | `OFF` | Treat compiler warnings as errors for all project libraries, binaries and test helpers (CI/developer setting). |
 
@@ -132,10 +136,25 @@ tar --format=ustar -C rootfs -cf - . | obd-convert --input - \
 ```
 
 Paste the printed `lowers[]` entry into the image config. The `converter`
-metadata records the backend (`builtin-ext2`), raw filesystem digest and raw
-virtual size for build logs; it is not required by `config.json`. Output files
-are assembled in a private temporary workspace below `--out-dir` and atomically
-renamed into place after they are complete.
+metadata records the selected backend (`libe2fs` by default when the binary was
+built with `OBD_ENABLE_LIBE2FS_BACKEND=ON`, otherwise `builtin-ext2`), raw
+filesystem digest and raw virtual size for build logs; it is not required by
+`config.json`. Output files are assembled in a private temporary workspace below
+`--out-dir` and atomically renamed into place after they are complete.
+
+Use `--backend builtin-ext2` when you need the dependency-free writer or want to
+exercise the small built-in ext2 path explicitly. Use `--backend libe2fs` for
+the pinned library backend; a binary built with `OBD_ENABLE_LIBE2FS_BACKEND=OFF`
+rejects that option as a usage error.
+
+Installed default builds place the pinned `libext2fs.so*` beside the tools under
+`lib/overlaybd-elio`, and `obd-convert` carries an
+`$ORIGIN/../lib/overlaybd-elio` runtime search path so that relative library is
+preferred. `libcom_err.so.2` is a system runtime dependency. If an operator
+intentionally omits the bundled libext2fs and relies on a compatible system
+libe2fs/libext2fs, the expected difference is slower construction for images
+with many files and less control over the exact deployment dependency, not a
+known output-correctness mismatch.
 
 ## Creating devices: three modes (ADR-0014)
 
@@ -204,8 +223,8 @@ created with `obdctl create-blank` (or the equivalent `create` with a
 > different bytes and content-addressed layer reuse collapses. It exists
 > purely as a runtime convenience for scratch data disks (ADR-0014); the
 > deterministic image-build path is `obd-convert` (ADR-0019), whose default
-> built-in backend writes an ext2-compatible image without host formatting.
-> A future pinned libe2fs backend must keep the same boundary. The
+> enabled build uses the pinned libe2fs backend without host formatting. The
+> explicit built-in backend remains available for dependency-free builds. The
 > supervisor enforces the boundary for its own convenience runs: a mode-3
 > device is marked at create time and `obdctl commit` refuses it with
 > "host mkfs ... cannot be sealed". A mode-2 blank that *you* format is
@@ -480,13 +499,16 @@ correlate by device id and by the supervisor's spawn logs.
   publishing them as OCI artifacts is the external CLI's job. `obd-convert`
   stages artifacts privately and atomically renames the completed LSMT into
   place, so failed conversions do not truncate an existing layer path.
-- **Built-in converter bounds.** The default `obd-convert` backend is
-  deterministic and unprivileged, but intentionally small: ext2-compatible
-  output only, 4 KiB blocks, images up to 128 MiB or an explicit aligned
-  `--size` budget, uid/gid values up to 65535, at most 32768 inodes, regular
-  files up to 4,243,456 bytes, directories up to 12 data blocks and short
-  symlinks. PAX/xattrs/devices/hardlinks/sparse tar entries require a future
-  backend.
+- **Converter input scope.** The default `obd-convert` backend is `libe2fs`
+  when built with `OBD_ENABLE_LIBE2FS_BACKEND=ON`; it is deterministic,
+  unprivileged, and raises the built-in backend's small image, file, directory
+  and 16-bit uid/gid limits. The current libe2fs path still caps in-memory tar
+  trees at 65536 nodes and caps any one directory at 1024 data blocks because it
+  does not create htree-indexed ext2 directories yet. The converter still
+  accepts only the current ustar regular-file, directory and symlink subset.
+  PAX/GNU long names, xattrs, devices, hardlinks and sparse tar entries remain
+  outside the current converter contract. The explicit `builtin-ext2` backend
+  remains available and keeps its documented bounded limits.
 - **Credentials**: only `credentialConfig` `mode=file` is honored; other
   modes are ignored with a warning (see [config.md](./config.md)).
 - **One supervisor per node** is the expected topology; multiple
