@@ -17,6 +17,7 @@ endif()
 option(OBD_BUILD_TESTS "Build unit and integration tests" ON)
 option(OBD_ENABLE_UBLK "Build the ublk block-device backend (requires linux/ublk_cmd.h and liburing)" ON)
 option(OBD_ENABLE_ZSTD "Enable Zstd compression support in ZFile (OverlayBD algo 2)" ON)
+option(OBD_ENABLE_LIBE2FS_BACKEND "Build obd-convert with the pinned libe2fs converter backend" ON)
 option(OBD_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -57,6 +58,11 @@ FetchContent_MakeAvailable(lz4)
 set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
 
 find_package(ZLIB REQUIRED)
+
+if(OBD_ENABLE_LIBE2FS_BACKEND)
+    enable_language(C)
+    include(ObdLibE2fs)
+endif()
 
 if(OBD_ENABLE_ZSTD)
     FetchContent_Declare(zstd
@@ -110,4 +116,5 @@ message(STATUS "overlaybd-elio ${PROJECT_VERSION} configuration:")
 message(STATUS "  build type      : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  tests           : ${OBD_BUILD_TESTS}")
 message(STATUS "  ublk backend    : ${OBD_ENABLE_UBLK}")
+message(STATUS "  libe2fs backend : ${OBD_ENABLE_LIBE2FS_BACKEND}")
 message(STATUS "")

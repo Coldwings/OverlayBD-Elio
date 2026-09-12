@@ -28,7 +28,8 @@ of pulling and unpacking full image layers first.
   file, or an in-place-edit LSMT-RW layer that seals into a standard LSMT
   lower (ADR-0008).
 - **Deterministic local builds** — `obd-convert` turns a rootfs tar stream into
-  a sealed LSMT layer without a block device, mount, or host mkfs (ADR-0019).
+  a sealed LSMT layer without a block device, mount, or host mkfs, using the
+  pinned libe2fs backend by default when enabled (ADR-0019).
 
 ## Architecture
 
@@ -54,11 +55,13 @@ process model, and thread model.
 ## Building
 
 Prerequisites: Linux, GCC 12+ or Clang 15+ (C++20), CMake ≥ 3.20,
+ordinary C build tools (`make` and binutils for the default converter backend),
 `liburing-dev`, `zlib1g-dev`, OpenSSL headers, kernel headers ≥ 6.0
 (`<linux/ublk_cmd.h>`). Dependencies (Elio, nlohmann/json, lz4, zstd,
-Catch2) are fetched by CMake FetchContent — the first configure needs
-network access. Python 3.8+ is required when `OBD_BUILD_TESTS=ON` (the
-default) for the test-source assertion guard and its self-tests.
+Catch2, and by default the pinned e2fsprogs/libext2fs converter backend) are
+fetched by CMake FetchContent — the first configure needs network access.
+Python 3.8+ is required when `OBD_BUILD_TESTS=ON` (the default) for the
+test-source assertion guard and its self-tests.
 
 ```bash
 cmake -S . -B build

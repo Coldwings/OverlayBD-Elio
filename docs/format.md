@@ -961,7 +961,8 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
   explicit UUID derived from that raw image's SHA-256 digest and a fixed
   converter tag, using a private temporary workspace before atomically
   publishing the final path. The resulting LSMT file is a standard sealed lower;
-  pinned by `cli: obd-convert builds a deterministic ext2 layer from tar`.
+  pinned by `cli: obd-convert builds a deterministic ext2 layer from tar` and
+  `cli: obd-convert defaults to libe2fs when the backend is enabled`.
 - **Error channels.** Cold paths (`open`, `parse`, writers) throw
   `obd::format_error` / `obd::error`; hot paths (`pread`/`pwrite`/`flush`)
   return negative -errno and never throw (the `source::BlobSource`

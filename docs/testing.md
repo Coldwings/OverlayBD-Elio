@@ -1141,26 +1141,47 @@ Every test, grouped by area, with the property it guards.
   that wrongly rejects an argument fails the assertion instead of hanging
   the job (#11).
 - `cli: obd-convert builds a deterministic ext2 layer from tar` — the REAL
-  converter binary consumes the same rootfs tar from a file and from stdin,
-  emits byte-identical sealed LSMT layers, reports the correct digest and
-  metadata, and the test reads the layer back as an ext2 image to verify file
-  content including a single-indirect regular file, explicit `0000` modes,
-  uid/gid and short symlink target (ADR-0019). It also verifies an explicit
-  aligned `--size` value controls the raw filesystem virtual size.
+  converter binary consumes the same rootfs tar from a file and from stdin with
+  `--backend builtin-ext2`, emits byte-identical sealed LSMT layers, reports
+  the correct digest and metadata, and the test reads the layer back as an ext2
+  image to verify file content including a single-indirect regular file,
+  explicit `0000` modes, uid/gid and short symlink target (ADR-0019). It also
+  verifies an explicit aligned `--size` value controls the raw filesystem
+  virtual size.
+- `cli: obd-convert defaults to libe2fs when the backend is enabled` — runs the
+  converter without `--backend`; enabled builds must report `libe2fs`, while
+  dependency-free builds must report `builtin-ext2`. The test repeats the run
+  to pin deterministic layer bytes and reads the result back as ext2 content,
+  including the same mode, uid/gid, symlink and zero-mode assertions as the
+  built-in backend test.
+- `cli: obd-convert libe2fs expands built-in file and directory limits` — in
+  libe2fs-enabled builds, proves the default backend can write a double-indirect
+  regular file, a directory beyond the built-in 12-data-block limit, a slow
+  symlink and uid/gid values above 65535, while the built-in backend rejects the
+  large file and explicit too-small libe2fs `--size` budgets, including the
+  libe2fs minimum-group boundary, fail before publishing output. It also
+  verifies the libe2fs image advertises the ext2 large-file ro-compat feature.
+- `obd-convert-libe2fs-install-runtime-path` — installs the current build tree,
+  checks the installed `obd-convert` runtime search path for
+  `$ORIGIN/../lib/overlaybd-elio`, verifies `libext2fs.so.2` resolves from that
+  bundled directory, and verifies `libcom_err.so.2` is resolved from the system
+  library set rather than bundled there.
 - `cli: obd-convert atomically replaces existing output symlinks` — pre-creates
   symlinks at the final LSMT and kept-raw output paths, then verifies
   `obd-convert` replaces those paths with regular files without truncating the
   symlink target.
 - `cli: obd-convert reports usage errors with exit 2` — unknown options,
-  missing option values, and non-numeric `--size` values are classified as
-  usage errors rather than runtime conversion failures.
+  missing option values, non-numeric `--size` values, invalid `--backend`
+  values, and explicit `--backend libe2fs` on dependency-free builds are
+  classified as usage errors rather than runtime conversion failures.
 - `cli: obd-convert rejects unsupported tar entries before writing a layer` —
   a tar entry outside the built-in backend's feature set, a checksum-valid
   non-ustar header, an empty stream, a malformed two-zero-block end marker, a
-  regular file beyond the single-indirect backend limit, a too-small explicit
-  `--size`, tar contents plus ext2 metadata beyond the image budget, a directory requiring
-  more than 12 data blocks, or a tree requiring more than 32768 inodes exits 1
-  with a clear error and leaves no published LSMT layer behind.
+  regular file beyond the built-in single-indirect backend limit, a too-small
+  explicit `--size`, tar contents plus ext2 metadata beyond the image budget, a
+  directory requiring more than 12 data blocks, or a tree requiring more than
+  32768 inodes
+  exits 1 with a clear error and leaves no published LSMT layer behind.
 
 ### integration
 

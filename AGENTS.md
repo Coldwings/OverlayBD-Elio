@@ -107,8 +107,10 @@ Every module above is implemented with tests and a `docs/<module>.md`.
   System packages: `liburing-dev`, `zlib1g-dev`; kernel headers >= 6.0 for
   `<linux/ublk_cmd.h>`.
 - Dependencies are fetched by CMake FetchContent: Elio (pinned by commit in
-  the top-level `CMakeLists.txt`), nlohmann/json, lz4, zstd, Catch2 (tests).
-  First configure needs network access for FetchContent.
+  the top-level `CMakeLists.txt`), nlohmann/json, lz4, zstd, Catch2 (tests),
+  and, by default, the pinned e2fsprogs/libext2fs converter backend. First
+  configure needs network access for FetchContent; the default converter backend
+  also needs ordinary C build tools (`make`, a C compiler and binutils).
 - ublk end-to-end tests require root (or `CAP_SYS_ADMIN` in the right user
   namespace) and a loaded `ublk_drv`; they **self-skip** otherwise. Never
   make the default test run depend on privileged kernel state.

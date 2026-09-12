@@ -17,11 +17,13 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <map>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -36,8 +38,10 @@ namespace {
 
 constexpr size_t kExt2BlockSize = 4096;
 constexpr size_t kIndirectToolSize = 13 * kExt2BlockSize + 123;
+constexpr size_t kExt2PointersPerBlock = kExt2BlockSize / 4;
+constexpr uint32_t kExt2FeatureRoCompatLargeFile = 0x0002;
 constexpr uint64_t kMaxBuiltInFileBytes =
-    static_cast<uint64_t>(12 + kExt2BlockSize / 4) * kExt2BlockSize;
+    static_cast<uint64_t>(12 + kExt2PointersPerBlock) * kExt2BlockSize;
 
 struct CommandResult {
     int exit_code = -1;
@@ -69,7 +73,8 @@ std::string read_all_fd(int fd) {
 }
 
 CommandResult run_convert(const std::vector<std::string>& args,
-                          const std::vector<uint8_t>* stdin_data = nullptr) {
+                          const std::vector<uint8_t>* stdin_data = nullptr,
+                          bool force_builtin_backend = true) {
     int stdout_pipe[2];
     int stderr_pipe[2];
     REQUIRE(::pipe(stdout_pipe) == 0);
@@ -79,6 +84,11 @@ CommandResult run_convert(const std::vector<std::string>& args,
 
     std::vector<std::string> storage;
     storage.emplace_back(OBD_TEST_OBD_CONVERT_BIN);
+    const bool has_backend = std::find(args.begin(), args.end(), "--backend") != args.end();
+    if (force_builtin_backend && !has_backend) {
+        storage.emplace_back("--backend");
+        storage.emplace_back("builtin-ext2");
+    }
     storage.insert(storage.end(), args.begin(), args.end());
     std::vector<char*> argv;
     for (auto& s : storage) argv.push_back(s.data());
@@ -222,6 +232,14 @@ std::vector<uint8_t> make_many_root_files_tar(size_t count) {
     return tar;
 }
 
+[[maybe_unused]] std::vector<uint8_t> make_libe2fs_feature_tar() {
+    std::vector<uint8_t> tar;
+    append_tar_entry(tar, "wide-owner", '0', 0644, 70000, 80000, {'w'});
+    append_tar_entry(tar, "slow-link", '2', 0777, 70001, 80001, {}, std::string(60, 't'));
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
 std::vector<uint8_t> make_sorted_directory_budget_tar() {
     std::vector<uint8_t> tar;
     constexpr size_t kExistingEntries = 156;
@@ -286,8 +304,8 @@ std::string file_sha256(const std::string& path) {
 
 struct Ext2Inode {
     uint16_t mode = 0;
-    uint16_t uid = 0;
-    uint16_t gid = 0;
+    uint32_t uid = 0;
+    uint32_t gid = 0;
     uint32_t size = 0;
     std::array<uint32_t, 15> blocks {};
 };
@@ -301,7 +319,8 @@ public:
         block_size_ = 1024u << bytes::load_u32_le(sb + 24);
         REQUIRE(block_size_ == 4096);
         inode_size_ = bytes::load_u16_le(sb + 88);
-        REQUIRE(inode_size_ == 128);
+        REQUIRE(inode_size_ >= 128);
+        ro_compat_ = bytes::load_u32_le(sb + 100);
         const uint8_t* gd = raw_.data() + block_size_;
         inode_table_block_ = bytes::load_u32_le(gd + 8);
     }
@@ -313,9 +332,11 @@ public:
         const uint8_t* p = raw_.data() + off;
         Ext2Inode n;
         n.mode = bytes::load_u16_le(p + 0);
-        n.uid = bytes::load_u16_le(p + 2);
+        n.uid = bytes::load_u16_le(p + 2) |
+                (static_cast<uint32_t>(bytes::load_u16_le(p + 120)) << 16);
         n.size = bytes::load_u32_le(p + 4);
-        n.gid = bytes::load_u16_le(p + 24);
+        n.gid = bytes::load_u16_le(p + 24) |
+                (static_cast<uint32_t>(bytes::load_u16_le(p + 122)) << 16);
         for (size_t i = 0; i < n.blocks.size(); ++i) {
             n.blocks[i] = bytes::load_u32_le(p + 40 + i * 4);
         }
@@ -325,8 +346,9 @@ public:
     std::map<std::string, uint32_t> list_dir(uint32_t ino) const {
         const Ext2Inode dir = inode(ino);
         std::map<std::string, uint32_t> out;
-        for (size_t i = 0; i < 12 && dir.blocks[i] != 0; ++i) {
-            const uint64_t base = static_cast<uint64_t>(dir.blocks[i]) * block_size_;
+        for (uint32_t block : data_blocks(dir)) {
+            REQUIRE(block != 0);
+            const uint64_t base = static_cast<uint64_t>(block) * block_size_;
             REQUIRE(base + block_size_ <= raw_.size());
             uint32_t pos = 0;
             while (pos < block_size_) {
@@ -363,23 +385,17 @@ public:
         std::vector<uint8_t> out;
         out.reserve(file.size);
         auto append_block = [&](uint32_t block) {
-            REQUIRE(block != 0);
+            const size_t want = std::min<size_t>(block_size_, file.size - out.size());
+            if (block == 0) {
+                out.insert(out.end(), want, 0);
+                return;
+            }
             const uint64_t base = static_cast<uint64_t>(block) * block_size_;
             REQUIRE(base + block_size_ <= raw_.size());
-            const size_t want = std::min<size_t>(block_size_, file.size - out.size());
             out.insert(out.end(), raw_.begin() + base, raw_.begin() + base + want);
         };
-        for (size_t i = 0; i < 12 && out.size() < file.size; ++i) {
-            append_block(file.blocks[i]);
-        }
-        if (out.size() < file.size) {
-            REQUIRE(file.blocks[12] != 0);
-            const uint64_t indirect_base =
-                static_cast<uint64_t>(file.blocks[12]) * block_size_;
-            REQUIRE(indirect_base + block_size_ <= raw_.size());
-            for (size_t off = 0; off < block_size_ && out.size() < file.size; off += 4) {
-                append_block(bytes::load_u32_le(raw_.data() + indirect_base + off));
-            }
+        for (uint32_t block : data_blocks(file)) {
+            append_block(block);
         }
         REQUIRE(out.size() == file.size);
         return out;
@@ -393,11 +409,54 @@ public:
         return std::string(reinterpret_cast<const char*>(raw_.data() + off), link.size);
     }
 
+    std::string symlink_target(uint32_t ino) const {
+        const Ext2Inode link = inode(ino);
+        if (link.size < 60) return inline_symlink(ino);
+        const auto bytes = read_file(ino);
+        return std::string(bytes.begin(), bytes.end());
+    }
+
+    uint32_t ro_compat_features() const { return ro_compat_; }
+
 private:
+    std::vector<uint32_t> data_blocks(const Ext2Inode& n) const {
+        const uint64_t block_count = (n.size + block_size_ - 1) / block_size_;
+        std::vector<uint32_t> out;
+        out.reserve(static_cast<size_t>(std::min<uint64_t>(block_count, 4096)));
+        auto add_block = [&](uint32_t block) {
+            if (out.size() < block_count) out.push_back(block);
+        };
+        auto visit_indirect = [&](auto&& self, uint32_t block, unsigned level) -> void {
+            if (out.size() >= block_count) return;
+            if (level == 0) {
+                add_block(block);
+                return;
+            }
+            if (block == 0) {
+                for (size_t i = 0; i < kExt2PointersPerBlock && out.size() < block_count; ++i) {
+                    self(self, 0, level - 1);
+                }
+                return;
+            }
+            const uint64_t base = static_cast<uint64_t>(block) * block_size_;
+            REQUIRE(base + block_size_ <= raw_.size());
+            for (size_t off = 0; off < block_size_ && out.size() < block_count; off += 4) {
+                self(self, bytes::load_u32_le(raw_.data() + base + off), level - 1);
+            }
+        };
+        for (size_t i = 0; i < 12 && out.size() < block_count; ++i) add_block(n.blocks[i]);
+        if (out.size() < block_count) visit_indirect(visit_indirect, n.blocks[12], 1);
+        if (out.size() < block_count) visit_indirect(visit_indirect, n.blocks[13], 2);
+        if (out.size() < block_count) visit_indirect(visit_indirect, n.blocks[14], 3);
+        REQUIRE(out.size() == block_count);
+        return out;
+    }
+
     std::vector<uint8_t> raw_;
     uint32_t block_size_ = 0;
     uint32_t inode_size_ = 0;
     uint32_t inode_table_block_ = 0;
+    uint32_t ro_compat_ = 0;
 };
 
 std::vector<uint8_t> read_layer_raw(const std::string& path) {
@@ -415,42 +474,8 @@ std::vector<uint8_t> read_layer_raw(const std::string& path) {
     });
 }
 
-}  // namespace
-
-// NOTE: name on one source line (check-docs extracts names line-wise).
-TEST_CASE("cli: obd-convert builds a deterministic ext2 layer from tar", "[cli]") {
-    TempDir dir;
-    const auto tar = make_rootfs_tar();
-    const std::string tar_path = test::write_file(dir / "rootfs.tar", tar);
-    const std::string out_a = dir / "a";
-    const std::string out_b = dir / "b";
-
-    const auto a = run_convert({"--input", tar_path, "--out-dir", out_a,
-                                "--name", "rootfs"});
-    REQUIRE(a.exit_code == 0);
-    const auto b = run_convert({"--input", "-", "--out-dir", out_b,
-                                "--name", "rootfs"}, &tar);
-    REQUIRE(b.exit_code == 0);
-    const uint64_t explicit_size = 8ull * 1024 * 1024;
-    const std::string out_sized = dir / "sized";
-    const auto sized = run_convert({"--input", tar_path, "--out-dir", out_sized,
-                                    "--name", "rootfs", "--size",
-                                    std::to_string(explicit_size)});
-    REQUIRE(sized.exit_code == 0);
-
-    const auto ja = nlohmann::json::parse(a.out);
-    const auto jb = nlohmann::json::parse(b.out);
-    const auto js = nlohmann::json::parse(sized.out);
-    REQUIRE(ja["converter"]["backend"].get<std::string>() == "builtin-ext2");
-    REQUIRE(ja["converter"]["filesystem"].get<std::string>() == "ext2");
-    REQUIRE(js["converter"]["virtual_size"].get<uint64_t>() == explicit_size);
-    const std::string layer_a = ja["lowers"][0]["file"].get<std::string>();
-    const std::string layer_b = jb["lowers"][0]["file"].get<std::string>();
-    REQUIRE(file_sha256(layer_a) == file_sha256(layer_b));
-    REQUIRE(ja["lowers"][0]["digest"].get<std::string>() ==
-            "sha256:" + file_sha256(layer_a));
-
-    Ext2View fs(read_layer_raw(layer_a));
+void assert_rootfs_metadata(const std::string& layer_path) {
+    Ext2View fs(read_layer_raw(layer_path));
     const uint32_t etc_ino = fs.lookup({"etc"});
     const auto etc = fs.inode(etc_ino);
     REQUIRE((etc.mode & 0170000) == 0040000);
@@ -500,6 +525,153 @@ TEST_CASE("cli: obd-convert builds a deterministic ext2 layer from tar", "[cli]"
     REQUIRE(fs.inline_symlink(zero_link_ino) == "etc/hello.txt");
 }
 
+}  // namespace
+
+// NOTE: name on one source line (check-docs extracts names line-wise).
+TEST_CASE("cli: obd-convert builds a deterministic ext2 layer from tar", "[cli]") {
+    TempDir dir;
+    const auto tar = make_rootfs_tar();
+    const std::string tar_path = test::write_file(dir / "rootfs.tar", tar);
+    const std::string out_a = dir / "a";
+    const std::string out_b = dir / "b";
+
+    const auto a = run_convert({"--input", tar_path, "--out-dir", out_a,
+                                "--name", "rootfs"});
+    REQUIRE(a.exit_code == 0);
+    const auto b = run_convert({"--input", "-", "--out-dir", out_b,
+                                "--name", "rootfs"}, &tar);
+    REQUIRE(b.exit_code == 0);
+    const uint64_t explicit_size = 8ull * 1024 * 1024;
+    const std::string out_sized = dir / "sized";
+    const auto sized = run_convert({"--input", tar_path, "--out-dir", out_sized,
+                                    "--name", "rootfs", "--size",
+                                    std::to_string(explicit_size)});
+    REQUIRE(sized.exit_code == 0);
+
+    const auto ja = nlohmann::json::parse(a.out);
+    const auto jb = nlohmann::json::parse(b.out);
+    const auto js = nlohmann::json::parse(sized.out);
+    REQUIRE(ja["converter"]["backend"].get<std::string>() == "builtin-ext2");
+    REQUIRE(ja["converter"]["filesystem"].get<std::string>() == "ext2");
+    REQUIRE(js["converter"]["virtual_size"].get<uint64_t>() == explicit_size);
+    const std::string layer_a = ja["lowers"][0]["file"].get<std::string>();
+    const std::string layer_b = jb["lowers"][0]["file"].get<std::string>();
+    REQUIRE(file_sha256(layer_a) == file_sha256(layer_b));
+    REQUIRE(ja["lowers"][0]["digest"].get<std::string>() ==
+            "sha256:" + file_sha256(layer_a));
+
+    assert_rootfs_metadata(layer_a);
+}
+
+
+// NOTE: name on one source line (check-docs extracts names line-wise).
+TEST_CASE("cli: obd-convert defaults to libe2fs when the backend is enabled", "[cli]") {
+    TempDir dir;
+    const auto tar = make_rootfs_tar();
+    const std::string tar_path = test::write_file(dir / "rootfs.tar", tar);
+    const std::string out_a = dir / "default-a";
+    const std::string out_b = dir / "default-b";
+
+    const auto a = run_convert({"--input", tar_path, "--out-dir", out_a,
+                                "--name", "rootfs"}, nullptr, false);
+    REQUIRE(a.exit_code == 0);
+#if OBD_TEST_HAVE_LIBE2FS
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+#endif
+    const auto b = run_convert({"--input", "-", "--out-dir", out_b,
+                                "--name", "rootfs"}, &tar, false);
+    REQUIRE(b.exit_code == 0);
+
+    const auto ja = nlohmann::json::parse(a.out);
+    const auto jb = nlohmann::json::parse(b.out);
+#if OBD_TEST_HAVE_LIBE2FS
+    REQUIRE(ja["converter"]["backend"].get<std::string>() == "libe2fs");
+#else
+    REQUIRE(ja["converter"]["backend"].get<std::string>() == "builtin-ext2");
+#endif
+    const std::string layer_a = ja["lowers"][0]["file"].get<std::string>();
+    const std::string layer_b = jb["lowers"][0]["file"].get<std::string>();
+    REQUIRE(file_sha256(layer_a) == file_sha256(layer_b));
+    assert_rootfs_metadata(layer_a);
+}
+
+// NOTE: name on one source line (check-docs extracts names line-wise).
+TEST_CASE("cli: obd-convert libe2fs expands built-in file and directory limits", "[cli]") {
+#if OBD_TEST_HAVE_LIBE2FS
+    TempDir dir;
+    const std::string large_tar = write_sparse_regular_files_tar(
+        dir / "large.tar", 1, kMaxBuiltInFileBytes + kExt2BlockSize);
+    const std::string large_dir = dir / "large";
+    const auto large = run_convert({"--input", large_tar, "--out-dir", large_dir,
+                                    "--name", "large"}, nullptr, false);
+    REQUIRE(large.exit_code == 0);
+    const auto large_manifest = nlohmann::json::parse(large.out);
+    REQUIRE(large_manifest["converter"]["backend"].get<std::string>() == "libe2fs");
+    const std::string large_layer = large_manifest["lowers"][0]["file"].get<std::string>();
+    Ext2View large_fs(read_layer_raw(large_layer));
+    const auto large_bytes = large_fs.read_file(large_fs.lookup({"big0"}));
+    REQUIRE(large_bytes.size() == kMaxBuiltInFileBytes + kExt2BlockSize);
+    REQUIRE(std::all_of(large_bytes.begin(), large_bytes.end(), [](uint8_t b) { return b == 0; }));
+
+    const auto builtin_large = run_convert({"--input", large_tar, "--out-dir", dir / "builtin-large",
+                                            "--name", "large", "--backend", "builtin-ext2"},
+                                           nullptr, false);
+    REQUIRE(builtin_large.exit_code == 1);
+    REQUIRE(builtin_large.err.find("file is too large") != std::string::npos);
+
+    const auto too_small = run_convert({"--input", large_tar, "--out-dir", dir / "too-small-large",
+                                        "--name", "large", "--size",
+                                        std::to_string(kMaxBuiltInFileBytes + kExt2BlockSize)},
+                                       nullptr, false);
+    REQUIRE(too_small.exit_code == 1);
+    REQUIRE(too_small.err.find("contents and ext2 metadata exceed image budget") !=
+            std::string::npos);
+
+    const auto feature_tar = make_libe2fs_feature_tar();
+    const std::string feature_path = test::write_file(dir / "features.tar", feature_tar);
+    const auto feature_result = run_convert({"--input", feature_path, "--out-dir", dir / "features",
+                                             "--name", "features"}, nullptr, false);
+    REQUIRE(feature_result.exit_code == 0);
+    const auto feature_manifest = nlohmann::json::parse(feature_result.out);
+    Ext2View feature_fs(read_layer_raw(feature_manifest["lowers"][0]["file"].get<std::string>()));
+    REQUIRE((feature_fs.ro_compat_features() & kExt2FeatureRoCompatLargeFile) != 0);
+    const auto wide_owner = feature_fs.inode(feature_fs.lookup({"wide-owner"}));
+    REQUIRE(wide_owner.uid == 70000);
+    REQUIRE(wide_owner.gid == 80000);
+    REQUIRE(feature_fs.symlink_target(feature_fs.lookup({"slow-link"})) == std::string(60, 't'));
+
+    const auto slow_symlink_too_small =
+        run_convert({"--input", feature_path, "--out-dir", dir / "slow-link-too-small",
+                     "--name", "features", "--size", "40960"}, nullptr, false);
+    REQUIRE(slow_symlink_too_small.exit_code == 1);
+    REQUIRE(slow_symlink_too_small.err.find("contents and ext2 metadata exceed image budget") !=
+            std::string::npos);
+
+    const auto tiny_tar = make_tiny_file_tar();
+    const std::string tiny_path = test::write_file(dir / "tiny.tar", tiny_tar);
+    const auto min_group_too_small =
+        run_convert({"--input", tiny_path, "--out-dir", dir / "min-group-too-small",
+                     "--name", "tiny", "--size", std::to_string(13ull * kExt2BlockSize)},
+                    nullptr, false);
+    REQUIRE(min_group_too_small.exit_code == 1);
+    REQUIRE(min_group_too_small.err.find("contents and ext2 metadata exceed image budget") !=
+            std::string::npos);
+
+    const auto many = make_many_root_files_tar(4100);
+    const std::string many_tar = test::write_file(dir / "many.tar", many);
+    const auto many_result = run_convert({"--input", many_tar, "--out-dir", dir / "many",
+                                          "--name", "many"}, nullptr, false);
+    REQUIRE(many_result.exit_code == 0);
+    const auto many_manifest = nlohmann::json::parse(many_result.out);
+    REQUIRE(many_manifest["converter"]["backend"].get<std::string>() == "libe2fs");
+    const std::string many_layer = many_manifest["lowers"][0]["file"].get<std::string>();
+    Ext2View many_fs(read_layer_raw(many_layer));
+    REQUIRE(many_fs.lookup({"f4099"}) != 0);
+#else
+    SUCCEED("libe2fs backend disabled in this build");
+#endif
+}
+
 // NOTE: name on one source line (check-docs extracts names line-wise).
 TEST_CASE("cli: obd-convert atomically replaces existing output symlinks", "[cli]") {
     TempDir dir;
@@ -541,6 +713,22 @@ TEST_CASE("cli: obd-convert reports usage errors with exit 2", "[cli]") {
     REQUIRE(bad_size.exit_code == 2);
     REQUIRE(bad_size.err.find("--size must be a positive integer") !=
             std::string::npos);
+
+    const auto bad_backend =
+        run_convert({"--input", "rootfs.tar", "--out-dir", "out",
+                     "--backend", "bogus"});
+    REQUIRE(bad_backend.exit_code == 2);
+    REQUIRE(bad_backend.err.find("--backend must be builtin-ext2 or libe2fs") !=
+            std::string::npos);
+
+#if !OBD_TEST_HAVE_LIBE2FS
+    const auto disabled_libe2fs =
+        run_convert({"--input", "rootfs.tar", "--out-dir", "out",
+                     "--backend", "libe2fs"});
+    REQUIRE(disabled_libe2fs.exit_code == 2);
+    REQUIRE(disabled_libe2fs.err.find("--backend libe2fs requires a build with") !=
+            std::string::npos);
+#endif
 }
 
 // NOTE: name on one source line (check-docs extracts names line-wise).
