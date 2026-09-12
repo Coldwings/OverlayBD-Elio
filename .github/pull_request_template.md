@@ -4,6 +4,7 @@
 
 - Issue:
 - Closing behavior intended on merge: yes / no
+- Intentional closing reference, if any:
 
 ## Summary
 

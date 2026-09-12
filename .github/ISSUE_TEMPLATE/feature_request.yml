@@ -36,3 +36,5 @@ body:
     attributes:
       label: Out of scope / follow-ups
       description: Identify intentionally deferred behavior so the issue cannot be closed by an accidental narrower subset.
+    validations:
+      required: true

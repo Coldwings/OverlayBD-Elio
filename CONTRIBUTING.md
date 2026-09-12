@@ -36,6 +36,14 @@ test run works unprivileged.
 
 ## Pull requests
 
+GitHub issue and pull request templates are part of the review workflow. New
+issues should use the matching form for bugs, features, documentation/spec
+changes, or ADR/design proposals, and should fill in the evidence, validation,
+and scope/deferred-work fields. PRs should use the repository PR template,
+identify the linked issue, state any intentional closing reference explicitly,
+and preserve the distinction between what the PR fixes and what remains for a
+follow-up.
+
 Every PR is expected to carry:
 
 - **Tests** — new behavior ships with Catch2 tests; format behavior is

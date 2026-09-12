@@ -38,3 +38,10 @@ body:
       description: What tests, docs, ADR updates, and CI coverage should prove the selected design?
     validations:
       required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope boundaries / follow-ups
+      description: State what the design intentionally does not cover and which follow-up issues remain.
+    validations:
+      required: true

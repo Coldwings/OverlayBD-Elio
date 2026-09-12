@@ -37,3 +37,12 @@ body:
     attributes:
       label: Validation
       description: Note docs checks, link checks, or related tests that should be run.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope boundaries / follow-ups
+      description: State what this documentation/spec issue intentionally does not settle and any related follow-up work.
+    validations:
+      required: true

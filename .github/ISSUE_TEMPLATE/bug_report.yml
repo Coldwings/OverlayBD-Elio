@@ -55,3 +55,5 @@ body:
     attributes:
       label: Scope boundaries / related issues
       description: Note related issues and what this issue intentionally does not claim or fix.
+    validations:
+      required: true
