@@ -24,7 +24,7 @@ void json_file(const std::string& path,const nlohmann::json& value) {
 struct ImportFixture {
     obd::test::TempDir dir;
     nlohmann::json descriptor;
-    explicit ImportFixture(bool gzip_target=false) {
+    explicit ImportFixture(bool gzip_target=false, const std::string& parent_uuid={}) {
         auto header=obd::test::make_tar_header(512);
         std::vector<uint8_t> target(header.begin(),header.end());
         target.resize(2048,0);
@@ -43,8 +43,11 @@ struct ImportFixture {
         int fd=open((dir/"raw").c_str(),O_RDONLY);
         REQUIRE(fd>=0);
         try {
+            obd::format::LsmtWriteOptions options;
+            options.uuid="11111111-1111-1111-1111-111111111111";
+            options.parent_uuid=parent_uuid;
             obd::format::write_lsmt_warp_layer(fd,1024,
-                {{0,1,0,false,0},{1,1,1,false,1}},dir/"metadata");
+                {{0,1,0,false,0},{1,1,1,false,1}},dir/"metadata",options);
         } catch(...) { close(fd); throw; }
         close(fd);
         if(gzip_target) obd::convert::build_gzip_index(dir/"target",dir/"gzip.idx");
@@ -137,4 +140,53 @@ TEST_CASE("convert: TurboOCI importer accepts upstream ZFile wrapped warp metada
     REQUIRE(load_import_file(lower.at("file").get<std::string>())==compressed);
     REQUIRE(lower.at("digest")==digest_of(compressed));
     REQUIRE(config.at("converter").at("virtual_size")==1024);
+}
+
+TEST_CASE("convert: TurboOCI differential import rejects missing and mismatched parent chains", "[convert][turbo]") {
+    ImportFixture base;
+    const auto parent=base.run();
+    for(int mutation=0;mutation<8;++mutation) {
+        ImportFixture child(false,"11111111-1111-1111-1111-111111111111");
+        auto config=parent;
+        std::string parent_path=child.dir/"parent.json";
+        switch(mutation) {
+        case 0: parent_path.clear(); break;
+        case 1: config["lowers"][0]["digest"]="sha256:"+std::string(64,'0'); break;
+        case 2: config["lowers"][0].erase("file"); break;
+        case 3: config["lowers"][0]["targetDigest"]="sha256:"+std::string(64,'0'); break;
+        case 4: config["upper"]={{"dir","mutable"}}; break;
+        case 5: config["lowers"]=nlohmann::json::array(); break;
+        case 6: config["lowers"].push_back(config["lowers"][0]); break;
+        case 7: while(config["lowers"].size()<255) config["lowers"].push_back(config["lowers"][0]); break;
+        }
+        if(!parent_path.empty()) json_file(parent_path,config);
+        REQUIRE_THROWS(obd::convert::import_turbo_image(child.dir/"package",child.dir/"descriptor",
+            child.dir/"target",child.dir/"imported",parent_path));
+        REQUIRE_FALSE(std::filesystem::exists(child.dir/"imported"));
+    }
+    ImportFixture wrong(false,"22222222-2222-2222-2222-222222222222");
+    json_file(wrong.dir/"parent.json",parent);
+    REQUIRE_THROWS(obd::convert::import_turbo_image(wrong.dir/"package",wrong.dir/"descriptor",
+        wrong.dir/"target",wrong.dir/"imported",wrong.dir/"parent.json"));
+    REQUIRE_FALSE(std::filesystem::exists(wrong.dir/"imported"));
+    ImportFixture root;
+    json_file(root.dir/"parent.json",parent);
+    REQUIRE_THROWS(obd::convert::import_turbo_image(root.dir/"package",root.dir/"descriptor",
+        root.dir/"target",root.dir/"imported",root.dir/"parent.json"));
+    REQUIRE_FALSE(std::filesystem::exists(root.dir/"imported"));
+}
+
+TEST_CASE("convert: TurboOCI differential import rejects incompatible parent geometry", "[convert][turbo]") {
+    ImportFixture child(false,"11111111-1111-1111-1111-111111111111");
+    int fd=open((child.dir/"raw").c_str(),O_RDONLY);
+    REQUIRE(fd>=0);
+    obd::format::LsmtWriteOptions options;
+    options.uuid="11111111-1111-1111-1111-111111111111";
+    try { obd::format::write_lsmt_single_layer(fd,512,child.dir/"parent.meta",options); }
+    catch(...) { close(fd); throw; }
+    close(fd);
+    json_file(child.dir/"parent.json",{{"lowers",nlohmann::json::array({{{"file",child.dir/"parent.meta"}}})}});
+    REQUIRE_THROWS(obd::convert::import_turbo_image(child.dir/"package",child.dir/"descriptor",
+        child.dir/"target",child.dir/"imported",child.dir/"parent.json"));
+    REQUIRE_FALSE(std::filesystem::exists(child.dir/"imported"));
 }

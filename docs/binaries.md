@@ -465,3 +465,26 @@ fixed for deterministic output. Nonzero precision finer than a nanosecond and
 timestamps outside the representable range are rejected. Explicit directory
 entries replace their complete xattr set; creating an implicit parent does not
 clear attributes inherited from lower layers.
+
+Import a differential package with `--parent-config parent-config.json`. The
+parent configuration must describe the complete local, read-only lower stack;
+relative paths are resolved against that configuration file. The importer
+validates the parent identities and UUID chain before appending the new lower.
+A dependent package without its parent, or a mismatched parent chain, fails
+before publication. Remote-only and directory-only parent entries are not
+accepted by this offline import helper; materialize their metadata and original
+target blobs locally first.
+
+For a two-layer conversion, import its packages in bottom-up order:
+
+```sh
+obd-convert --import-turboOCI generated/layer/layer-0/turboOCIv1.tar.gz \
+  --descriptor generated/layer/layer-0/descriptor.json --input base.tar.gz \
+  --out-dir imported --name base > base-config.json
+obd-convert --import-turboOCI generated/layer/layer-1/turboOCIv1.tar.gz \
+  --descriptor generated/layer/layer-1/descriptor.json --input upper.tar.gz \
+  --parent-config base-config.json --out-dir imported --name upper > image-config.json
+```
+
+`image-config.json` retains the base lower and adds the imported upper layer;
+keep both imported directories and both original target blobs available.

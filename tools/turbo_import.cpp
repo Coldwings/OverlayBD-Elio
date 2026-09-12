@@ -12,6 +12,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -102,12 +103,104 @@ std::vector<uint64_t> checkpoint_offsets(const std::string& path) {
     for(size_t i=0;i<count;++i) offsets.push_back(le(decoded.data()+i*29,8));
     return offsets;
 }
+struct LocalLayer {
+    nlohmann::json lower;
+    std::string metadata, target, index;
+    std::vector<uint64_t> checkpoints;
+};
+std::string uuid_key(std::string value) {
+    if(value.empty()) return {};
+    if(value.size()!=36) throw format_error("invalid TurboOCI layer UUID");
+    for(size_t i=0;i<value.size();++i) {
+        if(i==8 || i==13 || i==18 || i==23) {
+            if(value[i]!='-') throw format_error("invalid TurboOCI layer UUID");
+        } else if(!std::isxdigit(static_cast<unsigned char>(value[i])))
+            throw format_error("invalid TurboOCI layer UUID");
+        value[i]=static_cast<char>(std::tolower(static_cast<unsigned char>(value[i])));
+    }
+    return value=="00000000-0000-0000-0000-000000000000" ? "" : value;
+}
+elio::coro::task<std::unique_ptr<format::LsmtLayer>> open_local_layer(const LocalLayer& local) {
+    source::BlobSourcePtr metadata=co_await source::LocalFileSource::open(local.metadata);
+    metadata=co_await source::TarOffsetSource::open(std::move(metadata));
+    if(co_await format::is_zfile(*metadata))
+        metadata=co_await format::ZFileSource::open(std::move(metadata),true);
+    if(local.target.empty()) co_return co_await format::LsmtLayer::open(std::move(metadata));
+    source::BlobSourcePtr target=co_await source::LocalFileSource::open(local.target);
+    if(!local.index.empty()) {
+        auto index=co_await source::LocalFileSource::open(local.index);
+        auto gzip=co_await source::GzipIndexSource::open(std::move(target),std::move(index));
+        for(uint64_t offset:local.checkpoints) {
+            if(offset>=gzip->size()) continue;
+            uint8_t byte=0;
+            const auto n=co_await gzip->pread(&byte,1,offset);
+            if(n!=1) throw format_error("invalid parent TurboOCI gzip restart checkpoint");
+        }
+        target=std::move(gzip);
+    }
+    co_return co_await format::LsmtLayer::open_warp(std::move(metadata),std::move(target));
+}
+std::vector<LocalLayer> load_parents(const std::string& path) {
+    namespace fs=std::filesystem;
+    if(path.empty()) return {};
+    std::ifstream file(path,std::ios::binary);
+    if(!file) throw error(errno ? errno:ENOENT,"open TurboOCI parent config");
+    file.seekg(0,std::ios::end);
+    const auto size=file.tellg();
+    if(size<0 || size>1024*1024) throw format_error("TurboOCI parent config exceeds 1 MiB");
+    file.seekg(0);
+    nlohmann::json document;
+    file>>document;
+    if(!document.is_object() || !document.contains("lowers") || !document["lowers"].is_array() ||
+       document["lowers"].empty() || document["lowers"].size()>=255 ||
+       (document.contains("upper") && !document["upper"].empty()))
+        throw format_error("TurboOCI import requires a read-only parent stack of 1..254 layers");
+    const auto base=fs::absolute(path).parent_path();
+    auto resolve=[&](const std::string& value) {
+        return (base/fs::path(value)).lexically_normal().string();
+    };
+    std::vector<LocalLayer> parents;
+    for(const auto& lower:document["lowers"]) {
+        if(!lower.is_object() || lower.value("file",std::string{}).empty())
+            throw format_error("TurboOCI parent metadata requires a local file");
+        LocalLayer local;
+        local.metadata=resolve(lower.at("file").get<std::string>());
+        const auto metadata=identify(local.metadata);
+        if((lower.contains("digest") && lower.at("digest")!=metadata.digest) ||
+           (lower.contains("size") && lower.at("size")!=metadata.size))
+            throw format_error("TurboOCI parent metadata digest or size mismatch");
+        local.lower={{"file",local.metadata},{"digest",metadata.digest},{"size",metadata.size}};
+        if(lower.contains("targetFile") && !lower.at("targetFile").get<std::string>().empty()) {
+            local.target=resolve(lower.at("targetFile").get<std::string>());
+            const auto target=identify(local.target);
+            if((lower.contains("targetDigest") && lower.at("targetDigest")!=target.digest) ||
+               (lower.contains("targetSize") && lower.at("targetSize")!=target.size))
+                throw format_error("TurboOCI parent target digest or size mismatch");
+            local.lower["targetFile"]=local.target;
+            local.lower["targetDigest"]=target.digest;
+            local.lower["targetSize"]=target.size;
+            if(lower.contains("gzipIndex") && !lower.at("gzipIndex").get<std::string>().empty()) {
+                local.index=resolve(lower.at("gzipIndex").get<std::string>());
+                (void)identify(local.index); // require a regular local index before reading
+                local.checkpoints=checkpoint_offsets(local.index);
+                local.lower["gzipIndex"]=local.index;
+            }
+            if(target.gzip!=!local.index.empty())
+                throw format_error("TurboOCI parent gzip target/index mismatch");
+        } else if(lower.contains("targetDigest") || lower.contains("gzipIndex"))
+            throw format_error("TurboOCI parent target requires a local file");
+        parents.push_back(std::move(local));
+    }
+    return parents;
+}
+
 }
 
 nlohmann::json import_turbo_image(const std::string& package_path,
                                   const std::string& descriptor_path,
                                   const std::string& target_path,
-                                  const std::string& destination_dir) {
+                                  const std::string& destination_dir,
+                                  const std::string& parent_config_path) {
     namespace fs=std::filesystem;
     if(destination_dir.empty()) throw error(EINVAL,"empty TurboOCI destination");
     const auto destination=fs::absolute(destination_dir).lexically_normal();
@@ -143,6 +236,7 @@ nlohmann::json import_turbo_image(const std::string& package_path,
         throw format_error("TurboOCI package digest or size mismatch");
     if(target.digest!=target_digest || target.gzip!=gzip_media(target_media))
         throw format_error("TurboOCI target digest or media type mismatch");
+    const auto parents=load_parents(parent_config_path);
     PrivateDirectory staging{destination.string()+".tmp.XXXXXX"};
     std::vector<char> name(staging.path.begin(),staging.path.end()); name.push_back(0);
     if(!mkdtemp(name.data())) { staging.path.clear(); throw error(errno,"create TurboOCI validation directory"); }
@@ -178,6 +272,23 @@ nlohmann::json import_turbo_image(const std::string& package_path,
         if(co_await format::is_zfile(*metadata))
             metadata=co_await format::ZFileSource::open(std::move(metadata),true);
         auto layer=co_await format::LsmtLayer::open_warp(std::move(metadata),std::move(target_source));
+        const auto child_parent=uuid_key(layer->header().parent_uuid);
+        if(parents.empty()) {
+            if(!child_parent.empty()) throw format_error("differential TurboOCI layer requires --parent-config");
+        } else {
+            if(child_parent.empty()) throw format_error("root TurboOCI layer cannot extend a parent stack");
+            std::string previous;
+            for(const auto& parent:parents) {
+                auto opened=co_await open_local_layer(parent);
+                if(uuid_key(opened->header().parent_uuid)!=previous)
+                    throw format_error("TurboOCI parent UUID chain is incomplete or mismatched");
+                if(opened->virtual_size()!=layer->virtual_size())
+                    throw format_error("TurboOCI parent virtual size mismatch");
+                previous=uuid_key(opened->header().uuid);
+                if(previous.empty()) throw format_error("TurboOCI parent layer lacks a nonzero UUID");
+            }
+            if(previous!=child_parent) throw format_error("TurboOCI child parent UUID mismatch");
+        }
         co_return layer->virtual_size();
     },config);
     const auto metadata=identify(extracted.metadata_path);
@@ -185,7 +296,10 @@ nlohmann::json import_turbo_image(const std::string& package_path,
         {"digest",metadata.digest},{"size",metadata.size},{"targetFile",target_absolute},
         {"targetDigest",target.digest},{"targetSize",target.size}};
     if(target.gzip) lower["gzipIndex"]=(destination/"gzip.meta").string();
-    nlohmann::json result={{"repoBlobUrl",""},{"lowers",nlohmann::json::array({lower})},
+    nlohmann::json lowers=nlohmann::json::array();
+    for(const auto& parent:parents) lowers.push_back(parent.lower);
+    lowers.push_back(lower);
+    nlohmann::json result={{"repoBlobUrl",""},{"lowers",std::move(lowers)},
         {"converter",{{"backend","turbo-import"},{"imported",true},{"virtual_size",virtual_size}}},
         {"descriptor",descriptor}};
     if(syscall(SYS_renameat2,AT_FDCWD,(fs::path(staging.path)/"image").c_str(),AT_FDCWD,

@@ -1290,6 +1290,50 @@ TEST_CASE("cli: TurboOCI layered whiteouts preserve hardlinks and current additi
     });
     const auto raw_path = test::write_file(dir / "assembled.ext2", raw);
     REQUIRE(file_sha256(raw_path) == file_sha256(j["converter"]["raw_file"].get<std::string>()));
+    // Import each differential package in order. The importer must retain
+    // the complete parent stack rather than opening the top layer alone.
+    std::string parent_config;
+    std::string imported_text;
+    for(size_t i=0;i<2;++i) {
+        const auto descriptor_text=j["descriptors"][i].dump();
+        const auto descriptor_path=test::write_file(dir/("descriptor-"+std::to_string(i)+".json"),
+            std::vector<uint8_t>(descriptor_text.begin(),descriptor_text.end()));
+        std::vector<std::string> args={"--import-turboOCI",j["packages"][i].get<std::string>(),
+            "--descriptor",descriptor_path,"--input",i==0 ? a:b,
+            "--out-dir",dir/("import-"+std::to_string(i))};
+        if(i==1) {
+            const auto missing=run_convert(args,nullptr,false);
+            REQUIRE(missing.exit_code!=0);
+            REQUIRE(!std::filesystem::exists(dir/"import-1/layer"));
+            args.insert(args.end(),{"--parent-config",parent_config});
+        }
+        const auto imported=run_convert(args,nullptr,false);
+        INFO(imported.err);
+        REQUIRE(imported.exit_code==0);
+        imported_text=imported.out;
+        auto parents=nlohmann::json::parse(imported.out);
+        REQUIRE(parents["lowers"].size()==i+1);
+        // Parent paths are resolved against the config file, not cwd.
+        for(auto& lower:parents["lowers"]) {
+            for(const auto* key:{"file","targetFile","gzipIndex"})
+                if(lower.contains(key)) lower[key]=std::filesystem::relative(
+                    lower[key].get<std::string>(),dir.path()).string();
+        }
+        const auto text=parents.dump();
+        parent_config=test::write_file(dir/("parent-"+std::to_string(i)+".json"),
+            std::vector<uint8_t>(text.begin(),text.end()));
+    }
+    const auto imported_raw=test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
+        const auto cfg=image::ImageConfig::from_json_text(imported_text,{});
+        image::GlobalConfig global;
+        global.prefetch_enable=false;
+        auto opened=co_await image::open_image(cfg,global);
+        std::vector<uint8_t> data(opened.virtual_size);
+        const auto n=co_await opened.root->pread(data.data(),data.size(),0);
+        REQUIRE(n==static_cast<ssize_t>(data.size()));
+        co_return data;
+    });
+    REQUIRE(imported_raw==raw);
     Ext2View view(raw);
     REQUIRE(view.read_file(view.lookup({"alias"})) == old_bytes);
     REQUIRE(view.read_file(view.lookup({"original"})) == new_bytes);

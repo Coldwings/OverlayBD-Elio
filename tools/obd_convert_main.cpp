@@ -322,7 +322,7 @@ void usage(const char* argv0) {
                  "usage: %s --input <rootfs.tar|-> --out-dir <dir> [--name base]\n"
                  "          [--backend builtin-ext2|libe2fs] [--size bytes] [--keep-raw]\n"
                  "          [--turboOCI] (local tar or gzip, libe2fs required)\n"
-                 "          [--import-turboOCI package --descriptor descriptor.json]\n"
+                 "          [--import-turboOCI package --descriptor descriptor.json [--parent-config config.json]]\n"
                  "\n"
                  "Builds <out-dir>/<name>.lsmt from a ustar rootfs stream. Builds\n"
                  "with the pinned libe2fs backend use it by default; dependency-free\n"
@@ -1679,6 +1679,7 @@ struct Options {
     std::vector<std::string> inputs;
     std::string import_package;
     std::string descriptor;
+    std::string parent_config;
     std::string input;
     std::string out_dir;
     std::string name = "layer";
@@ -1705,6 +1706,7 @@ Options parse_args(int argc, char** argv) {
             opts.inputs.push_back(opts.input);
         }
         else if (a == "--import-turboOCI") opts.import_package = next("--import-turboOCI");
+        else if (a == "--parent-config") opts.parent_config = next("--parent-config");
         else if (a == "--descriptor") opts.descriptor = next("--descriptor");
         else if (a == "--out-dir") opts.out_dir = next("--out-dir");
         else if (a == "--name") opts.name = next("--name");
@@ -1734,8 +1736,8 @@ Options parse_args(int argc, char** argv) {
     if (!opts.import_package.empty()) {
         if (opts.descriptor.empty() || opts.input == "-" || opts.turbo_oci || opts.size != 0 || opts.keep_raw)
             throw UsageError("--import-turboOCI requires --descriptor and a local --input; conversion options cannot be combined");
-    } else if (!opts.descriptor.empty()) {
-        throw UsageError("--descriptor requires --import-turboOCI");
+    } else if (!opts.descriptor.empty() || !opts.parent_config.empty()) {
+        throw UsageError("--descriptor and --parent-config require --import-turboOCI");
     }
 #if !OBD_HAVE_LIBE2FS
     if (opts.backend == ConverterBackend::LibE2fs) {
@@ -1755,7 +1757,7 @@ int main(int argc, char** argv) {
         const Options opts = parse_args(argc, argv);
         if (!opts.import_package.empty()) {
             const auto imported = obd::convert::import_turbo_image(
-                opts.import_package, opts.descriptor, opts.input, opts.out_dir + "/" + opts.name);
+                opts.import_package, opts.descriptor, opts.input, opts.out_dir + "/" + opts.name, opts.parent_config);
             std::puts(imported.dump(2).c_str());
             return 0;
         }

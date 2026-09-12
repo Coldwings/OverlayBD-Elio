@@ -1,6 +1,6 @@
 # ADR-0020: Read TurboOCI natively and build its metadata locally
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-09-12
 - Supersedes: ADR-0008
 - Binds: docs/design-assumptions.md, docs/format.md, docs/config.md,
@@ -44,7 +44,9 @@ as the file-content source.
 - Import and produce the upstream metadata package and target annotations.
   Validate required entries, target identity, media type, and archive paths;
   report unsupported formats and malformed input instead of emitting a
-  runnable-looking partial configuration.
+  runnable-looking partial configuration. Differential package import
+  requires a complete local parent configuration and verifies its UUID chain;
+  a dependent layer must never be published as a standalone image.
 - Use libe2fs by default for device-free ext-family filesystem construction.
   Build metadata and remote mappings locally, without invoking upstream
   conversion binaries or bringing Photon into the runtime. Preserve original
