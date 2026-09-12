@@ -107,6 +107,8 @@ constexpr uint64_t max_ext2_i_blocks_data_blocks() {
 constexpr uint64_t kMaxLibE2fsFileBytes = max_ext2_i_blocks_data_blocks() * kBlockSize;
 constexpr uint64_t kMaxLibE2fsDirectoryBlocks = 1024;
 constexpr uint32_t kMaxLibE2fsNodes = 65536;
+constexpr uint64_t kExt2DirectoryBaseEntryBytes = 24;
+constexpr uint64_t kExt2DirectoryBaseMaxEntryBytes = 12;
 
 constexpr uint16_t kExt2SIfReg = 0100000;
 constexpr uint16_t kExt2SIfDir = 0040000;
@@ -382,7 +384,12 @@ enum class NodeKind { Dir, File, Symlink };
 
 struct Node {
     explicit Node(std::string n, NodeKind k, Node* p = nullptr)
-        : name(std::move(n)), kind(k), parent(p), dir_blocks(k == NodeKind::Dir ? 1 : 0) {}
+        : name(std::move(n)),
+          kind(k),
+          parent(p),
+          dir_blocks(k == NodeKind::Dir ? 1 : 0),
+          dir_entry_bytes(k == NodeKind::Dir ? kExt2DirectoryBaseEntryBytes : 0),
+          dir_entry_max_bytes(k == NodeKind::Dir ? kExt2DirectoryBaseMaxEntryBytes : 0) {}
 
     std::string name;
     NodeKind kind;
@@ -399,6 +406,8 @@ struct Node {
     std::vector<uint32_t> blocks;
     uint32_t indirect_block = 0;
     uint64_t dir_blocks = 0;
+    uint64_t dir_entry_bytes = 0;
+    uint64_t dir_entry_max_bytes = 0;
     std::vector<uint8_t> dir_data;
 };
 
@@ -643,8 +652,16 @@ uint64_t directory_payload_blocks_for_data_blocks(uint64_t data_blocks) {
     return regular_file_payload_blocks(data_blocks * kBlockSize);
 }
 
-uint64_t directory_blocks_with_pending_child(const Node& dir,
-                                             std::string_view pending_name) {
+uint64_t directory_blocks_for_entry_summary(uint64_t entry_bytes,
+                                            uint64_t max_entry_bytes) {
+    if (entry_bytes == 0) return 0;
+    const uint64_t guaranteed_payload_per_block =
+        kBlockSize - std::min<uint64_t>(max_entry_bytes - 1, kBlockSize - 1);
+    return div_ceil(entry_bytes, guaranteed_payload_per_block);
+}
+
+uint64_t directory_blocks_sorted(const Node& dir, std::string_view pending_name,
+                                 bool has_pending) {
     uint64_t blocks = 1;
     size_t used = 0;
     auto add_entry = [&](size_t name_len) {
@@ -659,14 +676,23 @@ uint64_t directory_blocks_with_pending_child(const Node& dir,
     add_entry(2);  // ".."
     bool inserted_pending = false;
     for (const auto& [name, _] : dir.children) {
-        if (!inserted_pending && pending_name < std::string_view(name)) {
+        if (has_pending && !inserted_pending && pending_name < std::string_view(name)) {
             add_entry(pending_name.size());
             inserted_pending = true;
         }
         add_entry(name.size());
     }
-    if (!inserted_pending) add_entry(pending_name.size());
+    if (has_pending && !inserted_pending) add_entry(pending_name.size());
     return blocks;
+}
+
+uint64_t directory_blocks_with_pending_child(const Node& dir,
+                                             std::string_view pending_name) {
+    return directory_blocks_sorted(dir, pending_name, true);
+}
+
+uint64_t exact_directory_blocks(const Node& dir) {
+    return directory_blocks_sorted(dir, {}, false);
 }
 
 struct TarReader {
@@ -753,30 +779,89 @@ struct TarReader {
         }
     }
 
+    std::string directory_display_name(const Node& dir) const {
+        return dir.name.empty() ? std::string("/") : dir.name;
+    }
+
+    void throw_directory_too_large(const Node& dir) const {
+        if (backend == ConverterBackend::BuiltinExt2) {
+            throw std::runtime_error(
+                "built-in ext2 backend supports directories up to 12 data blocks: " +
+                directory_display_name(dir));
+        }
+        throw std::runtime_error(
+            std::string(backend_name(backend)) +
+            " backend directory exceeds supported size: " + directory_display_name(dir));
+    }
+
+    void adjust_reserved_directory_blocks(uint64_t old_blocks, uint64_t new_blocks) {
+        const uint64_t old_payload = directory_payload_blocks_for_data_blocks(old_blocks);
+        const uint64_t new_payload = directory_payload_blocks_for_data_blocks(new_blocks);
+        if (new_payload >= old_payload) {
+            reserved_directory_blocks += new_payload - old_payload;
+        } else {
+            reserved_directory_blocks -= old_payload - new_payload;
+        }
+    }
+
+    void set_directory_blocks(Node& dir, uint64_t next_blocks) {
+        adjust_reserved_directory_blocks(dir.dir_blocks, next_blocks);
+        dir.dir_blocks = next_blocks;
+    }
+
+    uint64_t exact_reserved_directory_blocks(Node& dir) const {
+        if (dir.kind != NodeKind::Dir) return 0;
+        const uint64_t blocks = exact_directory_blocks(dir);
+        if (blocks > limits.max_directory_blocks) throw_directory_too_large(dir);
+        dir.dir_blocks = blocks;
+        uint64_t reserved = directory_payload_blocks_for_data_blocks(blocks);
+        for (const auto& [_, child] : dir.children) {
+            reserved += exact_reserved_directory_blocks(*child);
+        }
+        return reserved;
+    }
+
+    void finalize_directory_accounting(Node& root) {
+        reserved_directory_blocks = exact_reserved_directory_blocks(root);
+        ensure_image_budget("/");
+    }
+
     void reserve_directory_child(Node& parent, const std::string& leaf,
                                  bool child_is_directory) {
         if (child_is_directory && parent.child_directory_count >= kExt2MaxSubdirectories) {
             throw std::runtime_error(
                 std::string(backend_name(backend)) +
                 " backend directory has too many child directories for ext2 link count: " +
-                (parent.name.empty() ? std::string("/") : parent.name));
+                directory_display_name(parent));
         }
-        const uint64_t next_blocks = directory_blocks_with_pending_child(parent, leaf);
+
+        const uint64_t entry_bytes = min_dirent_len(leaf.size());
+        const uint64_t next_entry_bytes = parent.dir_entry_bytes + entry_bytes;
+        const uint64_t next_max_entry_bytes =
+            std::max<uint64_t>(parent.dir_entry_max_bytes, entry_bytes);
+        uint64_t next_blocks =
+            directory_blocks_for_entry_summary(next_entry_bytes, next_max_entry_bytes);
+        bool exact = false;
         if (next_blocks > limits.max_directory_blocks) {
-            if (backend == ConverterBackend::BuiltinExt2) {
-                throw std::runtime_error(
-                    "built-in ext2 backend supports directories up to 12 data blocks: " +
-                    (parent.name.empty() ? std::string("/") : parent.name));
-            }
-            throw std::runtime_error(
-                std::string(backend_name(backend)) +
-                " backend directory exceeds supported size: " +
-                (parent.name.empty() ? std::string("/") : parent.name));
+            next_blocks = directory_blocks_with_pending_child(parent, leaf);
+            exact = true;
+            if (next_blocks > limits.max_directory_blocks) throw_directory_too_large(parent);
         }
-        reserved_directory_blocks += directory_payload_blocks_for_data_blocks(next_blocks) -
-                                     directory_payload_blocks_for_data_blocks(parent.dir_blocks);
-        parent.dir_blocks = next_blocks;
-        if (child_is_directory) ++parent.child_directory_count;
+
+        set_directory_blocks(parent, next_blocks);
+        parent.dir_entry_bytes = next_entry_bytes;
+        parent.dir_entry_max_bytes = next_max_entry_bytes;
+        if (child_is_directory) {
+            ++parent.child_directory_count;
+            reserved_directory_blocks += directory_payload_blocks_for_data_blocks(1);
+        }
+
+        if (!exact && limits.enforce_image_budget &&
+            required_image_blocks(reserved_payload_blocks) > max_image_blocks) {
+            const uint64_t exact_blocks = directory_blocks_with_pending_child(parent, leaf);
+            if (exact_blocks > limits.max_directory_blocks) throw_directory_too_large(parent);
+            set_directory_blocks(parent, exact_blocks);
+        }
     }
 
     Node& ensure_dir(Node& root, const std::vector<std::string>& parts) {
@@ -788,7 +873,6 @@ struct TarReader {
                 ++node_count;
                 reserve_directory_child(*cur, part, true);
                 auto dir = std::make_unique<Node>(part, NodeKind::Dir, cur);
-                reserved_directory_blocks += directory_payload_blocks_for_data_blocks(dir->dir_blocks);
                 ensure_image_budget(part);
                 it = cur->children.emplace(part, std::move(dir)).first;
             }
@@ -919,6 +1003,7 @@ struct TarReader {
             }
             parent.children.emplace(leaf, std::move(node));
         }
+        finalize_directory_accounting(root);
     }
 };
 
@@ -1470,8 +1555,8 @@ void write_libe2fs_node(ext2_filsys fs, ext2_ino_t parent, const Node& node) {
         }
         check_libe2fs(err, "libe2fs mkdir " + node.name);
         ino = lookup_child(fs, parent, node.name);
-        set_inode_common(fs, ino, LINUX_S_IFDIR, node.perm, node.uid, node.gid);
         for (const auto& [_, child] : node.children) write_libe2fs_node(fs, ino, *child);
+        set_inode_common(fs, ino, LINUX_S_IFDIR, node.perm, node.uid, node.gid);
         return;
     }
 
@@ -1558,8 +1643,8 @@ void write_libe2fs_image(Node& root, const std::string& path, uint64_t requested
     reserve_libe2fs_fixed_inodes(fs.get());
     check_libe2fs(ext2fs_mkdir(fs.get(), EXT2_ROOT_INO, EXT2_ROOT_INO, nullptr),
                   "libe2fs create root directory");
-    set_inode_common(fs.get(), EXT2_ROOT_INO, LINUX_S_IFDIR, root.perm, root.uid, root.gid);
     for (const auto& [_, child] : root.children) write_libe2fs_node(fs.get(), EXT2_ROOT_INO, *child);
+    set_inode_common(fs.get(), EXT2_ROOT_INO, LINUX_S_IFDIR, root.perm, root.uid, root.gid);
     check_libe2fs(ext2fs_write_bitmaps(fs.get()), "libe2fs write bitmaps");
     ext2_filsys closing = fs.release();
     check_libe2fs(ext2fs_close(closing), "libe2fs close filesystem");

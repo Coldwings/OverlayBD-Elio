@@ -318,6 +318,9 @@ struct Ext2Inode {
     uint32_t uid = 0;
     uint32_t gid = 0;
     uint32_t size = 0;
+    uint32_t atime = 0;
+    uint32_t ctime = 0;
+    uint32_t mtime = 0;
     std::array<uint32_t, 15> blocks {};
 };
 
@@ -346,6 +349,9 @@ public:
         n.uid = bytes::load_u16_le(p + 2) |
                 (static_cast<uint32_t>(bytes::load_u16_le(p + 120)) << 16);
         n.size = bytes::load_u32_le(p + 4);
+        n.atime = bytes::load_u32_le(p + 8);
+        n.ctime = bytes::load_u32_le(p + 12);
+        n.mtime = bytes::load_u32_le(p + 16);
         n.gid = bytes::load_u16_le(p + 24) |
                 (static_cast<uint32_t>(bytes::load_u16_le(p + 122)) << 16);
         for (size_t i = 0; i < n.blocks.size(); ++i) {
@@ -520,10 +526,19 @@ struct Ext2SuperblockFields {
     return out;
 }
 
+void assert_zero_timestamps(const Ext2Inode& inode) {
+    REQUIRE(inode.atime == 0);
+    REQUIRE(inode.ctime == 0);
+    REQUIRE(inode.mtime == 0);
+}
+
 void assert_rootfs_metadata(const std::string& layer_path) {
     Ext2View fs(read_layer_raw(layer_path));
+    assert_zero_timestamps(fs.inode(2));
+
     const uint32_t etc_ino = fs.lookup({"etc"});
     const auto etc = fs.inode(etc_ino);
+    assert_zero_timestamps(etc);
     REQUIRE((etc.mode & 0170000) == 0040000);
     REQUIRE((etc.mode & 07777) == 0750);
     REQUIRE(etc.uid == 5);
@@ -531,6 +546,7 @@ void assert_rootfs_metadata(const std::string& layer_path) {
 
     const uint32_t hello_ino = fs.lookup({"etc", "hello.txt"});
     const auto hello = fs.inode(hello_ino);
+    assert_zero_timestamps(hello);
     REQUIRE((hello.mode & 0170000) == 0100000);
     REQUIRE((hello.mode & 07777) == 0640);
     REQUIRE(hello.uid == 1000);
@@ -543,12 +559,14 @@ void assert_rootfs_metadata(const std::string& layer_path) {
 
     const uint32_t link_ino = fs.lookup({"link-to-hello"});
     const auto link = fs.inode(link_ino);
+    assert_zero_timestamps(link);
     REQUIRE((link.mode & 0170000) == 0120000);
     REQUIRE(link.uid == 7);
     REQUIRE(link.gid == 8);
     REQUIRE(fs.inline_symlink(link_ino) == "etc/hello.txt");
 
     const auto zero_dir = fs.inode(fs.lookup({"zero-dir"}));
+    assert_zero_timestamps(zero_dir);
     REQUIRE((zero_dir.mode & 0170000) == 0040000);
     REQUIRE((zero_dir.mode & 07777) == 0000);
     REQUIRE(zero_dir.uid == 9);
@@ -556,6 +574,7 @@ void assert_rootfs_metadata(const std::string& layer_path) {
 
     const uint32_t zero_file_ino = fs.lookup({"zero-file"});
     const auto zero_file = fs.inode(zero_file_ino);
+    assert_zero_timestamps(zero_file);
     REQUIRE((zero_file.mode & 0170000) == 0100000);
     REQUIRE((zero_file.mode & 07777) == 0000);
     REQUIRE(zero_file.uid == 11);
