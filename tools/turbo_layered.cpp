@@ -108,7 +108,7 @@ struct Input {
 };
 void spool_gzip(const std::string& original,const std::string& output) {
     // build_gzip_index has already validated a single complete gzip member.
-    gzFile gzip=::gzopen(original.c_str(),"rb");
+    gzFile gzip=::gzopen(original.c_str(),"rbe");
     if(!gzip) throw error(EIO,"open gzip tar spool");
     struct GzGuard { gzFile file; ~GzGuard(){if(file) gzclose(file);} } guard{gzip};
     File out(output,O_WRONLY|O_CREAT|O_EXCL);

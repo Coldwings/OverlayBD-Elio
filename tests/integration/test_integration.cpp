@@ -2071,11 +2071,18 @@ TEST_CASE("integration: TurboOCI target persists separately and reopens offline"
     std::fill(target.begin() + 512, target.begin() + 1024, 0x54);
     const auto metadata_path = test::write_file(dir / "ext4.fs.meta", meta);
 
+    const auto fixture = std::filesystem::path(__FILE__).parent_path().parent_path() /
+        "fixtures/turboci";
+    std::ifstream gzip_input(fixture / "original.tar.gz", std::ios::binary);
+    const std::vector<uint8_t> gzip((std::istreambuf_iterator<char>(gzip_input)), {});
+    REQUIRE(gzip.size() > 1024);
+    const auto gzip_digest = sha256_hex_of(gzip);
     const auto digest = sha256_hex_of(target);
     const std::string layer_dir = dir / "cache";
     const std::string committed = layer_dir + "/targets/" + digest + "/overlaybd.commit";
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        BlobServer server(target);
+        BlobMapServer server({{"sha256:" + digest, target},
+                              {"sha256:" + gzip_digest, gzip}});
         elio::go([&server]() -> elio::coro::task<void> { co_await server.run(); });
         BlobGuard guard{server};
         const bool running = co_await test::wait_server_running(server);
@@ -2093,15 +2100,19 @@ TEST_CASE("integration: TurboOCI target persists separately and reopens offline"
             auto bad = j;
             bad["lowers"][0]["dir"] = dir / "bad-cache";
             bad["lowers"][0]["gzipIndex"] = bad_index;
+            bad["lowers"][0]["targetDigest"] = "sha256:" + gzip_digest;
+            bad["download"]["delay"] = 60;
             const auto bad_cfg = image::ImageConfig::from_json_text(bad.dump(), {});
-            bool rejected = false;
+            std::string rejection;
+            source::test_hooks::reset_unparked_layer_store_destructions_for_test();
             try {
                 auto unexpected = co_await image::open_image(bad_cfg, global);
                 co_await image::park_image_fills(unexpected);
-            } catch (const error&) {
-                rejected = true;
+            } catch (const error& e) {
+                rejection = e.what();
             }
-            REQUIRE(rejected);
+            REQUIRE(rejection.find("invalid ddgzidx v1 index") != std::string::npos);
+            REQUIRE(source::test_hooks::unparked_layer_store_destructions_for_test() == 0);
         }
         {
             const auto cfg = image::ImageConfig::from_json_text(j.dump(), {});
