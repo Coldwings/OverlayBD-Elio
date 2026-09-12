@@ -435,6 +435,14 @@ obd-convert --import-turboOCI generated/layer/layer-0/turboOCIv1.tar.gz \
   --out-dir imported --name rootfs > imported-config.json
 ```
 
+Import rejects declared package member sizes before extracting their payload:
+`ext4.fs.meta` plus `gzip.meta` have a cumulative default 1 GiB extraction
+budget, adjustable with
+`--max-import-metadata-size <positive-bytes>` for larger trusted metadata.
+This budget applies to the packaged metadata files, not the original blob or
+virtual filesystem size. Unique members and bounded tar padding also bound
+total decompressed package output. Failure removes the private staging directory.
+
 Import verifies package and target identities against the descriptor and
 validates the metadata before publishing `imported/rootfs`, which must not
 already exist. Both an OCI descriptor object and the converter's stdout wrapper
@@ -490,3 +498,10 @@ obd-convert --import-turboOCI generated/layer/layer-1/turboOCIv1.tar.gz \
 
 `image-config.json` retains the base lower and adds the imported upper layer;
 keep both imported directories and both original target blobs available.
+
+PAX `SCHILY.devmajor` and `SCHILY.devminor` override the corresponding archive
+header fields using decimal values and ordinary local/global PAX scope. Device
+nodes outside Linux's 12-bit major and 20-bit minor encoding are rejected.
+Import applies the same tar-prefix check to every original target, including
+parent targets: a USTAR/GNU prefix or two complete zero terminator blocks for an
+empty archive. This check does not replace full tar parsing during conversion.

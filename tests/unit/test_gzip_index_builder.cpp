@@ -87,3 +87,40 @@ TEST_CASE("format: gzip index output cannot replace its input", "[convert][gzip]
     REQUIRE_THROWS(obd::convert::build_gzip_index(path, path));
     REQUIRE(read_file(path) == bytes);
 }
+
+TEST_CASE("format: gzip index records the initial checkpoint for one final block", "[convert][gzip]") {
+    obd::test::TempDir dir;
+    const auto plain=obd::test::pattern_bytes(1024,71);
+    // Handwritten gzip framing with exactly one final, uncompressed DEFLATE
+    // block (BFINAL=1, BTYPE=00). No compressor-dependent block splitting.
+    std::vector<uint8_t> compressed{0x1f,0x8b,8,0,0,0,0,0,0,255,1};
+    auto append_le=[&](uint32_t value,size_t n) {
+        for(size_t i=0;i<n;++i) compressed.push_back(static_cast<uint8_t>(value>>(8*i)));
+    };
+    append_le(plain.size(),2);
+    append_le(static_cast<uint16_t>(~static_cast<uint16_t>(plain.size())),2);
+    compressed.insert(compressed.end(),plain.begin(),plain.end());
+    append_le(static_cast<uint32_t>(::crc32(0,plain.data(),plain.size())),4);
+    append_le(plain.size(),4);
+    obd::test::write_file(dir/"single.gz",compressed);
+    obd::convert::build_gzip_index(dir/"single.gz",dir/"single.idx");
+    const auto index=read_file(dir/"single.idx");
+    REQUIRE(le(index,25,8)==1);
+    std::vector<uint8_t> checkpoint(29);
+    uLongf count=checkpoint.size();
+    REQUIRE(::uncompress(checkpoint.data(),&count,index.data()+le(index,313,8),le(index,321,8))==Z_OK);
+    REQUIRE(count==29);
+    REQUIRE(le(checkpoint,0,8)==0);
+    REQUIRE(le(checkpoint,8,8)==10); // Immediately after the gzip header.
+    const auto result=obd::test::run_coro([&]() -> elio::coro::task<int> {
+        auto source=co_await obd::source::GzipIndexSource::open(
+            std::make_unique<obd::test::VectorSource>(compressed),
+            std::make_unique<obd::test::VectorSource>(index));
+        std::vector<uint8_t> output(plain.size());
+        const auto n=co_await source->pread(output.data(),output.size(),0);
+        REQUIRE(n==static_cast<ssize_t>(output.size()));
+        REQUIRE(output==plain);
+        co_return 0;
+    });
+    REQUIRE(result==0);
+}

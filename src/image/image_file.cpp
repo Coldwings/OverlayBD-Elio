@@ -61,6 +61,32 @@ private:
     std::shared_ptr<source::LayerStore> store_;
 };
 
+elio::coro::task<size_t> sweep_committed_store(const std::string& dir) {
+    const size_t sweep_dir_len = dir.size();
+    auto sweep_dir_owner =
+        std::make_unique<char[]>(sweep_dir_len + 1);
+    std::copy_n(dir.data(), sweep_dir_len,
+                sweep_dir_owner.get());
+    sweep_dir_owner[sweep_dir_len] = '\0';
+    char* const sweep_dir_data = sweep_dir_owner.release();
+    size_t swept = 0;
+    try {
+        swept = co_await elio::spawn_blocking(
+            [sweep_dir_data, sweep_dir_len]() noexcept -> size_t {
+                std::unique_ptr<char[]> owned_dir(sweep_dir_data);
+                try {
+                    return source::sweep_stale_layer_store_pairs(
+                        std::string(owned_dir.get(), sweep_dir_len));
+                } catch (...) {
+                    return 0;
+                }
+            });
+    } catch (...) {
+        delete[] sweep_dir_data;
+    }
+    co_return swept;
+}
+
 struct LocalProbe {
     std::string path;
     bool layer_store_commit = false;
@@ -339,7 +365,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     warm_targets.reserve(data_lowers.size());
     // Structural warming includes original TurboOCI blobs; trace indexes remain
     // exactly one metadata byte space per lower, as in upstream.
-    std::vector<source::BlobSource*> structural_targets;
+    std::vector<StructuralWarmupTarget> structural_targets;
     std::vector<source::LayerStore*> stores;
     std::vector<std::shared_ptr<source::LayerStore>> store_guards;
     std::exception_ptr assembly_failure;
@@ -363,28 +389,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         const LocalProbe local = probe_local_blob(lower);
         if (!local.path.empty()) {
             if (local.layer_store_commit) {
-                const size_t sweep_dir_len = lower.dir.size();
-                auto sweep_dir_owner =
-                    std::make_unique<char[]>(sweep_dir_len + 1);
-                std::copy_n(lower.dir.data(), sweep_dir_len,
-                            sweep_dir_owner.get());
-                sweep_dir_owner[sweep_dir_len] = '\0';
-                char* const sweep_dir_data = sweep_dir_owner.release();
-                size_t swept = 0;
-                try {
-                    swept = co_await elio::spawn_blocking(
-                        [sweep_dir_data, sweep_dir_len]() noexcept -> size_t {
-                            std::unique_ptr<char[]> owned_dir(sweep_dir_data);
-                            try {
-                                return source::sweep_stale_layer_store_pairs(
-                                    std::string(owned_dir.get(), sweep_dir_len));
-                            } catch (...) {
-                                return 0;
-                            }
-                        });
-                } catch (...) {
-                    delete[] sweep_dir_data;
-                }
+                const size_t swept = co_await sweep_committed_store(lower.dir);
                 if (swept != 0) {
                     ELIO_LOG_INFO(
                         "layer {} swept {} stale layer-store files beside "
@@ -506,7 +511,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             }
         }
         warm_targets.push_back(untarred.get());
-        structural_targets.push_back(untarred.get());
+        structural_targets.push_back({untarred.get(), layer_index});
         if (co_await format::is_zfile(*untarred)) {
             view = co_await format::ZFileSource::open(std::move(untarred),
                                                       /*caller_verify=*/true);
@@ -521,18 +526,17 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 auto sha = ImageConfig::digest_sha256_hex(lower.target_digest);
                 if (sha.size() != 64 ||
                     !std::all_of(sha.begin(), sha.end(), [](unsigned char c) {
-                        return std::isxdigit(c) != 0;
+                        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
                     })) {
                     throw error(EINVAL, "malformed TurboOCI target digest");
                 }
-                std::transform(sha.begin(), sha.end(), sha.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 // Target bytes and metadata bytes have independent identities
                 // and must never share a commit file or extent bitmap.
                 const auto target_dir = lower.dir.empty() ? std::string{} :
                     lower.dir + "/targets/" + sha;
                 const auto committed = target_dir + "/overlaybd.commit";
                 if (!target_dir.empty() && is_regular_file(committed)) {
+                    co_await sweep_committed_store(target_dir);
                     target = co_await source::LocalFileSource::open(committed);
                 } else {
                     if (cfg.repo_blob_url.empty()) {
@@ -598,7 +602,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             if (!gzip_target && !lower.gzip_index.empty()) {
                 throw format_error("TurboOCI gzipIndex requires a gzip target");
             }
-            structural_targets.push_back(target.get());
+            structural_targets.push_back({target.get(), layer_index});
             // The target is the original archive byte space. Do not strip a
             // tar header or apply the metadata layer's ZFile adapter to it.
             if (!lower.gzip_index.empty()) {
@@ -639,7 +643,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             static_cast<uint64_t>(global.prefetch_head_kb) << 10;
         wopts.tail_bytes =
             static_cast<uint64_t>(global.prefetch_tail_kb) << 10;
-        warmup_stats = co_await warmup_structural(structural_targets, wopts);
+        warmup_stats = co_await warmup_structural_grouped(structural_targets, wopts);
     }
 
     // Trace replay (ADR-0013): with the floor warmed, load the

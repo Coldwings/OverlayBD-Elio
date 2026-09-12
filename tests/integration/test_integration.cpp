@@ -2131,11 +2131,24 @@ TEST_CASE("integration: TurboOCI target persists separately and reopens offline"
             REQUIRE(complete);
         }
         REQUIRE_FALSE(std::filesystem::exists(layer_dir + "/overlaybd.commit"));
+        const auto target_cache_dir = std::filesystem::path(committed).parent_path().string();
+        test::write_file(target_cache_dir + "/.download.deadbeefdeadbeef",
+                         std::vector<uint8_t>(1, 0));
+        test::write_file(target_cache_dir + "/.bitmap.deadbeefdeadbeef",
+                         std::vector<uint8_t>(80, 0));
+        REQUIRE(names_with_prefix(target_cache_dir, ".download.").size() == 1);
+        REQUIRE(names_with_prefix(target_cache_dir, ".bitmap.").size() == 1);
         // No registry URL proves committed targets can reopen entirely offline.
         j.erase("repoBlobUrl");
+        global.prefetch_enable = true;
         const auto cfg = image::ImageConfig::from_json_text(j.dump(), {});
         auto reopened = co_await image::open_image(cfg, global);
         REQUIRE(reopened.layer_stores.empty());
+        REQUIRE(names_with_prefix(target_cache_dir, ".download.").empty());
+        REQUIRE(names_with_prefix(target_cache_dir, ".bitmap.").empty());
+        REQUIRE(reopened.warmup.layers_total == 1);
+        REQUIRE(reopened.warmup.layers_warmed == 1);
+        REQUIRE(reopened.warmup.windows_populated == 2);
         std::vector<uint8_t> data(1024);
         const auto n = co_await reopened.root->pread(data.data(), data.size(), 0);
         REQUIRE(n == 1024);

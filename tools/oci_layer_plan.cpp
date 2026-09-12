@@ -295,8 +295,13 @@ LayerPlan parse_oci_layer_plan(const std::string& tar_path) {
         entry.gid=narrow(attrs.count("gid") ? decimal(attrs.at("gid")) : number(h.data()+116,8));
         if(attrs.count("mtime")) pax_time(entry,attrs.at("mtime"));
         else header_time(entry,h.data()+136,12);
-        entry.device_major=narrow(number(h.data()+329,8));
-        entry.device_minor=narrow(number(h.data()+337,8));
+        entry.device_major=narrow(attrs.count("SCHILY.devmajor") ?
+            decimal(attrs.at("SCHILY.devmajor")) : number(h.data()+329,8));
+        entry.device_minor=narrow(attrs.count("SCHILY.devminor") ?
+            decimal(attrs.at("SCHILY.devminor")) : number(h.data()+337,8));
+        if ((entry.kind==EntryKind::Character || entry.kind==EntryKind::Block) &&
+            (entry.device_major>0xfff || entry.device_minor>0xfffff))
+            bad("device number exceeds Linux encoding");
         const uint64_t stored_size=attrs.count("size") ? decimal(attrs.at("size")) : header_size;
         const uint64_t skip=padded(stored_size);
         if (skip > reader.size-cursor) bad("payload extends beyond archive");

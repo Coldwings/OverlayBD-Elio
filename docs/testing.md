@@ -900,6 +900,8 @@ Every test, grouped by area, with the property it guards.
 - `image: writable image with a trace layer assembles and replays` — a
   writable (`upper`) image with `accelerationLayer` still sets the trace
   layer aside, replays it, and serves copy-on-write reads/writes.
+- `image: structural warm-up counts TurboOCI blobs as one lower` — metadata
+  and target warm independently while logical lower counters remain deduplicated.
 - `image: structural warm-up windows clamp and merge on small blobs` —
   the pure window computation: disjoint head/tail windows at the exact
   edges, per-side clamping, a single merged full window for any blob
@@ -1506,6 +1508,9 @@ Deterministic gzip index generation, corruption handling and output identity.
 - `format: gzip index builder is deterministic and readable`
 - `format: invalid gzip never publishes partial index`
 - `format: gzip index output cannot replace its input`
+- `format: gzip index records the initial checkpoint for one final block` —
+  uses a handwritten single-final-block gzip stream and checks complete recovery
+  from the checkpoint immediately after its gzip header.
 
 Independent restart-index layouts, bounds and concurrent random access.
 
@@ -1547,6 +1552,8 @@ OCI tar extensions, sparse maps, attributes, timestamps and rejection boundaries
 - `format: OCI plan rejects unsafe paths and malformed records`
 - `format: OCI plan validates archive termination and extension bounds`
 - `format: OCI plan preserves exact extended mtimes and rejects unrepresentable values`
+- `format: OCI plan honors scoped SCHILY device overrides` — checks extension
+  precedence, local/global scope, deletion and Linux device-number bounds.
 
 Descriptor validation, parent chains, empty archives and publication-time identity checks.
 
@@ -1558,6 +1565,8 @@ Descriptor validation, parent chains, empty archives and publication-time identi
 - `format: TurboOCI differential import rejects incompatible parent geometry`
 - `format: TurboOCI empty tar requires two complete zero terminator blocks`
 - `format: TurboOCI import revalidates every input immediately before publication`
+- `format: TurboOCI parent targets require valid tar prefixes` — checks raw
+  and gzip parents, malformed prefixes and terminators, and valid empty targets.
 
 Deterministic packaging and strict archive extraction.
 
@@ -1565,6 +1574,8 @@ Deterministic packaging and strict archive extraction.
 - `format: TurboOCI package errors preserve outputs and reject aliases`
 - `format: TurboOCI importer publishes validated metadata and optional index`
 - `format: TurboOCI importer rejects malformed archives without publication`
+- `format: TurboOCI extraction budget covers metadata and index cumulatively`
+- `format: TurboOCI importer bounds extraction before reading member payload`: Declared sizes, budget override and cleanup.
 
 Unmodified upstream-produced metadata and gzip fixture compatibility.
 

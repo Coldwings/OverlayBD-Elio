@@ -377,3 +377,24 @@ TEST_CASE("image: prefetch enable false skips structural warm-up",
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("image: structural warm-up counts TurboOCI blobs as one lower",
+          "[image][turboci]") {
+    PopulateRecorder metadata(512), target(1024), ordinary(512);
+    metadata.populate_result = -EIO;
+    const std::vector<image::StructuralWarmupTarget> sources = {
+        {&metadata, 0}, {&target, 0}, {&ordinary, 1}};
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        const auto stats = co_await image::warmup_structural_grouped(sources);
+        REQUIRE(stats.layers_total == 2);
+        REQUIRE(stats.layers_warmed == 2);
+        REQUIRE(stats.windows_failed == 1);
+        REQUIRE(stats.windows_populated == 2);
+        REQUIRE(stats.bytes_warmed == 1536);
+        REQUIRE(metadata.calls.size() == 1);
+        REQUIRE(target.calls.size() == 1);
+        REQUIRE(ordinary.calls.size() == 1);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}

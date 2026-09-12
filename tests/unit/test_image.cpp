@@ -312,6 +312,12 @@ TEST_CASE("image: TurboOCI configuration rejects orphan index and bad digest", "
         format_error);
     REQUIRE_THROWS_AS(image::ImageConfig::from_json_text(
         R"({"lowers":[{"targetDigest":"sha256:bad"}]})", {}), format_error);
+    for (const auto& hex : {std::string(64, 'A'), std::string(63, 'a') + "B"}) {
+        const nlohmann::json config = {{"lowers", nlohmann::json::array({
+            {{"targetDigest", "sha256:" + hex}}})}};
+        REQUIRE_THROWS_AS(image::ImageConfig::from_json_text(config.dump(), {}),
+                          format_error);
+    }
 }
 
 TEST_CASE("image: TurboOCI assembly retains original tar byte offsets", "[image][turboci]") {

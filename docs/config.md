@@ -348,11 +348,15 @@ This assembles one local lower plus a writable upper at
 
 A TurboOCI lower pairs its filesystem metadata `file` with the original OCI
 layer through `targetFile` (local path) or `targetDigest` (registry SHA-256 blob
-identity). When both are supplied, the local target is used. The target is the
+identity, `sha256:` followed by exactly 64 lowercase hexadecimal digits).
+When both are supplied, the local target is used. The target is the
 complete original archive: its tar header is not stripped. A remote target uses
 `repoBlobUrl` and the same registry authentication and read-admission funnel as
 ordinary lowers. With `dir`, its raw original bytes persist separately under
 `<dir>/targets/<target-sha256-hex>`; a completed target cache can reopen offline.
+Reopening sweeps stale staging pairs in that target directory. As with ordinary
+committed layers, completion verifies SHA-256 before publication; reopening
+trusts the committed file without scanning the entire blob again.
 The target cache is below gzip decoding and cannot collide with the metadata
 cache. Without `dir`, or when that directory cannot support persistence, reads
 use the remote source through the admission funnel.

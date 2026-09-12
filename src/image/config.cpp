@@ -194,7 +194,7 @@ ImageConfig ImageConfig::from_json_text(const std::string& text,
                 const auto hex = digest_sha256_hex(lower.target_digest);
                 if (hex.size() != 64 ||
                     !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
-                        return std::isxdigit(c) != 0;
+                        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
                     })) {
                     throw format_error("malformed TurboOCI targetDigest");
                 }

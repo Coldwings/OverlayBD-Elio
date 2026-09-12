@@ -146,6 +146,20 @@ std::string uuid_key(std::string value) {
     }
     return value=="00000000-0000-0000-0000-000000000000" ? "" : value;
 }
+elio::coro::task<void> validate_tar_target(source::BlobSource& target) {
+    std::array<uint8_t,512> tar_header{};
+    const auto tar_read=co_await target.pread(tar_header.data(),tar_header.size(),0);
+    if(tar_read!=static_cast<ssize_t>(tar_header.size()))
+        throw format_error("TurboOCI target does not have a complete tar header");
+    if(std::all_of(tar_header.begin(),tar_header.end(),[](uint8_t b){return b==0;})) {
+        const auto terminator=co_await target.pread(tar_header.data(),tar_header.size(),512);
+        if(target.size()<1024 || terminator!=static_cast<ssize_t>(tar_header.size()) ||
+           !std::all_of(tar_header.begin(),tar_header.end(),[](uint8_t b){return b==0;}))
+            throw format_error("TurboOCI empty tar requires two zero terminator blocks");
+    } else if(std::memcmp(tar_header.data()+257,"ustar",5)!=0)
+        throw format_error("TurboOCI target does not have a tar header");
+    co_return;
+}
 elio::coro::task<std::unique_ptr<format::LsmtLayer>> open_local_layer(const LocalLayer& local) {
     source::BlobSourcePtr metadata=co_await source::LocalFileSource::open(local.metadata);
     metadata=co_await source::TarOffsetSource::open(std::move(metadata));
@@ -164,6 +178,7 @@ elio::coro::task<std::unique_ptr<format::LsmtLayer>> open_local_layer(const Loca
         }
         target=std::move(gzip);
     }
+    co_await validate_tar_target(*target);
     co_return co_await format::LsmtLayer::open_warp(std::move(metadata),std::move(target));
 }
 std::vector<LocalLayer> load_parents(const std::string& path,Inputs& inputs) {
@@ -219,7 +234,8 @@ nlohmann::json import_turbo_image(const std::string& package_path,
                                   const std::string& descriptor_path,
                                   const std::string& target_path,
                                   const std::string& destination_dir,
-                                  const std::string& parent_config_path
+                                  const std::string& parent_config_path,
+                                  uint64_t metadata_budget
 #ifdef OBD_TEST_TURBO_IMPORT_HOOK
                                   , const std::function<void()>& before_publish
 #endif
@@ -257,7 +273,7 @@ nlohmann::json import_turbo_image(const std::string& package_path,
     std::vector<char> name(staging.path.begin(),staging.path.end()); name.push_back(0);
     if(!mkdtemp(name.data())) { staging.path.clear(); throw error(errno,"create TurboOCI validation directory"); }
     staging.path=name.data();
-    const auto extracted=import_turbo_package(package_path,(fs::path(staging.path)/"image").string());
+    const auto extracted=import_turbo_package(package_path,(fs::path(staging.path)/"image").string(),metadata_budget);
     if((!extracted.gzip_index_path.empty())!=target.gzip)
         throw format_error("TurboOCI gzip index does not match target media type");
     (void)record_input(inputs,extracted.metadata_path);
@@ -279,17 +295,7 @@ nlohmann::json import_turbo_image(const std::string& package_path,
             }
             target_source=std::move(gzip);
         }
-        std::array<uint8_t,512> tar_header{};
-        const auto tar_read=co_await target_source->pread(tar_header.data(),tar_header.size(),0);
-        if(tar_read!=static_cast<ssize_t>(tar_header.size()))
-            throw format_error("TurboOCI target does not have a complete tar header");
-        if(std::all_of(tar_header.begin(),tar_header.end(),[](uint8_t b){return b==0;})) {
-            const auto terminator=co_await target_source->pread(tar_header.data(),tar_header.size(),512);
-            if(target_source->size()<1024 || terminator!=static_cast<ssize_t>(tar_header.size()) ||
-               !std::all_of(tar_header.begin(),tar_header.end(),[](uint8_t b){return b==0;}))
-                throw format_error("TurboOCI empty tar requires two zero terminator blocks");
-        } else if(std::memcmp(tar_header.data()+257,"ustar",5)!=0)
-            throw format_error("TurboOCI target does not have a tar header");
+        co_await validate_tar_target(*target_source);
         source::BlobSourcePtr metadata=co_await source::LocalFileSource::open(extracted.metadata_path);
         metadata=co_await source::TarOffsetSource::open(std::move(metadata));
         if(co_await format::is_zfile(*metadata))

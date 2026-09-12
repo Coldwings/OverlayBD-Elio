@@ -212,7 +212,9 @@ std::string member_name(const std::array<uint8_t,512>& h) {
 }
 
 ImportedTurboPackage import_turbo_package(const std::string& package_path,
-                                          const std::string& output_directory) {
+                                          const std::string& output_directory,
+                                          uint64_t metadata_budget) {
+    if(!metadata_budget) throw error(EINVAL,"TurboOCI metadata budget must be positive");
     if(output_directory.empty()) throw error(EINVAL,"empty TurboOCI import directory");
     const std::filesystem::path destination(output_directory);
     if(destination.filename().empty() || destination.filename()=="." || destination.filename()=="..")
@@ -228,6 +230,7 @@ ImportedTurboPackage import_turbo_package(const std::string& package_path,
     temporary.path=name.data();
     GzipReader gzip(input.p);
     bool metadata=false,marker=false,index=false;
+    uint64_t remaining_budget=metadata_budget;
     std::array<uint8_t,512> h{};
     std::array<uint8_t,65536> data{};
     for(;;) {
@@ -257,6 +260,9 @@ ImportedTurboPackage import_turbo_package(const std::string& package_path,
         if(*seen) throw format_error("duplicate TurboOCI tar member: "+member);
         *seen=true;
         if(member==".turbo.ociv1" && size!=0) throw format_error("TurboOCI marker must be empty");
+        if(size>remaining_budget)
+            throw format_error("TurboOCI metadata exceeds import budget; increase --max-import-metadata-size");
+        remaining_budget-=size;
         File output;
         if(member!=".turbo.ociv1") {
             const auto path=std::filesystem::path(temporary.path)/member;

@@ -3,6 +3,7 @@
 #include "../../tools/gzip_index_builder.hpp"
 #include "format/writer.hpp"
 #include "common/sha256.hpp"
+#include "common/errors.hpp"
 #include "../support.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <fstream>
@@ -77,6 +78,13 @@ TEST_CASE("format: TurboOCI descriptor import returns validated runnable config"
     for(bool gzip:{false,true}) {
         ImportFixture f(gzip);
         if(gzip) json_file(f.dir/"descriptor",nlohmann::json{{"descriptor",f.descriptor}});
+        std::string budget_rejection;
+        try {
+            (void)obd::convert::import_turbo_image(f.dir/"package",f.dir/"descriptor",
+                f.dir/"target",f.dir/"imported",{},1);
+        } catch(const obd::error& e) { budget_rejection=e.what(); }
+        REQUIRE(budget_rejection.find("import budget")!=std::string::npos);
+        REQUIRE_FALSE(std::filesystem::exists(f.dir/"imported"));
         const auto config=f.run();
         const auto& lower=config.at("lowers").at(0);
         REQUIRE(lower.at("targetFile")==std::filesystem::absolute(f.dir/"target").string());
@@ -256,7 +264,7 @@ TEST_CASE("format: TurboOCI import revalidates every input immediately before pu
             std::filesystem::rename(replacement,path);
         };
         REQUIRE_THROWS(obd::convert::import_turbo_image(child.dir/"package",child.dir/"descriptor",
-            child.dir/"target",child.dir/"imported",child.dir/"parent.json",replace_before_publication));
+            child.dir/"target",child.dir/"imported",child.dir/"parent.json",obd::convert::kDefaultTurboMetadataBudget,replace_before_publication));
         REQUIRE(called);
         REQUIRE_FALSE(std::filesystem::exists(child.dir/"imported"));
         for(const auto& entry:std::filesystem::directory_iterator(child.dir.path()))
@@ -264,3 +272,46 @@ TEST_CASE("format: TurboOCI import revalidates every input immediately before pu
     }
 }
 #endif
+
+TEST_CASE("format: TurboOCI parent targets require valid tar prefixes", "[convert][turbo]") {
+    for(bool gzip:{false,true}) for(int variant=0;variant<4;++variant) {
+        ImportFixture parent(gzip);
+        auto config=parent.run();
+        // Keep metadata bounds satisfied, except for the deliberately short
+        // terminator case, which must fail at the shared tar validator first.
+        std::vector<uint8_t> target(variant==1 ? 512:2048,0);
+        if(variant==0) std::fill(target.begin(),target.begin()+512,'x');
+        if(variant==2) target[512]=1;
+        if(gzip) {
+            std::vector<uint8_t> packed(compressBound(target.size())+100);
+            z_stream z{};
+            REQUIRE(deflateInit2(&z,6,Z_DEFLATED,31,8,Z_DEFAULT_STRATEGY)==Z_OK);
+            z.next_in=target.data(); z.avail_in=target.size();
+            z.next_out=packed.data(); z.avail_out=packed.size();
+            REQUIRE(deflate(&z,Z_FINISH)==Z_STREAM_END);
+            packed.resize(z.total_out); deflateEnd(&z); target=std::move(packed);
+        }
+        const auto path=parent.dir/"target";
+        obd::test::write_file(path,target);
+        auto& lower=config["lowers"][0];
+        lower["targetDigest"]=digest_of(target);
+        lower["targetSize"]=target.size();
+        if(gzip) obd::convert::build_gzip_index(path,lower["gzipIndex"].get<std::string>());
+        ImportFixture child(false,"11111111-1111-1111-1111-111111111111");
+        json_file(child.dir/"parent.json",config);
+        if(variant==3) {
+            const auto imported=obd::convert::import_turbo_image(child.dir/"package",child.dir/"descriptor",
+                child.dir/"target",child.dir/"imported",child.dir/"parent.json");
+            REQUIRE(imported["lowers"].size()==2);
+        } else {
+            std::string rejection;
+            try {
+                (void)obd::convert::import_turbo_image(child.dir/"package",child.dir/"descriptor",
+                    child.dir/"target",child.dir/"imported",child.dir/"parent.json");
+            } catch(const obd::error& e) { rejection=e.what(); }
+            REQUIRE(rejection.find(variant==0 ? "does not have a tar header" :
+                "empty tar requires two zero terminator blocks")!=std::string::npos);
+            REQUIRE_FALSE(std::filesystem::exists(child.dir/"imported"));
+        }
+    }
+}

@@ -223,3 +223,29 @@ TEST_CASE("format: OCI plan preserves exact extended mtimes and rejects unrepres
     std::copy(header.begin(),header.end(),positive.data.begin());
     REQUIRE(positive.parse().entries[0].mtime_seconds==1700000000);
 }
+
+TEST_CASE("format: OCI plan honors scoped SCHILY device overrides", "[convert][oci-plan]") {
+    Tar tar;
+    tar.add("global",'g',pax("SCHILY.devmajor","8")+pax("SCHILY.devminor","9"));
+    tar.add("local",'x',pax("SCHILY.devmajor","4095")+pax("SCHILY.devminor","1048575"));
+    tar.add("char",'3'); // Header device fields are zero, overridden by PAX.
+    tar.add("block",'4');
+    tar.add("global",'g',pax("SCHILY.devmajor","")+pax("SCHILY.devminor",""));
+    tar.add("fallback",'3');
+    const auto plan=tar.parse();
+    REQUIRE(plan.entries[0].device_major==4095);
+    REQUIRE(plan.entries[0].device_minor==1048575);
+    REQUIRE(plan.entries[1].device_major==8);
+    REQUIRE(plan.entries[1].device_minor==9);
+    REQUIRE(plan.entries[2].device_major==0);
+    REQUIRE(plan.entries[2].device_minor==0);
+    for(const auto& [key,value]:std::vector<std::pair<std::string,std::string>>{
+        {"SCHILY.devmajor","4096"},{"SCHILY.devminor","1048576"},
+        {"SCHILY.devmajor","4294967296"},{"SCHILY.devminor","18446744073709551616"},
+        {"SCHILY.devmajor","-1"},{"SCHILY.devminor","1x"}}) {
+        Tar invalid;
+        invalid.add("pax",'x',pax(key,value));
+        invalid.add("device",'3');
+        REQUIRE_THROWS_AS(invalid.parse(),format_error);
+    }
+}

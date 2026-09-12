@@ -1,6 +1,7 @@
 #include "../../tools/turbo_package.hpp"
 #include "../support.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <algorithm>
 #include <fstream>
 #include <iterator>
@@ -155,4 +156,52 @@ TEST_CASE("format: TurboOCI importer rejects malformed archives without publicat
         for(const auto& entry:std::filesystem::directory_iterator(dir.path()))
             REQUIRE(entry.path().filename().string().find(".tmp.")==std::string::npos);
     }
+}
+
+TEST_CASE("format: TurboOCI importer bounds extraction before reading member payload", "[convert][turbo]") {
+    obd::test::TempDir dir;
+    const std::vector<uint8_t> payload(17, 'a');
+    obd::test::write_file(dir/"metadata",payload);
+    obd::convert::write_turbo_package(dir/"metadata","",dir/"valid.gz");
+    const auto valid=unpack(read_package(dir/"valid.gz"));
+    for(bool index:{false,true}) {
+        auto tar=valid;
+        std::fill(tar.begin(),tar.begin()+100,0);
+        const char* name=index ? "gzip.meta":"ext4.fs.meta";
+        std::memcpy(tar.data(),name,std::strlen(name));
+        const uint64_t size=obd::convert::kDefaultTurboMetadataBudget+1;
+        char numeric[13]{};
+        std::snprintf(numeric,sizeof(numeric),"%011llo",static_cast<unsigned long long>(size));
+        std::memcpy(tar.data()+124,numeric,12);
+        fix_checksum(tar,0);
+        // Deliberately omit the payload. A size-specific error proves rejection
+        // precedes both decompression of that payload and staging-file writes.
+        tar.resize(512);
+        obd::test::write_file(dir/"oversized.gz",gzip_tar(tar));
+        REQUIRE_THROWS_WITH(obd::convert::import_turbo_package(dir/"oversized.gz",dir/"out"),
+            Catch::Matchers::ContainsSubstring("import budget"));
+        REQUIRE_FALSE(std::filesystem::exists(dir/"out"));
+        for(const auto& entry:std::filesystem::directory_iterator(dir.path()))
+            REQUIRE(entry.path().filename().string().find(".tmp.")==std::string::npos);
+    }
+    REQUIRE_THROWS_WITH(obd::convert::import_turbo_package(dir/"valid.gz",dir/"out",16),
+        Catch::Matchers::ContainsSubstring("import budget"));
+    auto imported=obd::convert::import_turbo_package(dir/"valid.gz",dir/"out",17);
+    REQUIRE(read_package(imported.metadata_path)==payload);
+}
+
+TEST_CASE("format: TurboOCI extraction budget covers metadata and index cumulatively", "[convert][turbo]") {
+    obd::test::TempDir dir;
+    const std::vector<uint8_t> payload(17,'x');
+    obd::test::write_file(dir/"metadata",payload);
+    obd::test::write_file(dir/"index",payload);
+    obd::convert::write_turbo_package(dir/"metadata",dir/"index",dir/"package.gz");
+    REQUIRE_THROWS_WITH(obd::convert::import_turbo_package(dir/"package.gz",dir/"out",33),
+        Catch::Matchers::ContainsSubstring("import budget"));
+    REQUIRE_FALSE(std::filesystem::exists(dir/"out"));
+    for(const auto& entry:std::filesystem::directory_iterator(dir.path()))
+        REQUIRE(entry.path().filename().string().find(".tmp.")==std::string::npos);
+    const auto imported=obd::convert::import_turbo_package(dir/"package.gz",dir/"out",34);
+    REQUIRE(read_package(imported.metadata_path)==payload);
+    REQUIRE(read_package(imported.gzip_index_path)==payload);
 }

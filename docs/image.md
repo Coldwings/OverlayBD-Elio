@@ -629,9 +629,14 @@ each clamped to the blob (0 disables a side), merged into `[0, size)`
 when the clamped windows would cover the whole blob (no byte populated
 twice), empty for an empty blob.
 
+`warmup_structural_grouped` accepts `StructuralWarmupTarget` entries associating each stored blob with
+its logical `layer_index`. TurboOCI metadata and original target both receive
+windows, but `layers_total` and `layers_warmed` count their lower once; a
+successful slice from either blob marks that lower warmed. Window and byte
+counters still count actual work across both sources.
+
 `src/image/structural_warmup.hpp::warmup_structural` — populates the
-windows of every target (one stored-blob-level source per data lower, a
-nullptr entry is skipped): head before tail per layer, each `populate()`
+windows of every target (a nullptr entry is skipped): head before tail per layer, each `populate()`
 sequentially awaited. **Never throws**: a failed (or throwing) populate
 is logged, counted in `windows_failed`, and warm-up moves on; processing
 stops early when the wall-time budget is spent (`budget_exhausted`

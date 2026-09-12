@@ -43,6 +43,9 @@ as the file-content source.
   reads must not share mutable inflater state. Source reads remain asynchronous.
 - Import and produce the upstream metadata package and target annotations.
   Validate required entries, target identity, media type, and archive paths;
+  Enforce declared extraction sizes before writing against an operator-adjustable
+  cumulative metadata and gzip-index budget (1 GiB by default).
+  This is an extraction resource policy, not a virtual filesystem size limit;
   report unsupported formats and malformed input instead of emitting a
   runnable-looking partial configuration. Differential package import
   requires a complete local parent configuration and verifies its UUID chain;

@@ -323,6 +323,7 @@ void usage(const char* argv0) {
                  "          [--backend builtin-ext2|libe2fs] [--size bytes] [--keep-raw]\n"
                  "          [--turboOCI] (local tar or gzip, libe2fs required)\n"
                  "          [--import-turboOCI package --descriptor descriptor.json [--parent-config config.json]]\n"
+                 "          [--max-import-metadata-size bytes (default 1073741824)]\n"
                  "\n"
                  "Builds <out-dir>/<name>.lsmt from a ustar rootfs stream. Builds\n"
                  "with the pinned libe2fs backend use it by default; dependency-free\n"
@@ -1680,6 +1681,8 @@ struct Options {
     std::string import_package;
     std::string descriptor;
     std::string parent_config;
+    uint64_t import_metadata_budget = obd::convert::kDefaultTurboMetadataBudget;
+    bool import_budget_set = false;
     std::string input;
     std::string out_dir;
     std::string name = "layer";
@@ -1706,6 +1709,10 @@ Options parse_args(int argc, char** argv) {
             opts.inputs.push_back(opts.input);
         }
         else if (a == "--import-turboOCI") opts.import_package = next("--import-turboOCI");
+        else if (a == "--max-import-metadata-size") {
+            opts.import_metadata_budget = parse_size_arg(next("--max-import-metadata-size"), "--max-import-metadata-size");
+            opts.import_budget_set = true;
+        }
         else if (a == "--parent-config") opts.parent_config = next("--parent-config");
         else if (a == "--descriptor") opts.descriptor = next("--descriptor");
         else if (a == "--out-dir") opts.out_dir = next("--out-dir");
@@ -1736,8 +1743,8 @@ Options parse_args(int argc, char** argv) {
     if (!opts.import_package.empty()) {
         if (opts.descriptor.empty() || opts.input == "-" || opts.turbo_oci || opts.size != 0 || opts.keep_raw)
             throw UsageError("--import-turboOCI requires --descriptor and a local --input; conversion options cannot be combined");
-    } else if (!opts.descriptor.empty() || !opts.parent_config.empty()) {
-        throw UsageError("--descriptor and --parent-config require --import-turboOCI");
+    } else if (!opts.descriptor.empty() || !opts.parent_config.empty() || opts.import_budget_set) {
+        throw UsageError("--descriptor, --parent-config and --max-import-metadata-size require --import-turboOCI");
     }
 #if !OBD_HAVE_LIBE2FS
     if (opts.backend == ConverterBackend::LibE2fs) {
@@ -1757,7 +1764,7 @@ int main(int argc, char** argv) {
         const Options opts = parse_args(argc, argv);
         if (!opts.import_package.empty()) {
             const auto imported = obd::convert::import_turbo_image(
-                opts.import_package, opts.descriptor, opts.input, opts.out_dir + "/" + opts.name, opts.parent_config);
+                opts.import_package, opts.descriptor, opts.input, opts.out_dir + "/" + opts.name, opts.parent_config, opts.import_metadata_budget);
             std::puts(imported.dump(2).c_str());
             return 0;
         }
