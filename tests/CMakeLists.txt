@@ -73,7 +73,8 @@ if(OBD_E2FSCK_EXECUTABLE)
 endif()
 add_dependencies(obd_unit_tests obdctl obd-convert)
 catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
-    PROPERTIES TIMEOUT 60)
+    PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
+               TIMEOUT 60)
 
 if(OBD_ENABLE_UBLK)
     target_sources(obd_unit_tests PRIVATE
