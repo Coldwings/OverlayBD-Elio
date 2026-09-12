@@ -627,6 +627,19 @@ TEST_CASE("cli: obd-convert libe2fs expands built-in file and directory limits",
     REQUIRE(too_small.err.find("contents and ext2 metadata exceed image budget") !=
             std::string::npos);
 
+    const uint64_t explicit_capacity_size = 8ull * 1024 * 1024;
+    const std::string near_capacity_tar = write_sparse_regular_files_tar(
+        dir / "near-capacity.tar", 1, 2028ull * kExt2BlockSize);
+    const auto near_capacity =
+        run_convert({"--input", near_capacity_tar, "--out-dir", dir / "near-capacity",
+                     "--name", "near-capacity", "--size",
+                     std::to_string(explicit_capacity_size)},
+                    nullptr, false);
+    REQUIRE(near_capacity.exit_code == 0);
+    const auto near_capacity_manifest = nlohmann::json::parse(near_capacity.out);
+    REQUIRE(near_capacity_manifest["converter"]["virtual_size"].get<uint64_t>() ==
+            explicit_capacity_size);
+
     const auto feature_tar = make_libe2fs_feature_tar();
     const std::string feature_path = test::write_file(dir / "features.tar", feature_tar);
     const auto feature_result = run_convert({"--input", feature_path, "--out-dir", dir / "features",
