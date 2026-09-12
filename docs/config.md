@@ -351,7 +351,11 @@ layer through `targetFile` (local path) or `targetDigest` (registry SHA-256 blob
 identity). When both are supplied, the local target is used. The target is the
 complete original archive: its tar header is not stripped. A remote target uses
 `repoBlobUrl` and the same registry authentication and read-admission funnel as
-ordinary lowers.
+ordinary lowers. With `dir`, its raw original bytes persist separately under
+`<dir>/targets/<target-sha256-hex>`; a completed target cache can reopen offline.
+The target cache is below gzip decoding and cannot collide with the metadata
+cache. Without `dir`, or when that directory cannot support persistence, reads
+use the remote source through the admission funnel.
 
 `gzipIndex` is a local path to the upstream `ddgzidx` v1 restart index for a gzip
 encoded target. It requires a target; orphan indexes and malformed target

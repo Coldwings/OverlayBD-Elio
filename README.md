@@ -124,5 +124,6 @@ persisted at flush/checkpoint),
 ublk data plane, supervisor process model with ublk
 USER_RECOVERY crash recovery (ADR-0010), structural warm-up, trace replay,
 supervisor-driven trace recording (ADR-0012/0013), and deterministic rootfs
-conversion to local LSMT layers (ADR-0019). Deferred by design: TurboOCI and
-the upstream dynamic prefetch file-list mode.
+conversion to local LSMT layers (ADR-0019), native TurboOCI reads and
+OCI-to-TurboOCI conversion (ADR-0020). The upstream dynamic prefetch file-list
+mode remains deferred.

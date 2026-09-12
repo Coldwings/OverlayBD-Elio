@@ -46,7 +46,7 @@ TEST_CASE("convert: gzip index builder is deterministic and readable", "[convert
     REQUIRE(le(index,41,8)==index.size());
     REQUIRE(le(index,49,8)==plain.size());
     REQUIRE(le(index,313,8)+le(index,321,8)==index.size());
-    REQUIRE(obd::test::run_coro([&]() -> elio::coro::task<int> {
+    const auto result = obd::test::run_coro([&]() -> elio::coro::task<int> {
         auto source=co_await obd::source::GzipIndexSource::open(
             std::make_unique<obd::test::VectorSource>(compressed),
             std::make_unique<obd::test::VectorSource>(index));
@@ -57,7 +57,8 @@ TEST_CASE("convert: gzip index builder is deterministic and readable", "[convert
             REQUIRE(std::equal(out.begin(),out.end(),plain.begin()+offset));
         }
         co_return 0;
-    })==0);
+    });
+    REQUIRE(result == 0);
 }
 
 TEST_CASE("convert: invalid gzip never publishes partial index", "[convert][gzip]") {

@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include <sys/syscall.h>
+#include <linux/fs.h>
 #include <zlib.h>
 
 namespace obd::convert {
@@ -126,5 +128,171 @@ void write_turbo_package(const std::string& metadata_path,const std::string& gzi
     if(fclose(closing)!=0) throw error(errno,"close TurboOCI package");
     if(rename(temporary.path.c_str(),output_path.c_str())!=0) throw error(errno,"publish TurboOCI package");
     temporary.path.clear();
+}
+
+namespace {
+class GzipReader {
+    FILE* file_;
+    z_stream z_{};
+    bool active_=false, ended_=false;
+    std::array<uint8_t,65536> input_{};
+public:
+    explicit GzipReader(FILE* file):file_(file) {
+        if(inflateInit2(&z_,31)!=Z_OK) throw error(ENOMEM,"initialize TurboOCI gzip reader");
+        active_=true;
+    }
+    ~GzipReader() { if(active_) inflateEnd(&z_); }
+    size_t read(void* buffer,size_t count) {
+        if(ended_) return 0;
+        z_.next_out=static_cast<Bytef*>(buffer); z_.avail_out=static_cast<uInt>(count);
+        while(z_.avail_out) {
+            if(!z_.avail_in) {
+                size_t n=fread(input_.data(),1,input_.size(),file_);
+                if(!n) {
+                    if(ferror(file_)) throw error(errno ? errno:EIO,"read TurboOCI gzip package");
+                    throw format_error("truncated TurboOCI gzip stream");
+                }
+                z_.next_in=input_.data(); z_.avail_in=static_cast<uInt>(n);
+            }
+            const auto before_in=z_.avail_in, before_out=z_.avail_out;
+            const int status=inflate(&z_,Z_NO_FLUSH);
+            if(status==Z_STREAM_END) {
+                if(z_.avail_in || fgetc(file_)!=EOF)
+                    throw format_error("trailing or concatenated TurboOCI gzip data");
+                if(ferror(file_)) throw error(errno ? errno:EIO,"read TurboOCI gzip trailer");
+                ended_=true;
+                break;
+            }
+            if(status!=Z_OK && status!=Z_BUF_ERROR)
+                throw format_error("invalid TurboOCI gzip stream or trailer");
+            if(before_in==z_.avail_in && before_out==z_.avail_out)
+                throw format_error("TurboOCI gzip inflater made no progress");
+        }
+        return count-z_.avail_out;
+    }
+    void exact(void* buffer,size_t count) {
+        if(read(buffer,count)!=count) throw format_error("truncated TurboOCI tar archive");
+    }
+};
+struct PrivateDirectory {
+    std::string path;
+    ~PrivateDirectory() {
+        if(!path.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(path,ignored);
+        }
+    }
+};
+uint64_t parse_octal(const uint8_t* p,size_t n) {
+    uint64_t result=0;
+    size_t i=0;
+    while(i<n && p[i]==' ') ++i;
+    for(;i<n && p[i]>='0' && p[i]<='7';++i) result=result*8+p[i]-'0';
+    for(;i<n;++i) if(p[i]!=0 && p[i]!=' ')
+        throw format_error("invalid TurboOCI USTAR numeric field");
+    return result;
+}
+bool all_zero(const uint8_t* p,size_t n) {
+    return std::all_of(p,p+n,[](uint8_t b){return b==0;});
+}
+std::string member_name(const std::array<uint8_t,512>& h) {
+    if(std::memcmp(h.data()+257,"ustar\0",6)!=0 || std::memcmp(h.data()+263,"00",2)!=0)
+        throw format_error("TurboOCI archive requires USTAR headers");
+    if(!all_zero(h.data()+345,155) || !all_zero(h.data()+157,100) ||
+       (h[156]!='0' && h[156]!=0))
+        throw format_error("TurboOCI archive requires unprefixed regular files");
+    unsigned sum=0;
+    for(size_t i=0;i<h.size();++i) sum+=(i>=148 && i<156) ? ' ':h[i];
+    if(parse_octal(h.data()+148,8)!=sum) throw format_error("TurboOCI tar checksum mismatch");
+    const auto end=std::find(h.begin(),h.begin()+100,0);
+    if(end==h.begin()+100 || !all_zero(&*end,static_cast<size_t>(h.begin()+100-end)))
+        throw format_error("invalid TurboOCI tar member name");
+    return {reinterpret_cast<const char*>(h.data()),static_cast<size_t>(end-h.begin())};
+}
+}
+
+ImportedTurboPackage import_turbo_package(const std::string& package_path,
+                                          const std::string& output_directory) {
+    if(output_directory.empty()) throw error(EINVAL,"empty TurboOCI import directory");
+    const std::filesystem::path destination(output_directory);
+    if(destination.filename().empty() || destination.filename()=="." || destination.filename()=="..")
+        throw error(EINVAL,"invalid TurboOCI import directory");
+    struct stat existing{};
+    if(lstat(output_directory.c_str(),&existing)==0) throw error(EEXIST,"TurboOCI import destination exists");
+    if(errno!=ENOENT) throw error(errno,"inspect TurboOCI import destination");
+    File input{fopen(package_path.c_str(),"rb")};
+    if(!input.p) throw error(errno,"open TurboOCI package");
+    PrivateDirectory temporary{output_directory+".tmp.XXXXXX"};
+    std::vector<char> name(temporary.path.begin(),temporary.path.end()); name.push_back(0);
+    if(!mkdtemp(name.data())) { temporary.path.clear(); throw error(errno,"create TurboOCI import temporary"); }
+    temporary.path=name.data();
+    GzipReader gzip(input.p);
+    bool metadata=false,marker=false,index=false;
+    std::array<uint8_t,512> h{};
+    std::array<uint8_t,65536> data{};
+    for(;;) {
+        gzip.exact(h.data(),h.size());
+        if(all_zero(h.data(),h.size())) {
+            gzip.exact(h.data(),h.size());
+            if(!all_zero(h.data(),h.size())) throw format_error("TurboOCI tar requires two zero terminators");
+            // Traditional tar pads the final record. Permit bounded zero-only
+            // padding and consume through the gzip trailer to verify its CRC.
+            size_t padding=0;
+            for(;;) {
+                size_t n=gzip.read(data.data(),data.size());
+                if(!n) break;
+                padding+=n;
+                if(padding>1024*1024 || !all_zero(data.data(),n))
+                    throw format_error("invalid trailing TurboOCI tar data");
+            }
+            break;
+        }
+        const std::string member=member_name(h);
+        const uint64_t size=parse_octal(h.data()+124,12);
+        bool* seen=nullptr;
+        if(member=="ext4.fs.meta") seen=&metadata;
+        else if(member==".turbo.ociv1") seen=&marker;
+        else if(member=="gzip.meta") seen=&index;
+        else throw format_error("unsupported TurboOCI tar member: "+member);
+        if(*seen) throw format_error("duplicate TurboOCI tar member: "+member);
+        *seen=true;
+        if(member==".turbo.ociv1" && size!=0) throw format_error("TurboOCI marker must be empty");
+        File output;
+        if(member!=".turbo.ociv1") {
+            const auto path=std::filesystem::path(temporary.path)/member;
+            int fd=open(path.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
+            if(fd<0) throw error(errno,"create imported TurboOCI member");
+            output.p=fdopen(fd,"wb");
+            if(!output.p) { int saved=errno; close(fd); throw error(saved,"open imported TurboOCI member"); }
+        }
+        uint64_t left=size;
+        while(left) {
+            size_t n=static_cast<size_t>(std::min<uint64_t>(left,data.size()));
+            gzip.exact(data.data(),n);
+            if(fwrite(data.data(),1,n,output.p)!=n) throw error(errno ? errno:EIO,"write imported TurboOCI member");
+            left-=n;
+        }
+        const size_t padding=(512-size%512)%512;
+        if(padding) {
+            gzip.exact(data.data(),padding);
+            if(!all_zero(data.data(),padding)) throw format_error("nonzero TurboOCI member padding");
+        }
+        if(output.p) {
+            if(fflush(output.p)!=0 || fsync(fileno(output.p))!=0) throw error(errno,"flush imported TurboOCI member");
+            FILE* closing=output.p; output.p=nullptr;
+            if(fclose(closing)!=0) throw error(errno,"close imported TurboOCI member");
+        }
+    }
+    if(!metadata || !marker) throw format_error("TurboOCI package lacks metadata or marker");
+    ImportedTurboPackage result{(destination/"ext4.fs.meta").string(),
+                                index ? (destination/"gzip.meta").string():""};
+    // NOREPLACE preserves an independently created destination in the race
+    // between initial validation and publication; ordinary rename can replace
+    // an existing empty directory.
+    if(syscall(SYS_renameat2,AT_FDCWD,temporary.path.c_str(),AT_FDCWD,
+               output_directory.c_str(),RENAME_NOREPLACE)!=0)
+        throw error(errno,"publish imported TurboOCI package");
+    temporary.path.clear();
+    return result;
 }
 } // namespace obd::convert

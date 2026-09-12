@@ -65,7 +65,7 @@ struct Fixture {
 
 TEST_CASE("source: ddgzidx golden raw and zlib random reads", "[source][gzip]") {
     for (bool compressed : {false,true}) {
-        REQUIRE(obd::test::run_coro([compressed]() -> elio::coro::task<int> {
+        const auto result = obd::test::run_coro([compressed]() -> elio::coro::task<int> {
             Fixture f(compressed);
             auto source = co_await obd::source::GzipIndexSource::open(
                 std::make_unique<obd::test::VectorSource>(f.gzip),
@@ -84,13 +84,14 @@ TEST_CASE("source: ddgzidx golden raw and zlib random reads", "[source][gzip]") 
             REQUIRE(read_count_4 == 5);
             REQUIRE(std::string(data.data(),5)=="abcde");
             co_return 0;
-        })==0);
+        });
+        REQUIRE(result == 0);
     }
 }
 
 TEST_CASE("source: ddgzidx rejects malformed header and entry boundaries", "[source][gzip]") {
     for (int mutation=0; mutation<9; ++mutation) {
-        REQUIRE(obd::test::run_coro([mutation]() -> elio::coro::task<int> {
+        const auto result = obd::test::run_coro([mutation]() -> elio::coro::task<int> {
             Fixture f(false);
             switch (mutation) {
                 case 0: f.index[0]='x'; break;
@@ -112,12 +113,13 @@ TEST_CASE("source: ddgzidx rejects malformed header and entry boundaries", "[sou
             } catch (const std::exception&) { rejected=true; }
             REQUIRE(rejected);
             co_return 0;
-        })==0);
+        });
+        REQUIRE(result == 0);
     }
 }
 
 TEST_CASE("source: ddgzidx primes partial-byte checkpoint with dictionary", "[source][gzip]") {
-    REQUIRE(obd::test::run_coro([]() -> elio::coro::task<int> {
+    const auto result = obd::test::run_coro([]() -> elio::coro::task<int> {
         // Build two real DEFLATE blocks with the first ending inside a byte.
         // Derive the checkpoint using zlib's documented Z_BLOCK data_type,
         // independently of the ddgzidx reader and project converter.
@@ -176,5 +178,6 @@ TEST_CASE("source: ddgzidx primes partial-byte checkpoint with dictionary", "[so
         REQUIRE(b==100);
         REQUIRE(read==other);
         co_return 0;
-    })==0);
+    });
+    REQUIRE(result == 0);
 }

@@ -15,6 +15,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <zlib.h>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -22,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <thread>
@@ -376,6 +378,52 @@ public:
             n.blocks[i] = bytes::load_u32_le(p + 40 + i * 4);
         }
         return n;
+    }
+
+    std::pair<int64_t,uint32_t> mtime(uint32_t ino) const {
+        const uint64_t off=uint64_t(inode_table_block_)*block_size_+uint64_t(ino-1)*inode_size_;
+        REQUIRE(off+inode_size_<=raw_.size());
+        const auto* p=raw_.data()+off;
+        const auto low=bytes::load_u32_le(p+16);
+        int64_t seconds=low&0x80000000U ? int64_t(low)-4294967296LL : low;
+        uint32_t extra=0;
+        if(inode_size_>=140 && bytes::load_u16_le(p+128)>=12)
+            extra=bytes::load_u32_le(p+136);
+        seconds+=int64_t(extra&3)*4294967296LL;
+        return {seconds,extra>>2};
+    }
+
+    std::map<std::string,std::string> user_xattrs(uint32_t ino) const {
+        const uint64_t off=uint64_t(inode_table_block_)*block_size_+uint64_t(ino-1)*inode_size_;
+        REQUIRE(off+inode_size_<=raw_.size());
+        std::map<std::string,std::string> values;
+        auto scan=[&](uint64_t start,uint64_t value_base,uint64_t end) {
+            while(start+4<=end && bytes::load_u32_le(raw_.data()+start)!=0) {
+                REQUIRE(start+16<=end);
+                const auto* p=raw_.data()+start;
+                const uint8_t length=p[0],index=p[1];
+                const uint16_t value_offset=bytes::load_u16_le(p+2);
+                const uint32_t size=bytes::load_u32_le(p+8);
+                REQUIRE(start+16+length<=end);
+                REQUIRE(value_base+value_offset+size<=end);
+                if(index==1) values.emplace(std::string(reinterpret_cast<const char*>(p+16),length),
+                    std::string(reinterpret_cast<const char*>(raw_.data()+value_base+value_offset),size));
+                start+=(16+length+3)/4*4;
+            }
+        };
+        const uint32_t block=bytes::load_u32_le(raw_.data()+off+104);
+        if(block) {
+            const uint64_t base=uint64_t(block)*block_size_;
+            REQUIRE(base+block_size_<=raw_.size());
+            REQUIRE(bytes::load_u32_le(raw_.data()+base)==0xea020000);
+            scan(base+32,base,base+block_size_);
+        }
+        if(inode_size_>128) {
+            const uint64_t base=off+128+bytes::load_u16_le(raw_.data()+off+128);
+            if(base+4<=off+inode_size_ && bytes::load_u32_le(raw_.data()+base)==0xea020000)
+                scan(base+4,base+4,off+inode_size_);
+        }
+        return values;
     }
 
     std::map<std::string, uint32_t> list_dir(uint32_t ino) const {
@@ -1091,19 +1139,37 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
 
 TEST_CASE("cli: obd-convert TurboOCI tar preserves complete filesystem bytes", "[cli][turboci]") {
 #if OBD_TEST_HAVE_LIBE2FS
+    for (const bool gzip_input : {false, true}) {
     TempDir dir;
     const auto tar = make_rootfs_tar();
-    const auto input = test::write_file(dir / "original.tar", tar);
-    const auto ordinary = run_convert({"--input", input, "--out-dir", dir / "ordinary"}, nullptr, false);
-    const auto turbo = run_convert({"--input", input, "--out-dir", dir / "turbo", "--turboOCI"}, nullptr, false);
+    auto original = tar;
+    if (gzip_input) {
+        z_stream stream {};
+        REQUIRE(deflateInit2(&stream, 6, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY) == Z_OK);
+        original.resize(compressBound(tar.size()) + 64);
+        stream.next_in = const_cast<uint8_t*>(tar.data());
+        stream.avail_in = tar.size();
+        stream.next_out = original.data();
+        stream.avail_out = original.size();
+        REQUIRE(deflate(&stream, Z_FINISH) == Z_STREAM_END);
+        original.resize(stream.total_out);
+        deflateEnd(&stream);
+    }
+    const auto input = test::write_file(dir / "original.tar", original);
+    const auto turbo = run_convert({"--input", input, "--out-dir", dir / "turbo", "--turboOCI", "--keep-raw"}, nullptr, false);
     INFO(turbo.err);
-    REQUIRE(ordinary.exit_code == 0);
     REQUIRE(turbo.exit_code == 0);
-    const auto normal_json = nlohmann::json::parse(ordinary.out);
     const auto turbo_json = nlohmann::json::parse(turbo.out);
     REQUIRE(turbo_json["lowers"][0]["targetFile"] == input);
+    REQUIRE(turbo_json["lowers"][0].contains("gzipIndex") == gzip_input);
+    REQUIRE(turbo_json["descriptor"]["annotations"]["containerd.io/snapshot/overlaybd/version"] == "0.1.0-turbo.ociv1");
+    REQUIRE(turbo_json["descriptor"]["digest"] == "sha256:" + file_sha256(turbo_json["package"].get<std::string>()));
     REQUIRE(turbo_json["lowers"][0]["targetDigest"] == "sha256:" + file_sha256(input));
-    const auto expected = read_layer_raw(normal_json["lowers"][0]["file"].get<std::string>());
+    const int raw_fd = ::open(turbo_json["converter"]["raw_file"].get<std::string>().c_str(), O_RDONLY);
+    REQUIRE(raw_fd >= 0);
+    const auto expected_text = read_all_fd(raw_fd);
+    REQUIRE(::close(raw_fd) == 0);
+    const std::vector<uint8_t> expected(expected_text.begin(), expected_text.end());
     const auto actual = test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
         auto cfg = image::ImageConfig::from_json_text(turbo.out, {});
         image::GlobalConfig global;
@@ -1115,11 +1181,195 @@ TEST_CASE("cli: obd-convert TurboOCI tar preserves complete filesystem bytes", "
         co_return data;
     });
     REQUIRE(actual == expected);
+    Ext2View filesystem(actual);
+    const auto hello_ino = filesystem.lookup({"etc", "hello.txt"});
+    REQUIRE(filesystem.read_file(hello_ino) == std::vector<uint8_t>{'h', 'e', 'l', 'l', 'o', '\n'});
+    REQUIRE((filesystem.inode(hello_ino).mode & 07777) == 0640);
+    REQUIRE(filesystem.inode(hello_ino).uid == 1000);
+    REQUIRE(filesystem.inode(hello_ino).gid == 1001);
+    const auto descriptor = test::write_file(dir / "descriptor.json",
+        std::vector<uint8_t>(turbo.out.begin(), turbo.out.end()));
+    const auto imported = run_convert({"--import-turboOCI", turbo_json["package"].get<std::string>(),
+        "--descriptor", descriptor, "--input", input, "--out-dir", dir / "imported"}, nullptr, false);
+    INFO(imported.err);
+    REQUIRE(imported.exit_code == 0);
+    const auto imported_data = test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
+        auto cfg = image::ImageConfig::from_json_text(imported.out, {});
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+        auto opened = co_await image::open_image(cfg, global);
+        std::vector<uint8_t> data(opened.virtual_size);
+        const auto n = co_await opened.root->pread(data.data(), data.size(), 0);
+        REQUIRE(n == static_cast<ssize_t>(data.size()));
+        co_return data;
+    });
+    REQUIRE(imported_data == expected);
     const auto again = run_convert({"--input", input, "--out-dir", dir / "again", "--turboOCI"}, nullptr, false);
     REQUIRE(again.exit_code == 0);
     const auto again_json = nlohmann::json::parse(again.out);
     REQUIRE(file_sha256(turbo_json["lowers"][0]["file"].get<std::string>()) ==
             file_sha256(again_json["lowers"][0]["file"].get<std::string>()));
+    REQUIRE(file_sha256(turbo_json["package"].get<std::string>()) ==
+            file_sha256(again_json["package"].get<std::string>()));
+    }
+#else
+    SKIP("libe2fs backend disabled");
+#endif
+}
+
+TEST_CASE("cli: TurboOCI rejects corrupt gzip and existing destinations", "[cli][turboci]") {
+#if OBD_TEST_HAVE_LIBE2FS
+    TempDir dir;
+    const auto bad = test::write_file(dir / "bad.gz", {0x1f, 0x8b, 0x08, 0x00});
+    const auto failed = run_convert({"--input", bad, "--out-dir", dir / "bad-output", "--turboOCI"}, nullptr, false);
+    REQUIRE(failed.exit_code != 0);
+    REQUIRE(failed.out.empty());
+    REQUIRE(!std::filesystem::exists(dir / "bad-output/layer"));
+    REQUIRE(!std::filesystem::exists(dir / "bad-output/layer/layer-0/turboOCIv1.tar.gz"));
+    const auto tar = make_rootfs_tar();
+    const auto target = test::write_file(dir / "layer", tar);
+    const auto before = file_sha256(target);
+    const auto alias = run_convert({"--input", target, "--out-dir", dir.str(), "--turboOCI"}, nullptr, false);
+    REQUIRE(alias.exit_code != 0);
+    REQUIRE(file_sha256(target) == before);
+#else
+    SKIP("libe2fs backend disabled");
+#endif
+}
+
+TEST_CASE("cli: TurboOCI layered whiteouts preserve hardlinks and current additions", "[cli][turboci]") {
+#if OBD_TEST_HAVE_LIBE2FS
+    TempDir dir;
+    std::vector<uint8_t> first;
+    const auto old_bytes = test::pattern_bytes(8193, 31);
+    const auto new_bytes = test::pattern_bytes(12289, 57);
+    append_tar_entry(first, "original", '0', 0644, 10, 20, old_bytes);
+    append_tar_entry(first, "alias", '1', 0644, 10, 20, {}, "original");
+    append_tar_entry(first, "opaque/old", '0', 0644, 0, 0, {'o'});
+    append_tar_entry(first, "removed", '0', 0644, 0, 0, {'r'});
+    append_tar_entry(first, "remove-dir/child", '0', 0644, 0, 0, old_bytes);
+    append_tar_entry(first, "replace-file", '0', 0644, 0, 0, {'f'});
+    append_tar_entry(first, "replace-link", '2', 0777, 0, 0, {}, "alias");
+    append_tar_entry(first, "nested/child/old", '0', 0644, 0, 0, {'o'});
+    first.resize(first.size() + 1024, 0);
+    std::vector<uint8_t> second;
+    append_tar_entry(second, "opaque/new", '0', 0644, 0, 0, {'n'});
+    append_tar_entry(second, "opaque/.wh..wh..opq", '0', 0, 0, 0);
+    append_tar_entry(second, ".wh.removed", '0', 0, 0, 0);
+    append_tar_entry(second, ".wh.remove-dir", '0', 0, 0, 0);
+    append_tar_entry(second, "nested/child/.wh..wh..opq", '0', 0, 0, 0);
+    append_tar_entry(second, "nested/.wh..wh..opq", '0', 0, 0, 0);
+    for (const std::string name : {"replace-file", "replace-link"}) {
+        append_tar_entry(second, name + "/", '5', 0755, 0, 0);
+        append_tar_entry(second, name + "/.wh..wh..opq", '0', 0, 0, 0);
+        append_tar_entry(second, name + "/child", '0', 0644, 0, 0, {'c'});
+    }
+    append_tar_entry(second, "original", '0', 0600, 30, 40, new_bytes);
+    append_tar_entry(second, "forward", '1', 0644, 0, 0, {}, "later");
+    append_tar_entry(second, "later", '0', 0644, 0, 0, {'l'});
+    append_tar_entry(second, "pipe", '6', 0600, 0, 0);
+    append_tar_entry(second, "device", '3', 0600, 0, 0);
+    second.resize(second.size() + 1024, 0);
+    const auto a = test::write_file(dir / "one.tar", first);
+    const auto b = test::write_file(dir / "two.tar", second);
+    const auto result = run_convert({"--turboOCI", "--input", a, "--input", b,
+        "--out-dir", dir / "converted", "--keep-raw"}, nullptr, false);
+    INFO(result.err);
+    REQUIRE(result.exit_code == 0);
+    const auto j = nlohmann::json::parse(result.out);
+    REQUIRE(j["lowers"].size() == 2);
+    const auto raw = test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
+        auto cfg = image::ImageConfig::from_json_text(result.out, {});
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+        auto opened = co_await image::open_image(cfg, global);
+        std::vector<uint8_t> data(opened.virtual_size);
+        const auto n = co_await opened.root->pread(data.data(), data.size(), 0);
+        REQUIRE(n == static_cast<ssize_t>(data.size()));
+        co_return data;
+    });
+    const auto raw_path = test::write_file(dir / "assembled.ext2", raw);
+    REQUIRE(file_sha256(raw_path) == file_sha256(j["converter"]["raw_file"].get<std::string>()));
+    Ext2View view(raw);
+    REQUIRE(view.read_file(view.lookup({"alias"})) == old_bytes);
+    REQUIRE(view.read_file(view.lookup({"original"})) == new_bytes);
+    REQUIRE(view.lookup({"alias"}) != view.lookup({"original"}));
+    REQUIRE(view.lookup({"forward"}) == view.lookup({"later"}));
+    REQUIRE(view.list_dir(2).count("removed") == 0);
+    REQUIRE(view.list_dir(2).count("remove-dir") == 0);
+    REQUIRE(view.list_dir(view.lookup({"nested", "child"})).size() == 2);
+    REQUIRE(view.read_file(view.lookup({"replace-file", "child"})) == std::vector<uint8_t>{'c'});
+    REQUIRE(view.read_file(view.lookup({"replace-link", "child"})) == std::vector<uint8_t>{'c'});
+    const auto children = view.list_dir(view.lookup({"opaque"}));
+    REQUIRE(children.count("old") == 0);
+    REQUIRE(children.count(".wh..wh..opq") == 0);
+    REQUIRE(view.read_file(view.lookup({"opaque", "new"})) == std::vector<uint8_t>{'n'});
+    REQUIRE((view.inode(view.lookup({"pipe"})).mode & 0170000) == 0010000);
+    REQUIRE((view.inode(view.lookup({"device"})).mode & 0170000) == 0020000);
+#ifdef OBD_TEST_E2FSCK_BIN
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        ::execl(OBD_TEST_E2FSCK_BIN, OBD_TEST_E2FSCK_BIN, "-fn", raw_path.c_str(), nullptr);
+        ::_exit(127);
+    }
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0) {
+        REQUIRE(errno == EINTR);
+    }
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == 0);
+#endif
+#else
+    SKIP("libe2fs backend disabled");
+#endif
+}
+
+TEST_CASE("cli: TurboOCI replaces explicit directory xattrs and preserves nanosecond mtime", "[cli][turboci]") {
+#if OBD_TEST_HAVE_LIBE2FS
+    TempDir dir;
+    auto pax_record=[](const std::string& key,const std::string& value) {
+        const auto body=" "+key+"="+value+"\n";
+        size_t n=body.size()+1;
+        while(n!=body.size()+std::to_string(n).size()) n=body.size()+std::to_string(n).size();
+        return std::to_string(n)+body;
+    };
+    auto add_pax=[&](std::vector<uint8_t>& tar,const std::string& records) {
+        append_tar_entry(tar,"pax",'x',0644,0,0,{records.begin(),records.end()});
+    };
+    std::vector<uint8_t> lower,upper;
+    for(const auto* name:{"clear","replace","implicit"}) {
+        add_pax(lower,pax_record("SCHILY.xattr.user.old","old")+pax_record("mtime","1700000000.123456789"));
+        append_tar_entry(lower,name,'5',0755,0,0);
+    }
+    add_pax(upper,pax_record("mtime","-0.25"));
+    append_tar_entry(upper,"clear",'5',0700,0,0);
+    const std::string binary("a\0b",3);
+    add_pax(upper,pax_record("SCHILY.xattr.user.new",binary)+pax_record("mtime","2147483648.000000001"));
+    append_tar_entry(upper,"replace",'5',0750,0,0);
+    append_tar_entry(upper,"implicit/child",'0',0644,0,0,{'x'});
+    add_pax(upper,pax_record("mtime","15032385535.999999999"));
+    append_tar_entry(upper,"future",'0',0644,0,0,{'f'});
+    lower.resize(lower.size()+1024); upper.resize(upper.size()+1024);
+    const auto a=test::write_file(dir/"lower.tar",lower);
+    const auto b=test::write_file(dir/"upper.tar",upper);
+    const auto result=run_convert({"--turboOCI","--input",a,"--input",b,"--out-dir",dir/"out","--keep-raw"},nullptr,false);
+    INFO(result.err);
+    REQUIRE(result.exit_code==0);
+    const auto config=nlohmann::json::parse(result.out);
+    const auto raw_path=config["converter"]["raw_file"].get<std::string>();
+    const int fd=::open(raw_path.c_str(),O_RDONLY);
+    REQUIRE(fd>=0);
+    const auto text=read_all_fd(fd);
+    REQUIRE(::close(fd)==0);
+    Ext2View view(std::vector<uint8_t>(text.begin(),text.end()));
+    REQUIRE(view.user_xattrs(view.lookup({"clear"})).empty());
+    REQUIRE(view.user_xattrs(view.lookup({"replace"}))==std::map<std::string,std::string>{{"new",binary}});
+    REQUIRE(view.user_xattrs(view.lookup({"implicit"}))==std::map<std::string,std::string>{{"old","old"}});
+    REQUIRE(view.mtime(view.lookup({"clear"}))==std::pair<int64_t,uint32_t>{-1,750000000});
+    REQUIRE(view.mtime(view.lookup({"replace"}))==std::pair<int64_t,uint32_t>{2147483648LL,1});
+    REQUIRE(view.mtime(view.lookup({"implicit"}))==std::pair<int64_t,uint32_t>{1700000000,123456789});
+    REQUIRE(view.mtime(view.lookup({"future"}))==std::pair<int64_t,uint32_t>{15032385535LL,999999999});
 #else
     SKIP("libe2fs backend disabled");
 #endif

@@ -396,7 +396,7 @@ ctest --test-dir build --output-on-failure
 - obd-mkimage builds single-layer images only, on a synchronous cold path;
   it is a fixture generator, not a replacement for the upstream
   `overlaybd-*` image toolchain.
-- obd-convert currently supports regular files, directories and symlinks from
+- Ordinary obd-convert conversion supports regular files, directories and symlinks from
   ustar input. The default `libe2fs` backend raises the built-in backend's small
   ext2 writer limits but still caps the current unindexed directory path at
   65536 in-memory tar nodes and 1024 data blocks per directory; it does not yet
@@ -411,3 +411,57 @@ ctest --test-dir build --output-on-failure
   (ADR-0014).
 - obd-device supports exactly one image per process by design (ADR-0004);
   multi-device serving will not be added to it.
+
+### TurboOCI conversion and import (ADR-0020)
+
+`obd-convert --turboOCI --input original.tar.gz --out-dir output` retains the
+original local tar/gzip blob as the payload source. The libe2fs backend produces
+`output/layer/layer-0/ext4.fs.meta`; gzip inputs also produce `gzip.meta`
+in that directory. The deterministic
+`turboOCIv1.tar.gz` package contains the filesystem metadata, `.turbo.ociv1`
+marker, and optional index. The stdout JSON includes runnable local `lowers`,
+the package path, and an OCI descriptor with upstream target annotations.
+The original blob must remain available for reads. Move it only together with
+an appropriate configuration update.
+
+Save the stdout JSON as `descriptor.json` when importing the package elsewhere:
+
+```sh
+obd-convert --turboOCI --input original.tar.gz --out-dir generated > descriptor.json
+obd-convert --import-turboOCI generated/layer/layer-0/turboOCIv1.tar.gz \
+  --descriptor descriptor.json --input original.tar.gz \
+  --out-dir imported --name rootfs > imported-config.json
+```
+
+Import verifies package and target identities against the descriptor and
+validates the metadata before publishing `imported/rootfs`, which must not
+already exist. Both an OCI descriptor object and the converter's stdout wrapper
+are accepted for `--descriptor`. Publishing blobs to a registry remains the
+external CLI responsibility. EROFS and reverse materialization are outside this
+feature's scope.
+
+Repeat `--input` in bottom-up parent order to convert an OCI layer stack. The
+converter applies whiteouts and opaque directories before the current layer's
+entries, preserving surviving hardlinks and parent content. It publishes the
+complete stack atomically under `<out-dir>/<name>` (default name `layer`), which
+must not already exist. Each `layer-N` directory contains its metadata package
+and descriptor; the top-level JSON contains ordered `lowers`, `packages`, and
+`descriptors` arrays. `--keep-raw` retains the final filesystem at the path in
+`converter.raw_file` for inspection.
+
+The TurboOCI path requires libe2fs and local regular input files. It supports
+USTAR, local/global PAX, GNU long names and links, hardlinks, symbolic links,
+device nodes, FIFOs, binary xattrs, and GNU sparse PAX 0.1 and 1.0. GNU sparse
+0.0 and old GNU `S` entries are rejected explicitly. Each archive is bounded to
+65,536 entries, 16 MiB per extension, 64 MiB retained path/extension metadata,
+and one million sparse spans. Gzip input must contain one complete member;
+concatenated members and trailing bytes are rejected.
+
+TurboOCI filesystem metadata uses 256-byte ext-family inodes with the
+`EXTRA_ISIZE` feature (ext4-compatible timestamp extensions, without a journal
+or extent trees). Input `mtime` is preserved at nanosecond precision, including
+negative times and the extended epoch range; synthesized timestamps remain
+fixed for deterministic output. Nonzero precision finer than a nanosecond and
+timestamps outside the representable range are rejected. Explicit directory
+entries replace their complete xattr set; creating an implicit parent does not
+clear attributes inherited from lower layers.

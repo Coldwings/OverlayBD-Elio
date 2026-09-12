@@ -31,6 +31,12 @@ as the file-content source.
   `targetDigest`, and `gzipIndex` configuration semantics. Metadata and target
   offsets occupy separate byte spaces. Runtime mapping tags must not be
   confused with the merged-layer priority tags.
+- Persist remote original targets in a separate digest-keyed LayerStore under
+  `<lower.dir>/targets/<sha256-hex>`, below gzip decoding. A committed target
+  can reopen without registry access. The same download, admission, and
+  degraded-directory policies apply as for metadata blobs. Structural warm-up
+  includes both sources; the upstream trace format continues to address only
+  metadata sources, keeping one trace slot per lower and no target-offset alias.
 - Decode upstream warp indexes and `ddgzidx` version 1 explicitly, validating
   bounds, sizes, checksum, dictionary encoding, and restart positions before
   use. Random reads restore the DEFLATE bit position and dictionary; concurrent
@@ -47,6 +53,10 @@ as the file-content source.
   directories, hardlinks, symlinks, attributes, sparse content, and device-node
   metadata. Unsupported encodings must fail explicitly. A differential archive
   must never be treated silently as a flattened rootfs.
+- Preserve explicit entry modification times at nanosecond precision using
+  256-byte ext-family inodes and the extra-inode timestamp fields. Determinism
+  fixes synthesized metadata times, not timestamps already specified by input.
+  Explicit directory replacements replace the complete attribute set.
 - Generated metadata, gzip indexes, and package bytes are deterministic for
   identical inputs and options. Registry publishing remains the external CLI
   boundary established by ADR-0014.

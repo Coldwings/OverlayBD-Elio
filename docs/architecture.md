@@ -318,8 +318,8 @@ contracts above:
 
 ## Limitations & TODO
 
-- **TurboOCI** (the third upstream on-disk format) is not supported;
-  deferred.
+- **TurboOCI** supports ext-family metadata and original tar/gzip targets
+  (ADR-0020). EROFS metadata is unsupported.
 - **Crash recovery is bounded, not transparent persistence.** Devices are
   created with ublk `USER_RECOVERY` when `ublkConfig.enableRecovery` is
   true (the default) and the kernel supports it; the supervisor respawns

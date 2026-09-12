@@ -43,7 +43,7 @@ source::BlobSourcePtr mem(std::vector<uint8_t> data) {
 }
 
 TEST_CASE("format: native warp golden tags dispatch metadata and target", "[format][warp]") {
-    REQUIRE(test::run_coro([]() -> elio::coro::task<int> {
+    const auto result = test::run_coro([]() -> elio::coro::task<int> {
         auto layer = co_await format::LsmtLayer::open_warp(
             mem(fixture()), mem(std::vector<uint8_t>(1024, 0x54)));
         REQUIRE(layer->segments()[0].tag == 0);
@@ -58,11 +58,12 @@ TEST_CASE("format: native warp golden tags dispatch metadata and target", "[form
         REQUIRE(std::all_of(out.begin()+512, out.begin()+1536, [](auto c){return c==0x54;}));
         REQUIRE(std::all_of(out.begin()+1536, out.end(), [](auto c){return c==0;}));
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(result == 0);
 }
 
 TEST_CASE("format: native warp offsets survive layer merge clipping", "[format][warp]") {
-    REQUIRE(test::run_coro([]() -> elio::coro::task<int> {
+    const auto result = test::run_coro([]() -> elio::coro::task<int> {
         std::vector<uint8_t> target(1024, 0x54);
         std::fill(target.begin()+512, target.end(), 0x55);
         std::vector<std::unique_ptr<format::LsmtLayer>> stack;
@@ -79,11 +80,12 @@ TEST_CASE("format: native warp offsets survive layer merge clipping", "[format][
         REQUIRE(out[1024] == 0x55);
         REQUIRE(merged->merged_index().back().tag == 1);
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(result == 0);
 }
 
 TEST_CASE("format: native warp singleton tags normalize to metadata", "[format][warp]") {
-    REQUIRE(test::run_coro([]() -> elio::coro::task<int> {
+    const auto result = test::run_coro([]() -> elio::coro::task<int> {
         auto data = fixture({
             {0x0004000000000000ULL, 0xff00000000000008ULL},
             // INVALID_OFFSET padding must not participate in minimum tag.
@@ -93,7 +95,8 @@ TEST_CASE("format: native warp singleton tags normalize to metadata", "[format][
         REQUIRE(layer->segments().size() == 1);
         REQUIRE(layer->segments()[0].moffset == 8);
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(result == 0);
 }
 
 TEST_CASE("format: native warp rejects malformed tags and extents", "[format][warp]") {
@@ -109,16 +112,17 @@ TEST_CASE("format: native warp rejects malformed tags and extents", "[format][wa
     SECTION("overlap") { records[1][0] = 0x0008000000000000ULL; }
     SECTION("zero length") { records[1][0] = 1; }
     SECTION("past virtual size") { records[1][0] = 0x0008000000000003ULL; }
-    REQUIRE_THROWS_AS(test::run_coro([&]() -> elio::coro::task<int> {
+    const auto open_invalid = [&]() -> elio::coro::task<int> {
         auto layer = co_await format::LsmtLayer::open_warp(
             mem(fixture(records)), mem(std::vector<uint8_t>(target_size)));
         (void)layer;
         co_return 0;
-    }), format_error);
+    };
+    REQUIRE_THROWS_AS(test::run_coro(open_invalid), format_error);
 }
 
 TEST_CASE("format: native warp zero extents mask target bytes", "[format][warp]") {
-    REQUIRE(test::run_coro([]() -> elio::coro::task<int> {
+    const auto result = test::run_coro([]() -> elio::coro::task<int> {
         auto data = fixture({{0x0004000000000000ULL, 0x0700000000000008ULL},
                              {0x0008000000000001ULL, 0x0880000000000000ULL}});
         std::vector<std::unique_ptr<format::LsmtLayer>> stack;
@@ -129,7 +133,8 @@ TEST_CASE("format: native warp zero extents mask target bytes", "[format][warp]"
         REQUIRE(n == 1024);
         REQUIRE(std::all_of(out.begin(), out.end(), [](auto c){return c==0;}));
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(result == 0);
 }
 
 TEST_CASE("format: native warp rejects combined source size overflow", "[format][warp]") {
@@ -143,10 +148,11 @@ TEST_CASE("format: native warp rejects combined source size overflow", "[format]
             co_return -EIO;
         }
     };
-    REQUIRE_THROWS_AS(test::run_coro([]() -> elio::coro::task<int> {
+    const auto open_invalid = []() -> elio::coro::task<int> {
         auto layer = co_await format::LsmtLayer::open_warp(
             mem(fixture()), std::make_unique<HugeSource>());
         (void)layer;
         co_return 0;
-    }), format_error);
+    };
+    REQUIRE_THROWS_AS(test::run_coro(open_invalid), format_error);
 }

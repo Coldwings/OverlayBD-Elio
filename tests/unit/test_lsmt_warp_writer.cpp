@@ -53,7 +53,7 @@ TEST_CASE("format: warp writer compacts metadata with golden wire words", "[form
     REQUIRE(bytes::load_u64_le(blob.data()+4632) == 0x0100000000000003ULL);
     REQUIRE(bytes::load_u64_le(blob.data()+4648) == 0x0080000000000009ULL);
     REQUIRE(std::all_of(blob.begin()+4096, blob.begin()+4608, [](auto c){return c==0x4d;}));
-    REQUIRE(test::run_coro([&]() -> elio::coro::task<int> {
+    const auto result = test::run_coro([&]() -> elio::coro::task<int> {
         std::vector<uint8_t> target(2560, 0x54);
         std::vector<std::unique_ptr<format::LsmtLayer>> stack;
         stack.push_back(co_await format::LsmtLayer::open_warp(
@@ -67,7 +67,8 @@ TEST_CASE("format: warp writer compacts metadata with golden wire words", "[form
         REQUIRE(std::all_of(out.begin()+512, out.begin()+1536, [](auto c){return c==0x54;}));
         REQUIRE(std::all_of(out.begin()+1536, out.end(), [](auto c){return c==0;}));
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(result == 0);
 }
 
 TEST_CASE("format: warp writer validates before output mutation", "[format][warp]") {

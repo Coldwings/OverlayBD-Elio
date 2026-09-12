@@ -1304,7 +1304,8 @@ directly.
   redirect targets rely on the 401-drop-and-re-resolve path because
   redirect responses carry no comparable declared lifetime.
 - **Prefetch is structural warm-up plus trace replay** — overlaybd's
-  dynamic prefetcher and TurboOCI paths are out of scope (ADR-0007). The
+  dynamic prefetcher remains out of scope (ADR-0007). TurboOCI random
+  reads use the separate gzip restart-index source (ADR-0020). The
   structural head/tail warm-up (ADR-0012's cold-start floor) and the
   upstream-compatible trace blob (ADR-0013 — the trace layer
   is recognized in image assembly; see `docs/image.md`) both ride
@@ -1336,3 +1337,13 @@ directly.
 - **DART probing happens once at image open** — a proxy that comes up later
   is not picked up until reopen; conversely a proxy that dies after a
   successful probe surfaces as per-request errors (no mid-image re-probe).
+
+### TurboOCI target byte spaces (ADR-0020)
+
+The original target remains a complete tar or gzip blob. Remote target caching
+stores these original bytes in a digest-keyed directory separate from filesystem
+metadata; gzip restart decoding sits above that store. Structural warm-up may
+populate both metadata and target sources. Upstream trace records address only
+metadata sources, one slot per lower: target offsets are never recorded as
+metadata offsets or inserted as extra layer IDs. Target reads still share the
+device read-admission funnel and registry client.

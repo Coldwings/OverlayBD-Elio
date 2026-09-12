@@ -5,6 +5,7 @@
 // assembly. No kernel dependencies (ublk E2E lives in test_ublk_e2e.cpp
 // and self-skips). See docs/testing.md.
 #include "common/errors.hpp"
+#include "common/bytes.hpp"
 #include "common/sha256.hpp"
 #include "format/lsmt.hpp"
 #include "format/trace.hpp"
@@ -2038,6 +2039,132 @@ TEST_CASE("integration: concurrent mock servers bind distinct ephemeral ports",
         REQUIRE(buf == std::vector<uint8_t>(blob_b.begin(),
                                             blob_b.begin() + buf.size()));
         blocker.reset();
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: TurboOCI target persists separately and reopens offline",
+          "[integration][turboci]") {
+    TempDir dir;
+    constexpr size_t index_offset = 4608;
+    std::vector<uint8_t> meta(index_offset + 32 + 4096, 0);
+    const uint8_t magic[] = {0x4c,0x53,0x4d,0x54,0,1,2,0,
+        0x65,0x7e,0x63,0xd2,0x94,0x44,8,0x4c,0xa2,0xd2,0xc8,0xec,0x4f,0xcf,0xae,0x8a};
+    for (const auto base : {size_t(0), meta.size() - 4096}) {
+        std::copy(std::begin(magic), std::end(magic), meta.begin() + base);
+        bytes::store_u32_le(meta.data() + base + 24, 390);
+        bytes::store_u32_le(meta.data() + base + 28, base == 0 ? 3 : 6);
+        bytes::store_u64_le(meta.data() + base + 32, index_offset);
+        bytes::store_u64_le(meta.data() + base + 40, 2);
+        bytes::store_u64_le(meta.data() + base + 48, 1024);
+        meta[base + 132] = meta[base + 133] = 1;
+    }
+    std::fill(meta.begin() + 4096, meta.begin() + index_offset, 0x4d);
+    bytes::store_u64_le(meta.data() + index_offset, 0x0004000000000000ULL);
+    bytes::store_u64_le(meta.data() + index_offset + 8, 8);
+    bytes::store_u64_le(meta.data() + index_offset + 16, 0x0004000000000001ULL);
+    bytes::store_u64_le(meta.data() + index_offset + 24, 0x0100000000000001ULL);
+    auto target = std::vector<uint8_t>(1536, 0x48);
+    std::fill(target.begin() + 512, target.begin() + 1024, 0x54);
+    const auto metadata_path = test::write_file(dir / "ext4.fs.meta", meta);
+
+    const auto digest = sha256_hex_of(target);
+    const std::string layer_dir = dir / "cache";
+    const std::string committed = layer_dir + "/targets/" + digest + "/overlaybd.commit";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobServer server(target);
+        elio::go([&server]() -> elio::coro::task<void> { co_await server.run(); });
+        BlobGuard guard{server};
+        const bool running = co_await test::wait_server_running(server);
+        REQUIRE(running);
+        nlohmann::json j = {{"repoBlobUrl", server.repo_base()},
+            {"download", {{"enable", true}, {"delay", 0}, {"delayExtra", 0}}},
+            {"lowers", nlohmann::json::array({{{"file", metadata_path},
+                {"dir", layer_dir}, {"targetDigest", "sha256:" + digest}}})}};
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+        // A malformed index must park the already-started target fill.
+        {
+            const auto bad_index = test::write_file(dir / "bad-gzip.meta",
+                                                    std::vector<uint8_t>(333, 0));
+            auto bad = j;
+            bad["lowers"][0]["dir"] = dir / "bad-cache";
+            bad["lowers"][0]["gzipIndex"] = bad_index;
+            const auto bad_cfg = image::ImageConfig::from_json_text(bad.dump(), {});
+            bool rejected = false;
+            try {
+                auto unexpected = co_await image::open_image(bad_cfg, global);
+                co_await image::park_image_fills(unexpected);
+            } catch (const error&) {
+                rejected = true;
+            }
+            REQUIRE(rejected);
+        }
+        {
+            const auto cfg = image::ImageConfig::from_json_text(j.dump(), {});
+            auto opened = co_await image::open_image(cfg, global);
+            REQUIRE(opened.layer_stores.size() == 1);
+            std::vector<uint8_t> data(1024);
+            const auto n = co_await opened.root->pread(data.data(), data.size(), 0);
+            REQUIRE(n == 1024);
+            REQUIRE(std::all_of(data.begin() + 512, data.end(), [](auto c) { return c == 0x54; }));
+            bool complete = false;
+            for (int i = 0; i < 400 && !complete; ++i) {
+                complete = std::filesystem::exists(committed);
+                if (!complete) co_await elio::time::sleep_for(std::chrono::milliseconds(25));
+            }
+            co_await image::park_image_fills(opened);
+            REQUIRE(complete);
+        }
+        REQUIRE_FALSE(std::filesystem::exists(layer_dir + "/overlaybd.commit"));
+        // No registry URL proves committed targets can reopen entirely offline.
+        j.erase("repoBlobUrl");
+        const auto cfg = image::ImageConfig::from_json_text(j.dump(), {});
+        auto reopened = co_await image::open_image(cfg, global);
+        REQUIRE(reopened.layer_stores.empty());
+        std::vector<uint8_t> data(1024);
+        const auto n = co_await reopened.root->pread(data.data(), data.size(), 0);
+        REQUIRE(n == 1024);
+        REQUIRE(std::all_of(data.begin(), data.begin() + 512, [](auto c) { return c == 0x4d; }));
+        REQUIRE(std::all_of(data.begin() + 512, data.end(), [](auto c) { return c == 0x54; }));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: malformed remote TurboOCI metadata parks its store",
+          "[integration][turboci]") {
+    TempDir dir;
+    // Long enough for all format probes, but an invalid LSMT header. The
+    // consuming open_warp must not destroy the store before assembly parks it.
+    const std::vector<uint8_t> malformed(128 * 1024, 0x51);
+    const auto target_path = test::write_file(dir / "original.tar",
+                                             std::vector<uint8_t>(1536, 0));
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        BlobServer server(malformed);
+        elio::go([&server]() -> elio::coro::task<void> { co_await server.run(); });
+        BlobGuard guard{server};
+        const bool running = co_await test::wait_server_running(server);
+        REQUIRE(running);
+        auto j = remote_image_config_with_dir(server.repo_base(),
+            sha256_hex_of(malformed), malformed.size(), dir / "metadata-cache");
+        j["lowers"][0]["targetFile"] = target_path;
+        j["download"] = {{"enable", true}, {"delay", 60}, {"delayExtra", 0}};
+        const auto cfg = image::ImageConfig::from_json_text(j.dump(), {});
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+        source::test_hooks::reset_unparked_layer_store_destructions_for_test();
+        bool rejected = false;
+        std::optional<image::OpenedImage> opened;
+        try {
+            opened.emplace(co_await image::open_image(cfg, global));
+        } catch (const error&) {
+            rejected = true;
+        }
+        if (opened) co_await image::park_image_fills(*opened);
+        REQUIRE(rejected);
+        REQUIRE(source::test_hooks::unparked_layer_store_destructions_for_test() == 0);
         co_return 0;
     });
     REQUIRE(rc == 0);

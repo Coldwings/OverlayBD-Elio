@@ -6,7 +6,7 @@ add_executable(obd-mkimage obd_mkimage_main.cpp)
 obd_target_warnings(obd-mkimage)
 target_link_libraries(obd-mkimage PRIVATE obd_core)
 
-add_executable(obd-convert obd_convert_main.cpp gzip_index_builder.cpp turbo_package.cpp)
+add_executable(obd-convert obd_convert_main.cpp gzip_index_builder.cpp turbo_package.cpp turbo_import.cpp oci_layer_plan.cpp oci_ext2_builder.cpp turbo_layered.cpp)
 obd_target_warnings(obd-convert)
 target_link_libraries(obd-convert PRIVATE obd_core)
 if(OBD_ENABLE_LIBE2FS_BACKEND)

@@ -43,6 +43,24 @@ bool is_regular_file(const std::string& path) {
            S_ISREG(st.st_mode);
 }
 
+// Keep a store alive across consuming format opens: malformed metadata/indexes
+// can destroy their input before image assembly gets a chance to park fills.
+class SharedLayerStore final : public source::BlobSource {
+public:
+    explicit SharedLayerStore(std::shared_ptr<source::LayerStore> store)
+        : store_(std::move(store)) {}
+    elio::coro::task<ssize_t> pread(void* buf, size_t count, uint64_t offset) override {
+        co_return co_await store_->pread(buf, count, offset);
+    }
+    elio::coro::task<ssize_t> populate(uint64_t offset, size_t len) override {
+        co_return co_await store_->populate(offset, len);
+    }
+    uint64_t size() const noexcept override { return store_->size(); }
+    std::string_view label() const noexcept override { return store_->label(); }
+private:
+    std::shared_ptr<source::LayerStore> store_;
+};
+
 struct LocalProbe {
     std::string path;
     bool layer_store_commit = false;
@@ -319,7 +337,11 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     // the objects are owned by the layer chain built below.
     std::vector<source::BlobSource*> warm_targets;
     warm_targets.reserve(data_lowers.size());
+    // Structural warming includes original TurboOCI blobs; trace indexes remain
+    // exactly one metadata byte space per lower, as in upstream.
+    std::vector<source::BlobSource*> structural_targets;
     std::vector<source::LayerStore*> stores;
+    std::vector<std::shared_ptr<source::LayerStore>> store_guards;
     std::exception_ptr assembly_failure;
     try {
     // The trace recorder (ADR-0013, record path): created idle; the
@@ -440,10 +462,12 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                 lsc.populate_admit_timeout = kWarmupAdmitTimeout;
                 bool store_opened = false;
                 try {
-                    raw = co_await source::LayerStore::open(
+                    auto opened_store = co_await source::LayerStore::open(
                         std::move(tapped), lower.dir, sha, std::move(lsc));
-                    stores.push_back(
-                        static_cast<source::LayerStore*>(raw.get()));
+                    auto held = std::shared_ptr<source::LayerStore>(std::move(opened_store));
+                    store_guards.push_back(held);
+                    stores.push_back(held.get());
+                    raw = std::make_unique<SharedLayerStore>(std::move(held));
                     store_opened = true;
                 } catch (const error& e) {
                     // ADR-0016: persistence is best-effort. An unwritable,
@@ -482,6 +506,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             }
         }
         warm_targets.push_back(untarred.get());
+        structural_targets.push_back(untarred.get());
         if (co_await format::is_zfile(*untarred)) {
             view = co_await format::ZFileSource::open(std::move(untarred),
                                                       /*caller_verify=*/true);
@@ -493,14 +518,64 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             if (!lower.target_file.empty()) {
                 target = co_await source::LocalFileSource::open(lower.target_file);
             } else {
-                if (cfg.repo_blob_url.empty()) {
-                    throw error(EINVAL, "TurboOCI targetDigest requires repoBlobUrl");
+                auto sha = ImageConfig::digest_sha256_hex(lower.target_digest);
+                if (sha.size() != 64 ||
+                    !std::all_of(sha.begin(), sha.end(), [](unsigned char c) {
+                        return std::isxdigit(c) != 0;
+                    })) {
+                    throw error(EINVAL, "malformed TurboOCI target digest");
                 }
-                auto remote = co_await source::RegistrySource::open(
-                    client, cfg.repo_blob_url + "/" + lower.target_digest);
-                target = std::make_unique<source::AdmissionSource>(
-                    std::move(remote), funnel);
+                std::transform(sha.begin(), sha.end(), sha.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                // Target bytes and metadata bytes have independent identities
+                // and must never share a commit file or extent bitmap.
+                const auto target_dir = lower.dir.empty() ? std::string{} :
+                    lower.dir + "/targets/" + sha;
+                const auto committed = target_dir + "/overlaybd.commit";
+                if (!target_dir.empty() && is_regular_file(committed)) {
+                    target = co_await source::LocalFileSource::open(committed);
+                } else {
+                    if (cfg.repo_blob_url.empty()) {
+                        throw error(EINVAL, "TurboOCI targetDigest requires repoBlobUrl");
+                    }
+                    const auto url = cfg.repo_blob_url + "/" + lower.target_digest;
+                    auto remote = co_await source::RegistrySource::open(client, url);
+                    if (!target_dir.empty()) {
+                        std::error_code ec;
+                        std::filesystem::create_directories(target_dir, ec);
+                        source::LayerStore::Config lsc;
+                        lsc.try_count = cfg.download.try_count;
+                        lsc.fill.enable = cfg.download.enable;
+                        lsc.fill.delay_sec = cfg.download.delay_sec;
+                        lsc.fill.delay_extra_sec = cfg.download.delay_extra_sec;
+                        lsc.fill.max_mbps = cfg.download.max_mbps;
+                        lsc.fill.block_size = cfg.download.block_size;
+                        lsc.funnel = funnel;
+                        lsc.populate_admit_timeout = kWarmupAdmitTimeout;
+                        try {
+                            auto opened_store = co_await source::LayerStore::open(
+                                std::move(remote), target_dir, sha, std::move(lsc));
+                            auto held = std::shared_ptr<source::LayerStore>(
+                                std::move(opened_store));
+                            store_guards.push_back(held);
+                            stores.push_back(held.get());
+                            target = std::make_unique<SharedLayerStore>(std::move(held));
+                        } catch (const error& e) {
+                            ELIO_LOG_WARNING("TurboOCI target {}: persistence "
+                                "unavailable ({}); serving remotely", lower.target_digest,
+                                e.what());
+                        }
+                        if (!target) {
+                            remote = co_await source::RegistrySource::open(client, url);
+                        }
+                    }
+                    if (!target) {
+                        target = std::make_unique<source::AdmissionSource>(
+                            std::move(remote), funnel);
+                    }
+                }
             }
+            structural_targets.push_back(target.get());
             // The target is the original archive byte space. Do not strip a
             // tar header or apply the metadata layer's ZFile adapter to it.
             if (!lower.gzip_index.empty()) {
@@ -541,7 +616,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
             static_cast<uint64_t>(global.prefetch_head_kb) << 10;
         wopts.tail_bytes =
             static_cast<uint64_t>(global.prefetch_tail_kb) << 10;
-        warmup_stats = co_await warmup_structural(warm_targets, wopts);
+        warmup_stats = co_await warmup_structural(structural_targets, wopts);
     }
 
     // Trace replay (ADR-0013): with the floor warmed, load the

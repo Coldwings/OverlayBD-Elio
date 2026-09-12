@@ -304,8 +304,8 @@ mode:
   `obd::error(EINVAL)`; an absent or empty `upper` object keeps the
   read-only behavior exactly.
 
-The rationale and scope live in ADR-0008; writable layers and TurboOCI
-beyond this scope remain out (ADR-0007).
+ADR-0020 preserves the writable-layer contracts established by ADR-0008
+and adds native TurboOCI lower layers.
 
 ### The blank (raw) device mode (ADR-0014)
 
@@ -1120,8 +1120,8 @@ single Range-capable blob. No external golden files.
   image open even after graceful shutdown writes its checkpoint; that
   checkpoint is consumed only by the supervisor's offline `commit`, and a
   fresh open truncates the unsealed file. Committing/sealing an upper into
-  a new lower is an explicit, offline operation (ADR-0014); TurboOCI and
-  registry write-back remain out of scope (ADR-0007).
+  a new lower is an explicit, offline operation (ADR-0014);
+  registry write-back remains out of scope (ADR-0007).
 - **Sparse uppers depend on filesystem fiemap support** for extent recovery
   after reopen (see `docs/format.md`); exotic filesystems without
   `SEEK_HOLE`/fiemap semantics are unsupported for `upper.type = "sparse"`.

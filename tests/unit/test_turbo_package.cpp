@@ -82,3 +82,77 @@ TEST_CASE("convert: TurboOCI package errors preserve outputs and reject aliases"
     for(const auto& entry:std::filesystem::directory_iterator(dir.path()))
         REQUIRE(entry.path().filename().string().find(".tmp.")==std::string::npos);
 }
+
+namespace {
+std::vector<uint8_t> gzip_tar(const std::vector<uint8_t>& tar) {
+    std::vector<uint8_t> out(compressBound(tar.size())+100);
+    z_stream z{};
+    REQUIRE(deflateInit2(&z,6,Z_DEFLATED,31,8,Z_DEFAULT_STRATEGY)==Z_OK);
+    z.next_in=const_cast<uint8_t*>(tar.data()); z.avail_in=tar.size();
+    z.next_out=out.data(); z.avail_out=out.size();
+    REQUIRE(deflate(&z,Z_FINISH)==Z_STREAM_END);
+    out.resize(z.total_out); deflateEnd(&z);
+    return out;
+}
+void fix_checksum(std::vector<uint8_t>& tar,size_t at) {
+    std::fill(tar.begin()+at+148,tar.begin()+at+156,' ');
+    unsigned sum=0;
+    for(size_t i=0;i<512;++i) sum+=tar[at+i];
+    char text[8]{};
+    std::snprintf(text,sizeof(text),"%06o",sum);
+    std::memcpy(tar.data()+at+148,text,7); tar[at+155]=' ';
+}
+}
+
+TEST_CASE("convert: TurboOCI importer publishes validated metadata and optional index", "[convert][turbo]") {
+    obd::test::TempDir dir;
+    const auto metadata=obd::test::pattern_bytes(1003,17), index=obd::test::pattern_bytes(519,19);
+    obd::test::write_file(dir/"metadata",metadata); obd::test::write_file(dir/"index",index);
+    for(bool has_index:{false,true}) {
+        obd::convert::write_turbo_package(dir/"metadata",has_index ? dir/"index":"",dir/"package.gz");
+        const std::string destination=dir/(has_index ? "with-index":"without-index");
+        auto imported=obd::convert::import_turbo_package(dir/"package.gz",destination);
+        REQUIRE(imported.metadata_path==destination+"/ext4.fs.meta");
+        REQUIRE(read_package(imported.metadata_path)==metadata);
+        if(has_index) REQUIRE(read_package(imported.gzip_index_path)==index);
+        else REQUIRE(imported.gzip_index_path.empty());
+        REQUIRE_THROWS(obd::convert::import_turbo_package(dir/"package.gz",destination));
+        REQUIRE(read_package(imported.metadata_path)==metadata);
+    }
+}
+
+TEST_CASE("convert: TurboOCI importer rejects malformed archives without publication", "[convert][turbo]") {
+    obd::test::TempDir dir;
+    obd::test::write_file(dir/"metadata",std::vector<uint8_t>(3,'a'));
+    obd::convert::write_turbo_package(dir/"metadata","",dir/"valid.gz");
+    const auto valid=unpack(read_package(dir/"valid.gz"));
+    // The tiny payload makes the marker header start at offset 1024.
+    for(int mutation=0;mutation<11;++mutation) {
+        auto tar=valid;
+        switch(mutation) {
+            case 0: tar[148]^=1; break; // checksum
+            case 1: std::fill(tar.begin(),tar.begin()+100,0);
+                    std::memcpy(tar.data(),"../escape",9); fix_checksum(tar,0); break;
+            case 2: tar[156]='2'; fix_checksum(tar,0); break; // symlink
+            case 3: std::fill(tar.begin(),tar.begin()+100,0);
+                    std::memcpy(tar.data(),"erofs.fs.meta",13); fix_checksum(tar,0); break;
+            case 4: std::fill(tar.begin()+1024,tar.begin()+1124,0);
+                    std::memcpy(tar.data()+1024,"ext4.fs.meta",12); fix_checksum(tar,1024); break;
+            case 5: std::fill(tar.begin()+1024,tar.end(),0); break; // missing marker
+            case 6: tar[257]='x'; fix_checksum(tar,0); break;
+            case 7: tar[124]=0x80; fix_checksum(tar,0); break; // unsupported binary size
+            case 8: tar.back()=1; break; // bad tar termination
+            case 9: break; // gzip trailer corruption below
+            case 10: break; // concatenated gzip below
+        }
+        auto gzip=gzip_tar(tar);
+        if(mutation==9) gzip[gzip.size()-8]^=1;
+        if(mutation==10) { const auto member=gzip; gzip.insert(gzip.end(),member.begin(),member.end()); }
+        obd::test::write_file(dir/"bad.gz",gzip);
+        REQUIRE_THROWS(obd::convert::import_turbo_package(dir/"bad.gz",dir/"destination"));
+        REQUIRE_FALSE(std::filesystem::exists(dir/"destination"));
+        REQUIRE_FALSE(std::filesystem::exists(dir/"escape"));
+        for(const auto& entry:std::filesystem::directory_iterator(dir.path()))
+            REQUIRE(entry.path().filename().string().find(".tmp.")==std::string::npos);
+    }
+}
