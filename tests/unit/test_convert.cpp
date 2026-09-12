@@ -470,6 +470,21 @@ private:
     uint32_t ro_compat_ = 0;
 };
 
+[[maybe_unused]] std::vector<uint8_t> read_layer_range(const std::string& path, uint64_t offset, size_t size) {
+    return test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
+        auto local = co_await source::LocalFileSource::open(path);
+        source::BlobSourcePtr base = std::move(local);
+        auto layer = co_await format::LsmtLayer::open(std::move(base));
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(std::move(layer));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        std::vector<uint8_t> raw(size);
+        const ssize_t r = co_await merged->pread(raw.data(), raw.size(), offset);
+        REQUIRE(r == static_cast<ssize_t>(raw.size()));
+        co_return raw;
+    });
+}
+
 std::vector<uint8_t> read_layer_raw(const std::string& path) {
     return test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
         auto local = co_await source::LocalFileSource::open(path);
@@ -483,6 +498,26 @@ std::vector<uint8_t> read_layer_raw(const std::string& path) {
         REQUIRE(r == static_cast<ssize_t>(raw.size()));
         co_return raw;
     });
+}
+
+struct Ext2SuperblockFields {
+    uint32_t blocks_count = 0;
+    uint32_t mtime = 0;
+    uint32_t wtime = 0;
+    uint16_t block_group_nr = 0;
+    std::array<uint8_t, 16> uuid {};
+};
+
+[[maybe_unused]] Ext2SuperblockFields parse_ext2_superblock(const std::vector<uint8_t>& raw) {
+    REQUIRE(raw.size() >= 1024);
+    REQUIRE(bytes::load_u16_le(raw.data() + 56) == 0xef53);
+    Ext2SuperblockFields out;
+    out.blocks_count = bytes::load_u32_le(raw.data() + 4);
+    out.mtime = bytes::load_u32_le(raw.data() + 44);
+    out.wtime = bytes::load_u32_le(raw.data() + 48);
+    out.block_group_nr = bytes::load_u16_le(raw.data() + 90);
+    std::copy(raw.begin() + 104, raw.begin() + 120, out.uuid.begin());
+    return out;
 }
 
 void assert_rootfs_metadata(const std::string& layer_path) {
@@ -691,6 +726,36 @@ TEST_CASE("cli: obd-convert libe2fs expands built-in file and directory limits",
     const auto multi_group_manifest = nlohmann::json::parse(multi_group_short_tail.out);
     REQUIRE(multi_group_manifest["converter"]["virtual_size"].get<uint64_t>() ==
             multi_group_short_tail_size);
+
+    const uint64_t multi_group_retained_size =
+        (kExt2BlocksPerGroup + 64) * kExt2BlockSize;
+    const auto multi_group_retained =
+        run_convert({"--input", tiny_path, "--out-dir", dir / "multi-group-retained",
+                     "--name", "tiny", "--size", std::to_string(multi_group_retained_size)},
+                    nullptr, false);
+    REQUIRE(multi_group_retained.exit_code == 0);
+    const auto multi_group_retained_manifest =
+        nlohmann::json::parse(multi_group_retained.out);
+    REQUIRE(multi_group_retained_manifest["converter"]["virtual_size"].get<uint64_t>() ==
+            multi_group_retained_size);
+    const std::string multi_group_retained_layer =
+        multi_group_retained_manifest["lowers"][0]["file"].get<std::string>();
+    const auto primary_super = parse_ext2_superblock(
+        read_layer_range(multi_group_retained_layer, 1024, 1024));
+    const auto backup_super = parse_ext2_superblock(read_layer_range(
+        multi_group_retained_layer, kExt2BlocksPerGroup * kExt2BlockSize, 1024));
+    const std::array<uint8_t, 16> expected_uuid = {
+        'O', 'B', 'D', 'E', 'L', 'I', 'O', '-', 'C', 'O', 'N', 'V', 'E', 'R', 'T', 0};
+    REQUIRE(primary_super.blocks_count == kExt2BlocksPerGroup + 64);
+    REQUIRE(backup_super.blocks_count == kExt2BlocksPerGroup + 64);
+    REQUIRE(primary_super.block_group_nr == 0);
+    REQUIRE(backup_super.block_group_nr == 1);
+    REQUIRE(primary_super.mtime == 0);
+    REQUIRE(backup_super.mtime == 0);
+    REQUIRE(primary_super.wtime == 0);
+    REQUIRE(backup_super.wtime == 0);
+    REQUIRE(primary_super.uuid == expected_uuid);
+    REQUIRE(backup_super.uuid == expected_uuid);
 
     const auto too_many_child_dirs_tar = make_many_root_directories_tar(65534);
     const std::string too_many_child_dirs_path =

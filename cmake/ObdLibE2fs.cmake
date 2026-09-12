@@ -1,6 +1,6 @@
 # Optional converter-local pinned libext2fs backend.
 # The pin intentionally matches upstream containerd/overlaybd's standalone
-# libext2fs build (CMake/Finde2fs.cmake).
+# libext2fs build (CMake/FindE2fs.cmake).
 include(FetchContent)
 
 set(OBD_LIBE2FS_E2FSPROGS_REPOSITORY "https://github.com/data-accelerator/e2fsprogs.git"
