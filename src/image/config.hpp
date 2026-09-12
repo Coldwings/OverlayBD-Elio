@@ -78,6 +78,10 @@ struct LowerConfig {
     uint64_t size = 0;
     std::string dir;     // per-layer directory (download cache)
     std::string file;    // local blob file when present ("" = remote)
+    // TurboOCI v1: original OCI blob; gzip_index addresses uncompressed tar.
+    std::string target_file;
+    std::string target_digest;
+    std::string gzip_index;
 };
 
 /// Writable upper layer (ADR-0008). `dir` holds the layer file:

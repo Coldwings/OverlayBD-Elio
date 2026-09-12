@@ -8,6 +8,8 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <limits>
 
 #include <algorithm>
 #include <cstring>
@@ -160,6 +162,104 @@ void write_lsmt_single_layer(int in_fd, uint64_t in_size,
     if (::ftruncate(out_fd, static_cast<off_t>(total)) != 0) {
         throw_errno(errno, "ftruncate failed");
     }
+}
+
+void write_lsmt_warp_layer(int metadata_fd, uint64_t virtual_size,
+                          const std::vector<bytes::segment_mapping>& mappings,
+                          const std::string& out_path,
+                          const LsmtWriteOptions& opts) {
+    using Mapping = bytes::segment_mapping;
+    constexpr uint64_t sector = lsmt::kAlignment;
+    constexpr uint64_t max_file = std::numeric_limits<off_t>::max();
+    if (virtual_size == 0 || virtual_size % sector != 0 ||
+        virtual_size / sector > Mapping::kMaxOffset ||
+        mappings.size() > lsmt::kMaxRoIndexSize)
+        throw format_error("warp writer: invalid virtual size or index count");
+    struct stat input_stat {};
+    if (::fstat(metadata_fd, &input_stat) != 0)
+        throw_errno(errno, "warp writer: stat metadata input");
+    const int mode = ::fcntl(metadata_fd, F_GETFL);
+    if (mode < 0) throw_errno(errno, "warp writer: inspect metadata input");
+    if ((mode & O_ACCMODE) == O_WRONLY || input_stat.st_size < 0)
+        throw format_error("warp writer: unreadable metadata input");
+    const uint64_t input_sectors = static_cast<uint64_t>(input_stat.st_size) / sector;
+    auto segs = mappings;
+    uint64_t end = 0;
+    uint64_t data_end = lsmt::kSpace;
+    bool local = false, remote = false;
+    for (auto& m : segs) {
+        if (m.tag > 1 || m.length == 0 || m.length > Mapping::kMaxLength ||
+            m.offset >= Mapping::kInvalidOffset || m.offset < end ||
+            m.offset > virtual_size / sector ||
+            m.length > virtual_size / sector - m.offset ||
+            m.moffset > Mapping::kMaxMoffset ||
+            (!m.zeroed && m.length > Mapping::kMaxMoffset - m.moffset))
+            throw format_error("warp writer: invalid mapping");
+        end = m.end();
+        local |= m.tag == 0;
+        remote |= m.tag == 1;
+        if (m.tag == 0) {
+            if (!m.zeroed && (m.moffset > input_sectors ||
+                             m.length > input_sectors - m.moffset))
+                throw format_error("warp writer: metadata extent out of range");
+            m.moffset = data_end / sector;
+            if (!m.zeroed) {
+                const uint64_t n = uint64_t(m.length) * sector;
+                if (n > max_file - data_end)
+                    throw format_error("warp writer: output size overflow");
+                data_end += n;
+            }
+        }
+    }
+    if (remote && !local)
+        throw format_error("warp writer: remote mappings require a metadata tag");
+    const uint64_t index_bytes = segs.size() * Mapping::kEncodedSize;
+    if (index_bytes + lsmt::kSpace > max_file - data_end)
+        throw format_error("warp writer: output index size overflow");
+    const uint64_t total = data_end + index_bytes + lsmt::kSpace;
+    lsmt::HeaderTrailer ht;
+    ht.flags = (1u << lsmt::kFlagShiftType) | (1u << lsmt::kFlagShiftSealed);
+    ht.index_offset = data_end;
+    ht.index_size = segs.size();
+    ht.virtual_size = virtual_size;
+    ht.uuid = opts.uuid.empty() ? generate_uuid() : opts.uuid;
+    ht.parent_uuid = opts.parent_uuid;
+    ht.user_tag = opts.user_tag;
+    uint8_t header[lsmt::kSpace], trailer[lsmt::kSpace];
+    ht.serialize(trailer);
+    ht.set_flag_bit(lsmt::kFlagShiftHeader);
+    ht.serialize(header);  // validate option lengths before touching output
+    std::vector<uint8_t> index(index_bytes);
+    for (size_t i = 0; i < segs.size(); ++i)
+        bytes::store_segment_le(index.data() + i * Mapping::kEncodedSize, segs[i]);
+    std::vector<uint8_t> buffer(1 << 20);
+
+    // Open without O_TRUNC so accidental aliases cannot destroy the input.
+    const int fd = ::open(out_path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) throw_errno(errno, "warp writer: open output");
+    struct Guard { int fd; ~Guard() { ::close(fd); } } guard{fd};
+    struct stat output_stat {};
+    if (::fstat(fd, &output_stat) != 0)
+        throw_errno(errno, "warp writer: stat output");
+    if (input_stat.st_dev == output_stat.st_dev && input_stat.st_ino == output_stat.st_ino)
+        throw format_error("warp writer: output aliases metadata input");
+    if (::ftruncate(fd, 0) != 0) throw_errno(errno, "warp writer: truncate output");
+    full_pwrite(fd, header, sizeof(header), 0);
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const auto& m = segs[i];
+        if (m.tag != 0 || m.zeroed) continue;
+        const uint64_t n = uint64_t(m.length) * sector;
+        for (uint64_t done = 0; done < n;) {
+            const size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), n - done));
+            full_pread(metadata_fd, buffer.data(), chunk, mappings[i].moffset * sector + done);
+            full_pwrite(fd, buffer.data(), chunk, m.moffset * sector + done);
+            done += chunk;
+        }
+    }
+    full_pwrite(fd, index.data(), index.size(), data_end);
+    full_pwrite(fd, trailer, sizeof(trailer), total - lsmt::kSpace);
+    if (::ftruncate(fd, static_cast<off_t>(total)) != 0)
+        throw_errno(errno, "warp writer: finalize output");
 }
 
 void write_zfile(int in_fd, uint64_t in_size, const std::string& out_path,

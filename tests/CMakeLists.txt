@@ -40,6 +40,13 @@ add_executable(obd_unit_tests
     unit/test_admission.cpp
     unit/test_layer_store.cpp
     unit/test_registry.cpp
+    ../tools/turbo_package.cpp
+    unit/test_turbo_package.cpp
+    ../tools/gzip_index_builder.cpp
+    unit/test_gzip_index_builder.cpp
+    unit/test_lsmt_warp_writer.cpp
+    unit/test_gzip_index_source.cpp
+    unit/test_lsmt_warp.cpp
     unit/test_image.cpp
     unit/test_writable.cpp
     unit/test_cli.cpp

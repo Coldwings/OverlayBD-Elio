@@ -2,6 +2,7 @@
 #include "common/bytes.hpp"
 #include "common/sha256.hpp"
 #include "format/lsmt.hpp"
+#include "image/image_file.hpp"
 #include "source/local_file.hpp"
 
 #include "../support.hpp"
@@ -1086,4 +1087,40 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
     REQUIRE(inode_result.exit_code == 1);
     REQUIRE(inode_result.err.find("at most 32768 inodes") != std::string::npos);
     REQUIRE(::stat((many_inode_dir + "/many.lsmt").c_str(), &st) != 0);
+}
+
+TEST_CASE("cli: obd-convert TurboOCI tar preserves complete filesystem bytes", "[cli][turboci]") {
+#if OBD_TEST_HAVE_LIBE2FS
+    TempDir dir;
+    const auto tar = make_rootfs_tar();
+    const auto input = test::write_file(dir / "original.tar", tar);
+    const auto ordinary = run_convert({"--input", input, "--out-dir", dir / "ordinary"}, nullptr, false);
+    const auto turbo = run_convert({"--input", input, "--out-dir", dir / "turbo", "--turboOCI"}, nullptr, false);
+    INFO(turbo.err);
+    REQUIRE(ordinary.exit_code == 0);
+    REQUIRE(turbo.exit_code == 0);
+    const auto normal_json = nlohmann::json::parse(ordinary.out);
+    const auto turbo_json = nlohmann::json::parse(turbo.out);
+    REQUIRE(turbo_json["lowers"][0]["targetFile"] == input);
+    REQUIRE(turbo_json["lowers"][0]["targetDigest"] == "sha256:" + file_sha256(input));
+    const auto expected = read_layer_raw(normal_json["lowers"][0]["file"].get<std::string>());
+    const auto actual = test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
+        auto cfg = image::ImageConfig::from_json_text(turbo.out, {});
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+        auto opened = co_await image::open_image(cfg, global);
+        std::vector<uint8_t> data(opened.virtual_size);
+        const auto n = co_await opened.root->pread(data.data(), data.size(), 0);
+        REQUIRE(n == static_cast<ssize_t>(data.size()));
+        co_return data;
+    });
+    REQUIRE(actual == expected);
+    const auto again = run_convert({"--input", input, "--out-dir", dir / "again", "--turboOCI"}, nullptr, false);
+    REQUIRE(again.exit_code == 0);
+    const auto again_json = nlohmann::json::parse(again.out);
+    REQUIRE(file_sha256(turbo_json["lowers"][0]["file"].get<std::string>()) ==
+            file_sha256(again_json["lowers"][0]["file"].get<std::string>()));
+#else
+    SKIP("libe2fs backend disabled");
+#endif
 }

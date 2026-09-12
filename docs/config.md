@@ -343,3 +343,19 @@ Semantics (`src/source/credentials.cpp::CredentialStore`):
 This assembles one local lower plus a writable upper at
 `/var/lib/overlaybd/snapshots/16/rw/overlaybd.rw`
 (`"type": "sparse"` would use `overlaybd.sparse` instead).
+
+### TurboOCI lower targets (ADR-0020)
+
+A TurboOCI lower pairs its filesystem metadata `file` with the original OCI
+layer through `targetFile` (local path) or `targetDigest` (registry SHA-256 blob
+identity). When both are supplied, the local target is used. The target is the
+complete original archive: its tar header is not stripped. A remote target uses
+`repoBlobUrl` and the same registry authentication and read-admission funnel as
+ordinary lowers.
+
+`gzipIndex` is a local path to the upstream `ddgzidx` v1 restart index for a gzip
+encoded target. It requires a target; orphan indexes and malformed target
+digests are configuration errors. Without `gzipIndex`, target offsets address
+uncompressed tar bytes directly. The metadata lower may independently use the
+ordinary ZFile envelope. Metadata packages must be imported before their
+extracted filesystem metadata and gzip index paths are used here.

@@ -5,6 +5,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -181,6 +183,22 @@ ImageConfig ImageConfig::from_json_text(const std::string& text,
             lower.size = l.value("size", 0ULL);
             lower.dir = l.value("dir", "");
             lower.file = l.value("file", "");
+            lower.target_file = l.value("targetFile", "");
+            lower.target_digest = l.value("targetDigest", "");
+            lower.gzip_index = l.value("gzipIndex", "");
+            if (!lower.gzip_index.empty() && lower.target_file.empty() &&
+                lower.target_digest.empty()) {
+                throw format_error("gzipIndex requires targetFile or targetDigest");
+            }
+            if (!lower.target_digest.empty()) {
+                const auto hex = digest_sha256_hex(lower.target_digest);
+                if (hex.size() != 64 ||
+                    !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
+                        return std::isxdigit(c) != 0;
+                    })) {
+                    throw format_error("malformed TurboOCI targetDigest");
+                }
+            }
             cfg.lowers.push_back(std::move(lower));
         }
     }

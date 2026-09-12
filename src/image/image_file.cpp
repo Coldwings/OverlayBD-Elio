@@ -10,6 +10,7 @@
 #include "format/zfile.hpp"
 #include "source/admission.hpp"
 #include "source/dart.hpp"
+#include "source/gzip_index_source.hpp"
 #include "source/layer_store.hpp"
 #include "source/local_file.hpp"
 #include "source/registry.hpp"
@@ -487,8 +488,31 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         } else {
             view = std::move(untarred);
         }
-        layers.push_back(
-            co_await format::LsmtLayer::open(std::move(view)));
+        if (!lower.target_file.empty() || !lower.target_digest.empty()) {
+            source::BlobSourcePtr target;
+            if (!lower.target_file.empty()) {
+                target = co_await source::LocalFileSource::open(lower.target_file);
+            } else {
+                if (cfg.repo_blob_url.empty()) {
+                    throw error(EINVAL, "TurboOCI targetDigest requires repoBlobUrl");
+                }
+                auto remote = co_await source::RegistrySource::open(
+                    client, cfg.repo_blob_url + "/" + lower.target_digest);
+                target = std::make_unique<source::AdmissionSource>(
+                    std::move(remote), funnel);
+            }
+            // The target is the original archive byte space. Do not strip a
+            // tar header or apply the metadata layer's ZFile adapter to it.
+            if (!lower.gzip_index.empty()) {
+                auto index = co_await source::LocalFileSource::open(lower.gzip_index);
+                target = co_await source::GzipIndexSource::open(
+                    std::move(target), std::move(index));
+            }
+            layers.push_back(co_await format::LsmtLayer::open_warp(
+                std::move(view), std::move(target)));
+        } else {
+            layers.push_back(co_await format::LsmtLayer::open(std::move(view)));
+        }
         } catch (...) {
             layer_failure = std::current_exception();
         }

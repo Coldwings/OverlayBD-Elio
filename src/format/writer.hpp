@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace obd::format {
 
@@ -31,6 +32,18 @@ struct LsmtWriteOptions {
 void write_lsmt_single_layer(int in_fd, uint64_t in_size,
                              const std::string& out_path,
                              const LsmtWriteOptions& opts = {});
+
+/// Writes native warp metadata. Input tag 0 addresses the raw filesystem
+/// fd; tag 1 addresses sectors in the original (uncompressed) target tar.
+/// Only nonzero tag-0 extents are copied, compactly, into the output.
+/// Mappings must be sorted, disjoint, nonempty, and wire-representable.
+/// A tag-0 mapping is required when tag 1 is present (upstream mode 3).
+/// All structural validation precedes output mutation; target size is
+/// checked later by open_warp, since the target is not supplied here.
+void write_lsmt_warp_layer(int metadata_fd, uint64_t virtual_size,
+                          const std::vector<bytes::segment_mapping>& mappings,
+                          const std::string& out_path,
+                          const LsmtWriteOptions& opts = {});
 
 struct ZFileWriteOptions {
     uint32_t block_size = 4096;       // power of two, <= 65536

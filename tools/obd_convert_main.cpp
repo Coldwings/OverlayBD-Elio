@@ -5,6 +5,7 @@
 #include "common/errors.hpp"
 #include "common/sha256.hpp"
 #include "format/writer.hpp"
+#include "format/lsmt_format.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -318,6 +319,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --input <rootfs.tar|-> --out-dir <dir> [--name base]\n"
                  "          [--backend builtin-ext2|libe2fs] [--size bytes] [--keep-raw]\n"
+                 "          [--turboOCI] (local uncompressed USTAR, libe2fs required)\n"
                  "\n"
                  "Builds <out-dir>/<name>.lsmt from a ustar rootfs stream. Builds\n"
                  "with the pinned libe2fs backend use it by default; dependency-free\n"
@@ -400,6 +402,7 @@ struct Node {
     uint32_t gid = 0;
     uint64_t size = 0;
     std::string spool_path;
+    uint64_t tar_payload_offset = 0;
     std::string symlink_target;
     uint32_t inode = 0;
     uint32_t child_directory_count = 0;
@@ -704,6 +707,7 @@ struct TarReader {
     uint64_t max_image_blocks = kMaxBlocks;
     std::vector<std::string> spool_paths;
     uint64_t next_spool = 0;
+    uint64_t stream_offset = 0;
     uint64_t reserved_payload_blocks = 0;
     uint64_t reserved_directory_blocks = directory_payload_blocks_for_data_blocks(1);
     uint32_t node_count = 1;
@@ -725,10 +729,18 @@ struct TarReader {
         return work_dir + "/" + stem + ".entry-" + std::to_string(next_spool++) + ".tmp";
     }
 
+    bool read_tar_exact(void* buf, size_t count, bool allow_eof) {
+        if (count > std::numeric_limits<uint64_t>::max() - stream_offset)
+            throw std::runtime_error("tar offset overflow");
+        if (!read_exact(fd, buf, count, allow_eof)) return false;
+        stream_offset += count;
+        return true;
+    }
+
     void skip_padding(uint64_t payload_size) {
         const uint64_t pad = (512 - (payload_size % 512)) % 512;
         std::array<uint8_t, 512> discard {};
-        if (pad != 0) read_exact(fd, discard.data(), static_cast<size_t>(pad), false);
+        if (pad != 0) read_tar_exact(discard.data(), static_cast<size_t>(pad), false);
     }
 
     std::string spool_payload(uint64_t payload_size) {
@@ -741,7 +753,7 @@ struct TarReader {
         std::vector<uint8_t> buf(1 << 20);
         for (uint64_t left = payload_size; left > 0;) {
             const size_t chunk = static_cast<size_t>(std::min<uint64_t>(buf.size(), left));
-            read_exact(fd, buf.data(), chunk, false);
+            read_tar_exact(buf.data(), chunk, false);
             full_write(out, buf.data(), chunk);
             left -= chunk;
         }
@@ -912,13 +924,13 @@ struct TarReader {
         bool saw_entry = false;
         for (;;) {
             std::array<uint8_t, 512> header {};
-            if (!read_exact(fd, header.data(), header.size(), true)) {
+            if (!read_tar_exact(header.data(), header.size(), true)) {
                 if (!saw_entry) throw std::runtime_error("empty tar stream");
                 throw std::runtime_error("tar stream missing end-of-archive marker");
             }
             if (all_zero(header)) {
                 std::array<uint8_t, 512> second {};
-                if (!read_exact(fd, second.data(), second.size(), true) ||
+                if (!read_tar_exact(second.data(), second.size(), true) ||
                     !all_zero(second)) {
                     throw std::runtime_error(
                         "tar end-of-archive requires two zero blocks");
@@ -986,6 +998,7 @@ struct TarReader {
                 // final image sizing.
                 reserve_regular_file_payload(size, name);
                 node->size = size;
+                node->tar_payload_offset = stream_offset;
                 if (size != 0) node->spool_path = spool_payload(size);
                 skip_padding(size);
             } else {
@@ -1595,7 +1608,46 @@ void write_libe2fs_node(ext2_filsys fs, ext2_ino_t parent, const Node& node) {
     set_inode_common(fs, ino, LINUX_S_IFREG, node.perm, node.uid, node.gid);
 }
 
-void write_libe2fs_image(Node& root, const std::string& path, uint64_t requested_size) {
+void collect_warp_payloads(ext2_filsys fs, ext2_ino_t parent, const Node& node,
+                           std::vector<obd::bytes::segment_mapping>& remote) {
+    const ext2_ino_t ino = lookup_child(fs, parent, node.name);
+    if (node.kind == NodeKind::Dir) {
+        for (const auto& [_, child] : node.children)
+            collect_warp_payloads(fs, ino, *child, remote);
+        return;
+    }
+    if (node.kind != NodeKind::File) return;
+    struct ext2_inode inode {};
+    check_libe2fs(ext2fs_read_inode(fs, ino, &inode), "libe2fs read warp inode");
+    // The final partial sector must remain local: tar padding is not part
+    // of file data and need not equal the filesystem's zero tail.
+    const uint64_t full_sectors = node.size / 512;
+    for (uint64_t file_sector = 0; file_sector < full_sectors; file_sector += 8) {
+        blk64_t physical = 0;
+        int flags = 0;
+        check_libe2fs(ext2fs_bmap2(fs, ino, &inode, nullptr, 0,
+                                   file_sector / 8, &flags, &physical),
+                      "libe2fs map warp payload");
+        if (physical == 0 || flags != 0)
+            throw std::runtime_error("warp payload has an unmapped or uninitialized block");
+        const obd::bytes::segment_mapping m = {
+            physical * 8,
+            static_cast<uint32_t>(std::min<uint64_t>(8, full_sectors - file_sector)),
+            node.tar_payload_offset / 512 + file_sector, false, 1};
+        if (!remote.empty() && remote.back().end() == m.offset &&
+            remote.back().mend() == m.moffset &&
+            m.length <= obd::bytes::segment_mapping::kMaxLength - remote.back().length) {
+            remote.back().length += m.length;
+        } else {
+            remote.push_back(m);
+        }
+        if (remote.size() > obd::format::lsmt::kMaxRoIndexSize)
+            throw std::runtime_error("warp payload index exceeds supported count");
+    }
+}
+
+void write_libe2fs_image(Node& root, const std::string& path, uint64_t requested_size,
+                         std::vector<obd::bytes::segment_mapping>* remote = nullptr) {
     const uint64_t raw_size = requested_size == 0 ? auto_libe2fs_size_bytes(root) : requested_size;
     validate_explicit_image_blocks(raw_size, ConverterBackend::LibE2fs);
     const uint64_t total_blocks = raw_size / kBlockSize;
@@ -1645,6 +1697,10 @@ void write_libe2fs_image(Node& root, const std::string& path, uint64_t requested
                   "libe2fs create root directory");
     for (const auto& [_, child] : root.children) write_libe2fs_node(fs.get(), EXT2_ROOT_INO, *child);
     set_inode_common(fs.get(), EXT2_ROOT_INO, LINUX_S_IFDIR, root.perm, root.uid, root.gid);
+    if (remote) {
+        for (const auto& [_, child] : root.children)
+            collect_warp_payloads(fs.get(), EXT2_ROOT_INO, *child, *remote);
+    }
     check_libe2fs(ext2fs_write_bitmaps(fs.get()), "libe2fs write bitmaps");
     ext2_filsys closing = fs.release();
     check_libe2fs(ext2fs_close(closing), "libe2fs close filesystem");
@@ -1653,11 +1709,61 @@ void write_libe2fs_image(Node& root, const std::string& path, uint64_t requested
 
 #else
 
-void write_libe2fs_image(Node&, const std::string&, uint64_t) {
+void write_libe2fs_image(Node&, const std::string&, uint64_t,
+                         std::vector<obd::bytes::segment_mapping>* = nullptr) {
     throw std::runtime_error("libe2fs backend was not enabled at build time");
 }
 
 #endif
+
+std::vector<obd::bytes::segment_mapping> make_warp_mappings(
+    int raw_fd, uint64_t raw_size, std::vector<obd::bytes::segment_mapping> remote) {
+    using Mapping = obd::bytes::segment_mapping;
+    std::sort(remote.begin(), remote.end(), [](const auto& a, const auto& b) {
+        return a.offset < b.offset;
+    });
+    std::vector<Mapping> mappings;
+    auto append = [&](Mapping m) {
+        if (!mappings.empty()) {
+            auto& last = mappings.back();
+            if (last.end() == m.offset && last.tag == m.tag && last.zeroed == m.zeroed &&
+                (m.zeroed || last.mend() == m.moffset) &&
+                m.length <= Mapping::kMaxLength - last.length) {
+                last.length += m.length;
+                return;
+            }
+        }
+        mappings.push_back(m);
+        if (mappings.size() > obd::format::lsmt::kMaxRoIndexSize)
+            throw std::runtime_error("warp index exceeds supported count");
+    };
+    // Scan bounded buffers; zero metadata becomes explicit masks rather
+    // than materialized megabytes of free filesystem space.
+    std::vector<uint8_t> buffer(1 << 20);
+    auto metadata = [&](uint64_t begin, uint64_t end) {
+        while (begin < end) {
+            const size_t sectors = static_cast<size_t>(
+                std::min<uint64_t>(buffer.size() / 512, end - begin));
+            full_pread(raw_fd, buffer.data(), sectors * 512, begin * 512);
+            for (size_t i = 0; i < sectors; ++i) {
+                const auto first = buffer.begin() + i * 512;
+                const bool zero = std::all_of(first, first + 512, [](auto c) { return c == 0; });
+                append({begin + i, 1, begin + i, zero, 0});
+            }
+            begin += sectors;
+        }
+    };
+    uint64_t cursor = 0;
+    for (const auto& m : remote) {
+        if (m.offset < cursor || m.end() > raw_size / 512)
+            throw std::runtime_error("warp payload blocks overlap or exceed filesystem");
+        metadata(cursor, m.offset);
+        append(m);
+        cursor = m.end();
+    }
+    metadata(cursor, raw_size / 512);
+    return mappings;
+}
 
 struct Options {
     std::string input;
@@ -1670,6 +1776,7 @@ struct Options {
 #endif
     uint64_t size = 0;
     bool keep_raw = false;
+    bool turbo_oci = false;
 };
 
 Options parse_args(int argc, char** argv) {
@@ -1691,6 +1798,7 @@ Options parse_args(int argc, char** argv) {
         }
         else if (a == "--size") opts.size = parse_size_arg(next("--size"), "--size");
         else if (a == "--keep-raw") opts.keep_raw = true;
+        else if (a == "--turboOCI") opts.turbo_oci = true;
         else if (a == "--help" || a == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -1708,6 +1816,8 @@ Options parse_args(int argc, char** argv) {
         throw UsageError("--backend libe2fs requires a build with OBD_ENABLE_LIBE2FS_BACKEND=ON");
     }
 #endif
+    if (opts.turbo_oci && (opts.backend != ConverterBackend::LibE2fs || opts.input == "-"))
+        throw UsageError("--turboOCI requires libe2fs and a local seekable USTAR input file");
     std::filesystem::create_directories(opts.out_dir);
     return opts;
 }
@@ -1726,6 +1836,16 @@ int main(int argc, char** argv) {
             input.fd = fd;
         }
 
+        uint64_t target_size = 0;
+        std::string target_digest;
+        if (opts.turbo_oci) {
+            struct stat st {};
+            if (::fstat(input.fd, &st) != 0) obd::throw_errno(errno, "stat turboOCI input");
+            if (!S_ISREG(st.st_mode) || st.st_size < 0)
+                throw UsageError("--turboOCI requires a regular seekable input file");
+            target_size = static_cast<uint64_t>(st.st_size);
+            target_digest = sha256_of_fd(input.fd, target_size);
+        }
         Node root("", NodeKind::Dir, nullptr);
         TempWorkspace workspace(opts.out_dir, opts.name);
         const uint64_t image_block_budget = image_block_budget_for(opts.size, opts.backend);
@@ -1736,10 +1856,25 @@ int main(int argc, char** argv) {
 
         const std::string raw_path = workspace.path() + "/rootfs.ext2";
         const std::string lsmt_tmp_path = workspace.path() + "/layer.lsmt";
-        const std::string lsmt_path = opts.out_dir + "/" + opts.name + ".lsmt";
+        const std::string lsmt_path = opts.out_dir + "/" +
+            (opts.turbo_oci ? "ext4.fs.meta" : opts.name + ".lsmt");
         const std::string keep_raw_path = opts.out_dir + "/." + opts.name + ".ext2.tmp";
+        if (opts.turbo_oci) {
+            std::vector<std::string> outputs = {lsmt_path};
+            if (opts.keep_raw) outputs.push_back(keep_raw_path);
+            for (const auto& output : outputs) {
+                std::error_code ec;
+                const bool aliases = std::filesystem::equivalent(opts.input, output, ec);
+                if (aliases)
+                    throw UsageError("turboOCI output aliases original input: " + output);
+                if (ec && ec != std::errc::no_such_file_or_directory)
+                    throw std::system_error(ec, "inspect turboOCI output " + output);
+            }
+        }
+        std::vector<obd::bytes::segment_mapping> remote_mappings;
         if (opts.backend == ConverterBackend::LibE2fs) {
-            write_libe2fs_image(root, raw_path, opts.size);
+            write_libe2fs_image(root, raw_path, opts.size,
+                                opts.turbo_oci ? &remote_mappings : nullptr);
         } else {
             write_ext2_image(root, raw_path, opts.size);
         }
@@ -1752,7 +1887,15 @@ int main(int argc, char** argv) {
         obd::format::LsmtWriteOptions lopts;
         lopts.uuid = uuid_from_digest(raw_digest);
         lopts.user_tag = std::string("obd-convert ") + std::string(backend_name(opts.backend));
-        obd::format::write_lsmt_single_layer(raw_fd, raw_size, lsmt_tmp_path, lopts);
+        if (opts.turbo_oci) {
+            if (file_size(opts.input) != target_size ||
+                target_digest != sha256_of_file(opts.input))
+                throw std::runtime_error("turboOCI input changed during conversion");
+            const auto mappings = make_warp_mappings(raw_fd, raw_size, std::move(remote_mappings));
+            obd::format::write_lsmt_warp_layer(raw_fd, raw_size, mappings, lsmt_tmp_path, lopts);
+        } else {
+            obd::format::write_lsmt_single_layer(raw_fd, raw_size, lsmt_tmp_path, lopts);
+        }
         raw.reset();
         fsync_file(lsmt_tmp_path, "LSMT layer");
         const std::string lsmt_digest = sha256_of_file(lsmt_tmp_path);
@@ -1768,6 +1911,11 @@ int main(int argc, char** argv) {
         lower["digest"] = "sha256:" + lsmt_digest;
         lower["size"] = lsmt_size;
         lower["file"] = lsmt_path;
+        if (opts.turbo_oci) {
+            lower["targetFile"] = std::filesystem::absolute(opts.input).lexically_normal().string();
+            lower["targetDigest"] = "sha256:" + target_digest;
+            lower["targetSize"] = target_size;
+        }
         nlohmann::json snippet;
         snippet["repoBlobUrl"] = "";
         snippet["lowers"] = nlohmann::json::array({lower});
