@@ -47,7 +47,7 @@ size_t check_member(const std::vector<uint8_t>& tar,size_t at,const char* name,
 }
 }
 
-TEST_CASE("convert: TurboOCI package has deterministic upstream tar layout", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI package has deterministic upstream tar layout", "[convert][turbo]") {
     obd::test::TempDir dir;
     const auto meta=obd::test::pattern_bytes(1003,7), index=obd::test::pattern_bytes(519,9);
     obd::test::write_file(dir/"metadata",meta); obd::test::write_file(dir/"index",index);
@@ -67,7 +67,7 @@ TEST_CASE("convert: TurboOCI package has deterministic upstream tar layout", "[c
     }
 }
 
-TEST_CASE("convert: TurboOCI package errors preserve outputs and reject aliases", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI package errors preserve outputs and reject aliases", "[convert][turbo]") {
     obd::test::TempDir dir;
     const std::vector<uint8_t> bytes{'k','e','e','p'};
     obd::test::write_file(dir/"metadata",bytes); obd::test::write_file(dir/"output",bytes);
@@ -104,7 +104,7 @@ void fix_checksum(std::vector<uint8_t>& tar,size_t at) {
 }
 }
 
-TEST_CASE("convert: TurboOCI importer publishes validated metadata and optional index", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI importer publishes validated metadata and optional index", "[convert][turbo]") {
     obd::test::TempDir dir;
     const auto metadata=obd::test::pattern_bytes(1003,17), index=obd::test::pattern_bytes(519,19);
     obd::test::write_file(dir/"metadata",metadata); obd::test::write_file(dir/"index",index);
@@ -121,7 +121,7 @@ TEST_CASE("convert: TurboOCI importer publishes validated metadata and optional 
     }
 }
 
-TEST_CASE("convert: TurboOCI importer rejects malformed archives without publication", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI importer rejects malformed archives without publication", "[convert][turbo]") {
     obd::test::TempDir dir;
     obd::test::write_file(dir/"metadata",std::vector<uint8_t>(3,'a'));
     obd::convert::write_turbo_package(dir/"metadata","",dir/"valid.gz");

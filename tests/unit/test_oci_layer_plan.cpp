@@ -47,7 +47,7 @@ std::string pax(const std::string& key,const std::string& value) {
 }
 }
 
-TEST_CASE("convert: OCI plan preserves payload positions and whiteout operations", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan preserves payload positions and whiteout operations", "[convert][oci-plan]") {
     Tar tar;
     tar.add("./d/",'5');
     const auto first=tar.add("d/a",'0',std::string(513,'a'));
@@ -64,7 +64,7 @@ TEST_CASE("convert: OCI plan preserves payload positions and whiteout operations
     REQUIRE(plan.opaque_directories==std::vector<std::string>{"d"});
 }
 
-TEST_CASE("convert: OCI plan handles PAX scope and binary xattrs", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan handles PAX scope and binary xattrs", "[convert][oci-plan]") {
     Tar tar;
     tar.add("global",'g',pax("uid","123"));
     tar.add("local",'x',pax("path","long/path")+pax("uid","456")+
@@ -84,7 +84,7 @@ TEST_CASE("convert: OCI plan handles PAX scope and binary xattrs", "[convert][oc
     REQUIRE(plan.entries[2].uid==0);
 }
 
-TEST_CASE("convert: OCI plan retains hardlinks symlinks and special node kinds", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan retains hardlinks symlinks and special node kinds", "[convert][oci-plan]") {
     Tar tar;
     tar.add("a",'0',"content");
     tar.add("hard",'1',{},"./a");
@@ -101,7 +101,7 @@ TEST_CASE("convert: OCI plan retains hardlinks symlinks and special node kinds",
     REQUIRE(plan.entries[5].kind==convert::EntryKind::Fifo);
 }
 
-TEST_CASE("convert: OCI plan applies GNU long names and links once", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan applies GNU long names and links once", "[convert][oci-plan]") {
     Tar tar;
     const std::string name=std::string(90,'a')+"/"+std::string(90,'b');
     tar.add("././@LongLink",'L',name+std::string(1,'\0'));
@@ -115,7 +115,7 @@ TEST_CASE("convert: OCI plan applies GNU long names and links once", "[convert][
     REQUIRE(plan.entries[2].path=="next");
 }
 
-TEST_CASE("convert: OCI plan maps GNU sparse 0.1 original payload offsets", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan maps GNU sparse 0.1 original payload offsets", "[convert][oci-plan]") {
     Tar tar;
     tar.add("pax",'x',pax("GNU.sparse.map","512,3,2048,2")+
         pax("GNU.sparse.size","4096")+pax("GNU.sparse.numblocks","2"));
@@ -130,7 +130,7 @@ TEST_CASE("convert: OCI plan maps GNU sparse 0.1 original payload offsets", "[co
     REQUIRE(entry.payload_spans[1].tar_offset==at+3);
 }
 
-TEST_CASE("convert: OCI plan maps GNU sparse 1.0 past embedded map padding", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan maps GNU sparse 1.0 past embedded map padding", "[convert][oci-plan]") {
     Tar tar;
     tar.add("pax",'x',pax("GNU.sparse.major","1")+pax("GNU.sparse.minor","0")+
         pax("GNU.sparse.realsize","4096")+pax("GNU.sparse.name","real-name"));
@@ -145,7 +145,7 @@ TEST_CASE("convert: OCI plan maps GNU sparse 1.0 past embedded map padding", "[c
     REQUIRE(plan.entries[0].payload_spans[1].tar_offset==at+515);
 }
 
-TEST_CASE("convert: OCI plan rejects malformed sparse encodings", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan rejects malformed sparse encodings", "[convert][oci-plan]") {
     Tar tar;
     std::string metadata;
     SECTION("old duplicate-record encoding") { metadata=pax("GNU.sparse.offset","0")+pax("GNU.sparse.numbytes","5"); }
@@ -159,7 +159,7 @@ TEST_CASE("convert: OCI plan rejects malformed sparse encodings", "[convert][oci
     REQUIRE_THROWS_AS(tar.parse(),format_error);
 }
 
-TEST_CASE("convert: OCI plan rejects unsafe paths and malformed records", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan rejects unsafe paths and malformed records", "[convert][oci-plan]") {
     Tar tar;
     SECTION("parent traversal") { tar.add("a/../b"); }
     SECTION("absolute path") { tar.add("/outside"); }
@@ -174,7 +174,7 @@ TEST_CASE("convert: OCI plan rejects unsafe paths and malformed records", "[conv
     REQUIRE_THROWS_AS(tar.parse(),format_error);
 }
 
-TEST_CASE("convert: OCI plan validates archive termination and extension bounds", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan validates archive termination and extension bounds", "[convert][oci-plan]") {
     test::TempDir dir;
     Tar tar;
     tar.add("a");
@@ -187,7 +187,7 @@ TEST_CASE("convert: OCI plan validates archive termination and extension bounds"
     REQUIRE_THROWS_AS(convert::parse_oci_layer_plan(test::write_file(dir/"tar",tar.data)),format_error);
 }
 
-TEST_CASE("convert: OCI plan preserves exact extended mtimes and rejects unrepresentable values", "[convert][oci-plan]") {
+TEST_CASE("format: OCI plan preserves exact extended mtimes and rejects unrepresentable values", "[convert][oci-plan]") {
     struct Case { const char* text; int64_t seconds; uint32_t nanos; };
     for(const auto& item: {Case{"1700000000.123456789",1700000000,123456789},
                          Case{"-0.25",-1,750000000},

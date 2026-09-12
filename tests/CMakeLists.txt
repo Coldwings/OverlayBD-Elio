@@ -63,7 +63,8 @@ target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
 # The CLI test EXECUTES the real obdctl binary (argv → wire translation),
 # so the test target depends on it and is told its path.
 target_compile_definitions(obd_unit_tests
-    PRIVATE OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>"
+    PRIVATE OBD_TEST_TURBO_IMPORT_HOOK=1
+            OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>"
             OBD_TEST_OBD_CONVERT_BIN="$<TARGET_FILE:obd-convert>"
             OBD_TEST_HAVE_LIBE2FS=$<BOOL:${OBD_ENABLE_LIBE2FS_BACKEND}>)
 find_program(OBD_E2FSCK_EXECUTABLE e2fsck PATHS /usr/sbin /sbin)

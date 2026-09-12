@@ -235,7 +235,7 @@ void write_lsmt_warp_layer(int metadata_fd, uint64_t virtual_size,
     std::vector<uint8_t> buffer(1 << 20);
 
     // Open without O_TRUNC so accidental aliases cannot destroy the input.
-    const int fd = ::open(out_path.c_str(), O_RDWR | O_CREAT, 0644);
+    const int fd = ::open(out_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) throw_errno(errno, "warp writer: open output");
     struct Guard { int fd; ~Guard() { ::close(fd); } } guard{fd};
     struct stat output_stat {};

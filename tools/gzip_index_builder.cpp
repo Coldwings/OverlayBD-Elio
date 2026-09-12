@@ -49,7 +49,7 @@ std::vector<uint8_t> compress(const uint8_t* p, size_t n) {
 void build_gzip_index(const std::string& gzip_path, const std::string& index_path,
                       uint32_t span) {
     if(span<65536 || span>INT32_MAX) throw error(EINVAL,"invalid gzip index span");
-    File input{fopen(gzip_path.c_str(),"rb")};
+    File input{fopen(gzip_path.c_str(),"rbe")};
     if(!input.p) throw error(errno,"open gzip input");
     struct stat input_stat {}, output_stat {};
     if (fstat(fileno(input.p), &input_stat) != 0)
@@ -59,7 +59,7 @@ void build_gzip_index(const std::string& gzip_path, const std::string& index_pat
         throw error(EINVAL, "gzip index output aliases input");
     Temporary temporary{index_path+".tmp.XXXXXX"};
     std::vector<char> name(temporary.path.begin(),temporary.path.end()); name.push_back(0);
-    int fd=mkstemp(name.data());
+    int fd=mkostemp(name.data(), O_CLOEXEC);
     if(fd<0) { temporary.path.clear(); throw error(errno,"create gzip index temporary"); }
     temporary.path=name.data();
     File output{fdopen(fd,"w+b")};

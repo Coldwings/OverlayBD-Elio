@@ -421,7 +421,9 @@ in that directory. The deterministic
 `turboOCIv1.tar.gz` package contains the filesystem metadata, `.turbo.ociv1`
 marker, and optional index. The stdout JSON includes runnable local `lowers`,
 the package path, and an OCI descriptor with upstream target annotations.
-The original blob must remain available for reads. Move it only together with
+The original blob and imported parent files must remain unchanged and available
+for reads. Import revalidates input identities immediately before publication.
+Move files only together with
 an appropriate configuration update.
 
 Save the stdout JSON as `descriptor.json` when importing the package elsewhere:

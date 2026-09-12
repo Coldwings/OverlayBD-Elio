@@ -103,13 +103,13 @@ void reject_alias(const std::string& input,const std::string& output) {
 void write_turbo_package(const std::string& metadata_path,const std::string& gzip_index_path,
                          const std::string& output_path) {
     reject_alias(metadata_path,output_path); reject_alias(gzip_index_path,output_path);
-    File metadata{fopen(metadata_path.c_str(),"rb")};
+    File metadata{fopen(metadata_path.c_str(),"rbe")};
     if(!metadata.p) throw error(errno,"open TurboOCI metadata");
-    File index{gzip_index_path.empty() ? nullptr:fopen(gzip_index_path.c_str(),"rb")};
+    File index{gzip_index_path.empty() ? nullptr:fopen(gzip_index_path.c_str(),"rbe")};
     if(!gzip_index_path.empty() && !index.p) throw error(errno,"open TurboOCI gzip index");
     Temporary temporary{output_path+".tmp.XXXXXX"};
     std::vector<char> name(temporary.path.begin(),temporary.path.end()); name.push_back(0);
-    int fd=mkstemp(name.data());
+    int fd=mkostemp(name.data(), O_CLOEXEC);
     if(fd<0) { temporary.path.clear(); throw error(errno,"create TurboOCI package temporary"); }
     temporary.path=name.data();
     File output{fdopen(fd,"wb")};
@@ -220,7 +220,7 @@ ImportedTurboPackage import_turbo_package(const std::string& package_path,
     struct stat existing{};
     if(lstat(output_directory.c_str(),&existing)==0) throw error(EEXIST,"TurboOCI import destination exists");
     if(errno!=ENOENT) throw error(errno,"inspect TurboOCI import destination");
-    File input{fopen(package_path.c_str(),"rb")};
+    File input{fopen(package_path.c_str(),"rbe")};
     if(!input.p) throw error(errno,"open TurboOCI package");
     PrivateDirectory temporary{output_directory+".tmp.XXXXXX"};
     std::vector<char> name(temporary.path.begin(),temporary.path.end()); name.push_back(0);

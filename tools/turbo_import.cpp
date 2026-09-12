@@ -38,8 +38,10 @@ struct PrivateDirectory {
     }
 };
 struct Identity { uint64_t size; std::string digest; bool gzip; };
+struct RecordedInput { std::string path; Identity identity; };
+using Inputs = std::vector<RecordedInput>;
 Identity identify(const std::string& path) {
-    File f{fopen(path.c_str(),"rb")};
+    File f{fopen(path.c_str(),"rbe")};
     if(!f.p) throw error(errno,"open TurboOCI input for digest");
     struct stat st{};
     if(fstat(fileno(f.p),&st)!=0) throw error(errno,"stat TurboOCI input");
@@ -59,6 +61,30 @@ Identity identify(const std::string& path) {
     }
     if(total!=static_cast<uint64_t>(st.st_size)) throw error(EIO,"TurboOCI input changed during hashing");
     return {total,"sha256:"+hash.final_hex(),is_gzip};
+}
+Identity record_input(Inputs& inputs,const std::string& path) {
+    auto identity=identify(path);
+    inputs.push_back({path,identity});
+    return identity;
+}
+void revalidate_inputs(const Inputs& inputs) {
+    for(const auto& input:inputs) {
+        const auto current=identify(input.path);
+        if(current.size!=input.identity.size || current.digest!=input.identity.digest ||
+           current.gzip!=input.identity.gzip)
+            throw format_error("TurboOCI input changed before publication: "+input.path);
+    }
+}
+nlohmann::json read_control(const std::string& path,Inputs& inputs) {
+    File file{fopen(path.c_str(),"rbe")};
+    if(!file.p) throw error(errno,"open TurboOCI control input");
+    // Bound the actual consumed bytes, including a concurrent file growth.
+    std::vector<char> bytes(1024*1024+1);
+    const size_t count=fread(bytes.data(),1,bytes.size(),file.p);
+    if(ferror(file.p)) throw error(errno ? errno:EIO,"read TurboOCI control input");
+    if(count>1024*1024) throw format_error("TurboOCI control input exceeds 1 MiB");
+    inputs.push_back({path,{count,"sha256:"+common::Sha256::hex(bytes.data(),count),false}});
+    return nlohmann::json::parse(bytes.data(),bytes.data()+count);
 }
 bool valid_digest(const std::string& value) {
     return value.size()==71 && value.starts_with("sha256:") &&
@@ -80,7 +106,7 @@ uint64_t le(const uint8_t* p,size_t n) {
 // Decode bounded checkpoint positions before the async native reader validates
 // the header/table. Probing them later rejects malformed lazy dictionaries.
 std::vector<uint64_t> checkpoint_offsets(const std::string& path) {
-    File f{fopen(path.c_str(),"rb")};
+    File f{fopen(path.c_str(),"rbe")};
     if(!f.p) throw error(errno,"open imported gzip index");
     std::array<uint8_t,333> header{};
     if(fread(header.data(),1,header.size(),f.p)!=header.size()) throw format_error("truncated imported gzip header");
@@ -140,17 +166,10 @@ elio::coro::task<std::unique_ptr<format::LsmtLayer>> open_local_layer(const Loca
     }
     co_return co_await format::LsmtLayer::open_warp(std::move(metadata),std::move(target));
 }
-std::vector<LocalLayer> load_parents(const std::string& path) {
+std::vector<LocalLayer> load_parents(const std::string& path,Inputs& inputs) {
     namespace fs=std::filesystem;
     if(path.empty()) return {};
-    std::ifstream file(path,std::ios::binary);
-    if(!file) throw error(errno ? errno:ENOENT,"open TurboOCI parent config");
-    file.seekg(0,std::ios::end);
-    const auto size=file.tellg();
-    if(size<0 || size>1024*1024) throw format_error("TurboOCI parent config exceeds 1 MiB");
-    file.seekg(0);
-    nlohmann::json document;
-    file>>document;
+    const auto document=read_control(path,inputs);
     if(!document.is_object() || !document.contains("lowers") || !document["lowers"].is_array() ||
        document["lowers"].empty() || document["lowers"].size()>=255 ||
        (document.contains("upper") && !document["upper"].empty()))
@@ -165,14 +184,14 @@ std::vector<LocalLayer> load_parents(const std::string& path) {
             throw format_error("TurboOCI parent metadata requires a local file");
         LocalLayer local;
         local.metadata=resolve(lower.at("file").get<std::string>());
-        const auto metadata=identify(local.metadata);
+        const auto metadata=record_input(inputs,local.metadata);
         if((lower.contains("digest") && lower.at("digest")!=metadata.digest) ||
            (lower.contains("size") && lower.at("size")!=metadata.size))
             throw format_error("TurboOCI parent metadata digest or size mismatch");
         local.lower={{"file",local.metadata},{"digest",metadata.digest},{"size",metadata.size}};
         if(lower.contains("targetFile") && !lower.at("targetFile").get<std::string>().empty()) {
             local.target=resolve(lower.at("targetFile").get<std::string>());
-            const auto target=identify(local.target);
+            const auto target=record_input(inputs,local.target);
             if((lower.contains("targetDigest") && lower.at("targetDigest")!=target.digest) ||
                (lower.contains("targetSize") && lower.at("targetSize")!=target.size))
                 throw format_error("TurboOCI parent target digest or size mismatch");
@@ -181,7 +200,7 @@ std::vector<LocalLayer> load_parents(const std::string& path) {
             local.lower["targetSize"]=target.size;
             if(lower.contains("gzipIndex") && !lower.at("gzipIndex").get<std::string>().empty()) {
                 local.index=resolve(lower.at("gzipIndex").get<std::string>());
-                (void)identify(local.index); // require a regular local index before reading
+                (void)record_input(inputs,local.index); // require a regular local index before reading
                 local.checkpoints=checkpoint_offsets(local.index);
                 local.lower["gzipIndex"]=local.index;
             }
@@ -200,22 +219,19 @@ nlohmann::json import_turbo_image(const std::string& package_path,
                                   const std::string& descriptor_path,
                                   const std::string& target_path,
                                   const std::string& destination_dir,
-                                  const std::string& parent_config_path) {
+                                  const std::string& parent_config_path
+#ifdef OBD_TEST_TURBO_IMPORT_HOOK
+                                  , const std::function<void()>& before_publish
+#endif
+                                  ) {
     namespace fs=std::filesystem;
     if(destination_dir.empty()) throw error(EINVAL,"empty TurboOCI destination");
     const auto destination=fs::absolute(destination_dir).lexically_normal();
     struct stat st{};
     if(lstat(destination.c_str(),&st)==0) throw error(EEXIST,"TurboOCI import destination exists");
     if(errno!=ENOENT) throw error(errno,"inspect TurboOCI import destination");
-    std::ifstream descriptor_file(descriptor_path,std::ios::binary);
-    if(!descriptor_file) throw error(errno ? errno:ENOENT,"open TurboOCI descriptor");
-    // Descriptor input is control-plane metadata, bounded before JSON parsing.
-    descriptor_file.seekg(0,std::ios::end);
-    const auto descriptor_size=descriptor_file.tellg();
-    if(descriptor_size<0 || descriptor_size>1024*1024) throw format_error("TurboOCI descriptor exceeds 1 MiB");
-    descriptor_file.seekg(0);
-    nlohmann::json document;
-    descriptor_file>>document;
+    Inputs inputs;
+    const auto document=read_control(descriptor_path,inputs);
     const auto descriptor=document.contains("descriptor") ? document.at("descriptor"):document;
     if(!descriptor.is_object() || !descriptor.contains("size") || !descriptor.at("size").is_number_integer())
         throw format_error("invalid TurboOCI descriptor");
@@ -231,12 +247,12 @@ nlohmann::json import_turbo_image(const std::string& package_path,
     const std::string target_media=annotations.at(std::string(prefix)+"turbo-oci/target-media-type").get<std::string>();
     if(!valid_digest(target_digest) || (!gzip_media(target_media) && !tar_media(target_media)))
         throw format_error("unsupported TurboOCI target annotation");
-    const auto package=identify(package_path), target=identify(target_path);
+    const auto package=record_input(inputs,package_path), target=record_input(inputs,target_path);
     if(!package.gzip || package.digest!=digest || package.size!=descriptor.at("size").get<uint64_t>())
         throw format_error("TurboOCI package digest or size mismatch");
     if(target.digest!=target_digest || target.gzip!=gzip_media(target_media))
         throw format_error("TurboOCI target digest or media type mismatch");
-    const auto parents=load_parents(parent_config_path);
+    const auto parents=load_parents(parent_config_path,inputs);
     PrivateDirectory staging{destination.string()+".tmp.XXXXXX"};
     std::vector<char> name(staging.path.begin(),staging.path.end()); name.push_back(0);
     if(!mkdtemp(name.data())) { staging.path.clear(); throw error(errno,"create TurboOCI validation directory"); }
@@ -244,6 +260,8 @@ nlohmann::json import_turbo_image(const std::string& package_path,
     const auto extracted=import_turbo_package(package_path,(fs::path(staging.path)/"image").string());
     if((!extracted.gzip_index_path.empty())!=target.gzip)
         throw format_error("TurboOCI gzip index does not match target media type");
+    (void)record_input(inputs,extracted.metadata_path);
+    if(target.gzip) (void)record_input(inputs,extracted.gzip_index_path);
     const auto offsets=target.gzip ? checkpoint_offsets(extracted.gzip_index_path):std::vector<uint64_t>{};
     elio::runtime::run_config config;
     config.num_threads=1; config.blocking_threads=1;
@@ -263,9 +281,14 @@ nlohmann::json import_turbo_image(const std::string& package_path,
         }
         std::array<uint8_t,512> tar_header{};
         const auto tar_read=co_await target_source->pread(tar_header.data(),tar_header.size(),0);
-        if(tar_read!=static_cast<ssize_t>(tar_header.size()) ||
-           (!std::all_of(tar_header.begin(),tar_header.end(),[](uint8_t b){return b==0;}) &&
-            std::memcmp(tar_header.data()+257,"ustar",5)!=0))
+        if(tar_read!=static_cast<ssize_t>(tar_header.size()))
+            throw format_error("TurboOCI target does not have a complete tar header");
+        if(std::all_of(tar_header.begin(),tar_header.end(),[](uint8_t b){return b==0;})) {
+            const auto terminator=co_await target_source->pread(tar_header.data(),tar_header.size(),512);
+            if(target_source->size()<1024 || terminator!=static_cast<ssize_t>(tar_header.size()) ||
+               !std::all_of(tar_header.begin(),tar_header.end(),[](uint8_t b){return b==0;}))
+                throw format_error("TurboOCI empty tar requires two zero terminator blocks");
+        } else if(std::memcmp(tar_header.data()+257,"ustar",5)!=0)
             throw format_error("TurboOCI target does not have a tar header");
         source::BlobSourcePtr metadata=co_await source::LocalFileSource::open(extracted.metadata_path);
         metadata=co_await source::TarOffsetSource::open(std::move(metadata));
@@ -302,6 +325,10 @@ nlohmann::json import_turbo_image(const std::string& package_path,
     nlohmann::json result={{"repoBlobUrl",""},{"lowers",std::move(lowers)},
         {"converter",{{"backend","turbo-import"},{"imported",true},{"virtual_size",virtual_size}}},
         {"descriptor",descriptor}};
+#ifdef OBD_TEST_TURBO_IMPORT_HOOK
+    if(before_publish) before_publish();
+#endif
+    revalidate_inputs(inputs);
     if(syscall(SYS_renameat2,AT_FDCWD,(fs::path(staging.path)/"image").c_str(),AT_FDCWD,
                destination.c_str(),RENAME_NOREPLACE)!=0)
         throw error(errno,"publish validated TurboOCI image");

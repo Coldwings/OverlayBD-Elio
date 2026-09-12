@@ -28,7 +28,7 @@ uint64_t le(const std::vector<uint8_t>& v,size_t at,size_t n) {
 }
 }
 
-TEST_CASE("convert: gzip index builder is deterministic and readable", "[convert][gzip]") {
+TEST_CASE("format: gzip index builder is deterministic and readable", "[convert][gzip]") {
     obd::test::TempDir dir;
     auto plain=obd::test::pattern_bytes(2*1024*1024,53);
     auto compressed=gzip(plain);
@@ -61,7 +61,7 @@ TEST_CASE("convert: gzip index builder is deterministic and readable", "[convert
     REQUIRE(result == 0);
 }
 
-TEST_CASE("convert: invalid gzip never publishes partial index", "[convert][gzip]") {
+TEST_CASE("format: invalid gzip never publishes partial index", "[convert][gzip]") {
     obd::test::TempDir dir;
     const std::vector<uint8_t> previous{'k','e','e','p'};
     for(int mutation=0;mutation<3;++mutation) {
@@ -80,7 +80,7 @@ TEST_CASE("convert: invalid gzip never publishes partial index", "[convert][gzip
     }
 }
 
-TEST_CASE("convert: gzip index output cannot replace its input", "[convert][gzip]") {
+TEST_CASE("format: gzip index output cannot replace its input", "[convert][gzip]") {
     obd::test::TempDir dir;
     const auto bytes = gzip(std::vector<uint8_t>(2048, 42));
     const auto path = obd::test::write_file(dir / "input.gz", bytes);

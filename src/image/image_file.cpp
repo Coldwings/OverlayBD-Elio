@@ -575,6 +575,29 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                     }
                 }
             }
+            // The index is required by the target encoding, not an optional
+            // hint: treating compressed bytes as tar offsets can return wrong
+            // data even when every warp mapping is within the blob's bounds.
+            uint8_t signature[2]{};
+            const size_t signature_size = static_cast<size_t>(
+                std::min<uint64_t>(target->size(), sizeof(signature)));
+            const auto signature_read = co_await target->pread(
+                signature, signature_size, 0);
+            if (signature_read < 0) {
+                throw error(static_cast<int>(-signature_read),
+                            "read TurboOCI target signature");
+            }
+            if (signature_read != static_cast<ssize_t>(signature_size)) {
+                throw error(EIO, "short TurboOCI target signature");
+            }
+            const bool gzip_target = signature_size == 2 &&
+                signature[0] == 0x1f && signature[1] == 0x8b;
+            if (gzip_target && lower.gzip_index.empty()) {
+                throw format_error("TurboOCI gzip target requires gzipIndex");
+            }
+            if (!gzip_target && !lower.gzip_index.empty()) {
+                throw format_error("TurboOCI gzipIndex requires a gzip target");
+            }
             structural_targets.push_back(target.get());
             // The target is the original archive byte space. Do not strip a
             // tar header or apply the metadata layer's ZFile adapter to it.

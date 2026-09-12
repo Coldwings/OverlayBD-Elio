@@ -73,7 +73,7 @@ struct ImportFixture {
 };
 }
 
-TEST_CASE("convert: TurboOCI descriptor import returns validated runnable config", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI descriptor import returns validated runnable config", "[convert][turbo]") {
     for(bool gzip:{false,true}) {
         ImportFixture f(gzip);
         if(gzip) json_file(f.dir/"descriptor",nlohmann::json{{"descriptor",f.descriptor}});
@@ -88,7 +88,7 @@ TEST_CASE("convert: TurboOCI descriptor import returns validated runnable config
     }
 }
 
-TEST_CASE("convert: TurboOCI descriptor and native validation fail before publication", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI descriptor and native validation fail before publication", "[convert][turbo]") {
     for(int mutation=0;mutation<7;++mutation) {
         ImportFixture f;
         switch(mutation) {
@@ -111,7 +111,7 @@ TEST_CASE("convert: TurboOCI descriptor and native validation fail before public
     }
 }
 
-TEST_CASE("convert: TurboOCI importer rejects malformed lazy gzip dictionary", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI importer rejects malformed lazy gzip dictionary", "[convert][turbo]") {
     ImportFixture f(true);
     auto index=load_import_file(f.dir/"gzip.idx");
     REQUIRE(index.size()>333);
@@ -123,7 +123,7 @@ TEST_CASE("convert: TurboOCI importer rejects malformed lazy gzip dictionary", "
     REQUIRE_FALSE(std::filesystem::exists(f.dir/"imported"));
 }
 
-TEST_CASE("convert: TurboOCI importer accepts upstream ZFile wrapped warp metadata", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI importer accepts upstream ZFile wrapped warp metadata", "[convert][turbo]") {
     ImportFixture f;
     const auto raw=load_import_file(f.dir/"metadata");
     int fd=open((f.dir/"metadata").c_str(),O_RDONLY);
@@ -142,7 +142,7 @@ TEST_CASE("convert: TurboOCI importer accepts upstream ZFile wrapped warp metada
     REQUIRE(config.at("converter").at("virtual_size")==1024);
 }
 
-TEST_CASE("convert: TurboOCI differential import rejects missing and mismatched parent chains", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI differential import rejects missing and mismatched parent chains", "[convert][turbo]") {
     ImportFixture base;
     const auto parent=base.run();
     for(int mutation=0;mutation<8;++mutation) {
@@ -176,7 +176,7 @@ TEST_CASE("convert: TurboOCI differential import rejects missing and mismatched 
     REQUIRE_FALSE(std::filesystem::exists(root.dir/"imported"));
 }
 
-TEST_CASE("convert: TurboOCI differential import rejects incompatible parent geometry", "[convert][turbo]") {
+TEST_CASE("format: TurboOCI differential import rejects incompatible parent geometry", "[convert][turbo]") {
     ImportFixture child(false,"11111111-1111-1111-1111-111111111111");
     int fd=open((child.dir/"raw").c_str(),O_RDONLY);
     REQUIRE(fd>=0);
@@ -190,3 +190,77 @@ TEST_CASE("convert: TurboOCI differential import rejects incompatible parent geo
         child.dir/"target",child.dir/"imported",child.dir/"parent.json"));
     REQUIRE_FALSE(std::filesystem::exists(child.dir/"imported"));
 }
+
+TEST_CASE("format: TurboOCI empty tar requires two complete zero terminator blocks", "[convert][turbo]") {
+    for(bool gzip:{false,true}) for(int variant=0;variant<3;++variant) {
+        ImportFixture f(gzip);
+        std::vector<uint8_t> target(variant==0 ? 512:1024,0);
+        if(variant==1) target[512]=1;
+        if(gzip) {
+            std::vector<uint8_t> packed(compressBound(target.size())+100);
+            z_stream z{};
+            REQUIRE(deflateInit2(&z,6,Z_DEFLATED,31,8,Z_DEFAULT_STRATEGY)==Z_OK);
+            z.next_in=target.data(); z.avail_in=target.size();
+            z.next_out=packed.data(); z.avail_out=packed.size();
+            REQUIRE(deflate(&z,Z_FINISH)==Z_STREAM_END);
+            packed.resize(z.total_out); deflateEnd(&z); target=std::move(packed);
+        }
+        obd::test::write_file(f.dir/"target",target);
+        f.descriptor["annotations"]["containerd.io/snapshot/overlaybd/turbo-oci/target-digest"]=digest_of(target);
+        const int fd=open((f.dir/"raw").c_str(),O_RDONLY);
+        REQUIRE(fd>=0);
+        try { obd::format::write_lsmt_warp_layer(fd,512,{{0,1,0,false,0}},f.dir/"empty.meta"); }
+        catch(...) { close(fd); throw; }
+        close(fd);
+        if(gzip) obd::convert::build_gzip_index(f.dir/"target",f.dir/"empty.idx");
+        obd::convert::write_turbo_package(f.dir/"empty.meta",gzip ? f.dir/"empty.idx":"",f.dir/"package");
+        f.refresh_package();
+        if(variant==2) REQUIRE(f.run()["converter"]["virtual_size"]==512);
+        else {
+            REQUIRE_THROWS(f.run());
+            REQUIRE_FALSE(std::filesystem::exists(f.dir/"imported"));
+        }
+    }
+}
+
+#ifdef OBD_TEST_TURBO_IMPORT_HOOK
+TEST_CASE("format: TurboOCI import revalidates every input immediately before publication", "[convert][turbo]") {
+    for(int mutation=0;mutation<9;++mutation) {
+        ImportFixture parent(true);
+        const auto parent_config=parent.run();
+        ImportFixture child(true,"11111111-1111-1111-1111-111111111111");
+        json_file(child.dir/"parent.json",parent_config);
+        bool called=false;
+        auto replace_before_publication=[&] {
+            called=true;
+            std::string path;
+            switch(mutation) {
+            case 0: path=child.dir/"package"; break;
+            case 1: path=child.dir/"target"; break;
+            case 2: path=child.dir/"descriptor"; break;
+            case 3: path=child.dir/"parent.json"; break;
+            case 4: path=parent_config["lowers"][0]["file"].get<std::string>(); break;
+            case 5: path=parent_config["lowers"][0]["targetFile"].get<std::string>(); break;
+            case 6: path=parent_config["lowers"][0]["gzipIndex"].get<std::string>(); break;
+            default:
+                for(const auto& entry:std::filesystem::directory_iterator(child.dir.path()))
+                    if(entry.path().filename().string().starts_with("imported.tmp."))
+                        path=(entry.path()/"image"/(mutation==7 ? "ext4.fs.meta":"gzip.meta")).string();
+                break;
+            }
+            REQUIRE_FALSE(path.empty());
+            auto data=load_import_file(path);
+            REQUIRE_FALSE(data.empty());
+            data.back()^=1;
+            const auto replacement=obd::test::write_file(child.dir/"replacement",data);
+            std::filesystem::rename(replacement,path);
+        };
+        REQUIRE_THROWS(obd::convert::import_turbo_image(child.dir/"package",child.dir/"descriptor",
+            child.dir/"target",child.dir/"imported",child.dir/"parent.json",replace_before_publication));
+        REQUIRE(called);
+        REQUIRE_FALSE(std::filesystem::exists(child.dir/"imported"));
+        for(const auto& entry:std::filesystem::directory_iterator(child.dir.path()))
+            REQUIRE(entry.path().filename().string().find(".tmp.")==std::string::npos);
+    }
+}
+#endif
