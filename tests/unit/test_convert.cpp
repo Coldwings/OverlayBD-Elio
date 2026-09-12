@@ -251,6 +251,23 @@ std::vector<uint8_t> make_many_root_files_tar(size_t count) {
     return tar;
 }
 
+[[maybe_unused]] std::vector<uint8_t> make_libe2fs_directory_expansion_tar() {
+    std::vector<uint8_t> tar;
+    constexpr size_t kDirs = 420;
+    constexpr size_t kSymlinks = 420;
+    tar.reserve((kDirs + kSymlinks + 3) * 512);
+    append_tar_entry(tar, "p/", '5', 0755, 0, 0);
+    for (size_t i = 0; i < kDirs; ++i) {
+        append_tar_entry(tar, "p/d" + std::to_string(i) + "/", '5', 0755, 0, 0);
+    }
+    for (size_t i = 0; i < kSymlinks; ++i) {
+        append_tar_entry(tar, "p/s" + std::to_string(i), '2', 0777, 0, 0, {},
+                         "target-" + std::to_string(i));
+    }
+    tar.resize(tar.size() + 1024, 0);
+    return tar;
+}
+
 std::vector<uint8_t> make_sorted_directory_budget_tar() {
     std::vector<uint8_t> tar;
     constexpr size_t kExistingEntries = 156;
@@ -795,6 +812,22 @@ TEST_CASE("cli: obd-convert libe2fs expands built-in file and directory limits",
     const std::string many_layer = many_manifest["lowers"][0]["file"].get<std::string>();
     Ext2View many_fs(read_layer_raw(many_layer));
     REQUIRE(many_fs.lookup({"f4099"}) != 0);
+
+    const auto expansion_tar = make_libe2fs_directory_expansion_tar();
+    const std::string expansion_path = test::write_file(dir / "expansion.tar", expansion_tar);
+    const auto expansion = run_convert({"--input", expansion_path, "--out-dir",
+                                        dir / "expansion", "--name", "expansion"},
+                                       nullptr, false);
+    REQUIRE(expansion.exit_code == 0);
+    const auto expansion_manifest = nlohmann::json::parse(expansion.out);
+    REQUIRE(expansion_manifest["converter"]["backend"].get<std::string>() == "libe2fs");
+    const std::string expansion_layer =
+        expansion_manifest["lowers"][0]["file"].get<std::string>();
+    Ext2View expansion_fs(read_layer_raw(expansion_layer));
+    const auto expanded_dir = expansion_fs.inode(expansion_fs.lookup({"p", "d419"}));
+    REQUIRE((expanded_dir.mode & 0170000) == 0040000);
+    REQUIRE(expansion_fs.symlink_target(expansion_fs.lookup({"p", "s419"})) ==
+            "target-419");
 #else
     SUCCEED("libe2fs backend disabled in this build");
 #endif
@@ -875,6 +908,16 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
     struct stat st {};
     REQUIRE(::stat((out_dir + "/bad.lsmt").c_str(), &st) != 0);
 
+#if OBD_TEST_HAVE_LIBE2FS
+    const std::string default_bad_dir = dir / "default-bad";
+    const auto default_bad = run_convert({"--input", tar_path, "--out-dir",
+                                          default_bad_dir, "--name", "bad"},
+                                         nullptr, false);
+    REQUIRE(default_bad.exit_code == 1);
+    REQUIRE(default_bad.err.find("unsupported tar entry type") != std::string::npos);
+    REQUIRE(::stat((default_bad_dir + "/bad.lsmt").c_str(), &st) != 0);
+#endif
+
     const std::string empty_path = test::write_file(dir / "empty.tar", {});
     const std::string empty_dir = dir / "empty";
     const auto empty_result = run_convert({"--input", empty_path, "--out-dir",
@@ -882,6 +925,16 @@ TEST_CASE("cli: obd-convert rejects unsupported tar entries before writing a lay
     REQUIRE(empty_result.exit_code == 1);
     REQUIRE(empty_result.err.find("empty tar stream") != std::string::npos);
     REQUIRE(::stat((empty_dir + "/empty.lsmt").c_str(), &st) != 0);
+
+#if OBD_TEST_HAVE_LIBE2FS
+    const std::string default_empty_dir = dir / "default-empty";
+    const auto default_empty =
+        run_convert({"--input", empty_path, "--out-dir", default_empty_dir,
+                     "--name", "empty"}, nullptr, false);
+    REQUIRE(default_empty.exit_code == 1);
+    REQUIRE(default_empty.err.find("empty tar stream") != std::string::npos);
+    REQUIRE(::stat((default_empty_dir + "/empty.lsmt").c_str(), &st) != 0);
+#endif
 
     std::vector<uint8_t> empty_end_marker(1024, 0);
     const std::string empty_end_path =
