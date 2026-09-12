@@ -1,0 +1,57 @@
+name: Bug report
+description: Report incorrect implementation behavior against an accepted contract.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for product behavior that contradicts README/docs/ADR/API contracts. If the contract is unclear, file a docs/spec or ADR/design issue instead.
+  - type: input
+    id: component
+    attributes:
+      label: Affected component/files
+      description: List modules, tools, docs, tests, or paths involved.
+      placeholder: "src/source/layer_store.cpp, docs/source.md"
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior
+      description: What happens now, and why is it wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior or contract
+      description: Cite the contract, ADR, documentation, API comment, or invariant that should hold.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence / reproduction
+      description: Include exact commands, logs, seeds, file/line anchors, or static review evidence. Say when the report is static-only.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact and risk
+      description: Describe user-visible impact, data integrity/liveness risk, or why this matters.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation status
+      description: What has been run or checked? Include environment limits, skipped tests, or non-reproduction results.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope boundaries / related issues
+      description: Note related issues and what this issue intentionally does not claim or fix.

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation index
+    url: https://github.com/Coldwings/OverlayBD-Elio/blob/main/docs/README.md
+    about: Check current module contracts, ADR guidance, and test inventory before filing.

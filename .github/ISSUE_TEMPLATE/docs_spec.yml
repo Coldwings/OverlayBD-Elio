@@ -1,0 +1,39 @@
+name: Documentation or spec issue
+description: Report stale, missing, ambiguous, or internally inconsistent docs/spec text.
+title: "[Docs] "
+labels: ["documentation"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Affected documentation/spec
+      description: Link or list the file and section.
+      placeholder: "docs/source.md, docs/adr/README.md"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is stale, ambiguous, contradictory, or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Authoritative source of truth
+      description: Cite implementation, tests, accepted ADRs, README/contracts, or issue evidence that should govern the correction.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected documentation change
+      description: Describe the corrected wording or the information the docs should convey.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Note docs checks, link checks, or related tests that should be run.
