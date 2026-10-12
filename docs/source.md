@@ -623,12 +623,17 @@ prefix is `/dart`).
   rewriting inline for its data requests; this helper exists for tests,
   tooling, and documentation of the convention.)
 - `dart_proxy_reachable(address)` — bounded reachability probe: resolves the
-  host and attempts a cancellable TCP connect under a 1000 ms deadline
-  (`elio::with_timeout` + cancel token), so a silently-dropping network
-  cannot stall image open behind TCP retransmits. Returns `false` on any
+  host with Elio 0.6's owned `resolve_all(host, port, resolve_wait_options,
+  token)` outcome, then attempts a cancellable TCP connect. Both stages share
+  the original absolute 1000 ms deadline and a structured `when_any` timer token,
+  so slow DNS observation and a silently-dropping network cannot stall image
+  open behind libc lookup or TCP retransmits. Returns `false` on any
   failure (resolution, connect, timeout, exception). Mirrors overlaybd's
   `check_accelerate_url()`: on `false` the caller falls back to direct
-  registry reads instead of failing the device.
+  registry reads instead of failing the device. A late libc lookup may finish
+  after the observer returns; Elio owns its hostname and retains shared DNS
+  admission until reclamation. Normal scheduler shutdown still drains those
+  producers, since libc itself cannot be forcibly cancelled.
 
 ### `admission.hpp` — ReadClass, AdmissionFunnel, AdmissionSource
 
@@ -1058,6 +1063,20 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   stripping), malformed addresses (no port, non-numeric port, port > 65535)
   are rejected, and the prefixed URL preserves the embedded upstream URL
   verbatim.
+- `source: DART DNS deadline leaves late lookup owned until retirement` —
+  a held DNS producer outlives the one-second probe and its address frame;
+  the observer returns false, the original absolute deadline is retained,
+  admission remains held, and late hostname access is safe before reclamation.
+- `source: DART DNS failure and exception fall back to direct reads` — owned
+  DNS failures and lookup exceptions produce false and release admission.
+- `source: DART probe spawn rejection falls back without DNS work` — native
+  child-admission failure disables optional acceleration without escaping.
+- `source: DART delayed successful DNS shares its remaining TCP budget` —
+  delayed hostname resolution reaches a real loopback listener; a held connect
+  observes cancellation, and the actual timer branch retains the DNS deadline.
+- `source: DART literal probes bypass DNS and report TCP reachability` —
+  loopback literals consume no DNS work; listening and refused ports produce
+  true and false respectively.
 - `source: registry range reads and size probe` — `RegistrySource::open`
   learns the size from the Range 0-0 probe and `pread` returns exact bytes
   for an interior range.
