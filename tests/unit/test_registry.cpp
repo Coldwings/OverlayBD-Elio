@@ -713,6 +713,74 @@ TEST_CASE("source: cancelled registry auth leader preserves the shared token exc
     });
 }
 
+TEST_CASE("source: registry cancellation takes precedence over an observed operation failure", "[source][registry-streaming]") {
+    const bool length_request = GENERATE(false, true);
+    const bool discovery_failure = GENERATE(false, true);
+    const bool cancel_observer = GENERATE(false, true);
+    elio::runtime::run_config config;
+    config.num_threads = 1;
+    elio::run([length_request, discovery_failure, cancel_observer]() -> elio::coro::task<void> {
+        size_t exchanges = 0;
+        RawRegistry peer([&](const std::string&) {
+            ++exchanges;
+            if (!discovery_failure && exchanges == 1) {
+                return RawRegistry::Reply{
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1048576\r\n"
+                    "Content-Length: 1\r\n\r\np"};
+            }
+            if (discovery_failure) {
+                // Independent discovery must settle with a real framing
+                // error before its cancelled observer selects a result.
+                return RawRegistry::Reply{"HTTP/1.1 206 Partial Content\r\n", 4096, true};
+            }
+            const std::string head = length_request
+                ? "HTTP/1.1 200 OK\r\n"
+                : "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-23/1048576\r\n";
+            return RawRegistry::Reply{head + "Content-Length: 8\r\n\r\nabc", 4096, true};
+        }, false);
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            struct Observation {
+                bool cancel;
+                size_t failures = 0;
+                int underlying_error = 0;
+                elio::coro::join_handle<int64_t>* observer = nullptr;
+            } state{cancel_observer};
+            source::RegistryClientConfig client_config;
+            client_config.failure_context_for_test = &state;
+            client_config.observe_failure_for_test = [](void* context, int code) noexcept {
+                auto& observation = *static_cast<Observation*>(context);
+                ++observation.failures;
+                observation.underlying_error = code;
+                if (observation.cancel) observation.observer->request_cancel();
+            };
+            source::RegistryClient client(nullptr, client_config);
+            const std::string url = peer.url();
+            std::array<char, 8> output;
+            elio::sync::event start;
+            auto request = [&]() -> elio::coro::task<int64_t> {
+                co_await start.wait();
+                if (length_request) co_return co_await client.get_length(url);
+                co_return co_await client.get_data(url, output.data(), 16, output.size());
+            };
+            auto observer = elio::spawn(request());
+            state.observer = &observer;
+            start.set();
+            int64_t result = 0;
+            std::exception_ptr failure;
+            try { result = co_await observer; } catch (...) { failure = std::current_exception(); }
+            co_await observer.wait_destroyed_async();
+            if (failure) std::rethrow_exception(failure);
+            REQUIRE(state.underlying_error == EBADMSG);
+            REQUIRE(result == (cancel_observer ? -ECANCELED : -EBADMSG));
+            const size_t expected_failures = !cancel_observer && !length_request &&
+                !discovery_failure ? 3 : 1;
+            REQUIRE(state.failures == expected_failures);
+            REQUIRE(peer.requests() == expected_failures + (discovery_failure ? 0 : 1));
+            REQUIRE(peer.data_requests() == (length_request || discovery_failure ? 0 : expected_failures));
+        });
+    }, config);
+}
+
 TEST_CASE("source: registry discovery and range length ignore held probe bodies", "[source][registry-streaming]") {
     const bool unrepresentable = GENERATE(false, true);
     test::run_coro([unrepresentable]() -> elio::coro::task<void> {

@@ -174,6 +174,15 @@ RegistryClient::RegistryClient(CredentialStorePtr creds,
       cfg_(std::move(cfg)),
       http_(make_http_config(cfg_)) {}
 
+int RegistryClient::observation_error(
+    int code, const elio::coro::cancel_token& token) const {
+#ifdef OBD_TEST_HOOKS
+    if (cfg_.observe_failure_for_test)
+        cfg_.observe_failure_for_test(cfg_.failure_context_for_test, code);
+#endif
+    return token.is_cancelled() ? ECANCELED : code;
+}
+
 elio::coro::task<elio::http::client_result<elio::http::response>>
 RegistryClient::request_range(const std::string& url, uint64_t first,
                               uint64_t last, const std::string& auth_header) {
@@ -558,7 +567,7 @@ elio::coro::task<ssize_t> RegistryClient::get_data(const std::string& url,
         try {
             info = co_await resolve(url, min_token_generation);
         } catch (const std::system_error& e) {
-            co_return -e.code().value();
+            co_return -observation_error(e.code().value(), token);
         }
         // Auth discovery/refresh may be shared with other readers. Complete
         // that exchange independently, then leave this cancelled observation.
@@ -571,8 +580,8 @@ elio::coro::task<ssize_t> RegistryClient::get_data(const std::string& url,
         auto result = co_await request_data(request_url, offset, count,
                                             info.auth_header, buf);
         if (const auto* failure = std::get_if<elio::http::client_error>(&result)) {
-            const int e = failure->code.value();
-            if (e == ECANCELED || token.is_cancelled() || attempt == 2) co_return -e;
+            const int e = observation_error(failure->code.value(), token);
+            if (e == ECANCELED || attempt == 2) co_return -e;
             const auto delay = co_await elio::time::sleep_for(std::chrono::milliseconds(1), token);
             if (delay == elio::coro::cancel_result::cancelled) co_return -ECANCELED;
             continue;
@@ -635,7 +644,7 @@ elio::coro::task<int64_t> RegistryClient::get_length(const std::string& url) {
     try {
         info = co_await resolve(url);
     } catch (const std::system_error& e) {
-        co_return -e.code().value();
+        co_return -observation_error(e.code().value(), token);
     }
     if (token.is_cancelled()) co_return -ECANCELED;
     std::string request_url = info.final_url;
@@ -685,7 +694,7 @@ elio::coro::task<int64_t> RegistryClient::get_length(const std::string& url) {
             }
         }, streaming_options(cfg_));
     if (const auto* failure = std::get_if<elio::http::client_error>(&result))
-        co_return -failure->code.value();
+        co_return -observation_error(failure->code.value(), token);
     co_return length;
 }
 

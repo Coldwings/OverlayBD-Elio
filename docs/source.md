@@ -119,6 +119,10 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
   cancelling one reader cannot poison a token exchange shared by other readers.
   A cancelled reader waiting for that control work departs after it completes;
   this is not immediate cancellation of the entire authentication sequence.
+  If an operation fails, cancellation already requested when the caller
+  observes that failure takes precedence over its error code. This applies
+  to failed shared discovery as well as caller-owned payload/length exchanges;
+  it does not change the result policy for successful operations.
 - **Auth discovery** — an unauthenticated probe; on 401/403 the
   `WWW-Authenticate` Bearer challenge (`realm`, `service`, `scope`) is parsed
   and a token is fetched from the realm with Basic auth built from the
@@ -1148,6 +1152,11 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: cancelled registry auth leader preserves the shared token exchange` —
   a cancelled leader finishes its shared token provider, returns ECANCELED, and
   leaves the uncancelled follower's byte-exact read successful with one exchange.
+- `source: registry cancellation takes precedence over an observed operation failure` —
+  a per-client test seam cancels the observer after a real truncated response
+  reports EBADMSG; payload and length failures, including failed independent
+  discovery, report ECANCELED without retry. Uncancelled controls retain the
+  original framing error and retry policy.
 - `source: registry discovery and range length ignore held probe bodies` —
   discovery and a 206 total return promptly with missing/over-cap unused bodies,
   reject unrepresentable totals, retire those connections, and receive a healthy

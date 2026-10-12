@@ -59,6 +59,12 @@ struct RegistryClientConfig {
     std::string accelerate_base;
     /// Max decoded response body, buffered control or streamed payload.
     size_t max_response_size = 64 * 1024 * 1024;
+#ifdef OBD_TEST_HOOKS
+    // Per-client seam to order cancellation after a genuine operation failure
+    // and before the public observer selects its error. Production omits it.
+    void* failure_context_for_test = nullptr;
+    void (*observe_failure_for_test)(void*, int) noexcept = nullptr;
+#endif
 };
 
 /// Shared HTTP client + auth/redirect caches for one device process. All
@@ -85,6 +91,10 @@ public:
     elio::coro::task<int64_t> get_length(const std::string& url);
 
 private:
+    /// A cancelled observer reports ECANCELED after failed provider/HTTP work
+    /// has settled. Successful operations retain their existing result policy.
+    int observation_error(int code, const elio::coro::cancel_token& token) const;
+
     struct TokenEntry {
         std::string token;
         std::chrono::steady_clock::time_point expiry;
