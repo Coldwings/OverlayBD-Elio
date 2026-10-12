@@ -1,12 +1,14 @@
 // Unit tests: source module — tar adapter, credentials, DART address
 // handling.
 #include "source/credentials.hpp"
+#include "source/local_file.hpp"
 #include "source/dart.hpp"
 #include "source/tar_offset.hpp"
 
 #include "../support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
 
 using namespace obd;
 using obd::test::VectorSource;
@@ -95,4 +97,29 @@ TEST_CASE("source: DART address parsing and prefixed URL", "[source]") {
     REQUIRE(!source::parse_dart_address("localhost/dart").has_value());
     REQUIRE(!source::parse_dart_address("localhost:notaport/dart").has_value());
     REQUIRE(!source::parse_dart_address("localhost:99999/dart").has_value());
+}
+
+TEST_CASE("source: positional file reads preserve clamping and early EOF", "[source]") {
+    test::TempDir dir;
+    const auto input = test::pattern_bytes(1024, 47);
+    const auto path = test::write_file(dir / "local", input);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto file = co_await source::LocalFileSource::open(path);
+        std::vector<uint8_t> buffer(1536, 0xaa);
+        const auto clamped = co_await file->pread(buffer.data(), buffer.size(), 512);
+        REQUIRE(clamped == 512);
+        REQUIRE(std::equal(buffer.begin(), buffer.begin() + 512, input.begin() + 512));
+        REQUIRE(buffer[512] == 0xaa);
+        const auto empty = co_await file->pread(buffer.data(), 0, 0);
+        REQUIRE(empty == 0);
+        // The cached size stays 1024; the actual file now has an early EOF.
+        std::filesystem::resize_file(path, 256);
+        std::fill(buffer.begin(), buffer.end(), 0xaa);
+        const auto partial = co_await file->pread(buffer.data(), buffer.size(), 0);
+        REQUIRE(partial == 256);
+        REQUIRE(std::equal(buffer.begin(), buffer.begin() + 256, input.begin()));
+        REQUIRE(buffer[256] == 0xaa);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
 }

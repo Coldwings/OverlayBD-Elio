@@ -5,7 +5,8 @@
 #include "common/sha256.hpp"
 #include "format/writer.hpp"  // generate_uuid
 
-#include <elio/io/io_awaitables.hpp>
+#include <elio/io/file_transfer.hpp>
+#include <elio/io/file_operations.hpp>
 #include <elio/log/macros.hpp>
 
 #include <fcntl.h>
@@ -51,9 +52,9 @@ public:
         if (count == 0) co_return 0;
         auto handle = fd_->load(std::memory_order_acquire);
         if (!handle) co_return -EBADF;
-        const auto r = co_await elio::io::async_read(
-            handle->get(), buf, count, static_cast<off_t>(offset));
-        co_return r.result;
+        const auto result = co_await elio::io::pread_some(
+            handle->get(), std::span<std::byte>(static_cast<std::byte*>(buf), count), offset);
+        co_return result.error ? -result.error.value() : static_cast<ssize_t>(result.transferred);
     }
 
     uint64_t size() const noexcept override {
@@ -122,30 +123,18 @@ constexpr uint64_t kMaxSegLen = bytes::segment_mapping::kMaxLength;
 
 elio::coro::task<int> write_all(int fd, const void* buf, size_t count,
                                 uint64_t offset) {
-    const uint8_t* p = static_cast<const uint8_t*>(buf);
-    size_t done = 0;
-    while (done < count) {
-        const auto r = co_await elio::io::async_write(
-            fd, p + done, count - done, static_cast<off_t>(offset + done));
-        if (r.result < 0) co_return r.result;
-        if (r.result == 0) co_return -EIO;
-        done += static_cast<size_t>(r.result);
-    }
-    co_return 0;
+    const auto result = co_await elio::io::pwrite_exactly(
+        fd, std::span<const std::byte>(static_cast<const std::byte*>(buf), count), offset);
+    if (result.error) co_return -result.error.value();
+    co_return result.end == elio::io::transfer_end::complete ? 0 : -EIO;
 }
 
 elio::coro::task<int> read_all(int fd, void* buf, size_t count,
                                uint64_t offset) {
-    uint8_t* p = static_cast<uint8_t*>(buf);
-    size_t done = 0;
-    while (done < count) {
-        const auto r = co_await elio::io::async_read(
-            fd, p + done, count - done, static_cast<off_t>(offset + done));
-        if (r.result < 0) co_return r.result;
-        if (r.result == 0) co_return -EIO;
-        done += static_cast<size_t>(r.result);
-    }
-    co_return 0;
+    const auto result = co_await elio::io::pread_exactly(
+        fd, std::span<std::byte>(static_cast<std::byte*>(buf), count), offset);
+    if (result.error) co_return -result.error.value();
+    co_return result.end == elio::io::transfer_end::complete ? 0 : -EIO;
 }
 
 lsmt::HeaderTrailer make_ht(bool header, bool sealed, uint64_t index_offset,
@@ -562,8 +551,9 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
 elio::coro::task<int> LsmtRwLayer::flush() {
     auto handle = fd_.load(std::memory_order_acquire);
     if (!handle) co_return -EBADF;
-    if (::fdatasync(handle->get()) != 0) co_return -errno;
-    co_return 0;
+    const auto status = co_await elio::io::sync_file(
+        handle->get(), elio::io::file_sync_mode::data_only);
+    co_return status ? 0 : -status.error_value();
 }
 
 elio::coro::task<int> LsmtRwLayer::checkpoint() {
@@ -605,7 +595,8 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
     rc = co_await write_all(fd, region, sizeof(region),
                             index_offset + index_region);
     if (rc != 0) co_return rc;
-    if (::fdatasync(fd) != 0) co_return -errno;
+    const auto status = co_await elio::io::sync_file(fd, elio::io::file_sync_mode::data_only);
+    if (!status) co_return -status.error_value();
     data_bytes_.store(index_offset + index_region + sizeof(region),
                       std::memory_order_release);
     checkpointed_.store(true, std::memory_order_release);
@@ -722,8 +713,9 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
         if (rc != 0) goto out;
         sealed_bytes = trailer_offset + sizeof(region);
 
-        if (::fdatasync(out_fd) != 0) {
-            rc = -errno;
+        const auto status = co_await elio::io::sync_file(out_fd, elio::io::file_sync_mode::data_only);
+        if (!status) {
+            rc = -status.error_value();
             goto out;
         }
         const int live_fd = ::fcntl(out_fd, F_DUPFD_CLOEXEC, 0);
