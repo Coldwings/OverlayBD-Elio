@@ -117,8 +117,8 @@ public:
         kDisabled = 0,  // fill not enabled
         kWaiting = 1,   // in the start delay
         kFilling = 2,   // walking and persisting
-        kDone = 3,      // walk reached verified completion
-        kStopped = 4,   // left early: bypass, completion, or stop_fill()
+        kDone = 3,      // writer reached verified completion before fill exits
+        kStopped = 4,   // left before completion: bypass or stop_fill()
     };
 
     /// Opens (or creates) the persistence state for one layer in `dir`.

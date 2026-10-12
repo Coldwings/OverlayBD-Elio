@@ -847,7 +847,9 @@ remote bytes into a sparse local staging file with a sidecar extent map
   error backoff, and throttle waits use a fill-specific cancellable Elio
   timer so stop is observed promptly. `fill_status()` reports
   `kDisabled`/`kWaiting`/`kFilling`/
-  `kDone`/`kStopped`, but it is observability only. Fill shares the
+  `kDone`/`kStopped`, but it is observability only. A verified commit reports
+  `kDone` even when it interrupts a queue wait or timer, or arrives before a
+  pending remote read returns. Fill shares the
   lifetime contract below: call `park_fill()` before destroying the store
   so the fill coroutine has released its frame.
 - Write-behind: fetched extents queue (bounded by `queue_max_bytes`) for a
@@ -1138,6 +1140,10 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: native fill notifications survive allocation failure and stop races` —
   force byte-queue and checksum event waits, inject native writer dispatch
   allocation failure, and stop exactly between reset and wait registration.
+- `source: layer store fill records success when completion interrupts the producer` —
+  a verified commit records `kDone` while fill is in its start delay, waiting
+  for queue capacity, or returning from a remote read; gates force each
+  ordering and the owner is drained before assertions.
 - `source: layer store fill stays off in bypass` — an injected `ENOSPC`
   flips the store to `Bypass` mid-fill: fill stops (`kStopped`), reads
   continue remotely, nothing persists, no commit appears.

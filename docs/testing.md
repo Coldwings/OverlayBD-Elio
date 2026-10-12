@@ -1597,6 +1597,9 @@ Elio task-ownership and notification migration regressions:
 - `source: native fill notifications survive allocation failure and stop races` —
   bounded-byte writer queue and checksum notification, native allocation failure,
   and stop between event reset and registration.
+- `source: layer store fill records success when completion interrupts the producer` —
+  force a verified commit during the start delay, a full-queue wait, and a
+  pending remote read; all successful producer exits report `kDone`.
 
 Native Elio test hooks are enabled consistently on core and dependent test-build
 targets (`OBD_BUILD_TESTS=ON`); builds with tests disabled omit them. Scoped fault guards in
