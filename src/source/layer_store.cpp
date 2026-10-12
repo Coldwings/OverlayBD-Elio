@@ -894,6 +894,17 @@ elio::coro::task<void> LayerStore::run_fill() {
     // (when configured) behind both OnDemand and Prefetch traffic.
     fill_status_.store(static_cast<int>(FillStatus::kWaiting),
                        std::memory_order_release);
+    const auto finish = [this] {
+        // A verified commit interrupts every producer wait, not only the
+        // all-present checksum wait. Cancellation here can therefore mean
+        // success; the writer's terminal state is the authoritative result.
+        const bool done = state() == State::Complete;
+        ELIO_LOG_INFO("layer store {}: background fill {}",
+                      dir_, done ? "finished" : "stopped");
+        fill_status_.store(static_cast<int>(done ? FillStatus::kDone
+                                                 : FillStatus::kStopped),
+                           std::memory_order_release);
+    };
     uint32_t delay = cfg_.fill.delay_sec;
     if (cfg_.fill.delay_extra_sec != 0) {
         // std::random_device jitter (upstream download precedent); not part of the
@@ -905,8 +916,7 @@ elio::coro::task<void> LayerStore::run_fill() {
     if (!co_await sleep_fill_stop_aware(std::chrono::duration_cast<
                                         std::chrono::milliseconds>(
             std::chrono::seconds(delay)))) {
-        fill_status_.store(static_cast<int>(FillStatus::kStopped),
-                           std::memory_order_release);
+        finish();
         co_return;
     }
     fill_status_.store(static_cast<int>(FillStatus::kFilling),
@@ -930,7 +940,6 @@ elio::coro::task<void> LayerStore::run_fill() {
     uint64_t window_used = 0;
     auto window_start = std::chrono::steady_clock::now();
     unsigned consecutive_errors = 0;
-    bool done = false;
 
     while (!fill_stop_.load(std::memory_order_acquire) &&
            state() == State::Filling) {
@@ -980,7 +989,6 @@ elio::coro::task<void> LayerStore::run_fill() {
                 if (allocation_failed) co_await elio::time::yield();
             }
             if (state() == State::Complete) {
-                done = true;
                 break;
             }
             if (fill_stop_.load(std::memory_order_acquire) ||
@@ -1032,9 +1040,7 @@ elio::coro::task<void> LayerStore::run_fill() {
             if (!co_await sleep_fill_stop_aware(std::chrono::duration_cast<
                                                 std::chrono::milliseconds>(
                     std::chrono::seconds(1u << shift)))) {
-                fill_status_.store(
-                    static_cast<int>(FillStatus::kStopped),
-                    std::memory_order_release);
+                finish();
                 co_return;
             }
             continue;
@@ -1051,9 +1057,7 @@ elio::coro::task<void> LayerStore::run_fill() {
             const bool room =
                 co_await wait_queue_room(elen);
             if (!room) {
-                fill_status_.store(
-                    static_cast<int>(FillStatus::kStopped),
-                    std::memory_order_release);
+                finish();
                 co_return;
             }
             enqueue_write(x, buf, generation,
@@ -1069,9 +1073,7 @@ elio::coro::task<void> LayerStore::run_fill() {
                         std::chrono::duration_cast<
                             std::chrono::milliseconds>(
                             std::chrono::seconds(1) - elapsed))) {
-                    fill_status_.store(
-                        static_cast<int>(FillStatus::kStopped),
-                        std::memory_order_release);
+                    finish();
                     co_return;
                 }
             }
@@ -1079,11 +1081,7 @@ elio::coro::task<void> LayerStore::run_fill() {
             window_used = 0;
         }
     }
-    ELIO_LOG_INFO("layer store {}: background fill {}",
-                  dir_, done ? "finished" : "stopped");
-    fill_status_.store(static_cast<int>(done ? FillStatus::kDone
-                                             : FillStatus::kStopped),
-                       std::memory_order_release);
+    finish();
 }
 
 // ---------------------------------------------------------------------------
