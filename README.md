@@ -60,6 +60,7 @@ ordinary C build tools (`make` and binutils for the default converter backend),
 (`<linux/ublk_cmd.h>`). Dependencies (Elio, nlohmann/json, lz4, zstd,
 Catch2, and by default the pinned e2fsprogs/libext2fs converter backend) are
 fetched by CMake FetchContent — the first configure needs network access.
+The runtime is pinned to the immutable Elio v0.6.0 release commit.
 Python 3.8+ is required when `OBD_BUILD_TESTS=ON` (the default) for the
 test-source assertion guard and its self-tests.
 
