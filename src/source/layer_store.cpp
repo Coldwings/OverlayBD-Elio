@@ -10,6 +10,7 @@
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/coro/join_wait.hpp>
 #include <elio/time/timer.hpp>
 
 #include <fcntl.h>
@@ -273,7 +274,7 @@ elio::coro::task<std::unique_ptr<LayerStore>> LayerStore::open(
 
 LayerStore::~LayerStore() {
 #ifdef OBD_TEST_HOOKS
-    if (fill_task_ && !fill_task_->is_ready()) {
+    if (fill_task_ && !fill_task_->is_destroyed()) {
         g_unparked_layer_store_destructions.fetch_add(
             1, std::memory_order_relaxed);
     }
@@ -775,6 +776,9 @@ elio::coro::task<ssize_t> LayerStore::populate(uint64_t offset, size_t len) {
 
 elio::coro::task<bool> LayerStore::wait_queue_room(size_t len) {
     for (;;) {
+#ifdef OBD_TEST_HOOKS
+        std::function<void(bool)> hook;
+#endif
         {
             std::lock_guard lk(qmu_);
             if (stopping_ || state() != State::Filling ||
@@ -782,11 +786,41 @@ elio::coro::task<bool> LayerStore::wait_queue_room(size_t len) {
                 co_return false;
             }
             if (queued_bytes_ + len <= cfg_.queue_max_bytes) co_return true;
+            // The writer publishes capacity under this same mutex before
+            // signaling. Reset cannot race past a relevant notification.
+            fill_queue_room_.reset();
+#ifdef OBD_TEST_HOOKS
+            hook = fill_wait_hook_;
+#endif
         }
-        // Scavenger back-pressure: fill may wait on the writer; readers
-        // never do. 1 ms polling is cheap at concurrency 1.
-        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+#ifdef OBD_TEST_HOOKS
+        if (hook) hook(false);
+#endif
+        bool allocation_failed = false;
+        try {
+            const auto outcome = co_await fill_queue_room_.wait(fill_cancel_.get_token());
+            if (outcome != elio::coro::cancel_result::completed) co_return false;
+        } catch (const std::bad_alloc&) {
+            allocation_failed = true;
+        }
+        if (allocation_failed) co_await elio::time::yield();
     }
+}
+
+void LayerStore::stop_fill() noexcept {
+    fill_stop_.store(true, std::memory_order_release);
+    try {
+        fill_cancel_.cancel();
+    } catch (...) {
+        // Dispatch can allocate. The existing writer retries cancellation
+        // and event publication while the store remains owned by park_fill.
+    }
+    if (!cfg_.fill.enable) return;
+    {
+        std::lock_guard lk(qmu_);
+        fill_wake_requested_ = true;
+    }
+    qcv_.notify_one();
 }
 
 elio::coro::task<void> LayerStore::park_fill(
@@ -794,24 +828,45 @@ elio::coro::task<void> LayerStore::park_fill(
     stop_fill();
     if (!fill_task_) co_return;
 
-    auto waited = std::chrono::milliseconds(0);
-    bool warned = false;
-    while (!fill_task_->is_ready()) {
-        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
-        waited += std::chrono::milliseconds(1);
-        if (!warned && waited >= timeout) {
-            warned = true;
-            ELIO_LOG_WARNING(
-                "layer store {}: fill still running after {}ms; waiting for "
-                "the task to release before destroying the store",
-                dir_, timeout.count());
+    bool observe_budget = false;
+    {
+        std::lock_guard lk(qmu_);
+        observe_budget = !fill_park_started_;
+        fill_park_started_ = true;
+    }
+    if (observe_budget) {
+        try {
+            const auto outcome = co_await fill_task_->wait_until(
+                std::chrono::steady_clock::now() + timeout);
+            if (outcome == elio::coro::join_wait_outcome::timed_out) {
+                ELIO_LOG_WARNING(
+                    "layer store {}: fill still running after {}ms; waiting for "
+                    "the task to release before destroying the store",
+                    dir_, timeout.count());
+            }
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR("layer store {}: fill warning wait failed: {}",
+                           dir_, e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR("layer store {}: fill warning wait failed", dir_);
         }
     }
-
-    auto task = std::move(*fill_task_);
-    fill_task_.reset();
+    // A ready result may still retain raw-this callable captures. Keep the
+    // immutable handle so concurrent parkers can observe teardown together.
+    while (!fill_task_->is_destroyed()) {
+        try {
+            co_await fill_task_->wait_destroyed_async();
+        } catch (const std::bad_alloc&) {
+        }
+        if (!fill_task_->is_destroyed()) co_await elio::time::yield();
+    }
+    {
+        std::lock_guard lk(qmu_);
+        if (fill_result_reported_) co_return;
+        fill_result_reported_ = true;
+    }
     try {
-        co_await task;
+        fill_task_->await_resume();
     } catch (const std::exception& e) {
         ELIO_LOG_ERROR("layer store {}: fill task failed during parking: {}",
                        dir_, e.what());
@@ -824,17 +879,11 @@ elio::coro::task<void> LayerStore::park_fill(
 
 elio::coro::task<bool> LayerStore::sleep_fill_stop_aware(
     std::chrono::milliseconds duration) {
-    auto slept = std::chrono::milliseconds(0);
-    constexpr auto kStep = std::chrono::milliseconds(100);
-    while (slept < duration) {
-        if (fill_stop_.load(std::memory_order_acquire) ||
-            state() != State::Filling) {
-            co_return false;
-        }
-        const auto step = std::min(kStep, duration - slept);
-        co_await elio::time::sleep_for(step);
-        slept += step;
-    }
+    if (fill_stop_.load(std::memory_order_acquire) ||
+        state() != State::Filling) co_return false;
+    const auto outcome = co_await elio::time::sleep_for(
+        duration, fill_cancel_.get_token());
+    if (outcome != elio::coro::cancel_result::completed) co_return false;
     co_return !fill_stop_.load(std::memory_order_acquire) &&
               state() == State::Filling;
 }
@@ -845,6 +894,17 @@ elio::coro::task<void> LayerStore::run_fill() {
     // (when configured) behind both OnDemand and Prefetch traffic.
     fill_status_.store(static_cast<int>(FillStatus::kWaiting),
                        std::memory_order_release);
+    const auto finish = [this] {
+        // A verified commit interrupts every producer wait, not only the
+        // all-present checksum wait. Cancellation here can therefore mean
+        // success; the writer's terminal state is the authoritative result.
+        const bool done = state() == State::Complete;
+        ELIO_LOG_INFO("layer store {}: background fill {}",
+                      dir_, done ? "finished" : "stopped");
+        fill_status_.store(static_cast<int>(done ? FillStatus::kDone
+                                                 : FillStatus::kStopped),
+                           std::memory_order_release);
+    };
     uint32_t delay = cfg_.fill.delay_sec;
     if (cfg_.fill.delay_extra_sec != 0) {
         // std::random_device jitter (upstream download precedent); not part of the
@@ -852,13 +912,11 @@ elio::coro::task<void> LayerStore::run_fill() {
         std::random_device rd;
         delay += rd() % (cfg_.fill.delay_extra_sec + 1);
     }
-    // Slept in 100 ms slices so stop_fill() (park_image_fills, teardown)
-    // takes effect promptly even inside a long start delay.
+    // One cancellable timer lets stop_fill interrupt a long start delay.
     if (!co_await sleep_fill_stop_aware(std::chrono::duration_cast<
                                         std::chrono::milliseconds>(
             std::chrono::seconds(delay)))) {
-        fill_status_.store(static_cast<int>(FillStatus::kStopped),
-                           std::memory_order_release);
+        finish();
         co_return;
     }
     fill_status_.store(static_cast<int>(FillStatus::kFilling),
@@ -882,7 +940,6 @@ elio::coro::task<void> LayerStore::run_fill() {
     uint64_t window_used = 0;
     auto window_start = std::chrono::steady_clock::now();
     unsigned consecutive_errors = 0;
-    bool done = false;
 
     while (!fill_stop_.load(std::memory_order_acquire) &&
            state() == State::Filling) {
@@ -904,10 +961,34 @@ elio::coro::task<void> LayerStore::run_fill() {
                    state() == State::Filling &&
                    present_.load(std::memory_order_acquire) ==
                        extent_count_) {
-                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+#ifdef OBD_TEST_HOOKS
+                std::function<void(bool)> hook;
+#endif
+                {
+                    std::lock_guard lk(qmu_);
+                    if (fill_stop_.load(std::memory_order_acquire) ||
+                        state() != State::Filling ||
+                        present_.load(std::memory_order_acquire) != extent_count_) {
+                        break;
+                    }
+                    fill_completion_.reset();
+#ifdef OBD_TEST_HOOKS
+                    hook = fill_wait_hook_;
+#endif
+                }
+#ifdef OBD_TEST_HOOKS
+                if (hook) hook(true);
+#endif
+                bool allocation_failed = false;
+                try {
+                    const auto outcome = co_await fill_completion_.wait(fill_cancel_.get_token());
+                    if (outcome != elio::coro::cancel_result::completed) break;
+                } catch (const std::bad_alloc&) {
+                    allocation_failed = true;
+                }
+                if (allocation_failed) co_await elio::time::yield();
             }
             if (state() == State::Complete) {
-                done = true;
                 break;
             }
             if (fill_stop_.load(std::memory_order_acquire) ||
@@ -959,9 +1040,7 @@ elio::coro::task<void> LayerStore::run_fill() {
             if (!co_await sleep_fill_stop_aware(std::chrono::duration_cast<
                                                 std::chrono::milliseconds>(
                     std::chrono::seconds(1u << shift)))) {
-                fill_status_.store(
-                    static_cast<int>(FillStatus::kStopped),
-                    std::memory_order_release);
+                finish();
                 co_return;
             }
             continue;
@@ -978,9 +1057,7 @@ elio::coro::task<void> LayerStore::run_fill() {
             const bool room =
                 co_await wait_queue_room(elen);
             if (!room) {
-                fill_status_.store(
-                    static_cast<int>(FillStatus::kStopped),
-                    std::memory_order_release);
+                finish();
                 co_return;
             }
             enqueue_write(x, buf, generation,
@@ -996,9 +1073,7 @@ elio::coro::task<void> LayerStore::run_fill() {
                         std::chrono::duration_cast<
                             std::chrono::milliseconds>(
                             std::chrono::seconds(1) - elapsed))) {
-                    fill_status_.store(
-                        static_cast<int>(FillStatus::kStopped),
-                        std::memory_order_release);
+                    finish();
                     co_return;
                 }
             }
@@ -1006,17 +1081,47 @@ elio::coro::task<void> LayerStore::run_fill() {
             window_used = 0;
         }
     }
-    ELIO_LOG_INFO("layer store {}: background fill {}",
-                  dir_, done ? "finished" : "stopped");
-    fill_status_.store(static_cast<int>(done ? FillStatus::kDone
-                                             : FillStatus::kStopped),
-                       std::memory_order_release);
+    finish();
 }
 
 // ---------------------------------------------------------------------------
 // Write-behind writer thread (blocking disk work lives here, never on an
 // Elio worker — same precedent as the ublk queue threads)
 // ---------------------------------------------------------------------------
+
+void LayerStore::signal_fill_events_from_writer(bool completion) {
+    if (!cfg_.fill.enable) return;
+    {
+        // Rendezvous with each predicate-check/reset, including terminal
+        // state and checksum-generation changes published before this lock.
+        std::lock_guard lk(qmu_);
+    }
+    auto signal = [](elio::sync::event& event) {
+        for (;;) {
+            try {
+                event.set();
+                return;
+            } catch (const std::bad_alloc&) {
+                // set allocates before selecting waiters. Retry on the
+                // existing plain writer thread, with owners still retained.
+                std::this_thread::yield();
+            }
+        }
+    };
+    signal(fill_queue_room_);
+    if (completion) signal(fill_completion_);
+    if (completion && (fill_stop_.load(std::memory_order_acquire) ||
+                       state() != State::Filling)) {
+        for (;;) {
+            try {
+                fill_cancel_.cancel();
+                break;
+            } catch (const std::bad_alloc&) {
+                std::this_thread::yield();
+            }
+        }
+    }
+}
 
 void LayerStore::writer_main() {
     if (kick_completion_check_) {
@@ -1026,7 +1131,9 @@ void LayerStore::writer_main() {
     }
     std::unique_lock lk(qmu_);
     for (;;) {
-        qcv_.wait(lk, [&] { return stopping_ || !queue_.empty(); });
+        qcv_.wait(lk, [&] {
+            return stopping_ || fill_wake_requested_ || !queue_.empty();
+        });
         if (stopping_) {
             // Bounded best-effort drain by dropping: pending writes are
             // only cache; teardown must never hang.
@@ -1034,11 +1141,19 @@ void LayerStore::writer_main() {
             queued_bytes_ = 0;
             return;
         }
+        if (fill_wake_requested_) {
+            fill_wake_requested_ = false;
+            lk.unlock();
+            signal_fill_events_from_writer(true);
+            lk.lock();
+            continue;
+        }
         WriteJob job = std::move(queue_.front());
         queue_.pop_front();
         if (job.data) queued_bytes_ -= job.len;
         std::function<int(uint64_t)> hook = write_hook_;
         lk.unlock();
+        signal_fill_events_from_writer(false);
         process_job(job, hook);
         lk.lock();
     }
@@ -1111,6 +1226,8 @@ void LayerStore::enter_bypass(int err, const char* what) {
     if (state_.compare_exchange_strong(expected,
                                        static_cast<int>(State::Bypass),
                                        std::memory_order_acq_rel)) {
+        stop_fill();
+        signal_fill_events_from_writer(true);
         // Logged once: only the first transition wins the CAS.
         ELIO_LOG_ERROR("layer store {} entering bypass ({}: {}); reads "
                        "continue remotely",
@@ -1180,6 +1297,7 @@ void LayerStore::complete_layer() {
                          std::memory_order_release);
         state_.store(static_cast<int>(State::Complete),
                      std::memory_order_release);
+        signal_fill_events_from_writer(true);
         ELIO_LOG_INFO("layer store {} complete: {} ({} extents)", dir_,
                       commit_path(dir_), extent_count_);
         return;
@@ -1237,6 +1355,7 @@ void LayerStore::restart_fresh() {
     ::unlink(old_sidecar.c_str());
     ELIO_LOG_INFO("layer store {}: restarting fresh (nonce {})", dir_,
                   hex_nonce(nonce_));
+    signal_fill_events_from_writer(true);
 }
 
 }  // namespace obd::source

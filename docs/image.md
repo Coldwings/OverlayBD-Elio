@@ -198,6 +198,9 @@ result, skips replay, and returns a fully functional device whose later
 reads are served on demand. The underlying fetch may finish in the
 background and its result is discarded; this avoids relying on hard
 cancellation in registry/funnel paths that deliberately do not have it.
+The budget uses Elio's non-consuming deadline-aware join observation;
+timeout requests best-effort loader cancellation while the independently
+owned loader remains safe to finish after assembly proceeds.
 Replay is bounded by the separate 30 s wall-time budget below, and every
 populate it issues passes the device's read admission funnel (ADR-0012) as the
 **Prefetch scavenger class**, outranking background fill. Detaching
@@ -963,8 +966,13 @@ registry). Run with `ctest --test-dir build --output-on-failure` (see
   `image: trace recording stale stop never drains a restarted timer` —
   a late stop waiting on an old timer drain stays bound to that old
   timer after a new recording starts;
+  finalization waiters use a manual-reset Elio event in their retained
+  generation record, and timer drains use native multi-observer frame
+  teardown waits on that generation's handle; observer allocation failure
+  retries in the existing owner frame and rechecks the generation result;
   `image: concurrent trace stops join the winning finalize` — an
   expiry stop and explicit stop are held after both observe Recording;
+  another concurrent stop joins the same published generation result;
   the loser joins and returns the winner's result;
   `image: trace recording captures only remote fetches through the layer store`
   — local hits record nothing, misses record exactly the fetched

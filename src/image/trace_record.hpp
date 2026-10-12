@@ -43,6 +43,7 @@
 
 #include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/sync/event.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -211,11 +212,13 @@ private:
     struct FinalizeCompletion {
         uint64_t generation = 0;
         std::optional<FinalizeResult> result;
+        elio::sync::event done;
     };
 
     struct TimerDrain {
         bool draining = false;
         bool drained = false;
+        std::optional<elio::coro::join_handle<void>> task;
     };
 
     class TimerCallbackScope {
@@ -268,7 +271,6 @@ private:
     std::optional<FinalizeResult> last_;
     std::shared_ptr<FinalizeCompletion> finalizing_;
     std::shared_ptr<elio::coro::cancel_source> timer_cancel_;
-    std::optional<elio::coro::join_handle<void>> timer_task_;
     std::shared_ptr<TimerDrain> timer_drain_;
     std::optional<FinalizeResult> timer_callback_result_;
     std::thread::id timer_callback_thread_;

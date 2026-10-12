@@ -184,7 +184,7 @@ onto the ADR-0011 machinery):
   traffic.
 - transient remote errors back off (2 s doubling, capped at 64 s) and the
   walk resumes — persisted extents survive in the sidecar, so progress is
-  never lost; the backoff sleep is sliced so `stop_fill()` can still park
+  never lost; the backoff uses a cancellable timer so `stop_fill()` can still park
   the task promptly;
 - completion rides the same sha256-verify + atomic rename as read-through
   warming; an all-present bitmap is only a pending verification state, so
@@ -844,9 +844,12 @@ remote bytes into a sparse local staging file with a sidecar extent map
   a per-second `max_mbps` MiB/s budget, transient-error backoff, and
   completion through the same sha256 + rename path as read-through
   warming. `stop_fill()` asks the walk to exit; start delay, transient
-  error backoff, and throttle waits are sliced so stop is observed
-  promptly. `fill_status()` reports `kDisabled`/`kWaiting`/`kFilling`/
-  `kDone`/`kStopped`, but it is observability only. Fill shares the
+  error backoff, and throttle waits use a fill-specific cancellable Elio
+  timer so stop is observed promptly. `fill_status()` reports
+  `kDisabled`/`kWaiting`/`kFilling`/
+  `kDone`/`kStopped`, but it is observability only. A verified commit reports
+  `kDone` even when it interrupts a queue wait or timer, or arrives before a
+  pending remote read returns. Fill shares the
   lifetime contract below: call `park_fill()` before destroying the store
   so the fill coroutine has released its frame.
 - Write-behind: fetched extents queue (bounded by `queue_max_bytes`) for a
@@ -970,6 +973,18 @@ Callers may rely on:
   the joinable fill task to release its coroutine frame. A terminal
   `fill_status()` is useful for observation, but it is not a destruction
   barrier by itself.
+  Parking uses native non-consuming join observation for its warning
+  threshold and native async destruction observation for the actual barrier;
+  exceeding the threshold never releases an active store. Concurrent parkers
+  retain the same fill handle and observe teardown independently.
+  Observer allocation failure retries in the existing owner coroutine with
+  native yield; it cannot end the frame barrier or require a new cleanup task.
+  Fill byte-queue room and checksum/retry waits use separate Elio events.
+  Predicate checks and event reset share the writer's short queue mutex;
+  writer publication rendezvouses through that mutex and signals outside it.
+  Notification allocation failure retries on the existing plain writer thread.
+  Synchronous stop coalesces a writer wake, so a worker never loops on event
+  dispatch allocation and cancellation failure cannot strand a fill waiter.
 - **Writable sources** — `WritableBlobSource::pwrite`/`flush` are called only
   from the ublk data plane on the image root, after the bridge has confirmed
   the root implements the interface; writers and readers may race on
@@ -1118,6 +1133,17 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: layer store fill stop interrupts error backoff` — a transient
   remote read failure enters the exponential fill backoff; `stop_fill()`
   interrupts that sleep promptly and `park_fill()` releases the task.
+- `source: concurrent fill parking retains a slow remote past warning deadlines` —
+  two parkers remain pending after their warning thresholds while a remote
+  await is held; both finish only after the fill releases its frame, including
+  a real native destruction-observer allocation failure.
+- `source: native fill notifications survive allocation failure and stop races` —
+  force byte-queue and checksum event waits, inject native writer dispatch
+  allocation failure, and stop exactly between reset and wait registration.
+- `source: layer store fill records success when completion interrupts the producer` —
+  a verified commit records `kDone` while fill is in its start delay, waiting
+  for queue capacity, or returning from a remote read; gates force each
+  ordering and the owner is drained before assertions.
 - `source: layer store fill stays off in bypass` — an injected `ENOSPC`
   flips the store to `Bypass` mid-fill: fill stops (`kStopped`), reads
   continue remotely, nothing persists, no commit appears.
@@ -1337,7 +1363,7 @@ directly.
   (the device server calls `park_image_fills` during shutdown and
   post-open boot-failure cleanup; stores composed by hand use
   `park_fill()`; start delay, transient-error backoff, and throttle waits
-  are slept in bounded slices so parking is prompt).
+  use a fill-specific cancellable timer so parking can wake them promptly).
   `delay_extra_sec` uses `std::random_device` per store, so delays are
   not reproducible run-to-run.
 - **Redirect caching trusts `Location` for 300 s** — a CDN URL that expires
