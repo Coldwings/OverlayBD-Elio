@@ -78,8 +78,8 @@ catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
                TIMEOUT 60)
 
 # Compile the production DART implementation independently with Elio's DNS
-# test hooks. No hooked Elio definitions enter obd_core or shipped binaries,
-# and every translation unit in this dedicated executable uses the same mode.
+# test hooks, without linking obd_core. Every translation unit in this
+# dedicated executable uses the same mode. Test-disabled builds omit hooks.
 add_executable(obd_dart_dns_tests
     unit/test_dart_dns.cpp
     ../src/source/dart.cpp)
