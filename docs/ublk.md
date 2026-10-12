@@ -264,6 +264,10 @@ Elio side (any Elio worker thread):
 - `void push_completion(uint16_t tag, int32_t result)` — completes a
   request: `result >= 0` = bytes transferred, `< 0` = `-errno`. Wakes the
   queue thread via `done_efd`.
+- `void fail(int err) noexcept` — publishes the failure errno and sticky
+  flag, then wakes the queue thread through the same `done_efd`. A completion
+  that cannot be enqueued can therefore end the ring wait without another
+  request or a device stop.
 
 Queue thread side:
 
@@ -296,6 +300,9 @@ cancelling admitted handlers. An admitted request's completion token posts
 `-EIO` if its child is rejected or cancelled before invocation; a source
 exception also posts `-EIO`. Lifetime ownership stays with Elio, while the
 token records the kernel completion obligation (ADR-0006).
+If the fallback completion itself cannot be enqueued, the token marks the
+queue failed and wakes its waiter. The same failure publication is used after
+the bridge drains admitted handlers when a loop exception escapes.
 
 ### `src/ublk/device.hpp` — `obd::ublk::Device`
 
@@ -451,6 +458,13 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   both publish terminal completions, including `-EIO` for a throwing source.
 - `ublk: a cancelled task group still completes a skipped tag` — a handler
   cancelled before invocation posts `-EIO` without calling the source.
+- `ublk: failed completion publication wakes the queue before stop` — a
+  private per-queue fault at completion insertion forces a skipped child's
+  fallback, or both normal publication and fallback, to fail. A bounded plain
+  thread observes the actual `done_efd` wake before stop; a separate section
+  checks direct external failure publication. Owners drain before assertions.
+  This uses eventfd readiness without registering a kernel ublk device or
+  executing the queue's io_uring loop.
 - `ublk: command buffer geometry matches the driver layout` — pins the mmap
   geometry against the driver formulas: stride = 98304 for the 24-byte
   descriptor, `cmd_buf_size(128, …)` = 4096, `cmd_buf_size(4096, …)` =
