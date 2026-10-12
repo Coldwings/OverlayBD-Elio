@@ -119,10 +119,11 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
   cancelling one reader cannot poison a token exchange shared by other readers.
   A cancelled reader waiting for that control work departs after it completes;
   this is not immediate cancellation of the entire authentication sequence.
-  If an operation fails, cancellation already requested when the caller
-  observes that failure takes precedence over its error code. This applies
-  to failed shared discovery as well as caller-owned payload/length exchanges;
-  it does not change the result policy for successful operations.
+  If shared discovery throws an operational error or a caller-owned HTTP
+  exchange returns an Elio `client_error`, cancellation already requested
+  when the caller observes that error takes precedence over its code.
+  Successful exchange summaries retain their existing status, range and
+  body-validation result policy.
 - **Auth discovery** — an unauthenticated probe; on 401/403 the
   `WWW-Authenticate` Bearer challenge (`realm`, `service`, `scope`) is parsed
   and a token is fetched from the realm with Basic auth built from the
