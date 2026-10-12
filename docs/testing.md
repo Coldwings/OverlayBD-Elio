@@ -1589,3 +1589,10 @@ Deterministic packaging and strict archive extraction.
 Unmodified upstream-produced metadata and gzip fixture compatibility.
 
 - `image: upstream TurboOCI gzip fixture reads original payload`
+
+Elio positional-transfer adapter regressions:
+
+- `source: positional file reads preserve clamping and early EOF` — cached
+  size clamping, zero-length reads, partial EOF and untouched buffer suffixes.
+- `format: writable mapped reads reject early file EOF` — sparse and LSMT
+  mapped reads retain strict format-level EOF errors after partial progress.
