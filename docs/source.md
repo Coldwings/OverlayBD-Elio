@@ -498,7 +498,7 @@ anonymous pull.
   Payload and retry waits honor current-task cancellation with `-ECANCELED`;
   shared authentication work finishes before a cancelled observer leaves.
   All scoped reader activity has stopped before awaited return. Operational
-  failures use return values; allocation or request-setup exceptions may propagate.
+  failures use return values.
 - `get_length(url)` — blob size from a `Range: bytes=0-0` probe's
   `Content-Range` total, without consuming an irrelevant 206 body. When the
   server ignores Range and answers 200, counts the complete decoded body in
@@ -506,7 +506,7 @@ anonymous pull.
   fails, and a body beyond the default 64 MiB cap returns `-EMSGSIZE`.
   Totals beyond signed 64-bit representation return `-EOVERFLOW`. The final
   caller-owned exchange honors current-task cancellation. Operational failures
-  return negative `-errno`; allocation or request-setup exceptions may propagate.
+  return negative `-errno`.
 
 Internal behavior worth depending on (see Concepts): tokens cached for 80%
 of the OAuth2 `expires_in` lifetime (30 s fallback for absent/unparsable/

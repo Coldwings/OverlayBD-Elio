@@ -72,7 +72,7 @@ public:
 
     /// Range GET of [offset, offset+count) into `buf`. Returns `count` on
     /// success, negative -errno on failure (EPERM auth, ERANGE 416, EBUSY
-    /// 429, EIO otherwise, ETIMEDOUT after retries).
+    /// 429, EIO otherwise, ETIMEDOUT on a transport deadline).
     /// Failed reads may have overwritten a prefix of `buf`.
     /// Payload and retry waits honor the current Elio task's cancellation;
     /// shared auth discovery/refresh finishes before this caller departs.
