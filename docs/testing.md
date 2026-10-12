@@ -570,7 +570,7 @@ Every test, grouped by area, with the property it guards.
   return exactly the requested window against the mock registry.
 - `source: registry streaming consumes fragmented range framing` — raw TCP
   fixed-length/chunked replies span reader pulls, preserve destination guard
-  bytes, and validate final framing before connection reuse.
+  bytes, and validate final framing before payload connection reuse.
 - `source: registry streaming drains ignored range before connection reuse` —
   a full-body 200 at zero copies the prefix and drains the remainder before the
   next request shares its connection.
@@ -584,6 +584,17 @@ Every test, grouped by area, with the property it guards.
   the connection before a healthy response.
 - `source: registry request guards and owned errors ignore ambient errno` —
   owned URL failures and range preconditions ignore poisoned ambient errno.
+- `source: registry cancellation retires a blocked payload buffer before return` —
+  a cancelled partial read releases its borrowed buffer before return; a delayed
+  peer suffix cannot mutate reused storage or contaminate the next connection.
+- `source: cancelled registry auth leader preserves the shared token exchange` —
+  leader cancellation leaves the shared token exchange and follower read intact.
+- `source: registry discovery and range length ignore held probe bodies` —
+  discovery and 206 length totals close unconsumed bodies promptly, including
+  absent bodies larger than the configured cap, before a healthy data response.
+- `source: registry ignored range length counts decoded bytes within its cap` —
+  fixed-length, chunked and close-delimited 200 responses count decoded bytes
+  under the configured cap; missing chunk finalization remains an error.
 - `source: registry bearer auth flow via token endpoint` — a 401 with
   `WWW-Authenticate` drives a token fetch and an authorized retry.
 - `source: registry redirect mode drops auth on the CDN URL` —

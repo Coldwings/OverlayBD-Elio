@@ -74,11 +74,14 @@ public:
     /// success, negative -errno on failure (EPERM auth, ERANGE 416, EBUSY
     /// 429, EIO otherwise, ETIMEDOUT after retries).
     /// Failed reads may have overwritten a prefix of `buf`.
+    /// Payload and retry waits honor the current Elio task's cancellation;
+    /// shared auth discovery/refresh finishes before this caller departs.
     elio::coro::task<ssize_t> get_data(const std::string& url, void* buf,
                                        uint64_t offset, size_t count);
 
-    /// Total blob size from a Range 0-0 Content-Range total; -errno on
-    /// failure.
+    /// Total blob size from a header-only 206 Content-Range total; ignored
+    /// Range 200 bodies are counted with bounded scratch storage and the
+    /// configured decoded-body cap. Negative -errno on failure.
     elio::coro::task<int64_t> get_length(const std::string& url);
 
 private:
@@ -105,11 +108,16 @@ private:
         uint64_t token_generation = 0;
     };
 
-    /// Buffered Range GET for control probes and token JSON. Transport
-    /// failures carry an owned error value, independent of ambient errno.
+    /// Buffered token JSON, with an independent provider token. Failures carry
+    /// an owned error value, independent of ambient errno.
     elio::coro::task<elio::http::client_result<elio::http::response>> request_range(
         const std::string& url, uint64_t first, uint64_t last,
         const std::string& auth_header);
+
+    /// Header-only auth/redirect discovery. Irrelevant bodies are closed,
+    /// not buffered or drained; provider work is independent of one reader.
+    elio::coro::task<elio::http::client_result<elio::http::response>> request_probe(
+        const std::string& url, const std::string& auth_header);
 
     struct DataResponse {
         int status = 0;

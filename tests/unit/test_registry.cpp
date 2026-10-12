@@ -312,10 +312,13 @@ public:
         std::string wire;
         size_t fragment_size = 4096;
         bool close_after = false;
+        elio::sync::event* late_release = nullptr;
+        std::string late_wire = {};
     };
     using Plan = std::function<Reply(const std::string&)>;
 
-    explicit RawRegistry(Plan plan) : plan_(std::move(plan)) {
+    explicit RawRegistry(Plan plan, bool automatic_probes = true)
+        : plan_(std::move(plan)), automatic_probes_(automatic_probes) {
         listener_ = elio::net::tcp_listener::bind(
             elio::net::ipv4_address("127.0.0.1", 0));
         if (!listener_) throw std::system_error(errno, std::generic_category(),
@@ -327,6 +330,7 @@ public:
     }
     void stop() { stopped_.cancel(); }
     size_t connections() const noexcept { return connections_.load(); }
+    size_t requests() const noexcept { return requests_.load(); }
     size_t data_requests() const noexcept { return data_requests_.load(); }
 
     elio::coro::task<void> run() {
@@ -350,14 +354,16 @@ public:
                 const std::string request = pending.substr(0, end + 4);
                 pending.erase(0, end + 4);
                 if (!counted) { ++connections_; counted = true; }
-                if (request.find("Range: bytes=0-0\r\n") != std::string::npos) {
+                ++requests_;
+                const bool probe = request.find("Range: bytes=0-0\r\n") != std::string::npos;
+                if (probe && automatic_probes_) {
                     auto written = co_await stream.write_all(
                         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1048576\r\n"
                         "Content-Length: 1\r\n\r\np", token);
                     if (written.result < 0) break;
                     continue;
                 }
-                ++data_requests_;
+                if (!probe) ++data_requests_;
                 const Reply reply = plan_(request);
                 bool failed = false;
                 for (size_t pos = 0; pos < reply.wire.size(); pos += reply.fragment_size) {
@@ -366,6 +372,13 @@ public:
                     if (written.result < 0) { failed = true; break; }
                     co_await elio::time::sleep_for(std::chrono::microseconds(10), token);
                 }
+                if (!failed && reply.late_release) {
+                    const auto released = co_await reply.late_release->wait(token);
+                    if (released == elio::coro::cancel_result::completed) {
+                        const auto written = co_await stream.write_all(reply.late_wire, token);
+                        failed = written.result < 0;
+                    }
+                }
                 if (failed || reply.close_after) break;
             }
         }
@@ -373,9 +386,11 @@ public:
 
 private:
     Plan plan_;
+    bool automatic_probes_;
     std::optional<elio::net::tcp_listener> listener_;
     elio::coro::cancel_source stopped_;
     std::atomic<size_t> connections_{0};
+    std::atomic<size_t> requests_{0};
     std::atomic<size_t> data_requests_{0};
 };
 
@@ -495,7 +510,7 @@ TEST_CASE("source: registry streaming consumes fragmented range framing", "[sour
                 REQUIRE(guarded.front() == 0xd5);
                 REQUIRE(guarded.back() == 0xd5);
             }
-            REQUIRE(peer.connections() == 1);
+            REQUIRE(peer.connections() == 2);  // retired probe + reused payload connection
             REQUIRE(peer.data_requests() == 2);
         });
     });
@@ -517,7 +532,7 @@ TEST_CASE("source: registry streaming drains ignored range before connection reu
                 REQUIRE(read == static_cast<ssize_t>(output.size()));
                 REQUIRE(std::all_of(output.begin(), output.end(), [](char c) { return c == 'r'; }));
             }
-            REQUIRE(peer.connections() == 1);
+            REQUIRE(peer.connections() == 2);  // discovery retires only its own connection
         });
     });
 }
@@ -544,7 +559,7 @@ TEST_CASE("source: registry streaming detects short bodies and missing final fra
             const auto good = co_await client.get_data(peer.url("/healthy"), output.data(), 16, output.size());
             REQUIRE(good == 8);
             REQUIRE(std::string(output.data(), output.size()) == "healthy!");
-            REQUIRE(peer.connections() == (failure == 0 ? 1 : 4));
+            REQUIRE(peer.connections() == (failure == 0 ? 3 : 6));
         });
     });
 }
@@ -602,7 +617,170 @@ TEST_CASE("source: registry streaming rejects status before unread error body", 
             const auto good = co_await client.get_data(peer.url("/healthy"), output.data(), 16, output.size());
             REQUIRE(good == 8);
             REQUIRE(std::string(output.data(), output.size()) == "healthy!");
-            REQUIRE(peer.connections() == (status == 416 ? 2 : 4));
+            REQUIRE(peer.connections() == (status == 416 ? 4 : 6));
+        });
+    });
+}
+
+TEST_CASE("source: registry cancellation retires a blocked payload buffer before return", "[source][registry-streaming]") {
+    elio::runtime::run_config config;
+    config.num_threads = 1;  // observe buffer progress without cross-worker data races
+    elio::run([]() -> elio::coro::task<void> {
+        elio::sync::event late_release;
+        RawRegistry peer([&](const std::string& request) {
+            const std::string head = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-23/1048576\r\n"
+                "Content-Length: 8\r\n\r\n";
+            if (request.starts_with("GET /healthy ")) return RawRegistry::Reply{head + "healthy!"};
+            return RawRegistry::Reply{head + "abcd", 4096, true, &late_release, "efgh"};
+        });
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            source::RegistryClientConfig client_config;
+            client_config.read_timeout = std::chrono::seconds(5);
+            source::RegistryClient client(nullptr, client_config);
+            const std::string url = peer.url("/cancel");
+            std::array<char, 8> loan;
+            loan.fill('x');
+            auto reading = elio::spawn(client.get_data(url, loan.data(), 16, loan.size()));
+            std::exception_ptr failure;
+            try {
+                const auto progress_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (std::string_view(loan.data(), 4) != "abcd" &&
+                       !reading.is_ready() && std::chrono::steady_clock::now() < progress_deadline) {
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                }
+                REQUIRE(std::string_view(loan.data(), 4) == "abcd");
+                REQUIRE_FALSE(reading.is_ready());
+                const auto cancelled_at = std::chrono::steady_clock::now();
+                reading.request_cancel();
+                const auto cancelled = co_await reading;
+                REQUIRE(cancelled == -ECANCELED);
+                REQUIRE(std::chrono::steady_clock::now() - cancelled_at < std::chrono::seconds(2));
+                REQUIRE(peer.data_requests() == 1);  // cancellation never retries the request
+
+                loan.fill('r');  // caller reuses storage immediately after awaited return
+                late_release.set();  // now the old peer attempts its delayed payload suffix
+                std::array<char, 8> healthy;
+                const auto next = co_await client.get_data(peer.url("/healthy"), healthy.data(), 16, healthy.size());
+                REQUIRE(next == 8);
+                REQUIRE(std::string(healthy.data(), healthy.size()) == "healthy!");
+                REQUIRE(std::all_of(loan.begin(), loan.end(), [](char c) { return c == 'r'; }));
+                REQUIRE(peer.connections() == 4);  // probes + retired cancelled exchange + healthy payload
+                REQUIRE(peer.data_requests() == 2);
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            // Preserve the borrowed buffer even if a test assertion fails.
+            reading.request_cancel();
+            late_release.set();
+            co_await reading.wait_destroyed_async();
+            if (failure) std::rethrow_exception(failure);
+        });
+    }, config);
+}
+
+TEST_CASE("source: cancelled registry auth leader preserves the shared token exchange", "[source][registry-streaming]") {
+    test::run_coro([]() -> elio::coro::task<void> {
+        auto blob = test::pattern_bytes(4096, 91);
+        MockRegistry mock(blob);
+        mock.token_delay_ms_ = 80;
+        elio::go([&mock]() -> elio::coro::task<void> { co_await mock.run(); });
+        MockGuard guard{mock};
+        const bool running = co_await test::wait_server_running(mock);
+        REQUIRE(running);
+        source::RegistryClient client(test_creds(), {});
+        const std::string url = mock.repo_base() + "/auth/x";
+        std::array<uint8_t, 128> leader_buffer;
+        std::array<uint8_t, 128> follower_buffer;
+        auto leader = elio::spawn(client.get_data(url, leader_buffer.data(), 16, leader_buffer.size()));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (mock.token_hits_.load() == 0 && !leader.is_ready() &&
+               std::chrono::steady_clock::now() < deadline) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        const bool exchange_started = mock.token_hits_.load() == 1;
+        auto follower = elio::spawn(client.get_data(url, follower_buffer.data(), 16, follower_buffer.size()));
+        leader.request_cancel();
+        const auto leader_result = co_await leader;
+        const auto follower_result = co_await follower;
+        co_await leader.wait_destroyed_async();
+        co_await follower.wait_destroyed_async();
+        REQUIRE(exchange_started);
+        REQUIRE(leader_result == -ECANCELED);
+        REQUIRE(follower_result == static_cast<ssize_t>(follower_buffer.size()));
+        REQUIRE(std::equal(follower_buffer.begin(), follower_buffer.end(), blob.begin() + 16));
+        REQUIRE(mock.token_hits_.load() == 1);
+        co_await wait_drained(mock);
+    });
+}
+
+TEST_CASE("source: registry discovery and range length ignore held probe bodies", "[source][registry-streaming]") {
+    const bool unrepresentable = GENERATE(false, true);
+    test::run_coro([unrepresentable]() -> elio::coro::task<void> {
+        RawRegistry peer([unrepresentable](const std::string& request) {
+            if (request.find("Range: bytes=0-0\r\n") != std::string::npos) {
+                // The advertised body is larger than the configured cap and
+                // never arrives. Only status/headers are relevant to discovery
+                // and to a 206 size total; both retire this connection promptly.
+                const std::string total = unrepresentable ? "9223372036854775808" : "1048576";
+                return RawRegistry::Reply{
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/" + total +
+                    "\r\nContent-Length: 1048576\r\n\r\n"};
+            }
+            return RawRegistry::Reply{
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-23/1048576\r\n"
+                "Content-Length: 8\r\n\r\nhealthy!"};
+        }, false);
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            source::RegistryClientConfig config;
+            config.max_response_size = 8;
+            config.read_timeout = std::chrono::seconds(5);
+            source::RegistryClient client(nullptr, config);
+            const auto start = std::chrono::steady_clock::now();
+            const auto size = co_await client.get_length(peer.url());
+            REQUIRE(size == (unrepresentable ? -EOVERFLOW : 1048576));
+            REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+            std::array<char, 8> output;
+            const auto read = co_await client.get_data(peer.url(), output.data(), 16, output.size());
+            REQUIRE(read == 8);
+            REQUIRE(std::string(output.data(), output.size()) == "healthy!");
+            REQUIRE(peer.requests() == 3);
+            REQUIRE(peer.connections() == 3);
+        });
+    });
+}
+
+TEST_CASE("source: registry ignored range length counts decoded bytes within its cap", "[source][registry-streaming]") {
+    const int framing = GENERATE(0, 1, 2, 3);
+    const bool excessive = GENERATE(false, true);
+    test::run_coro([framing, excessive]() -> elio::coro::task<void> {
+        constexpr size_t cap = 32768;
+        const std::string payload(cap + (excessive ? 1 : 0), 's');
+        size_t requests = 0;
+        RawRegistry peer([&](const std::string&) {
+            ++requests;
+            std::string head = "HTTP/1.1 200 OK\r\n";
+            if (framing == 0) head += "Content-Length: " + std::to_string(payload.size()) + "\r\n";
+            else if (framing == 2) head += "Connection: close\r\n";
+            else head += "Transfer-Encoding: chunked\r\n";
+            head += "\r\n";
+            if (requests == 1) return RawRegistry::Reply{std::move(head)};  // irrelevant discovery body held
+            std::string wire = std::move(head);
+            if (framing == 1 || framing == 3) {
+                char size[32];
+                std::snprintf(size, sizeof(size), "%zx", payload.size());
+                wire += std::string(size) + "\r\n" + payload + "\r\n";
+                if (framing == 1) wire += "0\r\nX-End: complete\r\n\r\n";
+            } else wire += payload;
+            return RawRegistry::Reply{std::move(wire), 4093, framing == 2 || framing == 3};
+        }, false);
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            source::RegistryClientConfig config;
+            config.max_response_size = cap;
+            source::RegistryClient client(nullptr, config);
+            const auto size = co_await client.get_length(peer.url());
+            REQUIRE(size == (excessive ? -EMSGSIZE : framing == 3 ? -EBADMSG : static_cast<int64_t>(cap)));
+            REQUIRE(peer.requests() == 2);
+            REQUIRE(peer.connections() == 2);
         });
     });
 }
