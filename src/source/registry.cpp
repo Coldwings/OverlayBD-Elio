@@ -374,14 +374,15 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
                                    std::string(challenge_hdr));
         }
         std::string auth;
+        std::string token_key;
         uint64_t token_generation = 0;
         std::optional<std::chrono::steady_clock::time_point> token_expiry;
         if (challenge->bearer) {
-            const std::string key = challenge->realm + "|" +
+            token_key = challenge->realm + "|" +
                                     challenge->service + "|" +
                                     challenge->scope;
             const TokenEntry entry = co_await get_token(
-                key, challenge->realm, challenge->service, challenge->scope,
+                token_key, challenge->realm, challenge->service, challenge->scope,
                 url, min_token_generation);
             auth = "Bearer " + entry.token;
             token_generation = entry.generation;
@@ -398,26 +399,39 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
                 throw_errno(EPERM, "no credentials for " + url);
             }
         }
-        // Re-issue the probe with auth to discover Self vs Redirect mode
-        // (registryfs_v2 get_actual_url).
-        errno = 0;
-        auto probe2 = co_await request_range(url, 0, 0, auth);
-        if (!probe2) {
-            throw_errno(errno ? errno : EIO,
-                        "registry probe with auth failed: " + url);
-        }
-        const auto location2 = probe2->get_headers().get("Location");
-        const int status2 = probe2->status_code();
-        if (status2 >= 300 && status2 < 400 && !location2.empty()) {
-            info.final_url = std::string(location2);
-            // Redirect mode: CDN URL needs no auth.
-        } else if (status2 == 200 || status2 == 206) {
-            info.final_url = url;
-            info.auth_header = auth;  // Self mode: auth on every request.
-        } else {
-            throw_errno(status_to_errno(status2),
-                        "registry probe with auth rejected (HTTP " +
-                            std::to_string(status2) + "): " + url);
+        // Discovery can reuse a token cached for another URL. Server-side
+        // rejection must advance its generation just like a data-response 401.
+        // Three authenticated probes bound discovery independently of data GETs.
+        for (int attempt = 0; ; ++attempt) {
+            errno = 0;
+            auto probe2 = co_await request_range(url, 0, 0, auth);
+            if (!probe2) {
+                throw_errno(errno ? errno : EIO,
+                            "registry probe with auth failed: " + url);
+            }
+            const auto location2 = probe2->get_headers().get("Location");
+            const int status2 = probe2->status_code();
+            if ((status2 == 401 || status2 == 403) && challenge->bearer && attempt < 2) {
+                const TokenEntry entry = co_await get_token(
+                    token_key, challenge->realm, challenge->service, challenge->scope,
+                    url, token_generation + 1);
+                auth = "Bearer " + entry.token;
+                token_generation = entry.generation;
+                token_expiry = entry.expiry;
+                continue;
+            }
+            if (status2 >= 300 && status2 < 400 && !location2.empty()) {
+                info.final_url = std::string(location2);
+                // Redirect mode: CDN URL needs no auth.
+            } else if (status2 == 200 || status2 == 206) {
+                info.final_url = url;
+                info.auth_header = auth;  // Self mode: auth on every request.
+            } else {
+                throw_errno(status_to_errno(status2),
+                            "registry probe with auth rejected (HTTP " +
+                                std::to_string(status2) + "): " + url);
+            }
+            break;
         }
         // The redirect/URL-info responses (3xx Location, probe 200/206)
         // carry no server-declared expiry in the registryfs v2 contract —
