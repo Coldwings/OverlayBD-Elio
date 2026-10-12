@@ -164,6 +164,7 @@ public:
     }
     uint64_t size() const noexcept override { return data_.size(); }
     std::string_view label() const noexcept override { return "writer-wait"; }
+    unsigned reads_started() const noexcept { return reads_.load(); }
     elio::sync::event start;
     elio::sync::event further;
 private:
@@ -1160,12 +1161,19 @@ TEST_CASE("source: layer store fill resumes after checksum retry",
         const bool done = co_await poll_until([&] {
             return store->state() == source::LayerStore::State::Complete;
         });
-        REQUIRE(done);
-        const bool fill_done = co_await poll_until([&] {
-            return store->fill_status() ==
-                   source::LayerStore::FillStatus::kDone;
+        const bool fill_terminal = co_await poll_until([&] {
+            const auto status = store->fill_status();
+            return status == source::LayerStore::FillStatus::kDone ||
+                   status == source::LayerStore::FillStatus::kStopped;
         });
-        REQUIRE(fill_done);
+        const auto final_status = store->fill_status();
+        // Keep assertion failures from unwinding an owner with a live fill.
+        // A failed native task is also reported by the destruction barrier.
+        co_await store->park_fill(std::chrono::milliseconds(500));
+        CAPTURE(static_cast<int>(final_status));
+        REQUIRE(done);
+        REQUIRE(fill_terminal);
+        REQUIRE(final_status == source::LayerStore::FillStatus::kDone);
         REQUIRE(verify_attempt.load(std::memory_order_acquire) == 2);
         REQUIRE(src->reads_completed() >= 2);
         co_return 0;
@@ -1416,6 +1424,7 @@ TEST_CASE("source: native fill notifications survive allocation failure and stop
     std::atomic<bool> fill_waiting{false};
     bool reached_wait = false;
     bool fill_finished = false;
+    auto final_status = source::LayerStore::FillStatus::kDisabled;
     elio::run_config runtime;
     runtime.num_threads = 1;
     runtime.blocking_threads = 1;
@@ -1462,6 +1471,7 @@ TEST_CASE("source: native fill notifications survive allocation failure and stop
             return status == source::LayerStore::FillStatus::kDone ||
                    status == source::LayerStore::FillStatus::kStopped;
         }, 5000);
+        final_status = store->fill_status();
         co_await store->park_fill(std::chrono::milliseconds(0));
         co_await elio::spawn_blocking([&] { store.reset(); });
         co_return 0;
@@ -1469,8 +1479,119 @@ TEST_CASE("source: native fill notifications survive allocation failure and stop
     REQUIRE(rc == 0);
     CHECK(reached_wait);
     CHECK(fill_finished);
+    CHECK(final_status == (stop_at_reset ? source::LayerStore::FillStatus::kStopped
+                                        : source::LayerStore::FillStatus::kDone));
     CHECK_FALSE(writer_timed_out.load());
     if (fault) CHECK(fault->failures() == 1);
+}
+
+TEST_CASE("source: layer store fill records success when completion interrupts the producer", "[source]") {
+    enum class Producer { Delay, QueueRoom, RemoteRead };
+    Producer producer = Producer::Delay;
+    SECTION("commit cancels the start delay") { producer = Producer::Delay; }
+    SECTION("commit wakes a producer waiting for queue capacity") { producer = Producer::QueueRoom; }
+    SECTION("commit precedes a pending remote read returning") { producer = Producer::RemoteRead; }
+    test::TempDir dir;
+    const auto blob = test::pattern_bytes(
+        (producer == Producer::QueueRoom ? 2 : 1) * kExtent, 219);
+    std::atomic<unsigned> writer_stage{0};
+    std::atomic<unsigned> queue_wait_stage{0};
+    std::atomic<bool> release_first{false};
+    std::atomic<bool> release_second{false};
+    std::atomic<bool> writer_timed_out{false};
+    bool expected_wait = false;
+    bool complete = false;
+    bool terminal = false;
+    bool populated = true;
+    auto final_status = source::LayerStore::FillStatus::kDisabled;
+    elio::run_config runtime;
+    runtime.num_threads = 1;
+    runtime.blocking_threads = 1;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        auto remote = std::make_unique<WriterWaitSource>(blob);
+        auto* gated = remote.get();
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = producer == Producer::Delay ? 60 : 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.queue_max_bytes = kExtent;
+        auto store = co_await source::LayerStore::open(
+            std::move(remote), dir.str(), digest_of(blob), cfg);
+        if (producer != Producer::Delay) {
+            store->set_test_write_hook([&](uint64_t) {
+                const auto stage = writer_stage.fetch_add(1) + 1;
+                if (stage > 2) return 0;
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(10);
+                const auto& release = stage == 1 ? release_first : release_second;
+                while (!release.load()) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        writer_timed_out.store(true);
+                        break;
+                    }
+                    std::this_thread::yield();
+                }
+                return 0;
+            });
+            store->set_test_fill_wait_hook([&](bool completion) {
+                if (!completion) queue_wait_stage.store(writer_stage.load());
+            });
+        }
+        gated->start.set();
+        if (producer == Producer::Delay) {
+            expected_wait = store->fill_status() ==
+                            source::LayerStore::FillStatus::kWaiting;
+            gated->further.set();
+            const auto result = co_await store->populate(0, blob.size());
+            populated = result == 0;
+        } else {
+            const bool first_held = co_await poll_until(
+                [&] { return writer_stage.load() == 1; }, 5000);
+            const bool remote_held = co_await poll_until(
+                [&] { return gated->reads_started() >= 2; }, 5000);
+            if (producer == Producer::QueueRoom) {
+                // Keep extent 0 uncommitted until the next read reaches the
+                // full queue. Then hold extent 1 while fill queues a duplicate
+                // extent 0 and waits again: the only subsequent wake is commit.
+                gated->further.set();
+                const bool first_wait = co_await poll_until(
+                    [&] { return queue_wait_stage.load() == 1; }, 5000);
+                release_first.store(true);
+                const bool final_wait = co_await poll_until(
+                    [&] { return queue_wait_stage.load() == 2; }, 5000);
+                expected_wait = first_held && remote_held && first_wait && final_wait;
+                release_second.store(true);
+            } else {
+                // The writer can now commit while fill still owns a remote
+                // await. Returning that read must classify the outer-loop exit.
+                expected_wait = first_held && remote_held;
+                release_first.store(true);
+            }
+        }
+        complete = co_await poll_until([&] {
+            return store->state() == source::LayerStore::State::Complete;
+        }, 5000);
+        // Also release every gate on a failed setup, before drain/assertions.
+        release_first.store(true);
+        release_second.store(true);
+        gated->further.set();
+        terminal = co_await poll_until([&] {
+            const auto status = store->fill_status();
+            return status == source::LayerStore::FillStatus::kDone ||
+                   status == source::LayerStore::FillStatus::kStopped;
+        }, 5000);
+        final_status = store->fill_status();
+        co_await store->park_fill(std::chrono::milliseconds(0));
+        co_await elio::spawn_blocking([&] { store.reset(); });
+        co_return 0;
+    }, runtime);
+    REQUIRE(rc == 0);
+    CHECK(expected_wait);
+    CHECK(populated);
+    CHECK(complete);
+    CHECK(terminal);
+    CHECK_FALSE(writer_timed_out.load());
+    CHECK(final_status == source::LayerStore::FillStatus::kDone);
 }
 
 TEST_CASE("source: layer store fill stays off in bypass", "[source]") {
