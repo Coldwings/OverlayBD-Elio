@@ -957,9 +957,10 @@ Callers may rely on:
   Fetched extent data is held as `shared_ptr<const …>` while it awaits
   write-behind.
 - **Object lifetimes** — sources are owned via `BlobSourcePtr`
-  (`unique_ptr`); wrapping takes ownership. A `LocalFileSource` may be
-  destroyed with reads in flight (the destructor orders the fd close against
-  the io_uring backend). A `LayerStore` must not be destroyed while
+  (`unique_ptr`); wrapping takes ownership. Keep a `LocalFileSource` and its
+  borrowed buffers alive until each read returns. Destructor fd-close ordering
+  covers submitted backend operations, not an outer transfer that may submit
+  another short-read step. A `LayerStore` must not be destroyed while
   `pread`/`populate` coroutines or a background fill are in flight on it
   (a suspended fetch, joiner, or fill step touches members on resume) —
   park an active fill first: `park_fill()` stops the walk and waits for
