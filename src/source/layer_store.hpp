@@ -176,9 +176,7 @@ public:
     /// step. Idempotent. stop_fill() alone is only a request: callers that
     /// may destroy the store must await park_fill() so the coroutine frame is
     /// released first (see the lifetime contract above).
-    void stop_fill() noexcept {
-        fill_stop_.store(true, std::memory_order_release);
-    }
+    void stop_fill() noexcept;
 
     /// Requests fill stop and joins the fill coroutine before returning.
     /// `timeout` is a warning threshold only: if a non-interruptible remote
@@ -197,6 +195,12 @@ public:
     /// before the in-flight entry is retired). Not part of the module
     /// API.
     void set_test_fetch_done_hook(std::function<void()> hook);
+#ifdef OBD_TEST_HOOKS
+    void set_test_fill_wait_hook(std::function<void(bool)> hook) {
+        std::lock_guard lk(qmu_);
+        fill_wait_hook_ = std::move(hook);
+    }
+#endif
 
     /// Test-only hook: invoked by the writer thread after all extents are
     /// present and just before completion verification begins. Not part
@@ -269,6 +273,9 @@ private:
 
     // Writer thread (the only place blocking disk syscalls run).
     void writer_main();
+    // Writer-thread notification retries cannot block an Elio worker. A
+    // synchronous stop requests this dispatch through qmu_/qcv_ instead.
+    void signal_fill_events_from_writer(bool completion);
     void process_job(const WriteJob& job,
                      const std::function<int(uint64_t)>& hook);
     void on_write_error(int err);
@@ -331,14 +338,23 @@ private:
     std::deque<WriteJob> queue_;
     uint64_t queued_bytes_ = 0;
     bool stopping_ = false;
+    bool fill_wake_requested_ = false;  // qmu_; coalesced stop notification
     std::function<int(uint64_t)> write_hook_;  // test-only, under qmu_
     std::function<void(uint32_t)> completion_hook_;  // test-only, under qmu_
     std::function<void()> fetch_done_hook_;    // test-only, coroutine-side
+#ifdef OBD_TEST_HOOKS
+    std::function<void(bool)> fill_wait_hook_;  // reset-before-wait boundary
+#endif
     uint32_t attempts_ = 0;        // completion-verify attempts (writer only)
     bool kick_completion_check_ = false;  // set before the writer starts
 
     // Background fill (one joinable coroutine; see the lifetime contract).
     std::optional<elio::coro::join_handle<void>> fill_task_;
+    bool fill_park_started_ = false;  // qmu_; one warning-budget observer
+    bool fill_result_reported_ = false;  // qmu_; single result consumer
+    elio::coro::cancel_source fill_cancel_;
+    elio::sync::event fill_queue_room_;
+    elio::sync::event fill_completion_;
     std::atomic<int> fill_status_{static_cast<int>(FillStatus::kDisabled)};
     std::atomic<bool> fill_stop_{false};
 };
