@@ -3,10 +3,10 @@
 
 #include "common/sha256.hpp"
 
-#include <elio/io/io_awaitables.hpp>
+#include <elio/io/file_transfer.hpp>
+#include <elio/io/file_operations.hpp>
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn.hpp>
-#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
 
 #include <fcntl.h>
@@ -507,32 +507,15 @@ TraceRecorder::finalize_locked_state(int fd, std::string path,
     res.records = writer.record_count();
     res.size = blob.size();
 
-    const uint8_t* p = blob.data();
-    size_t done = 0;
-    while (done < blob.size()) {
-        const auto r = co_await elio::io::async_write(
-            fd, p + done, blob.size() - done, static_cast<off_t>(done));
-        if (r.result < 0) {
-            res.error = "trace write failed: " +
-                        std::string(std::strerror(
-                            static_cast<int>(-r.result)));
-            ::close(fd);
-            co_return res;
-        }
-        if (r.result == 0) {
-            res.error = "trace write failed: short write";
-            ::close(fd);
-            co_return res;
-        }
-        done += static_cast<size_t>(r.result);
+    const auto written = co_await elio::io::pwrite_exactly(fd, std::as_bytes(blob), 0);
+    if (written.error || written.end != elio::io::transfer_end::complete) {
+        res.error = "trace write failed: " + std::string(
+            std::strerror(written.error ? written.error.value() : EIO));
+        ::close(fd);
+        co_return res;
     }
-    // fsync can block for an unbounded time (dirty-data flush under IO
-    // congestion); finalize can run on a LIVE device (duration expiry),
-    // so offload it — never block an Elio worker on a sync syscall.
-    // errno is captured inside the blocking lambda (thread-local).
-    const int fs_rc = co_await elio::spawn_blocking([fd] {
-        return ::fsync(fd) != 0 ? -errno : 0;
-    });
+    const auto synced = co_await elio::io::sync_file(fd);
+    const int fs_rc = synced ? 0 : -synced.error_value();
     if (fs_rc != 0) {
         res.error = std::string("trace fsync failed: ") +
                     std::strerror(-fs_rc);

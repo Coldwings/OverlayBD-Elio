@@ -1602,3 +1602,10 @@ Existing awakened-timer, sole-blocking-thread device drain and concurrent trace
 finalization cases also exercise observer/waiter allocation failure. These
 inject specific native setup failures, not arbitrary process-wide allocation
 failure or forced scheduler shutdown.
+
+Elio positional-transfer adapter regressions:
+
+- `source: positional file reads preserve clamping and early EOF` — cached
+  size clamping, zero-length reads, partial EOF and untouched buffer suffixes.
+- `format: writable mapped reads reject early file EOF` — sparse and LSMT
+  mapped reads retain strict format-level EOF errors after partial progress.

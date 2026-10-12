@@ -5,6 +5,7 @@
 #include "common/errors.hpp"
 
 #include <elio/io/io_awaitables.hpp>
+#include <elio/io/file_transfer.hpp>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -49,17 +50,10 @@ elio::coro::task<ssize_t> LocalFileSource::pread(void* buf, size_t count,
     const uint64_t bound = size_.load(std::memory_order_acquire);
     if (offset >= bound) co_return 0;
     if (count > bound - offset) count = static_cast<size_t>(bound - offset);
-    uint8_t* p = static_cast<uint8_t*>(buf);
-    size_t done = 0;
-    while (done < count) {
-        const auto r = co_await elio::io::async_read(
-            fd_, p + done, count - done,
-            static_cast<int64_t>(offset + done));
-        if (r.result < 0) co_return r.result;
-        if (r.result == 0) break;  // EOF (size_ changed underneath us)
-        done += static_cast<size_t>(r.result);
-    }
-    co_return static_cast<ssize_t>(done);
+    const auto result = co_await elio::io::pread_exactly(
+        fd_, std::span<std::byte>(static_cast<std::byte*>(buf), count), offset);
+    if (result.error) co_return -result.error.value();
+    co_return static_cast<ssize_t>(result.transferred);
 }
 
 }  // namespace obd::source

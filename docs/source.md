@@ -410,12 +410,15 @@ read-only file, read through the Elio IO backend (io_uring when available).
   a backend EOF occurs (possible only if the file shrank after open).
   Returns the backend's negative errno verbatim on IO failure.
 - `fd()` — the underlying descriptor (diagnostics/interop).
-- The destructor closes the fd via `elio::io::close_fd_for_destructor`,
-  which orders the close against in-flight io_uring operations — destroying
-  a source with reads in flight is safe.
+- Keep the source and destination buffer alive until `pread` returns; its
+  borrowed descriptor must remain open and unrecycled across every exact-read
+  step. The destructor uses `elio::io::close_fd_for_destructor` to order close
+  against submitted backend operations. This does not drain the outer source
+  coroutine or authorize destroying the source between short-read steps.
 
 Complexity: `pread` is O(count) with at most one extra backend call per
-short backend read; no allocation on the read path.
+short backend read; no response-sized data buffer is allocated. Coroutine and
+backend operation state retain their normal runtime allocation behavior.
 
 ### `registry.hpp` — RegistryClientConfig, RegistryClient, RegistrySource
 
@@ -955,9 +958,10 @@ Callers may rely on:
   Fetched extent data is held as `shared_ptr<const …>` while it awaits
   write-behind.
 - **Object lifetimes** — sources are owned via `BlobSourcePtr`
-  (`unique_ptr`); wrapping takes ownership. A `LocalFileSource` may be
-  destroyed with reads in flight (the destructor orders the fd close against
-  the io_uring backend). A `LayerStore` must not be destroyed while
+  (`unique_ptr`); wrapping takes ownership. Keep a `LocalFileSource` and its
+  borrowed buffers alive until each read returns. Destructor fd-close ordering
+  covers submitted backend operations, not an outer transfer that may submit
+  another short-read step. A `LayerStore` must not be destroyed while
   `pread`/`populate` coroutines or a background fill are in flight on it
   (a suspended fetch, joiner, or fill step touches members on resume) —
   park an active fill first: `park_fill()` stops the walk and waits for
@@ -1367,3 +1371,13 @@ populate both metadata and target sources. Upstream trace records address only
 metadata sources, one slot per lower: target offsets are never recorded as
 metadata offsets or inserted as extra layer IDs. Target reads still share the
 device read-admission funnel and registry client.
+
+## Implementation notes
+
+Positional local-file reads and committed LayerStore reads use Elio v0.6.0
+`pread_exactly` over borrowed spans. Elio advances offsets, splits oversized
+requests and preserves transfer progress. LocalFileSource returns a terminal
+error even after progress; LayerStore keeps its POSIX partial-return policy.
+Both return the transferred prefix on early EOF and retain the existing
+source-size clamping. Dedicated writer-thread persistence remains synchronous:
+those operations do not execute in an Elio scheduler coroutine.
