@@ -1633,6 +1633,11 @@ Elio task-ownership and notification migration regressions:
   concurrent tag handlers and terminal completion for a throwing source.
 - `ublk: a cancelled task group still completes a skipped tag` — the kernel
   completion obligation survives pre-invocation child cancellation.
+- `ublk: failed completion publication wakes the queue before stop` —
+  completion insertion faults exercise failed fallback publication; the real
+  queue wake eventfd becomes readable before any stop wake. Direct external
+  failure publication is covered separately; ublk registration and the ring
+  loop remain bypassed, with no global allocation failure injection.
 - `source: concurrent fill parking retains a slow remote past warning deadlines` —
   simultaneous teardown observers retain owners past diagnostic deadlines.
 - `source: native fill notifications survive allocation failure and stop races` —

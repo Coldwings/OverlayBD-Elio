@@ -16,10 +16,13 @@
 
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <poll.h>
 
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <system_error>
 #include <thread>
 
@@ -88,6 +91,11 @@ struct DeviceTestAccess {
         auto& q = *dev.queues_.front();
         std::lock_guard<std::mutex> lock(q.mu_);
         return q.done_.size() == 1 && q.done_.front().second == 512;
+    }
+    static Queue& queue(Device& dev) { return *dev.queues_.front(); }
+    static int done_efd(Device& dev) { return queue(dev).done_efd_; }
+    static void set_completion_enqueue_hook(Device& dev, std::function<void()> hook) {
+        queue(dev).completion_enqueue_hook_for_test_ = std::move(hook);
     }
 };
 
@@ -309,6 +317,98 @@ TEST_CASE("ublk: a cancelled task group still completes a skipped tag", "[ublk][
     CHECK(completions.front().first == 0);
     CHECK(completions.front().second == -EIO);
     CHECK(state.destroyed.load());
+}
+
+TEST_CASE("ublk: failed completion publication wakes the queue before stop", "[ublk][shutdown]") {
+    using obd::ublk::DeviceTestAccess;
+    enum class Failure { SkippedChild, Completion, External };
+    Failure failure = Failure::SkippedChild;
+    SECTION("skipped child fallback cannot enqueue") { failure = Failure::SkippedChild; }
+    SECTION("normal completion and fallback cannot enqueue") { failure = Failure::Completion; }
+    SECTION("external failure publication") { failure = Failure::External; }
+    ReadState state;
+    std::atomic<unsigned> enqueue_attempts{0};
+    std::atomic<bool> waiter_entered{false};
+    std::atomic<bool> waiter_finished{false};
+    std::atomic<bool> waiter_woken{false};
+    bool waited_before_failure = false;
+    bool bridge_waiting_before_failure = false;
+    bool woke_before_stop = false;
+    bool failed_before_stop = false;
+    int queue_error = 0;
+    std::deque<std::pair<uint16_t, int32_t>> completions;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<CompletingSource>(state));
+        if (failure != Failure::External) {
+            DeviceTestAccess::set_completion_enqueue_hook(*dev, [&] {
+                enqueue_attempts.fetch_add(1);
+                throw std::bad_alloc();
+            });
+        }
+        const int done_efd = DeviceTestAccess::done_efd(*dev);
+        // Observe the production wake descriptor from a plain queue-side
+        // thread. Kernel registration/ring ownership remains bypassed here.
+        std::jthread waiter([&] {
+            pollfd descriptor{done_efd, POLLIN, 0};
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(5);
+            waiter_entered.store(true);
+            for (;;) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now());
+                if (remaining.count() <= 0) break;
+                const int result = ::poll(&descriptor, 1, static_cast<int>(remaining.count()));
+                if (result < 0 && errno == EINTR) continue;
+                waiter_woken.store(result > 0 && (descriptor.revents & POLLIN) != 0);
+                break;
+            }
+            waiter_finished.store(true);
+        });
+        DeviceTestAccess::start(*dev);
+        for (int i = 0; i < 5000 &&
+             (!waiter_entered.load() ||
+              elio::runtime::worker_thread::current()->io_context().pending_count() == 0); ++i) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        waited_before_failure = waiter_entered.load() && !waiter_finished.load();
+        bridge_waiting_before_failure =
+            elio::runtime::worker_thread::current()->io_context().pending_count() != 0;
+        state.release.store(true);  // also releases a mistakenly-started read
+        if (failure == Failure::External) {
+            // Covers the shared publication used by deferred bridge-loop
+            // failure without injecting a synthetic exception into that loop.
+            DeviceTestAccess::queue(*dev).fail(EIO);
+        } else {
+            if (failure == Failure::SkippedChild) DeviceTestAccess::cancel_bridge(*dev);
+            DeviceTestAccess::enqueue_read(*dev);
+        }
+        for (int i = 0; i < 5000 && !waiter_finished.load(); ++i) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        // Snapshot before stop's own wakeup, which would hide the regression.
+        woke_before_stop = waiter_finished.load() && waiter_woken.load();
+        failed_before_stop = DeviceTestAccess::queue(*dev).failed();
+        queue_error = DeviceTestAccess::queue(*dev).failure();
+        co_await dev->stop_async();
+        completions = DeviceTestAccess::completions(*dev);
+        co_await elio::spawn_blocking([&] {
+            waiter.join();
+            dev.reset();
+        });
+    }, one_worker());
+    CAPTURE(enqueue_attempts.load(), waiter_entered.load(), waiter_finished.load(), queue_error);
+    CHECK(waited_before_failure);
+    CHECK(bridge_waiting_before_failure);
+    CHECK(woke_before_stop);
+    CHECK(failed_before_stop);
+    CHECK(queue_error == EIO);
+    CHECK(completions.empty());
+    CHECK(enqueue_attempts.load() == (failure == Failure::External ? 0u :
+                                    failure == Failure::SkippedChild ? 1u : 2u));
+    CHECK(state.entered.load() == (failure == Failure::Completion));
+    CHECK(state.finished.load() == (failure == Failure::Completion));
+    CHECK(state.destroyed.load());
+    CHECK(state.destroyed_off_worker.load());
 }
 
 TEST_CASE("ublk: control task releases its device owner before final destruction", "[ublk][shutdown]") {

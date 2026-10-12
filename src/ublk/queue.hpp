@@ -24,6 +24,9 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#ifdef OBD_TEST_HOOKS
+#include <functional>
+#endif
 
 namespace obd::ublk {
 
@@ -88,10 +91,11 @@ public:
     void notify_elio() noexcept;
 
     /// Marks the queue failed from outside the queue thread (e.g. an
-    /// exception escaping run()).
+    /// exception escaping run()) and interrupts its current wait.
     void fail(int err) noexcept {
         failure_.store(err);
         failed_.store(true);
+        wakeup();
     }
     bool failed() const noexcept { return failed_.load(); }
     int failure() const noexcept { return failure_.load(); }
@@ -126,6 +130,11 @@ private:
     std::mutex mu_;
     std::deque<IoRequest> pending_;
     std::deque<std::pair<uint16_t, int32_t>> done_;
+#ifdef OBD_TEST_HOOKS
+    // Inject failure before the potentially allocating completion insertion.
+    // Private and per-queue; absent from builds with tests disabled.
+    std::function<void()> completion_enqueue_hook_for_test_;
+#endif
 
     std::atomic<bool> failed_{false};
     std::atomic<int> failure_{0};
