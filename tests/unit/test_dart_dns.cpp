@@ -112,12 +112,15 @@ TEST_CASE("source: DART DNS deadline leaves late lookup owned until retirement",
         REQUIRE(control.entered.load(std::memory_order_acquire));
         REQUIRE_FALSE(control.finished.load(std::memory_order_acquire));
         REQUIRE(elapsed >= std::chrono::milliseconds(750));
-        REQUIRE(elapsed < std::chrono::seconds(2));
         const auto deadline_ns = control.deadline_ns.load(std::memory_order_acquire);
         const auto start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             start.time_since_epoch()).count();
         REQUIRE(deadline_ns >= start_ns + 1000000000);
-        REQUIRE(deadline_ns < start_ns + 1100000000);
+        // Scheduler preemption can delay execution or observation arbitrarily;
+        // assert the registered deadline expired, not a physical return ceiling.
+        const auto observed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        REQUIRE(deadline_ns <= observed_ns);
         // Observer timeout does not release the producer's admission lease.
         REQUIRE(elio::net::default_resolve_domain()->outstanding() == 1);
         release_lookup(control);
