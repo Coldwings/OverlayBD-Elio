@@ -1140,3 +1140,10 @@ single Range-capable blob. No external golden files.
   probes at open (parallel open is a candidate optimization).
 - **`OpenedImage` ownership is monolithic** — there is no API to add/remove
   a layer or re-resolve a single lower without reassembling the image.
+
+## Implementation notes
+
+Trace finalization writes the complete encoded span with Elio `pwrite_exactly`
+and awaits `sync_file` before publishing success. Transfers and durability errors
+remain trace-finalization failures; the recorder retains its descriptor and
+encoded buffer until each operation returns.

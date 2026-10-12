@@ -6,6 +6,7 @@
 #include "common/sha256.hpp"
 
 #include <elio/io/io_awaitables.hpp>
+#include <elio/io/file_transfer.hpp>
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
@@ -489,19 +490,11 @@ bool LayerStore::try_load_pair(uint64_t nonce, const std::string& staging,
 elio::coro::task<ssize_t> LayerStore::read_fd_loop(int fd, void* buf,
                                                    size_t count,
                                                    uint64_t offset) {
-    uint8_t* p = static_cast<uint8_t*>(buf);
-    size_t done = 0;
-    while (done < count) {
-        const auto r = co_await elio::io::async_read(
-            fd, p + done, count - done,
-            static_cast<int64_t>(offset + done));
-        if (r.result < 0) {
-            co_return done > 0 ? static_cast<ssize_t>(done) : r.result;
-        }
-        if (r.result == 0) break;  // EOF (file shrank underneath us)
-        done += static_cast<size_t>(r.result);
-    }
-    co_return static_cast<ssize_t>(done);
+    const auto result = co_await elio::io::pread_exactly(
+        fd, std::span<std::byte>(static_cast<std::byte*>(buf), count), offset);
+    // Cache reads retain POSIX partial-return semantics on a later error.
+    if (result.error && result.transferred == 0) co_return -result.error.value();
+    co_return static_cast<ssize_t>(result.transferred);
 }
 
 elio::coro::task<LayerStore::FetchResult> LayerStore::join_or_fetch(
