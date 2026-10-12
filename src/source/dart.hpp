@@ -52,6 +52,8 @@ std::string dart_prefixed_url(const DartProxyAddress& address,
 /// Mirrors overlaybd's check_accelerate_url(): when the probe fails, the
 /// caller falls back to fetching directly from the registry (acceleration
 /// disabled) instead of failing the device.
+/// DNS observation and TCP connect share one 1000 ms deadline. Late libc
+/// lookups remain owned/admission-bounded by Elio after the observer returns.
 elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address);
 
 }  // namespace obd::source

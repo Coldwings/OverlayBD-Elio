@@ -2,7 +2,7 @@
 #include "source/dart.hpp"
 
 #include <elio/coro/with_timeout.hpp>
-#include <elio/net/resolve.hpp>
+#include <elio/net/resolve_wait.hpp>
 #include <elio/net/tcp.hpp>
 
 namespace obd::source {
@@ -53,15 +53,20 @@ elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address) {
     // Bounded probe (overlaybd check_accelerate_url semantics): a silent
     // network (dropped SYNs) must fall back to direct reads quickly, not
     // stall image open behind TCP retransmits.
-    auto probe = [&address](elio::coro::cancel_token token)
+    const auto deadline = std::chrono::steady_clock::now() + kReachableProbeTimeout;
+    auto probe = [&address, deadline](elio::coro::cancel_token token)
         -> elio::coro::task<bool> {
         try {
-            auto addrs = co_await elio::net::resolve_all(address.host,
-                                                         address.port);
-            if (addrs.empty()) co_return false;
+            elio::net::resolve_wait_options options;
+            options.deadline = deadline;
+            auto resolved = co_await elio::net::resolve_all(
+                address.host, address.port, std::move(options), token);
+            if (!resolved || std::chrono::steady_clock::now() >= deadline)
+                co_return false;
             // Cancellable connect: the token fires at the probe deadline so
-            // a silently-dropping network cannot stall image open.
-            auto stream = co_await elio::net::tcp_connect(addrs.front(),
+            // DNS and a silently-dropping TCP peer share the original budget.
+            // Elio owns late libc lookup work after our DNS observer departs.
+            auto stream = co_await elio::net::tcp_connect(resolved.addresses.front(),
                                                           std::move(token));
             co_return stream.has_value();
         } catch (const std::exception&) {

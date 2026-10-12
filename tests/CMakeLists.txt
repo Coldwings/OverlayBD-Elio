@@ -77,6 +77,20 @@ catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
     PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
                TIMEOUT 60)
 
+# Compile the production DART implementation independently with Elio's DNS
+# test hooks. No hooked Elio definitions enter obd_core or shipped binaries,
+# and every translation unit in this dedicated executable uses the same mode.
+add_executable(obd_dart_dns_tests
+    unit/test_dart_dns.cpp
+    ../src/source/dart.cpp)
+obd_target_warnings(obd_dart_dns_tests)
+target_include_directories(obd_dart_dns_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(obd_dart_dns_tests PRIVATE elio Catch2::Catch2WithMain)
+target_compile_definitions(obd_dart_dns_tests PRIVATE ELIO_RUNTIME_TEST_HOOKS=1)
+catch_discover_tests(obd_dart_dns_tests
+    PROPERTIES SKIP_RETURN_CODE 4 TIMEOUT 15)
+
 if(OBD_ENABLE_UBLK)
     target_sources(obd_unit_tests PRIVATE
         unit/test_ublk.cpp unit/test_ublk_shutdown.cpp)
