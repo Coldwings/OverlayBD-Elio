@@ -686,6 +686,9 @@ Every test, grouped by area, with the property it guards.
 - `source: layer store fill does not starve readers` — with fill active
   and back-pressured (tiny queue, slow disk), cold-reader preads each
   complete within a bounded 1 s budget, byte-exactly.
+- `source: registry new URL refreshes a server-rejected cached token` —
+  server-side revocation on an uncached URL sharing another blob's token,
+  plus bounded failure when every refreshed generation is rejected.
 - `source: registry concurrent 401s share one token refresh` — N
   concurrent reads on a server-side-expired token trigger exactly one
   coalesced token exchange (mock counts token endpoint hits); all reads

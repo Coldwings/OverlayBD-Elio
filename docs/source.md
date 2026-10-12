@@ -141,6 +141,9 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
   a token generation; a request that took a 401 retries only with a strictly
   newer generation, so a just-rejected token is never reused even while it
   is still time-valid (ADR-0015). The per-request retry budget is unchanged.
+  Authenticated URL discovery applies the same generation rule when a token
+  cached for another URL is rejected: it permits at most three authenticated
+  probes, sharing refresh exchanges, before returning `-EPERM`.
 - **Status mapping** — 416 → `-ERANGE`, 429 → `-EBUSY`, 401/403 after retry
   → `-EPERM`, 404 → `-ENOENT`, everything else → `-EIO`.
 
@@ -515,9 +518,9 @@ proactive refresh deadline; 401/403 on a data request drops the cached URL
 info and re-resolves with a strictly newer token generation; a 206 whose
 `Content-Range` does not start at `offset` invalidates the cache and
 retries. Both caches and the
-in-flight exchange map are guarded by an `elio::sync::mutex`; network IO
-never happens under the lock except during the resolve probe sequence,
-which is naturally serialized per URL.
+in-flight exchange map are guarded by an `elio::sync::mutex`; network IO,
+including discovery probes, runs outside that lock. Token exchanges for the
+same key are coalesced; independent URL discovery is not serialized.
 
 ```cpp
 class RegistrySource final : public BlobSource {
@@ -1203,6 +1206,9 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   and back-pressured (tiny queue, slow disk), eight concurrent-reader
   preads of cold extents each complete within a bounded 1 s budget
   byte-exactly.
+- `source: registry new URL refreshes a server-rejected cached token` — a
+  new blob URL sharing a revoked but locally time-valid token refreshes once;
+  permanently rejected authenticated discovery terminates after three probes.
 - `source: registry concurrent 401s share one token refresh` — eight
   concurrent reads that all take a 401 on the server-side-expired token
   trigger exactly one coalesced token exchange (the mock counts token

@@ -890,6 +890,38 @@ TEST_CASE("source: DART prefix passthrough preserves the embedded URL",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("source: registry new URL refreshes a server-rejected cached token", "[source]") {
+    test::run_coro([]() -> elio::coro::task<void> {
+        auto blob = test::pattern_bytes(4096, 25);
+        MockRegistry mock(blob);
+        mock.serial_tokens_ = true;
+        mock.expires_in_ = 100;
+        elio::go([&mock]() -> elio::coro::task<void> { co_await mock.run(); });
+        MockGuard guard{mock};
+        const bool running = co_await test::wait_server_running(mock);
+        REQUIRE(running);
+        auto client = std::make_shared<source::RegistryClient>(test_creds(), source::RegistryClientConfig{});
+        auto first = co_await source::RegistrySource::open(client, mock.repo_base() + "/auth/x");
+        REQUIRE(first->size() == blob.size());
+        REQUIRE(mock.token_hits_.load() == 1);
+
+        // The new URL has no URL-info cache, but shares x's time-valid token.
+        mock.accept_serial_above_ = 1;
+        std::array<uint8_t, 128> buffer;
+        const auto read = co_await client->get_data(mock.repo_base() + "/auth/y", buffer.data(), 16, buffer.size());
+        REQUIRE(read == static_cast<ssize_t>(buffer.size()));
+        REQUIRE(std::equal(buffer.begin(), buffer.end(), blob.begin() + 16));
+        REQUIRE(mock.token_hits_.load() == 2);
+
+        // Discovery itself must also terminate when no generation is accepted.
+        mock.accept_serial_above_ = 10000;
+        const auto denied = co_await client->get_data(mock.repo_base() + "/auth/z", buffer.data(), 16, buffer.size());
+        REQUIRE(denied == -EPERM);
+        REQUIRE(mock.token_hits_.load() == 4);  // cached probe + two refreshes
+        co_await wait_drained(mock);
+    });
+}
+
 TEST_CASE("source: registry concurrent 401s share one token refresh",
           "[source]") {
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
