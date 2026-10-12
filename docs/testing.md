@@ -603,6 +603,10 @@ Every test, grouped by area, with the property it guards.
   peer suffix cannot mutate reused storage or contaminate the next connection.
 - `source: cancelled registry auth leader preserves the shared token exchange` —
   leader cancellation leaves the shared token exchange and follower read intact.
+- `source: registry cancellation takes precedence over an observed operation failure` —
+  cancelled payload and length observers report ECANCELED after a real framing
+  failure, including failed shared discovery; uncancelled controls retain the
+  framing error and existing retry policy.
 - `source: registry discovery and range length ignore held probe bodies` —
   discovery and 206 length totals close unconsumed bodies promptly, including
   absent bodies larger than the configured cap, before a healthy data response.
