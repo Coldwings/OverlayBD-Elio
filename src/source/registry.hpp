@@ -57,8 +57,14 @@ struct RegistryClientConfig {
     std::chrono::seconds read_timeout{30};
     /// DART accelerate base ("http://host:port/prefix"), empty = direct.
     std::string accelerate_base;
-    /// Max buffered response body (largest single Range we ever request).
+    /// Max decoded response body, buffered control or streamed payload.
     size_t max_response_size = 64 * 1024 * 1024;
+#ifdef OBD_TEST_HOOKS
+    // Per-client seam to order cancellation after a genuine operation failure
+    // and before the public observer selects its error. Production omits it.
+    void* failure_context_for_test = nullptr;
+    void (*observe_failure_for_test)(void*, int) noexcept = nullptr;
+#endif
 };
 
 /// Shared HTTP client + auth/redirect caches for one device process. All
@@ -72,15 +78,23 @@ public:
 
     /// Range GET of [offset, offset+count) into `buf`. Returns `count` on
     /// success, negative -errno on failure (EPERM auth, ERANGE 416, EBUSY
-    /// 429, EIO otherwise, ETIMEDOUT after retries).
+    /// 429, EIO otherwise, ETIMEDOUT on a transport deadline).
+    /// Failed reads may have overwritten a prefix of `buf`.
+    /// Payload and retry waits honor the current Elio task's cancellation;
+    /// shared auth discovery/refresh finishes before this caller departs.
     elio::coro::task<ssize_t> get_data(const std::string& url, void* buf,
                                        uint64_t offset, size_t count);
 
-    /// Total blob size from a Range 0-0 Content-Range total; -errno on
-    /// failure.
+    /// Total blob size from a header-only 206 Content-Range total; ignored
+    /// Range 200 bodies are counted with bounded scratch storage and the
+    /// configured decoded-body cap. Negative -errno on failure.
     elio::coro::task<int64_t> get_length(const std::string& url);
 
 private:
+    /// A cancelled observer reports ECANCELED after failed provider/HTTP work
+    /// has settled. Successful operations retain their existing result policy.
+    int observation_error(int code, const elio::coro::cancel_token& token) const;
+
     struct TokenEntry {
         std::string token;
         std::chrono::steady_clock::time_point expiry;
@@ -104,11 +118,28 @@ private:
         uint64_t token_generation = 0;
     };
 
-    /// GET with Range [first,last]; returns nullopt with errno set on
-    /// transport failure.
-    elio::coro::task<std::optional<elio::http::response>> request_range(
+    /// Buffered token JSON, with an independent provider token. Failures carry
+    /// an owned error value, independent of ambient errno.
+    elio::coro::task<elio::http::client_result<elio::http::response>> request_range(
         const std::string& url, uint64_t first, uint64_t last,
         const std::string& auth_header);
+
+    /// Header-only auth/redirect discovery. Irrelevant bodies are closed,
+    /// not buffered or drained; provider work is independent of one reader.
+    elio::coro::task<elio::http::client_result<elio::http::response>> request_probe(
+        const std::string& url, const std::string& auth_header);
+
+    struct DataResponse {
+        int status = 0;
+        bool matching_range = false;
+        size_t body_size = 0;
+    };
+
+    /// Stream accepted payload directly into the destination, then drain
+    /// excess bytes with bounded scratch storage to validate final framing.
+    elio::coro::task<elio::http::client_result<DataResponse>> request_data(
+        const std::string& url, uint64_t first, size_t count,
+        const std::string& auth_header, void* buf);
 
     /// Resolves auth + redirect state for `url`, refreshing caches as
     /// needed (registryfs_v2 get_scope_auth/get_actual_url). When

@@ -96,6 +96,34 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
 
 - **GET with Range only** — never HEAD. Blob size comes from a `Range:
   bytes=0-0` probe's `Content-Range` total.
+- **Scoped payload streaming** — accepted range responses use Elio 0.6's
+  `http::client::with_response` and scoped body reader to fill the caller's
+  buffer. Excess payload is drained with an 8 KiB scratch buffer before
+  reporting success, preserving final framing validation and connection reuse.
+  Rejected status or range headers close the exchange without reading its body.
+  Discovery probes and valid 206 length totals inspect final headers and retire
+  irrelevant bodies immediately. Ignored-Range 200 length responses count all
+  decoded bytes with an 8 KiB scratch buffer. Only token JSON stays buffered.
+  Transport errors carry owned Elio `client_error` values; they are never
+  recovered from ambient `errno` after a coroutine suspension.
+- **Control framing boundary** — discovery and valid 206 length metadata depend
+  on complete headers, so missing, oversized or malformed unused bodies do not
+  invalidate their metadata. These exchanges are closed and cannot be reused.
+  Accepted payload and ignored-Range 200 length responses must reach complete
+  body framing and obey the configured decoded-body cap before success.
+- **Cooperative request cancellation** — payload exchanges, retry backoff,
+  and the final caller-owned length request receive the current Elio task's
+  cancellation token. Cancellation returns `-ECANCELED` without retrying;
+  all response-buffer access has stopped before awaited return. Discovery and
+  token-provider control requests keep an independent explicit HTTP token so
+  cancelling one reader cannot poison a token exchange shared by other readers.
+  A cancelled reader waiting for that control work departs after it completes;
+  this is not immediate cancellation of the entire authentication sequence.
+  If shared discovery throws an operational error or a caller-owned HTTP
+  exchange returns an Elio `client_error`, cancellation already requested
+  when the caller observes that error takes precedence over its code.
+  Successful exchange summaries retain their existing status, range and
+  body-validation result policy.
 - **Auth discovery** — an unauthenticated probe; on 401/403 the
   `WWW-Authenticate` Bearer challenge (`realm`, `service`, `scope`) is parsed
   and a token is fetched from the realm with Basic auth built from the
@@ -438,8 +466,13 @@ struct RegistryClientConfig {
 `src/source/registry.hpp::RegistryClientConfig` — knobs for one client.
 `accelerate_base` is the DART prefix base (`"http://host:port/prefix"`); when
 non-empty every data request is rewritten to `accelerate_base + "/" +
-<actual blob URL>` (ADR-0005). `max_response_size` bounds a single buffered
-response body and therefore the largest single Range the client will serve.
+<actual blob URL>` (ADR-0005). `max_response_size` bounds consumed decoded bodies
+(buffered token JSON, streamed payload, and ignored-Range 200 length counting),
+and independently bounds informational response bytes. It also bounds the
+largest single requested data Range. An unused discovery/206 size body is not
+consumed and its declared length does not trigger this cap. A valid 206 total
+may describe a larger blob; callers read it in bounded ranges. Payload and 200
+length receiving use fixed scratch storage rather than a body-sized allocation.
 
 ```cpp
 class RegistryClient {
@@ -462,11 +495,23 @@ anonymous pull.
   (callers clamp to the blob size first, so a server-side short body is an
   error, `-EIO`). Negative `-errno` on failure: `-EPERM` (auth rejected
   after re-resolution), `-ERANGE` (416), `-EBUSY` (429 after retries),
-  `-ETIMEDOUT` (retry budget exhausted on transport errors), `-EIO`
-  otherwise. Never throws.
+  `-ETIMEDOUT` (transport deadline), `-EIO`
+  otherwise. A zero count returns 0 without a request; a nonempty null buffer
+  returns `-EINVAL`, overflowing range/return arithmetic returns `-EOVERFLOW`,
+  and requests beyond the configured body cap return `-EMSGSIZE`. Failed reads
+  may overwrite a prefix of the destination; callers must discard those bytes.
+  Payload and retry waits honor current-task cancellation with `-ECANCELED`;
+  shared authentication work finishes before a cancelled observer leaves.
+  All scoped reader activity has stopped before awaited return. Operational
+  failures use return values.
 - `get_length(url)` — blob size from a `Range: bytes=0-0` probe's
-  `Content-Range` total; falls back to the body length when the server
-  ignores Range and answers 200. Negative `-errno` on failure. Never throws.
+  `Content-Range` total, without consuming an irrelevant 206 body. When the
+  server ignores Range and answers 200, counts the complete decoded body in
+  fixed scratch storage under the configured cap; missing final framing still
+  fails, and a body beyond the default 64 MiB cap returns `-EMSGSIZE`.
+  Totals beyond signed 64-bit representation return `-EOVERFLOW`. The final
+  caller-owned exchange honors current-task cancellation. Operational failures
+  return negative `-errno`.
 
 Internal behavior worth depending on (see Concepts): tokens cached for 80%
 of the OAuth2 `expires_in` lifetime (30 s fallback for absent/unparsable/
@@ -478,9 +523,9 @@ proactive refresh deadline; 401/403 on a data request drops the cached URL
 info and re-resolves with a strictly newer token generation; a 206 whose
 `Content-Range` does not start at `offset` invalidates the cache and
 retries. Both caches and the
-in-flight exchange map are guarded by an `elio::sync::mutex`; network IO
-never happens under the lock except during the resolve probe sequence,
-which is naturally serialized per URL.
+in-flight exchange map are guarded by an `elio::sync::mutex`; network IO,
+including discovery probes, runs outside that lock. Token exchanges for the
+same key are coalesced; independent URL discovery is not serialized.
 
 ```cpp
 class RegistrySource final : public BlobSource {
@@ -1080,6 +1125,46 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: registry range reads and size probe` — `RegistrySource::open`
   learns the size from the Range 0-0 probe and `pread` returns exact bytes
   for an interior range.
+- `source: registry streaming consumes fragmented range framing` — fragmented
+  fixed-length and chunked responses fill the guarded destination byte-exactly,
+  consume final trailers, and reuse their payload connection for subsequent
+  ranges after the separate header-only discovery connection is retired.
+- `source: registry streaming drains ignored range before connection reuse` —
+  a 200 response at offset zero copies only the requested prefix and drains the
+  larger body with bounded scratch storage before the next pooled response.
+- `source: registry streaming detects short bodies and missing final framing` —
+  valid short bodies return EIO; transport truncation or a missing terminal chunk
+  remains a framing error even after all requested bytes arrived, and a later
+  healthy response is uncontaminated.
+- `source: registry streaming keeps decoded body size bounded` — fixed-length
+  and chunked responses honor the configured decoded body cap and destination
+  guard bytes; exceeding the cap returns EMSGSIZE after bounded retries.
+- `source: registry streaming rejects status before unread error body` — ignored
+  ranges at nonzero offsets, 416, and 429 return their mapped errors without
+  waiting for an absent error body, then receive a healthy response on a new
+  connection.
+- `source: registry request guards and owned errors ignore ambient errno` —
+  malformed URLs map to EINVAL despite poisoned errno, and empty, null,
+  overflowing, and over-cap ranges are handled before network activity.
+- `source: registry cancellation retires a blocked payload buffer before return` —
+  cancellation after a copied prefix settles the outstanding read, returns
+  ECANCELED without retry, permits immediate buffer reuse despite a late peer
+  suffix, and receives a healthy response on a fresh connection.
+- `source: cancelled registry auth leader preserves the shared token exchange` —
+  a cancelled leader finishes its shared token provider, returns ECANCELED, and
+  leaves the uncancelled follower's byte-exact read successful with one exchange.
+- `source: registry cancellation takes precedence over an observed operation failure` —
+  a per-client test seam cancels the observer after a real truncated response
+  reports EBADMSG; payload and length failures, including failed independent
+  discovery, report ECANCELED without retry. Uncancelled controls retain the
+  original framing error and retry policy.
+- `source: registry discovery and range length ignore held probe bodies` —
+  discovery and a 206 total return promptly with missing/over-cap unused bodies,
+  reject unrepresentable totals, retire those connections, and receive a healthy
+  range on a new connection.
+- `source: registry ignored range length counts decoded bytes within its cap` —
+  fixed-length, chunked and close-delimited 200 bodies are counted byte-exactly
+  with the configured cap; excess bytes and incomplete chunk framing fail.
 - `source: registry bearer auth flow via token endpoint` — a 401 Bearer
   challenge drives a token fetch with Basic credentials, and subsequent
   reads carry the bearer token (the mock only serves `Bearer sekrit`).
