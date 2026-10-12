@@ -118,6 +118,9 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
   a token generation; a request that took a 401 retries only with a strictly
   newer generation, so a just-rejected token is never reused even while it
   is still time-valid (ADR-0015). The per-request retry budget is unchanged.
+  Authenticated URL discovery applies the same generation rule when a token
+  cached for another URL is rejected: it permits at most three authenticated
+  probes, sharing refresh exchanges, before returning `-EPERM`.
 - **Status mapping** — 416 → `-ERANGE`, 429 → `-EBUSY`, 401/403 after retry
   → `-EPERM`, 404 → `-ENOENT`, everything else → `-EIO`.
 
@@ -1167,6 +1170,9 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   and back-pressured (tiny queue, slow disk), eight concurrent-reader
   preads of cold extents each complete within a bounded 1 s budget
   byte-exactly.
+- `source: registry new URL refreshes a server-rejected cached token` — a
+  new blob URL sharing a revoked but locally time-valid token refreshes once;
+  permanently rejected authenticated discovery terminates after three probes.
 - `source: registry concurrent 401s share one token refresh` — eight
   concurrent reads that all take a 401 on the server-side-expired token
   trigger exactly one coalesced token exchange (the mock counts token
