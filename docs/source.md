@@ -1351,7 +1351,7 @@ directly.
   (the device server calls `park_image_fills` during shutdown and
   post-open boot-failure cleanup; stores composed by hand use
   `park_fill()`; start delay, transient-error backoff, and throttle waits
-  are slept in bounded slices so parking is prompt).
+  use a fill-specific cancellable timer so parking can wake them promptly).
   `delay_extra_sec` uses `std::random_device` per store, so delays are
   not reproducible run-to-run.
 - **Redirect caching trusts `Location` for 300 s** — a CDN URL that expires
