@@ -568,6 +568,22 @@ Every test, grouped by area, with the property it guards.
   serves bytes from the refreshed URL (issue #15).
 - `source: registry range reads and size probe` — HTTP `Range` reads
   return exactly the requested window against the mock registry.
+- `source: registry streaming consumes fragmented range framing` — raw TCP
+  fixed-length/chunked replies span reader pulls, preserve destination guard
+  bytes, and validate final framing before connection reuse.
+- `source: registry streaming drains ignored range before connection reuse` —
+  a full-body 200 at zero copies the prefix and drains the remainder before the
+  next request shares its connection.
+- `source: registry streaming detects short bodies and missing final framing` —
+  valid short payloads, premature EOF, and a missing terminal chunk return the
+  intended errors; a later healthy response is byte-exact.
+- `source: registry streaming keeps decoded body size bounded` — both framing
+  forms respect the configured cap and never overwrite destination guard bytes.
+- `source: registry streaming rejects status before unread error body` —
+  nonzero ignored ranges, 416, and 429 abort unread bodies promptly and retire
+  the connection before a healthy response.
+- `source: registry request guards and owned errors ignore ambient errno` —
+  owned URL failures and range preconditions ignore poisoned ambient errno.
 - `source: registry bearer auth flow via token endpoint` — a 401 with
   `WWW-Authenticate` drives a token fetch and an authorized retry.
 - `source: registry redirect mode drops auth on the CDN URL` —

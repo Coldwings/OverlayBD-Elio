@@ -57,7 +57,7 @@ struct RegistryClientConfig {
     std::chrono::seconds read_timeout{30};
     /// DART accelerate base ("http://host:port/prefix"), empty = direct.
     std::string accelerate_base;
-    /// Max buffered response body (largest single Range we ever request).
+    /// Max decoded response body, buffered control or streamed payload.
     size_t max_response_size = 64 * 1024 * 1024;
 };
 
@@ -73,6 +73,7 @@ public:
     /// Range GET of [offset, offset+count) into `buf`. Returns `count` on
     /// success, negative -errno on failure (EPERM auth, ERANGE 416, EBUSY
     /// 429, EIO otherwise, ETIMEDOUT after retries).
+    /// Failed reads may have overwritten a prefix of `buf`.
     elio::coro::task<ssize_t> get_data(const std::string& url, void* buf,
                                        uint64_t offset, size_t count);
 
@@ -104,11 +105,23 @@ private:
         uint64_t token_generation = 0;
     };
 
-    /// GET with Range [first,last]; returns nullopt with errno set on
-    /// transport failure.
-    elio::coro::task<std::optional<elio::http::response>> request_range(
+    /// Buffered Range GET for control probes and token JSON. Transport
+    /// failures carry an owned error value, independent of ambient errno.
+    elio::coro::task<elio::http::client_result<elio::http::response>> request_range(
         const std::string& url, uint64_t first, uint64_t last,
         const std::string& auth_header);
+
+    struct DataResponse {
+        int status = 0;
+        bool matching_range = false;
+        size_t body_size = 0;
+    };
+
+    /// Stream accepted payload directly into the destination, then drain
+    /// excess bytes with bounded scratch storage to validate final framing.
+    elio::coro::task<elio::http::client_result<DataResponse>> request_data(
+        const std::string& url, uint64_t first, size_t count,
+        const std::string& auth_header, void* buf);
 
     /// Resolves auth + redirect state for `url`, refreshing caches as
     /// needed (registryfs_v2 get_scope_auth/get_actual_url). When

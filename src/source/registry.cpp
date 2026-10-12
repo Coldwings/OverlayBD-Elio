@@ -10,9 +10,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdio>
 #include <limits>
 #include <optional>
+#include <span>
 
 namespace obd::source {
 
@@ -141,6 +144,22 @@ elio::http::client_config make_http_config(const RegistryClientConfig& cfg) {
     return cc;
 }
 
+elio::http::request make_range_request(const elio::http::url& target,
+                                     uint64_t first, uint64_t last,
+                                     const std::string& auth_header) {
+    elio::http::request req(elio::http::method::GET, target.path_with_query());
+    req.set_host(target.host_authority());
+    req.set_header("Accept", "*/*");
+    req.set_header("Range", make_range_header(first, last));
+    if (!auth_header.empty()) req.set_header("Authorization", auth_header);
+    return req;
+}
+
+elio::http::client_error invalid_target() {
+    return {std::error_code(EINVAL, std::generic_category()),
+            elio::http::client_stage::target};
+}
+
 }  // namespace
 
 RegistryClient::RegistryClient(CredentialStorePtr creds,
@@ -149,23 +168,62 @@ RegistryClient::RegistryClient(CredentialStorePtr creds,
       cfg_(std::move(cfg)),
       http_(make_http_config(cfg_)) {}
 
-elio::coro::task<std::optional<elio::http::response>>
+elio::coro::task<elio::http::client_result<elio::http::response>>
 RegistryClient::request_range(const std::string& url, uint64_t first,
                               uint64_t last, const std::string& auth_header) {
     auto parsed = elio::http::url::parse(url);
-    if (!parsed) {
-        errno = EINVAL;
-        co_return std::nullopt;
-    }
-    elio::http::request req(elio::http::method::GET, parsed->path_with_query());
-    req.set_host(parsed->host_authority());
-    req.set_header("Accept", "*/*");
-    req.set_header("Range", make_range_header(first, last));
-    if (!auth_header.empty()) {
-        req.set_header("Authorization", auth_header);
-    }
-    errno = 0;
-    co_return co_await http_.send(req, *parsed);
+    if (!parsed) co_return invalid_target();
+    auto req = make_range_request(*parsed, first, last, auth_header);
+    co_return co_await http_.send_result(req, *parsed);
+}
+
+elio::coro::task<elio::http::client_result<RegistryClient::DataResponse>>
+RegistryClient::request_data(const std::string& url, uint64_t first,
+                             size_t count, const std::string& auth_header,
+                             void* buf) {
+    auto parsed = elio::http::url::parse(url);
+    if (!parsed) co_return invalid_target();
+    auto req = make_range_request(*parsed, first, first + count - 1,
+                                  auth_header);
+    DataResponse response;
+    elio::http::streaming_response_options options;
+    options.max_body_size = cfg_.max_response_size;
+    options.max_informational_bytes = cfg_.max_response_size;
+    auto outcome = co_await http_.with_response(
+        std::move(req), std::move(*parsed), {},
+        [&response, buf, count, first](
+            const elio::http::response& head,
+            elio::http::response_body_reader& body,
+            const elio::coro::cancel_token& token) -> elio::coro::task<void> {
+            response.status = head.status_code();
+            if (response.status == 206) {
+                const auto range = parse_content_range(
+                    head.get_headers().get("Content-Range"));
+                response.matching_range = range && range->first == first;
+                if (!response.matching_range) co_return;
+            } else if (response.status != 200 || first != 0) {
+                // Reject before consuming an irrelevant error/full-blob body.
+                // Elio closes this unfinished exchange instead of pooling it.
+                co_return;
+            }
+            std::array<std::byte, 8192> scratch;
+            for (;;) {
+                auto destination = response.body_size < count
+                    ? std::span<std::byte>(static_cast<std::byte*>(buf) +
+                                             response.body_size,
+                                           count - response.body_size)
+                    : std::span<std::byte>(scratch);
+                auto result = co_await body.read_into(destination, token);
+                if (std::holds_alternative<elio::http::client_error>(result))
+                    co_return;  // propagated by with_response after cleanup
+                const auto progress = std::get<elio::http::body_read_progress>(result);
+                response.body_size += progress.transferred;
+                if (progress.complete) co_return;
+            }
+        }, options);
+    if (const auto* failure = std::get_if<elio::http::client_error>(&outcome))
+        co_return *failure;
+    co_return response;
 }
 
 elio::coro::task<RegistryClient::TokenResponse> RegistryClient::fetch_token(
@@ -186,21 +244,21 @@ elio::coro::task<RegistryClient::TokenResponse> RegistryClient::fetch_token(
                                             cred->password);
         }
     }
-    errno = 0;
-    auto resp = co_await request_range(token_url, 0, 0, auth);
-    if (!resp) {
-        throw_errno(errno ? errno : EIO, "token request failed: " + realm);
+    auto result = co_await request_range(token_url, 0, 0, auth);
+    if (const auto* failure = std::get_if<elio::http::client_error>(&result)) {
+        throw_errno(failure->code.value(), "token request failed: " + realm);
     }
-    if (resp->status_code() != 200) {
+    const auto& resp = std::get<elio::http::response>(result);
+    if (resp.status_code() != 200) {
         // Token endpoints ignore Range; a 200 with full body is expected.
-        throw_errno(status_to_errno(resp->status_code()),
+        throw_errno(status_to_errno(resp.status_code()),
                     "token request rejected (HTTP " +
-                        std::to_string(resp->status_code()) + "): " + realm);
+                        std::to_string(resp.status_code()) + "): " + realm);
     }
     nlohmann::json j;
     std::string token;
     try {
-        j = nlohmann::json::parse(resp->body());
+        j = nlohmann::json::parse(resp.body());
         // Field extraction lives inside the guard too: a non-string token
         // field must map to format_error (obd::error → system_error), not
         // escape as a raw nlohmann type_error on a hot path.
@@ -344,13 +402,13 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
     }
 
     // Probe: Range 0-0, no auth (registryfs_v2 get_scope_auth semantics).
-    errno = 0;
-    auto probe = co_await request_range(url, 0, 0, "");
-    if (!probe) {
-        throw_errno(errno ? errno : EIO, "registry probe failed: " + url);
+    auto probe_result = co_await request_range(url, 0, 0, "");
+    if (const auto* failure = std::get_if<elio::http::client_error>(&probe_result)) {
+        throw_errno(failure->code.value(), "registry probe failed: " + url);
     }
-    const int status = probe->status_code();
-    const auto location = probe->get_headers().get("Location");
+    const auto& probe = std::get<elio::http::response>(probe_result);
+    const int status = probe.status_code();
+    const auto location = probe.get_headers().get("Location");
 
     UrlInfo info;
     if (status >= 300 && status < 400 && !location.empty()) {
@@ -364,7 +422,7 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
                       std::chrono::seconds(300);
     } else if (status == 401 || status == 403) {
         const auto challenge_hdr =
-            probe->get_headers().get("WWW-Authenticate");
+            probe.get_headers().get("WWW-Authenticate");
         if (challenge_hdr.empty()) {
             throw_errno(EPERM, "registry denied without challenge: " + url);
         }
@@ -400,14 +458,14 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
         }
         // Re-issue the probe with auth to discover Self vs Redirect mode
         // (registryfs_v2 get_actual_url).
-        errno = 0;
-        auto probe2 = co_await request_range(url, 0, 0, auth);
-        if (!probe2) {
-            throw_errno(errno ? errno : EIO,
+        auto probe2_result = co_await request_range(url, 0, 0, auth);
+        if (const auto* failure = std::get_if<elio::http::client_error>(&probe2_result)) {
+            throw_errno(failure->code.value(),
                         "registry probe with auth failed: " + url);
         }
-        const auto location2 = probe2->get_headers().get("Location");
-        const int status2 = probe2->status_code();
+        const auto& probe2 = std::get<elio::http::response>(probe2_result);
+        const auto location2 = probe2.get_headers().get("Location");
+        const int status2 = probe2.status_code();
         if (status2 >= 300 && status2 < 400 && !location2.empty()) {
             info.final_url = std::string(location2);
             // Redirect mode: CDN URL needs no auth.
@@ -447,6 +505,11 @@ elio::coro::task<RegistryClient::UrlInfo> RegistryClient::resolve(
 elio::coro::task<ssize_t> RegistryClient::get_data(const std::string& url,
                                                    void* buf, uint64_t offset,
                                                    size_t count) {
+    if (count == 0) co_return 0;
+    if (!buf) co_return -EINVAL;
+    if (count > static_cast<size_t>(std::numeric_limits<ssize_t>::max()) ||
+        offset > UINT64_MAX - (count - 1)) co_return -EOVERFLOW;
+    if (count > cfg_.max_response_size) co_return -EMSGSIZE;
     // Generation the retried request must beat: set after a 401 so the
     // re-resolve cannot reuse the exact token that was just rejected.
     uint64_t min_token_generation = 0;
@@ -462,37 +525,30 @@ elio::coro::task<ssize_t> RegistryClient::get_data(const std::string& url,
             // DART prefix passthrough (ADR-0005): prefix + "/" + actual URL.
             request_url = cfg_.accelerate_base + "/" + info.final_url;
         }
-        errno = 0;
-        auto resp = co_await request_range(request_url, offset,
-                                           offset + count - 1,
-                                           info.auth_header);
-        if (!resp) {
-            const int e = errno ? errno : EIO;
+        auto result = co_await request_data(request_url, offset, count,
+                                            info.auth_header, buf);
+        if (const auto* failure = std::get_if<elio::http::client_error>(&result)) {
+            const int e = failure->code.value();
             if (attempt == 2) co_return -e;
             co_await elio::time::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
-        const int status = resp->status_code();
+        const auto& resp = std::get<DataResponse>(result);
+        const int status = resp.status;
         if (status == 206) {
-            const auto cr_hdr = resp->get_headers().get("Content-Range");
-            const auto cr = parse_content_range(cr_hdr);
-            if (!cr || cr->first != offset) {
+            if (!resp.matching_range) {
                 if (attempt == 2) co_return -EIO;
                 co_await mu_.lock();
                 url_infos_.erase(url);
                 mu_.unlock();
                 continue;
             }
-            const auto& body = resp->body();
-            if (body.size() < count) co_return -EIO;
-            std::memcpy(buf, body.data(), count);
+            if (resp.body_size < count) co_return -EIO;
             co_return static_cast<ssize_t>(count);
         }
         if (status == 200) {
             // Server ignored Range: only valid for a full-blob read at 0.
-            const auto& body = resp->body();
-            if (offset == 0 && body.size() >= count) {
-                std::memcpy(buf, body.data(), count);
+            if (offset == 0 && resp.body_size >= count) {
                 co_return static_cast<ssize_t>(count);
             }
             if (attempt == 2) co_return -EIO;
@@ -536,19 +592,20 @@ elio::coro::task<int64_t> RegistryClient::get_length(const std::string& url) {
     if (!cfg_.accelerate_base.empty()) {
         request_url = cfg_.accelerate_base + "/" + info.final_url;
     }
-    errno = 0;
-    auto resp = co_await request_range(request_url, 0, 0, info.auth_header);
-    if (!resp) co_return -(errno ? errno : EIO);
-    const auto cr_hdr = resp->get_headers().get("Content-Range");
+    auto result = co_await request_range(request_url, 0, 0, info.auth_header);
+    if (const auto* failure = std::get_if<elio::http::client_error>(&result))
+        co_return -failure->code.value();
+    const auto& resp = std::get<elio::http::response>(result);
+    const auto cr_hdr = resp.get_headers().get("Content-Range");
     const auto cr = parse_content_range(cr_hdr);
-    if (resp->status_code() == 206 && cr && cr->total != UINT64_MAX) {
+    if (resp.status_code() == 206 && cr && cr->total != UINT64_MAX) {
         co_return static_cast<int64_t>(cr->total);
     }
-    if (resp->status_code() == 200) {
+    if (resp.status_code() == 200) {
         // Server ignored Range and answered with the full blob.
-        co_return static_cast<int64_t>(resp->body().size());
+        co_return static_cast<int64_t>(resp.body().size());
     }
-    co_return -status_to_errno(resp->status_code());
+    co_return -status_to_errno(resp.status_code());
 }
 
 elio::coro::task<std::unique_ptr<RegistrySource>> RegistrySource::open(

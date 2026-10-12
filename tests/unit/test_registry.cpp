@@ -6,14 +6,20 @@
 #include "../support.hpp"
 
 #include <elio/http/http_server.hpp>
+#include <elio/net/tcp.hpp>
+#include <elio/net/stream.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <array>
 #include <cerrno>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -297,6 +303,97 @@ source::CredentialStorePtr test_creds() {
     return store;
 }
 
+/// A raw TCP peer for framing and connection-retirement checks. Unlike the
+/// HTTP server mock, it can deliberately truncate a chunk trailer or leave
+/// an error body unread. Each accepted connection serves sequential requests.
+class RawRegistry {
+public:
+    struct Reply {
+        std::string wire;
+        size_t fragment_size = 4096;
+        bool close_after = false;
+    };
+    using Plan = std::function<Reply(const std::string&)>;
+
+    explicit RawRegistry(Plan plan) : plan_(std::move(plan)) {
+        listener_ = elio::net::tcp_listener::bind(
+            elio::net::ipv4_address("127.0.0.1", 0));
+        if (!listener_) throw std::system_error(errno, std::generic_category(),
+                                                 "raw registry bind");
+    }
+    std::string url(std::string_view path = "/blob") const {
+        return "http://127.0.0.1:" +
+            std::to_string(listener_->local_address().port()) + std::string(path);
+    }
+    void stop() { stopped_.cancel(); }
+    size_t connections() const noexcept { return connections_.load(); }
+    size_t data_requests() const noexcept { return data_requests_.load(); }
+
+    elio::coro::task<void> run() {
+        auto token = stopped_.get_token();
+        while (!token.is_cancelled()) {
+            auto accepted = co_await listener_->accept(token);
+            if (!accepted) co_return;
+            elio::net::stream stream(std::move(*accepted));
+            bool counted = false;
+            std::string pending;
+            for (;;) {
+                while (pending.find("\r\n\r\n") == std::string::npos) {
+                    std::array<char, 1024> buffer;
+                    auto read = co_await stream.read(buffer.data(), buffer.size(), token);
+                    if (read.result <= 0) break;
+                    pending.append(buffer.data(), static_cast<size_t>(read.result));
+                    if (pending.size() > 16384) throw std::runtime_error("oversized test request");
+                }
+                auto end = pending.find("\r\n\r\n");
+                if (end == std::string::npos) break;
+                const std::string request = pending.substr(0, end + 4);
+                pending.erase(0, end + 4);
+                if (!counted) { ++connections_; counted = true; }
+                if (request.find("Range: bytes=0-0\r\n") != std::string::npos) {
+                    auto written = co_await stream.write_all(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1048576\r\n"
+                        "Content-Length: 1\r\n\r\np", token);
+                    if (written.result < 0) break;
+                    continue;
+                }
+                ++data_requests_;
+                const Reply reply = plan_(request);
+                bool failed = false;
+                for (size_t pos = 0; pos < reply.wire.size(); pos += reply.fragment_size) {
+                    auto written = co_await stream.write_all(
+                        std::string_view(reply.wire).substr(pos, reply.fragment_size), token);
+                    if (written.result < 0) { failed = true; break; }
+                    co_await elio::time::sleep_for(std::chrono::microseconds(10), token);
+                }
+                if (failed || reply.close_after) break;
+            }
+        }
+    }
+
+private:
+    Plan plan_;
+    std::optional<elio::net::tcp_listener> listener_;
+    elio::coro::cancel_source stopped_;
+    std::atomic<size_t> connections_{0};
+    std::atomic<size_t> data_requests_{0};
+};
+
+template <typename Consumer>
+elio::coro::task<void> with_raw_registry(RawRegistry& peer, Consumer consumer) {
+    auto server = elio::spawn(peer.run());
+    std::exception_ptr failure;
+    try { co_await consumer(); } catch (...) { failure = std::current_exception(); }
+    peer.stop();
+    try {
+        co_await server;
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+    }
+    co_await server.wait_destroyed_async();
+    if (failure) std::rethrow_exception(failure);
+}
+
 }  // namespace
 
 TEST_CASE("source: mock registry refreshes port after bind collision",
@@ -365,6 +462,170 @@ TEST_CASE("source: registry range reads and size probe", "[source]") {
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: registry streaming consumes fragmented range framing", "[source][registry-streaming]") {
+    const bool chunked = GENERATE(false, true);
+    test::run_coro([chunked]() -> elio::coro::task<void> {
+        const auto bytes = test::pattern_bytes(65539, 74);
+        const std::string payload(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        RawRegistry peer([&](const std::string&) {
+            std::string wire = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-65554/1048576\r\n";
+            if (chunked) {
+                wire += "Transfer-Encoding: chunked\r\n\r\n";
+                for (size_t pos = 0; pos < payload.size(); pos += 7003) {
+                    const auto chunk = std::string_view(payload).substr(pos, 7003);
+                    char length[32];
+                    std::snprintf(length, sizeof(length), "%zx", chunk.size());
+                    wire += std::string(length) + "\r\n" + std::string(chunk) + "\r\n";
+                }
+                wire += "0\r\nX-End: complete\r\n\r\n";
+            } else {
+                wire += "Content-Length: " + std::to_string(payload.size()) + "\r\n\r\n" + payload;
+            }
+            return RawRegistry::Reply{std::move(wire), 4093};
+        });
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            source::RegistryClient client(nullptr, {});
+            std::vector<uint8_t> guarded(bytes.size() + 2, 0xd5);
+            for (int i = 0; i < 2; ++i) {
+                const auto read = co_await client.get_data(peer.url(), guarded.data() + 1, 16, bytes.size());
+                REQUIRE(read == static_cast<ssize_t>(bytes.size()));
+                REQUIRE(std::equal(bytes.begin(), bytes.end(), guarded.begin() + 1));
+                REQUIRE(guarded.front() == 0xd5);
+                REQUIRE(guarded.back() == 0xd5);
+            }
+            REQUIRE(peer.connections() == 1);
+            REQUIRE(peer.data_requests() == 2);
+        });
+    });
+}
+
+TEST_CASE("source: registry streaming drains ignored range before connection reuse", "[source][registry-streaming]") {
+    test::run_coro([]() -> elio::coro::task<void> {
+        const std::string payload(65539, 'r');
+        RawRegistry peer([&](const std::string&) {
+            return RawRegistry::Reply{"HTTP/1.1 200 OK\r\nContent-Length: " +
+                std::to_string(payload.size()) + "\r\n\r\n" + payload, 4093};
+        });
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            source::RegistryClient client(nullptr, {});
+            std::array<char, 128> output;
+            for (int i = 0; i < 2; ++i) {
+                output.fill('x');
+                const auto read = co_await client.get_data(peer.url(), output.data(), 0, output.size());
+                REQUIRE(read == static_cast<ssize_t>(output.size()));
+                REQUIRE(std::all_of(output.begin(), output.end(), [](char c) { return c == 'r'; }));
+            }
+            REQUIRE(peer.connections() == 1);
+        });
+    });
+}
+
+TEST_CASE("source: registry streaming detects short bodies and missing final framing", "[source][registry-streaming]") {
+    const int failure = GENERATE(0, 1, 2);
+    test::run_coro([failure]() -> elio::coro::task<void> {
+        RawRegistry peer([failure](const std::string& request) {
+            const bool healthy = request.starts_with("GET /healthy ");
+            const std::string head = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-23/1048576\r\n";
+            if (healthy) return RawRegistry::Reply{head + "Content-Length: 8\r\n\r\nhealthy!"};
+            if (failure == 0) return RawRegistry::Reply{head + "Content-Length: 3\r\n\r\nabc"};
+            if (failure == 1) return RawRegistry::Reply{head + "Content-Length: 8\r\n\r\nabc", 4096, true};
+            // All requested bytes arrive, but the required zero chunk/trailer
+            // never does: copying eight bytes cannot establish success.
+            return RawRegistry::Reply{head + "Transfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n", 4096, true};
+        });
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            source::RegistryClient client(nullptr, {});
+            std::array<char, 8> output;
+            const auto bad = co_await client.get_data(peer.url("/bad"), output.data(), 16, output.size());
+            REQUIRE(bad == (failure == 0 ? -EIO : -EBADMSG));
+            REQUIRE(peer.data_requests() == (failure == 0 ? 1 : 3));
+            const auto good = co_await client.get_data(peer.url("/healthy"), output.data(), 16, output.size());
+            REQUIRE(good == 8);
+            REQUIRE(std::string(output.data(), output.size()) == "healthy!");
+            REQUIRE(peer.connections() == (failure == 0 ? 1 : 4));
+        });
+    });
+}
+
+TEST_CASE("source: registry streaming keeps decoded body size bounded", "[source][registry-streaming]") {
+    const bool chunked = GENERATE(false, true);
+    const bool excessive = GENERATE(false, true);
+    test::run_coro([chunked, excessive]() -> elio::coro::task<void> {
+        RawRegistry peer([chunked, excessive](const std::string&) {
+            const std::string head = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-23/1048576\r\n";
+            if (chunked) return RawRegistry::Reply{head + "Transfer-Encoding: chunked\r\n\r\n" +
+                (excessive ? "9\r\nabcdefghi\r\n" : "8\r\nabcdefgh\r\n") + "0\r\n\r\n"};
+            return RawRegistry::Reply{head + (excessive ? "Content-Length: 9\r\n\r\nabcdefghi" :
+                "Content-Length: 8\r\n\r\nabcdefgh")};
+        });
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            source::RegistryClientConfig config;
+            config.max_response_size = 8;
+            source::RegistryClient client(nullptr, config);
+            std::array<char, 10> output;
+            output.fill('x');
+            const auto read = co_await client.get_data(peer.url(), output.data() + 1, 16, 8);
+            REQUIRE(read == (excessive ? -EMSGSIZE : 8));
+            REQUIRE(output.front() == 'x');
+            REQUIRE(output.back() == 'x');
+            if (!excessive) REQUIRE(std::string(output.data() + 1, 8) == "abcdefgh");
+            REQUIRE(peer.data_requests() == (excessive ? 3 : 1));
+        });
+    });
+}
+
+TEST_CASE("source: registry streaming rejects status before unread error body", "[source][registry-streaming]") {
+    const int status = GENERATE(200, 416, 429);
+    test::run_coro([status]() -> elio::coro::task<void> {
+        RawRegistry peer([status](const std::string& request) {
+            if (request.starts_with("GET /healthy ")) return RawRegistry::Reply{
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-23/1048576\r\n"
+                "Content-Length: 8\r\n\r\nhealthy!"};
+            // No body follows these headers. A buffered implementation would
+            // wait for its read timeout rather than return the status result.
+            return RawRegistry::Reply{"HTTP/1.1 " + std::to_string(status) +
+                " Rejected\r\nContent-Length: 1048576\r\n\r\n"};
+        });
+        co_await with_raw_registry(peer, [&]() -> elio::coro::task<void> {
+            source::RegistryClientConfig config;
+            config.read_timeout = std::chrono::seconds(5);
+            source::RegistryClient client(nullptr, config);
+            std::array<char, 8> output;
+            output.fill('x');
+            const auto start = std::chrono::steady_clock::now();
+            const auto bad = co_await client.get_data(peer.url("/bad"), output.data(), 16, output.size());
+            REQUIRE(bad == (status == 416 ? -ERANGE : status == 429 ? -EBUSY : -EIO));
+            REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+            REQUIRE(std::all_of(output.begin(), output.end(), [](char c) { return c == 'x'; }));
+            const auto good = co_await client.get_data(peer.url("/healthy"), output.data(), 16, output.size());
+            REQUIRE(good == 8);
+            REQUIRE(std::string(output.data(), output.size()) == "healthy!");
+            REQUIRE(peer.connections() == (status == 416 ? 2 : 4));
+        });
+    });
+}
+
+TEST_CASE("source: registry request guards and owned errors ignore ambient errno", "[source][registry-streaming]") {
+    test::run_coro([]() -> elio::coro::task<void> {
+        source::RegistryClient client(nullptr, {});
+        std::array<char, 8> output;
+        errno = EBUSY;
+        const auto invalid = co_await client.get_data("not a URL", output.data(), 0, output.size());
+        REQUIRE(invalid == -EINVAL);
+        errno = EBUSY;
+        const auto length = co_await client.get_length("not a URL");
+        REQUIRE(length == -EINVAL);
+        const auto empty = co_await client.get_data("not a URL", nullptr, 0, 0);
+        REQUIRE(empty == 0);
+        const auto missing = co_await client.get_data("not a URL", nullptr, 0, 1);
+        REQUIRE(missing == -EINVAL);
+        const auto overflow = co_await client.get_data("not a URL", output.data(), UINT64_MAX, 2);
+        REQUIRE(overflow == -EOVERFLOW);
+        const auto too_large = co_await client.get_data("not a URL", output.data(), 0, 64 * 1024 * 1024 + 1);
+        REQUIRE(too_large == -EMSGSIZE);
+    });
 }
 
 TEST_CASE("source: registry bearer auth flow via token endpoint",

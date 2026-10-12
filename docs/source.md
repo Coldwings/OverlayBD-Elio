@@ -96,6 +96,14 @@ Following `docs/design-assumptions.md` and `src/common/errors.hpp`:
 
 - **GET with Range only** — never HEAD. Blob size comes from a `Range:
   bytes=0-0` probe's `Content-Range` total.
+- **Scoped payload streaming** — accepted range responses use Elio 0.6's
+  `http::client::with_response` and scoped body reader to fill the caller's
+  buffer. Excess payload is drained with an 8 KiB scratch buffer before
+  reporting success, preserving final framing validation and connection reuse.
+  Rejected status or range headers close the exchange without reading its body.
+  Token JSON and cold Range 0-0 probes remain bounded buffered control requests.
+  Transport errors carry owned Elio `client_error` values; they are never
+  recovered from ambient `errno` after a coroutine suspension.
 - **Auth discovery** — an unauthenticated probe; on 401/403 the
   `WWW-Authenticate` Bearer challenge (`realm`, `service`, `scope`) is parsed
   and a token is fetched from the realm with Basic auth built from the
@@ -432,8 +440,11 @@ struct RegistryClientConfig {
 `src/source/registry.hpp::RegistryClientConfig` — knobs for one client.
 `accelerate_base` is the DART prefix base (`"http://host:port/prefix"`); when
 non-empty every data request is rewritten to `accelerate_base + "/" +
-<actual blob URL>` (ADR-0005). `max_response_size` bounds a single buffered
-response body and therefore the largest single Range the client will serve.
+<actual blob URL>` (ADR-0005). `max_response_size` bounds the decoded body of
+both buffered control requests and streamed payload, and independently bounds
+informational response bytes. It also bounds the largest single requested Range.
+Payload receiving uses the caller's buffer plus fixed scratch storage rather
+than an additional allocation proportional to the body size.
 
 ```cpp
 class RegistryClient {
@@ -456,11 +467,17 @@ anonymous pull.
   (callers clamp to the blob size first, so a server-side short body is an
   error, `-EIO`). Negative `-errno` on failure: `-EPERM` (auth rejected
   after re-resolution), `-ERANGE` (416), `-EBUSY` (429 after retries),
-  `-ETIMEDOUT` (retry budget exhausted on transport errors), `-EIO`
-  otherwise. Never throws.
+  `-ETIMEDOUT` (transport deadline), `-EIO`
+  otherwise. A zero count returns 0 without a request; a nonempty null buffer
+  returns `-EINVAL`, overflowing range/return arithmetic returns `-EOVERFLOW`,
+  and requests beyond the configured body cap return `-EMSGSIZE`. Failed reads
+  may overwrite a prefix of the destination; callers must discard those bytes.
+  All scoped reader activity has stopped before awaited return. Operational
+  failures use return values; allocation or request-setup exceptions may propagate.
 - `get_length(url)` — blob size from a `Range: bytes=0-0` probe's
   `Content-Range` total; falls back to the body length when the server
-  ignores Range and answers 200. Negative `-errno` on failure. Never throws.
+  ignores Range and answers 200. Operational failures return negative `-errno`;
+  allocation or request-setup exceptions may propagate.
 
 Internal behavior worth depending on (see Concepts): tokens cached for 80%
 of the OAuth2 `expires_in` lifetime (30 s fallback for absent/unparsable/
@@ -1039,6 +1056,26 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
 - `source: registry range reads and size probe` — `RegistrySource::open`
   learns the size from the Range 0-0 probe and `pread` returns exact bytes
   for an interior range.
+- `source: registry streaming consumes fragmented range framing` — fragmented
+  fixed-length and chunked responses fill the guarded destination byte-exactly,
+  consume final trailers, and reuse one connection for subsequent ranges.
+- `source: registry streaming drains ignored range before connection reuse` —
+  a 200 response at offset zero copies only the requested prefix and drains the
+  larger body with bounded scratch storage before the next pooled response.
+- `source: registry streaming detects short bodies and missing final framing` —
+  valid short bodies return EIO; transport truncation or a missing terminal chunk
+  remains a framing error even after all requested bytes arrived, and a later
+  healthy response is uncontaminated.
+- `source: registry streaming keeps decoded body size bounded` — fixed-length
+  and chunked responses honor the configured decoded body cap and destination
+  guard bytes; exceeding the cap returns EMSGSIZE after bounded retries.
+- `source: registry streaming rejects status before unread error body` — ignored
+  ranges at nonzero offsets, 416, and 429 return their mapped errors without
+  waiting for an absent error body, then receive a healthy response on a new
+  connection.
+- `source: registry request guards and owned errors ignore ambient errno` —
+  malformed URLs map to EINVAL despite poisoned errno, and empty, null,
+  overflowing, and over-cap ranges are handled before network activity.
 - `source: registry bearer auth flow via token endpoint` — a 401 Bearer
   challenge drives a token fetch with Basic credentials, and subsequent
   reads carry the bearer token (the mock only serves `Bearer sekrit`).
