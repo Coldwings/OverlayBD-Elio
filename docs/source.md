@@ -410,12 +410,15 @@ read-only file, read through the Elio IO backend (io_uring when available).
   a backend EOF occurs (possible only if the file shrank after open).
   Returns the backend's negative errno verbatim on IO failure.
 - `fd()` — the underlying descriptor (diagnostics/interop).
-- The destructor closes the fd via `elio::io::close_fd_for_destructor`,
-  which orders the close against in-flight io_uring operations — destroying
-  a source with reads in flight is safe.
+- Keep the source and destination buffer alive until `pread` returns; its
+  borrowed descriptor must remain open and unrecycled across every exact-read
+  step. The destructor uses `elio::io::close_fd_for_destructor` to order close
+  against submitted backend operations. This does not drain the outer source
+  coroutine or authorize destroying the source between short-read steps.
 
 Complexity: `pread` is O(count) with at most one extra backend call per
-short backend read; no allocation on the read path.
+short backend read; no response-sized data buffer is allocated. Coroutine and
+backend operation state retain their normal runtime allocation behavior.
 
 ### `registry.hpp` — RegistryClientConfig, RegistryClient, RegistrySource
 
