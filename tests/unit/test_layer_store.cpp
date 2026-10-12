@@ -15,10 +15,12 @@
 #include "common/sha256.hpp"
 
 #include "../support.hpp"
+#include "../runtime_faults.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
 
 #include <fcntl.h>
@@ -126,6 +128,47 @@ public:
 
 private:
     VectorSource inner_;
+};
+
+class HeldFillSource final : public source::BlobSource {
+public:
+    explicit HeldFillSource(std::atomic<bool>& destroyed) : destroyed_(destroyed) {}
+    ~HeldFillSource() override { destroyed_.store(true); }
+    elio::coro::task<ssize_t> pread(void* buf, size_t count, uint64_t) override {
+        entered.set();
+        co_await release.wait();
+        std::memset(buf, 0x73, count);
+        co_return static_cast<ssize_t>(count);
+    }
+    uint64_t size() const noexcept override { return kExtent; }
+    std::string_view label() const noexcept override { return "held-fill"; }
+    elio::sync::event entered;
+    elio::sync::event release;
+private:
+    std::atomic<bool>& destroyed_;
+};
+
+// A second range read is held so the writer can publish all-present before
+// fill continues. This forces the checksum-completion event without relying
+// on relative coroutine/writer speeds or accumulating duplicate cache writes.
+class WriterWaitSource final : public source::BlobSource {
+public:
+    explicit WriterWaitSource(std::vector<uint8_t> data) : data_(std::move(data)) {}
+    elio::coro::task<ssize_t> pread(void* buf, size_t count, uint64_t offset) override {
+        co_await start.wait();
+        if (reads_.fetch_add(1) != 0) co_await further.wait();
+        if (offset >= data_.size()) co_return 0;
+        const auto n = static_cast<size_t>(std::min<uint64_t>(count, data_.size() - offset));
+        std::memcpy(buf, data_.data() + offset, n);
+        co_return static_cast<ssize_t>(n);
+    }
+    uint64_t size() const noexcept override { return data_.size(); }
+    std::string_view label() const noexcept override { return "writer-wait"; }
+    elio::sync::event start;
+    elio::sync::event further;
+private:
+    std::vector<uint8_t> data_;
+    std::atomic<unsigned> reads_{0};
 };
 
 /// Returns `initial` until switch_to_replacement(), then returns
@@ -1312,6 +1355,122 @@ TEST_CASE("source: layer store fill stop interrupts error backoff",
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: concurrent fill parking retains a slow remote past warning deadlines", "[source]") {
+    bool inject_failure = false;
+    SECTION("normal observer setup") { inject_failure = false; }
+    SECTION("native observer allocation fails") { inject_failure = true; }
+    std::optional<test::DestroyedWaitFault> fault;
+    if (inject_failure) fault.emplace();
+    test::TempDir dir;
+    std::atomic<bool> destroyed{false};
+    bool both_pending = false;
+    bool retained = false;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto remote = std::make_unique<HeldFillSource>(destroyed);
+        auto* held = remote.get();
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        auto store = co_await source::LayerStore::open(
+            std::move(remote), dir.str(), "", cfg);
+        co_await held->entered.wait();
+        // An already-expired warning deadline needs no private timer. Fault
+        // injection therefore reaches the store's actual ownership barrier.
+        auto first = elio::spawn(store->park_fill(std::chrono::milliseconds(0)));
+        auto second = elio::spawn(store->park_fill(std::chrono::milliseconds(0)));
+        co_await elio::time::sleep_for(std::chrono::milliseconds(20));
+        both_pending = !first.is_ready() && !second.is_ready();
+        retained = !destroyed.load();
+        held->release.set();
+        co_await first;
+        co_await second;
+        co_await first.wait_destroyed_async();
+        co_await second.wait_destroyed_async();
+        co_await store->park_fill(std::chrono::milliseconds(1));
+        co_await elio::spawn_blocking([&] { store.reset(); });
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    CHECK(both_pending);
+    CHECK(retained);
+    CHECK(destroyed.load());
+    if (fault) CHECK(fault->failures() == 1);
+}
+
+TEST_CASE("source: native fill notifications survive allocation failure and stop races", "[source]") {
+    bool queue_room = false;
+    bool stop_at_reset = false;
+    SECTION("queue capacity notification retries allocation") { queue_room = true; }
+    SECTION("checksum notification retries allocation") { queue_room = false; }
+    SECTION("stop arrives after checksum event reset") { stop_at_reset = true; }
+    std::optional<test::WriterEventFault> fault;
+    if (!stop_at_reset) fault.emplace();
+    test::TempDir dir;
+    const auto blob = test::pattern_bytes((queue_room ? 3 : 1) * kExtent, 217);
+    std::atomic<bool> writer_held{false};
+    std::atomic<bool> writer_release{false};
+    std::atomic<bool> writer_timed_out{false};
+    std::atomic<bool> fill_waiting{false};
+    bool reached_wait = false;
+    bool fill_finished = false;
+    elio::run_config runtime;
+    runtime.num_threads = 1;
+    runtime.blocking_threads = 1;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        auto remote = std::make_unique<WriterWaitSource>(blob);
+        auto* gated = remote.get();
+        source::LayerStore::Config cfg;
+        cfg.fill.enable = true;
+        cfg.fill.delay_sec = 0;
+        cfg.fill.delay_extra_sec = 0;
+        cfg.queue_max_bytes = kExtent;
+        auto store = co_await source::LayerStore::open(
+            std::move(remote), dir.str(), digest_of(blob), cfg);
+        auto hold_writer = [&] {
+            if (writer_held.exchange(true)) return;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!writer_release.load()) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    writer_timed_out.store(true);
+                    break;
+                }
+                std::this_thread::yield();
+            }
+        };
+        if (queue_room) {
+            store->set_test_write_hook([&](uint64_t) { hold_writer(); return 0; });
+        } else {
+            store->set_test_completion_hook([&](uint32_t) { hold_writer(); });
+        }
+        store->set_test_fill_wait_hook([&](bool completion) {
+            if (completion == queue_room) return;
+            fill_waiting.store(true);
+            if (stop_at_reset) store->stop_fill();
+        });
+        gated->start.set();
+        const bool held = co_await poll_until([&] { return writer_held.load(); }, 5000);
+        gated->further.set();
+        reached_wait = held && co_await poll_until([&] { return fill_waiting.load(); }, 5000);
+        // One worker ensures observing this marker happens after fill either
+        // registered its native waiter or consumed the already-cancelled token.
+        writer_release.store(true);
+        fill_finished = co_await poll_until([&] {
+            const auto status = store->fill_status();
+            return status == source::LayerStore::FillStatus::kDone ||
+                   status == source::LayerStore::FillStatus::kStopped;
+        }, 5000);
+        co_await store->park_fill(std::chrono::milliseconds(0));
+        co_await elio::spawn_blocking([&] { store.reset(); });
+        co_return 0;
+    }, runtime);
+    REQUIRE(rc == 0);
+    CHECK(reached_wait);
+    CHECK(fill_finished);
+    CHECK_FALSE(writer_timed_out.load());
+    if (fault) CHECK(fault->failures() == 1);
 }
 
 TEST_CASE("source: layer store fill stays off in bypass", "[source]") {

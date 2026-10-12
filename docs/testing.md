@@ -1580,3 +1580,25 @@ Deterministic packaging and strict archive extraction.
 Unmodified upstream-produced metadata and gzip fixture compatibility.
 
 - `image: upstream TurboOCI gzip fixture reads original payload`
+
+Elio task-ownership and notification migration regressions:
+
+- `supervisor: client task failure preserves daemon shutdown drain` —
+  log-and-continue policy and worker placement alongside staged group joins.
+- `ublk: task group drains every admitted tag including source failures` —
+  concurrent tag handlers and terminal completion for a throwing source.
+- `ublk: a cancelled task group still completes a skipped tag` — the kernel
+  completion obligation survives pre-invocation child cancellation.
+- `source: concurrent fill parking retains a slow remote past warning deadlines` —
+  simultaneous teardown observers retain owners past diagnostic deadlines.
+- `source: native fill notifications survive allocation failure and stop races` —
+  bounded-byte writer queue and checksum notification, native allocation failure,
+  and stop between event reset and registration.
+
+Native Elio test hooks are enabled consistently on core and dependent test-build
+targets (`OBD_BUILD_TESTS=ON`); builds with tests disabled omit them. Scoped fault guards in
+`tests/runtime_faults.hpp` restore the actual upstream observer/event hooks.
+Existing awakened-timer, sole-blocking-thread device drain and concurrent trace
+finalization cases also exercise observer/waiter allocation failure. These
+inject specific native setup failures, not arbitrary process-wide allocation
+failure or forced scheduler shutdown.

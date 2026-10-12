@@ -18,6 +18,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,7 +33,7 @@ public:
     /// opens queues, launches queue threads (which park their FETCH
     /// commands), issues SET_PARAMS, spawns the bridge coroutines, then
     /// START_DEV (retrying EBUSY until every queue is parked). Must be
-    /// awaited on the Elio scheduler (bridges spawn with elio::go()).
+    /// awaited on the Elio scheduler (bridges are independent joinable tasks).
     /// Throws obd::error on failure.
     static elio::coro::task<std::unique_ptr<Device>> create(
         const DeviceParams& params, source::BlobSourcePtr src,
@@ -115,9 +116,11 @@ private:
     std::atomic<uint64_t> cur_bytes_{0};
 
     std::atomic<bool> stop_{false};
-    // Coroutines that dereference queues_/src_ (bridges + per-IO
-    // handlers). stop() drains this before ~Queue may run.
-    std::atomic<int> io_tasks_running_{0};
+    // One native handle per finite queue. Each bridge owns its tag handlers
+    // with TaskGroup and cannot return before they release their captures.
+    std::vector<elio::coro::join_handle<void>> bridge_tasks_;
+    std::mutex bridge_result_mu_;
+    bool bridge_results_reported_ = false;
     std::vector<std::unique_ptr<Queue>> queues_;
     std::vector<std::thread> threads_;
 };

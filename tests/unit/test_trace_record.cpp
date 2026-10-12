@@ -15,6 +15,7 @@
 #include "source/layer_store.hpp"
 
 #include "../support.hpp"
+#include "../runtime_faults.hpp"
 
 #include <elio/runtime/spawn.hpp>
 #include <elio/time/timer.hpp>
@@ -480,6 +481,11 @@ TEST_CASE("image: trace recording stop is idempotent and reports expiry stats",
 
 TEST_CASE("image: trace recording stop drains an awakened duration timer",
           "[image]") {
+    bool inject_failure = false;
+    SECTION("normal observer setup") { inject_failure = false; }
+    SECTION("native observer allocation fails") { inject_failure = true; }
+    std::optional<test::DestroyedWaitFault> fault;
+    if (inject_failure) fault.emplace();
     test::TempDir dir;
     const auto data = test::pattern_bytes(64 * 1024, 74);
     const std::string out = dir / "out.trace";
@@ -556,6 +562,7 @@ TEST_CASE("image: trace recording stop drains an awakened duration timer",
     REQUIRE(stopped->records == 1);
     const auto records = parse_file(out);
     REQUIRE(records.size() == 1);
+    if (fault) CHECK(fault->failures() == 1);
 }
 
 TEST_CASE("image: trace recording expiry callback is skipped when explicit stop wins",
@@ -1371,6 +1378,10 @@ TEST_CASE("image: trace recording stale stop never drains a restarted timer",
 
 TEST_CASE("image: concurrent trace stops join the winning finalize",
           "[image]") {
+    bool inject_failure = false;
+    SECTION("normal finalize observation") { inject_failure = false; }
+    SECTION("native event waiter allocation fails") { inject_failure = true; }
+    test::WakeStateFault wake_fault;
     test::TempDir dir;
     const auto data = test::pattern_bytes(64 * 1024, 74);
     const std::string out = dir / "out.trace";
@@ -1479,11 +1490,21 @@ TEST_CASE("image: concurrent trace stops join the winning finalize",
         // Give the loser a chance to hit the join path while finalization is
         // still held. The old split-state implementation could return a
         // spurious no-recording error from this window.
+        if (inject_failure) {
+            wake_fault.arm();
+        }
         second_stop_claim_release.store(true, std::memory_order_release);
+        auto another_stop = elio::spawn(rec->stop("another-stop"));
         co_await elio::time::sleep_for(10ms);
         release_all();
         expiry_stop = co_await await_stop_handle(expiry_task);
         explicit_stop = co_await await_stop_handle(explicit_task);
+        const auto another_result = co_await await_stop_handle(another_stop);
+        CHECK(another_result.reason == "expired");
+        CHECK(another_result.sha256 == expiry_stop->sha256);
+        if (inject_failure) {
+            CHECK(wake_fault.consumed());
+        }
         co_return 0;
     });
     REQUIRE(rc == 0);

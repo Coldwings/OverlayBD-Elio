@@ -1944,6 +1944,12 @@ while IFS= read -r line <&3; do :; done
                 if (!gate->wait()) throw std::runtime_error("startup failure gate not reached");
                 gate->release();
             } else {
+                if (point == "client_failure") {
+                    check(gate->count("client_failure") == 1,
+                          "client failure injection did not run");
+                    check(daemon_rc.load() < 0,
+                          "client failure cancelled the daemon body");
+                }
                 check(::kill(::getpid(), SIGTERM) == 0, "cannot signal shutdown");
             }
             signalled = true;
@@ -2042,6 +2048,11 @@ while IFS= read -r line <&3; do :; done
     CHECK(rc == 0);
     CHECK(daemon_rc.load() == (point == "startup_failure" ? 1 : 0));
     CHECK(daemon_error == (point == "startup_failure" ? "injected daemon startup failure" : ""));
+    CHECK(gate->count("client_worker_2") >= 1);
+    if (point != "startup_failure") CHECK(gate->count("reaper_worker_0") == 1);
+    if (point == "monitor_eof" || point == "command") {
+        CHECK(gate->count("monitor_worker_1") == 1);
+    }
     CHECK(mask_rc == 0);
 }
 
@@ -2117,4 +2128,8 @@ TEST_CASE("supervisor: shutdown wakes a partial accepted command", "[supervisor]
 
 TEST_CASE("supervisor: startup failure drains already admitted client work", "[supervisor][daemon-startup-lifetime]") {
     check_daemon_lifetime("startup_failure");
+}
+
+TEST_CASE("supervisor: client task failure preserves daemon shutdown drain", "[supervisor][daemon-lifetime]") {
+    check_daemon_lifetime("client_failure");
 }

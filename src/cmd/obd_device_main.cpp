@@ -18,6 +18,7 @@
 #include <elio/runtime/async_main.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/time/timer.hpp>
 #include <elio/signal/signalfd.hpp>
 #include <elio/sync/mutex.hpp>
 
@@ -372,7 +373,15 @@ elio::coro::task<int> device_main(Args args) {
             ELIO_LOG_ERROR("device control failed during shutdown: unknown exception");
             result = 1;
         }
-        co_await elio::spawn_blocking([&] { control->wait_destroyed(); });
+        // Keep the existing owner frame on observer allocation failure: a
+        // ready result still does not authorize releasing control captures.
+        while (!control->is_destroyed()) {
+            try {
+                co_await control->wait_destroyed_async();
+            } catch (const std::bad_alloc&) {
+            }
+            if (!control->is_destroyed()) co_await elio::time::yield();
+        }
         control.reset();
     }
     if (dev) {

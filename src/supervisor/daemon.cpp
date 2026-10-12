@@ -9,10 +9,12 @@
 #include "supervisor/protocol.hpp"
 
 #include <elio/coro/with_timeout.hpp>
+#include <elio/coro/task_group.hpp>
 #include <elio/io/io_awaitables.hpp>
 #include <elio/log/macros.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/affinity.hpp>
 #include <elio/signal/signalfd.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/sync/mutex.hpp>
@@ -179,72 +181,47 @@ struct SyncMutexGuard {
     ~SyncMutexGuard() { m.unlock(); }
 };
 
-// Own the scheduler wrapper as well as its coroutine result. A join_handle's
-// ready state precedes callable/frame destruction; only is_destroyed proves
-// that its raw-this captures have departed. Admission and closing share a lock.
-// The brief timer is used only when draining, never to block a worker.
-class OwnedTasks {
-public:
-    template<class F>
-    void spawn(F&& function, std::optional<size_t> worker = {}) {
-        std::lock_guard lock(mu_);
-        if (closed_) throw std::logic_error("daemon task admission is closed");
-        for (auto it = tasks_.begin(); it != tasks_.end();) {
-            if (it->is_destroyed()) {
-                report(*it);
-                it = tasks_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        // Reserve before scheduling: allocation failure must not leave an
-        // already-running coroutine without a retained ownership handle.
-        tasks_.reserve(tasks_.size() + 1);
-        auto* scheduler = elio::runtime::scheduler::current();
-        if (worker) {
-            tasks_.push_back(scheduler->go_joinable_to(
-                *worker, std::forward<F>(function)));
-        } else {
-            tasks_.push_back(scheduler->go_joinable(std::forward<F>(function)));
-        }
-    }
+constexpr elio::coro::task_group_options kDaemonTaskOptions{
+    .failure_policy = elio::coro::task_group_failure_policy::collect_all};
 
-    elio::coro::task<void> join() {
-        std::vector<elio::coro::join_handle<void>> tasks;
-        {
-            std::lock_guard lock(mu_);
-            closed_ = true;
-            tasks.swap(tasks_);
-        }
-        for (auto& task : tasks) {
-            while (!task.is_destroyed()) {
-                bool timer_failed = false;
-                try {
-                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
-                } catch (...) {
-                    timer_failed = true;
-                }
-                // Rejected timer setup must not abandon the ownership drain.
-                if (timer_failed) co_await elio::time::yield();
-            }
-            report(task);
-        }
+void report_daemon_task_failure(std::exception_ptr failure) {
+    try {
+        std::rethrow_exception(std::move(failure));
+    } catch (const std::exception& error) {
+        ELIO_LOG_ERROR("daemon task failed: {}", error.what());
+    } catch (...) {
+        ELIO_LOG_ERROR("daemon task failed with an unknown exception");
     }
+}
 
-private:
-    static void report(elio::coro::join_handle<void>& task) {
+// Logging and placement are daemon policy; TaskGroup owns admission and
+// frame/capture teardown. Report body failures promptly rather than retaining
+// every exception for the lifetime of a long-running daemon.
+template<class F>
+void spawn_daemon_task(elio::coro::task_group& group, F&& function,
+                       std::optional<size_t> worker = {}) {
+    group.spawn([function = std::forward<F>(function), worker]() mutable
+                    -> elio::coro::task<void> {
         try {
-            task.await_resume();
-        } catch (const std::exception& error) {
-            ELIO_LOG_ERROR("daemon task failed: {}", error.what());
+            if (worker) co_await elio::runtime::set_affinity(*worker);
+            co_await function();
         } catch (...) {
-            ELIO_LOG_ERROR("daemon task failed with an unknown exception");
+            report_daemon_task_failure(std::current_exception());
         }
+    });
+}
+
+elio::coro::task<void> join_daemon_tasks(elio::coro::task_group& group) {
+    try {
+        co_await group.join();
+    } catch (const elio::coro::task_group_error& error) {
+        for (const auto& failure : error.failures()) {
+            report_daemon_task_failure(failure);
+        }
+    } catch (...) {
+        report_daemon_task_failure(std::current_exception());
     }
-    std::mutex mu_;
-    bool closed_ = false;
-    std::vector<elio::coro::join_handle<void>> tasks_;
-};
+}
 
 /// Default MkfsRunner (ADR-0014 mode 3): fork `mkfs.<type> <device>` and
 /// reap it without blocking an Elio worker (a WNOHANG poll between async
@@ -477,26 +454,24 @@ public:
         elio::signal::signal_fd term_fd(term_set);
 
         // Allocate the drain coroutine frames before any child is admitted.
-        auto accept_join = accept_tasks_.join();
-        auto client_join = client_tasks_.join();
-        auto monitor_join = monitor_tasks_.join();
-        auto reaper_join = reaper_tasks_.join();
+        auto accept_join = join_daemon_tasks(accept_tasks_);
+        auto client_join = join_daemon_tasks(client_tasks_);
+        auto monitor_join = join_daemon_tasks(monitor_tasks_);
+        auto reaper_join = join_daemon_tasks(reaper_tasks_);
         std::exception_ptr failure;
         try {
-            accept_tasks_.spawn([this, &listener]() -> elio::coro::task<void> {
+            spawn_daemon_task(accept_tasks_, [this, &listener]() -> elio::coro::task<void> {
                 co_await accept_loop(*listener);
             });
             if (test_gate_ && test_gate_->is_armed("startup_failure")) {
                 co_await test_gate_->observe("startup_failure", {});
                 throw std::runtime_error("injected daemon startup failure");
             }
-            // go_to pins the reaper to worker 0: its signal_fd caches the
-            // creating worker's io_context, and the reaper also awaits sync
-            // primitives (mu_) whose wakeups could otherwise migrate it onto
-            // a worker where the cached io_context is invalid.
-            reaper_tasks_.spawn([this]() -> elio::coro::task<void> {
-                // signal_fd caches the creating worker's io_context; construct
-                // it inside the coroutine that awaits it.
+            // Keep the SIGCHLD activity on worker 0. Elio v0.6 resolves the
+            // current worker's I/O context at every signal_fd wait.
+            spawn_daemon_task(reaper_tasks_, [this]() -> elio::coro::task<void> {
+                if (test_gate_) test_gate_->mark(
+                    "reaper_worker_" + std::to_string(elio::runtime::current_worker_id()));
                 elio::signal::signal_set chld_set;
                 chld_set.add(SIGCHLD);
                 elio::signal::signal_fd chld_fd(chld_set);
@@ -596,13 +571,21 @@ private:
             };
             // Test placement forces command/monitor overlap on distinct
             // workers without changing the normal daemon's scheduling.
-            client_tasks_.spawn(std::move(handle),
+            spawn_daemon_task(client_tasks_, std::move(handle),
                 test_gate_ ? std::optional<size_t>{2} : std::nullopt);
         }
     }
 
     elio::coro::task<void> handle_client(elio::net::uds_stream stream) {
-        if (test_gate_) test_gate_->mark("client_read");
+        if (test_gate_) {
+            test_gate_->mark("client_read");
+            test_gate_->mark(
+                "client_worker_" + std::to_string(elio::runtime::current_worker_id()));
+            if (test_gate_->is_armed("client_failure")) {
+                test_gate_->mark("client_failure");
+                throw std::runtime_error("injected daemon client failure");
+            }
+        }
         LineReader reader(stream, client_cancel_.get_token());
         std::string reply;
         auto line = co_await reader.next();
@@ -996,11 +979,15 @@ private:
         }
         auto monitor = [this, entry, channel = take_channel(*entry->child)]() mutable
                        -> elio::coro::task<void> {
-            if (test_gate_) test_gate_->mark("monitor_started");
+            if (test_gate_) {
+                test_gate_->mark("monitor_started");
+                test_gate_->mark(
+                    "monitor_worker_" + std::to_string(elio::runtime::current_worker_id()));
+            }
             co_await supervise_entry(entry, std::move(channel));
             if (test_gate_) test_gate_->mark("monitor_departed");
         };
-        monitor_tasks_.spawn(std::move(monitor),
+        spawn_daemon_task(monitor_tasks_, std::move(monitor),
             test_gate_ ? std::optional<size_t>{1} : std::nullopt);
 
         // Wait for the child to report ready/failed.
@@ -1772,10 +1759,10 @@ private:
 
     DaemonConfig cfg_;
     std::shared_ptr<detail::DaemonTestGate> test_gate_;
-    OwnedTasks accept_tasks_;
-    OwnedTasks client_tasks_;
-    OwnedTasks monitor_tasks_;
-    OwnedTasks reaper_tasks_;
+    elio::coro::task_group accept_tasks_{kDaemonTaskOptions};
+    elio::coro::task_group client_tasks_{kDaemonTaskOptions};
+    elio::coro::task_group monitor_tasks_{kDaemonTaskOptions};
+    elio::coro::task_group reaper_tasks_{kDaemonTaskOptions};
     elio::coro::cancel_source accept_cancel_;
     elio::coro::cancel_source client_cancel_;
     elio::coro::cancel_source monitor_cancel_;

@@ -242,7 +242,7 @@ elio::coro::task<bool> TraceRecorder::start_impl(
         cancel = std::make_shared<elio::coro::cancel_source>();
         timer_cancel_ = cancel;
         timer_drain_ = std::make_shared<TimerDrain>();
-        timer_task_.emplace(elio::spawn(
+        timer_drain_->task.emplace(elio::spawn(
             run_timer(generation, duration_sec, cancel)));
         // Enable the hot-path gate INSIDE the lock, as the last step
         // after every field the gate's fast path reads is consistent:
@@ -313,54 +313,42 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop(
 
 elio::coro::task<void> TraceRecorder::drain_timer_task(
     std::shared_ptr<TimerDrain> drain) {
-    std::optional<elio::coro::join_handle<void>> timer_task;
-    for (;;) {
-        bool wait_for_other_drain = false;
-        std::function<elio::coro::task<void>()> claim_hook;
-        std::function<elio::coro::task<void>()> wait_hook;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            if (!drain || drain->drained) co_return;
-            if (drain->draining) {
-                wait_for_other_drain = true;
-                wait_hook = timer_drain_wait_hook_;
-            } else {
-                drain->draining = true;
-                if (timer_drain_ == drain && timer_task_) {
-                    timer_task.emplace(std::move(*timer_task_));
-                    timer_task_.reset();
-                    claim_hook = timer_drain_claim_hook_;
-                } else {
-                    drain->drained = true;
-                    if (timer_drain_ == drain) timer_drain_.reset();
-                    co_return;
-                }
-            }
-        }
-        if (!wait_for_other_drain) {
-            if (claim_hook) co_await claim_hook();
-            break;
-        }
-        if (wait_hook) co_await wait_hook();
-        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    while (!timer_task->is_destroyed()) {
-        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
-    }
-    try {
-        timer_task->await_resume();
-    } catch (const std::exception& e) {
-        ELIO_LOG_ERROR("trace duration timer failed: {}", e.what());
-    } catch (...) {
-        ELIO_LOG_ERROR("trace duration timer failed: unknown exception");
-    }
-
+    std::function<elio::coro::task<void>()> hook;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (drain) {
-            drain->drained = true;
-            if (timer_drain_ == drain) timer_drain_.reset();
+        if (!drain || drain->drained) co_return;
+        if (drain->draining) hook = timer_drain_wait_hook_;
+        else {
+            drain->draining = true;
+            hook = timer_drain_claim_hook_;
+        }
+    }
+    if (hook) co_await hook();
+    // The handle stays in its generation record. Native destruction waits
+    // support simultaneous observers without moving or consuming its result.
+    if (drain->task) {
+        while (!drain->task->is_destroyed()) {
+            try {
+                co_await drain->task->wait_destroyed_async();
+            } catch (const std::bad_alloc&) {
+            }
+            if (!drain->task->is_destroyed()) co_await elio::time::yield();
+        }
+    }
+    bool report = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        report = !drain->drained;
+        drain->drained = true;
+        if (timer_drain_ == drain) timer_drain_.reset();
+    }
+    if (report && drain->task) {
+        try {
+            drain->task->await_resume();
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR("trace duration timer failed: {}", e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR("trace duration timer failed: unknown exception");
         }
     }
 }
@@ -435,7 +423,16 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
         if (stop_claim_hook) {
             co_await stop_claim_hook();
         } else if (wait_for_finalizer) {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            bool allocation_failed = false;
+            try {
+                co_await joined_finalize->done.wait();
+            } catch (const std::bad_alloc&) {
+                allocation_failed = true;
+            }
+            // Recheck this retained generation's result before registering a
+            // new waiter. Never unwind a losing stop merely because it could
+            // not allocate observation state while finalization is active.
+            if (allocation_failed) co_await elio::time::yield();
         }
     }
     if (owns_finalize) {
@@ -447,6 +444,18 @@ elio::coro::task<TraceRecorder::FinalizeResult> TraceRecorder::stop_impl(
             if (finalizing_ == owned_finalize) finalizing_.reset();
             state_ = State::Idle;
             on_expire_ = nullptr;
+        }
+        // Dispatch outside mu_: a resumed waiter may immediately read its
+        // retained generation. Native event dispatch allocates before waking;
+        // retry a failed allocation so already-parked stops are not orphaned.
+        bool notified = false;
+        while (!notified) {
+            try {
+                owned_finalize->done.set();
+                notified = true;
+            } catch (const std::bad_alloc&) {
+            }
+            if (!notified) co_await elio::time::yield();
         }
         have_result = true;
     }

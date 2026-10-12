@@ -285,11 +285,17 @@ elio::coro::task<void> run_bridge(Queue* q, source::BlobSource* src,
 ```
 
 Runs the bridge loop for one queue against the block source until `stop`
-becomes true (or the efd watch errors out on teardown). Spawn with
-`elio::go()` from the device process; one bridge per queue. Waits on
+becomes true (or the efd watch errors out on teardown). Launch an independent
+joinable task from the device process; one bridge per queue. Waits on
 `q->elio_efd()`, drains `try_pop_request`, and fans each request out as its
 own `handle_io` coroutine implementing the op dispatch table above.
 `-EINTR` / `-EAGAIN` on the eventfd read are retried.
+Each bridge owns its tag handlers in an Elio collect-all TaskGroup and
+joins them before returning. Ordinary stop wakes the bridge without
+cancelling admitted handlers. An admitted request's completion token posts
+`-EIO` if its child is rejected or cancelled before invocation; a source
+exception also posts `-EIO`. Lifetime ownership stays with Elio, while the
+token records the kernel completion obligation (ADR-0006).
 
 ### `src/ublk/device.hpp` — `obd::ublk::Device`
 
@@ -297,7 +303,7 @@ Full lifecycle of one image as one ublk device. Non-copyable.
 
 - `static elio::coro::task<std::unique_ptr<Device>> create(const
   DeviceParams&, source::BlobSourcePtr src)` — **must be awaited on the
-  Elio scheduler** (bridge coroutines spawn with `elio::go()`). Order:
+  Elio scheduler** (bridge coroutines are independently joinable). Order:
   open `Ctrl` → `ADD_DEV` → `SET_PARAMS` → open all queues → launch queue
   threads (they park the FETCH commands) → spawn one bridge coroutine per
   queue → `START_DEV`, retrying `EBUSY` up to 100 × 50 ms (5 s). Throws
@@ -319,11 +325,13 @@ Full lifecycle of one image as one ublk device. Non-copyable.
 - `bool started() const` — true once the kernel gendisk is live
   (`START_DEV` succeeded).
 - `void stop() noexcept` — blocking: signals queue threads and bridges,
-  waits for every bridge and source I/O handler to finish, then joins queue
+  waits for every bridge frame and its grouped I/O handlers to release,
+  then joins queue
   threads. Idempotent. Call off an Elio worker with source executors still
   able to progress; elapsed time never permits release of unfinished I/O.
 - `elio::coro::task<void> stop_async()` — scheduler-side equivalent: signals
-  stop and awaits I/O completion without occupying a worker or the blocking
+  stop and uses native async frame-destruction observation without
+  occupying a worker or the blocking
   pool, then joins queue threads off-worker. Retain the Device until the
   await completes. Use this from coroutines, including setup-error cleanup.
 - `~Device()` — `stop()`, then `STOP_DEV` / `DEL_DEV` via `~Ctrl`.
@@ -377,6 +385,8 @@ Three distinct execution contexts, with strict permissions:
   they must do so on exceptions and early returns as well as success. Awaiting
   source I/O must not occupy the sole blocking thread: the source may need it
   to complete. Stop calls for a Device are sequential, not concurrent.
+  Native destruction-observer allocation failure retries in the existing
+  stop coroutine frame; owners remain retained until the bridge frame departs.
 - `run_bridge` and `handle_io` are Elio coroutines; all source IO goes
   through the Elio IO backend (no blocking syscalls on the scheduler).
 - Inputs are not mutated: `DeviceParams` is read-only after `create`;
@@ -431,9 +441,16 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 - `ublk: async stop lets a source finish on the sole blocking thread` — a
   pending read completes through the single blocking thread after stop begins;
   the source remains owned until the handler posts its completion and exits.
+  A test section injects a real native destruction-observer allocation failure
+  and checks that the same owner still drains successfully.
 - `ublk: async stop handles a partially initialized device` — cleanup before
   any queue is opened. These unit tests bypass kernel registration, command
   mappings, queue rings and queue threads; each has a 30-second CTest timeout.
+- `ublk: task group drains every admitted tag including source failures` —
+  two held reads remain owned during stop and use the sole blocking thread;
+  both publish terminal completions, including `-EIO` for a throwing source.
+- `ublk: a cancelled task group still completes a skipped tag` — a handler
+  cancelled before invocation posts `-EIO` without calling the source.
 - `ublk: command buffer geometry matches the driver layout` — pins the mmap
   geometry against the driver formulas: stride = 98304 for the 24-byte
   descriptor, `cmd_buf_size(128, …)` = 4096, `cmd_buf_size(4096, …)` =

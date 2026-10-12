@@ -67,15 +67,10 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
             });
         }
         // Bridge coroutines on the Elio scheduler, one per queue.
+        dev->bridge_tasks_.reserve(dev->queues_.size());
         for (auto& queue : dev->queues_) {
-            dev->io_tasks_running_.fetch_add(1, std::memory_order_acq_rel);
-            try {
-                elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_,
-                         &dev->io_tasks_running_);
-            } catch (...) {
-                dev->io_tasks_running_.fetch_sub(1, std::memory_order_acq_rel);
-                throw;
-            }
+            dev->bridge_tasks_.push_back(elio::spawn(
+                run_bridge, queue.get(), dev->src_.get(), &dev->stop_));
         }
         ELIO_LOG_INFO("ublk dev {}: bridges started, START_DEV poll",
                       dev->dev_id_);
@@ -158,15 +153,10 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
                 }
             });
         }
+        dev->bridge_tasks_.reserve(dev->queues_.size());
         for (auto& queue : dev->queues_) {
-            dev->io_tasks_running_.fetch_add(1, std::memory_order_acq_rel);
-            try {
-                elio::go(run_bridge, queue.get(), dev->src_.get(), &dev->stop_,
-                         &dev->io_tasks_running_);
-            } catch (...) {
-                dev->io_tasks_running_.fetch_sub(1, std::memory_order_acq_rel);
-                throw;
-            }
+            dev->bridge_tasks_.push_back(elio::spawn(
+                run_bridge, queue.get(), dev->src_.get(), &dev->stop_));
         }
         // END_USER_RECOVERY completes the handshake once every tag has a
         // parked FETCH (same EBUSY polling as START_DEV).
@@ -263,8 +253,14 @@ elio::coro::task<void> Device::stop_async() {
     request_stop();
     // A source may itself await spawn_blocking. Do not occupy the pool
     // while draining: even one worker and one blocking thread must progress.
-    while (io_tasks_running_.load(std::memory_order_acquire) > 0) {
-        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+    for (auto& bridge : bridge_tasks_) {
+        while (!bridge.is_destroyed()) {
+            try {
+                co_await bridge.wait_destroyed_async();
+            } catch (const std::bad_alloc&) {
+            }
+            if (!bridge.is_destroyed()) co_await elio::time::yield();
+        }
     }
     co_await elio::spawn_blocking([this] { stop(); });
 }
@@ -273,8 +269,21 @@ void Device::stop() noexcept {
     request_stop();
     // Blocking callers must leave the scheduler/source executors running.
     // Elapsed time cannot end the lifetime of an outstanding source IO.
-    while (io_tasks_running_.load(std::memory_order_acquire) > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    for (auto& bridge : bridge_tasks_) bridge.wait_destroyed();
+    {
+        std::lock_guard lock(bridge_result_mu_);
+        if (!bridge_results_reported_) {
+            bridge_results_reported_ = true;
+            for (auto& bridge : bridge_tasks_) {
+                try {
+                    bridge.await_resume();
+                } catch (const std::exception& e) {
+                    ELIO_LOG_ERROR("ublk bridge failed during stop: {}", e.what());
+                } catch (...) {
+                    ELIO_LOG_ERROR("ublk bridge failed during stop: unknown exception");
+                }
+            }
+        }
     }
     for (auto& t : threads_) {
         if (t.joinable()) t.join();
