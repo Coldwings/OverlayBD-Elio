@@ -9,6 +9,7 @@ each guards.
 | Location | Contents | Built into |
 |---|---|---|
 | `tests/unit/` | Catch2 unit tests, one file per module area | `obd_unit_tests` |
+| `tests/unit/test_dart_dns.cpp` | DART DNS ownership/deadline regressions, with isolated Elio test hooks | `obd_dart_dns_tests` |
 | `tests/integration/` | End-to-end tests over a mock registry; the ublk E2E | `obd_integration_tests` |
 | `tests/scripts/` | Source-guard regression tests | Python standard library, via CTest |
 | `tests/support.hpp` | Shared fixtures (below) | header-only |
@@ -277,6 +278,7 @@ chosen per entry with headroom for slow machines and loaded runs:
 | `build-warning-coverage` | 30 s | generator-dependent compile-command audit, registered only for Makefiles/Ninja |
 | `obd_unit_tests` (`~[shutdown]`) | 60 s | unit and supervisor-unit tests are fast even under load; admission-funnel latency samples are synthetic, not wall-clock |
 | `obd_unit_tests` (`[shutdown]`) | 30 s | the ublk shutdown subset is short and is separated so it can keep a tighter bound |
+| `obd_dart_dns_tests` | 15 s | deterministic one-second DNS observer departure and local TCP probe tests |
 | `obd_integration_tests` | 300 s | mock-registry E2E take seconds; latency E2E has real-time injected delays; ublk E2E run longer when `/dev/ublk-control` is present and self-skip otherwise |
 
 `ctest-timeout-coverage` runs as part of the normal CTest suite and
@@ -562,6 +564,18 @@ Every test, grouped by area, with the property it guards.
 - `source: DART address parsing and prefixed URL` — `host:port[/prefix]`
   parsing, scheme stripping, `/dart` default prefix, and the
   prefix-passthrough URL shape (ADR-0005).
+- `source: DART DNS deadline leaves late lookup owned until retirement` —
+  blocked test DNS work survives observer departure and input-frame destruction,
+  retains its admission lease, and safely finishes after explicit release.
+- `source: DART DNS failure and exception fall back to direct reads` —
+  owned resolution failures and exceptions disable acceleration cleanly.
+- `source: DART probe spawn rejection falls back without DNS work` —
+  native child-admission failure returns false without starting a lookup.
+- `source: DART delayed successful DNS shares its remaining TCP budget` —
+  real hostname-to-loopback success and a held cancellable connect after partial
+  DNS budget consumption, with matching logical DNS/timer deadlines.
+- `source: DART literal probes bypass DNS and report TCP reachability` —
+  loopback literals skip DNS; listening/refused peers produce true/false.
 - `source: mock registry refreshes port after bind collision` — forces a
   deterministic close-to-bind `EADDRINUSE` collision on the first reserved
   mock-registry port, then verifies the fixture publishes a fresh port and

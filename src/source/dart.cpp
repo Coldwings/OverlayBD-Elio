@@ -1,9 +1,10 @@
 // DART proxy integration. See dart.hpp.
 #include "source/dart.hpp"
 
-#include <elio/coro/with_timeout.hpp>
-#include <elio/net/resolve.hpp>
+#include <elio/coro/when_any.hpp>
+#include <elio/net/resolve_wait.hpp>
 #include <elio/net/tcp.hpp>
+#include <elio/time/timer.hpp>
 
 namespace obd::source {
 
@@ -53,24 +54,50 @@ elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address) {
     // Bounded probe (overlaybd check_accelerate_url semantics): a silent
     // network (dropped SYNs) must fall back to direct reads quickly, not
     // stall image open behind TCP retransmits.
-    auto probe = [&address](elio::coro::cancel_token token)
+    const auto deadline = std::chrono::steady_clock::now() + kReachableProbeTimeout;
+    auto probe = [&address, deadline](elio::coro::cancel_token token)
         -> elio::coro::task<bool> {
         try {
-            auto addrs = co_await elio::net::resolve_all(address.host,
-                                                         address.port);
-            if (addrs.empty()) co_return false;
+            elio::net::resolve_wait_options options;
+            options.deadline = deadline;
+            auto resolved = co_await elio::net::resolve_all(
+                address.host, address.port, std::move(options), token);
+            if (!resolved || std::chrono::steady_clock::now() >= deadline)
+                co_return false;
             // Cancellable connect: the token fires at the probe deadline so
-            // a silently-dropping network cannot stall image open.
-            auto stream = co_await elio::net::tcp_connect(addrs.front(),
+            // DNS and a silently-dropping TCP peer share the original budget.
+            // Elio owns late libc lookup work after our DNS observer departs.
+#ifdef OBD_TEST_HOOKS
+            if (auto connect = detail::dart_probe_connect_for_test.load()) {
+                const auto connected = co_await connect(std::move(token));
+                co_return connected && std::chrono::steady_clock::now() < deadline;
+            }
+#endif
+            auto stream = co_await elio::net::tcp_connect(resolved.addresses.front(),
                                                           std::move(token));
-            co_return stream.has_value();
+            co_return stream.has_value() && std::chrono::steady_clock::now() < deadline;
         } catch (const std::exception&) {
             co_return false;
         }
     };
-    auto outcome = co_await elio::with_timeout(kReachableProbeTimeout,
-                                               std::move(probe));
-    co_return outcome && *outcome;
+    try {
+        auto [winner, reachable] = co_await elio::when_any(
+            std::move(probe),
+            [deadline](elio::coro::cancel_token token) -> elio::coro::task<bool> {
+                // Compute the remaining budget when this child actually runs;
+                // a delayed timer child must not start a fresh one-second wait.
+#ifdef OBD_TEST_HOOKS
+                if (auto observe = detail::dart_probe_timer_deadline_for_test.load())
+                    observe(deadline);
+#endif
+                co_await elio::time::sleep_for(
+                    deadline - std::chrono::steady_clock::now(), std::move(token));
+                co_return false;
+            });
+        co_return winner == 0 && reachable;
+    } catch (const std::exception&) {
+        co_return false;
+    }
 }
 
 }  // namespace obd::source
