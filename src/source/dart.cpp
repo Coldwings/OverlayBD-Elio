@@ -67,6 +67,12 @@ elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address) {
             // Cancellable connect: the token fires at the probe deadline so
             // DNS and a silently-dropping TCP peer share the original budget.
             // Elio owns late libc lookup work after our DNS observer departs.
+#ifdef OBD_TEST_HOOKS
+            if (auto connect = detail::dart_probe_connect_for_test.load()) {
+                const auto connected = co_await connect(std::move(token));
+                co_return connected && std::chrono::steady_clock::now() < deadline;
+            }
+#endif
             auto stream = co_await elio::net::tcp_connect(resolved.addresses.front(),
                                                           std::move(token));
             co_return stream.has_value() && std::chrono::steady_clock::now() < deadline;
@@ -80,6 +86,10 @@ elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address) {
             [deadline](elio::coro::cancel_token token) -> elio::coro::task<bool> {
                 // Compute the remaining budget when this child actually runs;
                 // a delayed timer child must not start a fresh one-second wait.
+#ifdef OBD_TEST_HOOKS
+                if (auto observe = detail::dart_probe_timer_deadline_for_test.load())
+                    observe(deadline);
+#endif
                 co_await elio::time::sleep_for(
                     deadline - std::chrono::steady_clock::now(), std::move(token));
                 co_return false;

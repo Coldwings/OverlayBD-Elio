@@ -571,6 +571,9 @@ Every test, grouped by area, with the property it guards.
   owned resolution failures and exceptions disable acceleration cleanly.
 - `source: DART probe spawn rejection falls back without DNS work` —
   native child-admission failure returns false without starting a lookup.
+- `source: DART delayed successful DNS shares its remaining TCP budget` —
+  real hostname-to-loopback success and a held cancellable connect after partial
+  DNS budget consumption, with matching logical DNS/timer deadlines.
 - `source: DART literal probes bypass DNS and report TCP reachability` —
   loopback literals skip DNS; listening/refused peers produce true/false.
 - `source: mock registry refreshes port after bind collision` — forces a

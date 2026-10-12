@@ -87,7 +87,8 @@ obd_target_warnings(obd_dart_dns_tests)
 target_include_directories(obd_dart_dns_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_dart_dns_tests PRIVATE elio Catch2::Catch2WithMain)
-target_compile_definitions(obd_dart_dns_tests PRIVATE ELIO_RUNTIME_TEST_HOOKS=1)
+target_compile_definitions(obd_dart_dns_tests PRIVATE
+    ELIO_RUNTIME_TEST_HOOKS=1 OBD_TEST_HOOKS=1)
 catch_discover_tests(obd_dart_dns_tests
     PROPERTIES SKIP_RETURN_CODE 4 TIMEOUT 15)
 

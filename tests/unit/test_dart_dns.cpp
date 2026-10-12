@@ -5,6 +5,7 @@
 
 #include <elio/net/resolve_wait.hpp>
 #include <elio/net/tcp.hpp>
+#include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -23,6 +24,9 @@ struct LookupControl {
     std::atomic<bool> finished{false};
     std::atomic<size_t> calls{0};
     std::atomic<int64_t> deadline_ns{0};
+    std::atomic<int64_t> outer_deadline_ns{0};
+    std::atomic<bool> connect_entered{false};
+    std::atomic<bool> connect_cancelled{false};
     std::string late_host;
     int error = 0;
     bool throw_error = false;
@@ -52,6 +56,20 @@ void release_lookup(LookupControl& control) {
     control.release.notify_all();
 }
 
+void observe_outer_deadline(std::chrono::steady_clock::time_point deadline) {
+    lookup_control.load()->outer_deadline_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count());
+}
+
+elio::coro::task<bool> controlled_connect(elio::coro::cancel_token token) {
+    auto* control = lookup_control.load();
+    elio::sync::event pending;
+    control->connect_entered.store(true);
+    const auto outcome = co_await pending.wait(std::move(token));
+    control->connect_cancelled.store(outcome == elio::coro::cancel_result::cancelled);
+    co_return false;
+}
+
 elio::coro::task<elio::coro::cancel_result> observe_deadline(
     std::chrono::steady_clock::time_point deadline,
     elio::coro::cancel_token token) {
@@ -74,11 +92,14 @@ struct LookupHook {
             controlled_lookup, std::memory_order_release);
         elio::coro::detail::join_timer_wait_for_test.store(
             observe_deadline, std::memory_order_release);
+        obd::source::detail::dart_probe_timer_deadline_for_test.store(observe_outer_deadline);
     }
     ~LookupHook() {
         release_lookup(control);
         elio::net::detail::owned_dns_lookup_for_test.store(nullptr, std::memory_order_release);
         elio::coro::detail::join_timer_wait_for_test.store(nullptr, std::memory_order_release);
+        obd::source::detail::dart_probe_timer_deadline_for_test.store(nullptr);
+        obd::source::detail::dart_probe_connect_for_test.store(nullptr);
         lookup_control.store(nullptr, std::memory_order_release);
     }
     LookupControl& control;
@@ -147,6 +168,41 @@ TEST_CASE("source: DART DNS failure and exception fall back to direct reads", "[
         REQUIRE_FALSE(reachable);
         co_await wait_dns_retired();
         REQUIRE(control.calls.load() == 1);
+    });
+}
+
+TEST_CASE("source: DART delayed successful DNS shares its remaining TCP budget", "[source][dart-dns]") {
+    const bool hold_connect = GENERATE(false, true);
+    LookupControl control;
+    LookupHook hook(control);
+    if (hold_connect)
+        obd::source::detail::dart_probe_connect_for_test.store(controlled_connect);
+    obd::test::run_coro([&]() -> elio::coro::task<void> {
+        ReleaseLookup release{control};
+        auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+        REQUIRE(listener);
+        obd::source::DartProxyAddress address;
+        address.host = "delayed-dart-probe.example";
+        address.port = listener->local_address().port();
+        auto releaser = elio::spawn([&]() -> elio::coro::task<void> {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(600));
+            release_lookup(control);
+        });
+        const auto reachable = co_await obd::source::dart_proxy_reachable(address);
+        co_await releaser.wait_destroyed_async();
+        co_await wait_dns_retired();
+        REQUIRE(reachable == !hold_connect);
+        REQUIRE(control.calls.load() == 1);
+        // Observe the actual production timer branch's logical deadline rather
+        // than asserting a physical return ceiling on a preemptible scheduler.
+        REQUIRE(control.outer_deadline_ns.load() == control.deadline_ns.load());
+        if (hold_connect) {
+            REQUIRE(control.connect_entered.load());
+            REQUIRE(control.connect_cancelled.load());
+            const auto observed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            REQUIRE(observed_ns >= control.outer_deadline_ns.load());
+        }
     });
 }
 

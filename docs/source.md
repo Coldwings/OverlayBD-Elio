@@ -1053,6 +1053,9 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   DNS failures and lookup exceptions produce false and release admission.
 - `source: DART probe spawn rejection falls back without DNS work` — native
   child-admission failure disables optional acceleration without escaping.
+- `source: DART delayed successful DNS shares its remaining TCP budget` —
+  delayed hostname resolution reaches a real loopback listener; a held connect
+  observes cancellation, and the actual timer branch retains the DNS deadline.
 - `source: DART literal probes bypass DNS and report TCP reachability` —
   loopback literals consume no DNS work; listening and refused ports produce
   true and false respectively.

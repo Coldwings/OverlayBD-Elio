@@ -17,6 +17,10 @@
 #pragma once
 
 #include <elio/coro/task.hpp>
+#ifdef OBD_TEST_HOOKS
+#include <elio/coro/cancel_token.hpp>
+#include <atomic>
+#endif
 
 #include <chrono>
 #include <optional>
@@ -55,5 +59,16 @@ std::string dart_prefixed_url(const DartProxyAddress& address,
 /// DNS observation and TCP connect share one 1000 ms deadline. Late libc
 /// lookups remain owned/admission-bounded by Elio after the observer returns.
 elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address);
+
+#ifdef OBD_TEST_HOOKS
+namespace detail {
+// Private seams for observing the actual timer deadline and holding TCP while
+// the native cancellation protocol runs. Production builds omit these hooks.
+inline std::atomic<void (*)(std::chrono::steady_clock::time_point)>
+    dart_probe_timer_deadline_for_test{nullptr};
+inline std::atomic<elio::coro::task<bool> (*)(elio::coro::cancel_token)>
+    dart_probe_connect_for_test{nullptr};
+}
+#endif
 
 }  // namespace obd::source
