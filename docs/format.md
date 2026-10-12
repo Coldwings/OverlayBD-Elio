@@ -1239,10 +1239,10 @@ original OCI blob's digest.
 
 Scheduler-facing writable-file transfers use Elio v0.6.0 positional helpers;
 format reads still map early EOF to `-EIO`. LSMT flush/checkpoint/seal and sparse
-flush/reclamation use Elio file operations, with native support or bounded
+open/flush/reclamation use Elio file operations, with native support or bounded
 blocking fallback. Borrowed descriptors and buffers remain alive until return.
 Sparse writes use `pwrite_some` so each completed full-sector prefix is indexed
 before the next transfer; this format-specific publication loop is intentional.
 Data-before-zero-mask and zero-mask-before-reclamation ordering stays explicit.
-Atomic sidecar publication, directory sync, cold setup and blocking grow/seal
+Atomic sidecar publication, directory sync, locked trace-start truncation and blocking grow/seal
 utilities remain synchronous transactions on their existing execution paths.

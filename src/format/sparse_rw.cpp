@@ -400,10 +400,8 @@ elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
         }
     }
     layer->load_zero_masks();
-    if (::ftruncate(fd, static_cast<off_t>(effective_vsize)) != 0) {
-        const int e = errno;
-        throw_errno(e, "cannot size sparse layer " + path);
-    }
+    const auto sized = co_await elio::io::truncate_file(fd, effective_vsize);
+    if (!sized) throw_errno(sized.error_value(), "cannot size sparse layer " + path);
     layer->ro_ = std::make_unique<SparseRwLayer::View>(
         fd, layer->vsize_, "sparse-rw:" + path);
     co_return layer;
