@@ -19,6 +19,7 @@
 #include <elio/log/macros.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/coro/join_wait.hpp>
 #include <elio/time/timer.hpp>
 
 #include <sys/stat.h>
@@ -118,7 +119,6 @@ constexpr uint64_t kMaxTraceBlobBytes = uint64_t{64} << 20;
 /// from extending device bring-up by the registry client's full retry
 /// envelope before replay even starts.
 constexpr std::chrono::milliseconds kTraceBlobLoadBudget{30000};
-constexpr std::chrono::milliseconds kTraceBlobLoadPoll{5};
 constexpr std::chrono::milliseconds kFillParkTimeout{5000};
 
 elio::coro::task<void> park_layer_store_fills(
@@ -238,9 +238,9 @@ elio::coro::task<std::vector<uint8_t>> load_trace_blob_bounded(
 
     auto task = scheduler->go_joinable(std::move(load));
     const auto deadline = std::chrono::steady_clock::now() + budget;
-    while (!task.is_ready()) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
+    try {
+        const auto outcome = co_await task.wait_until(deadline);
+        if (outcome != elio::coro::join_wait_outcome::completed) {
             try {
                 task.request_cancel();
             } catch (const std::exception& e) {
@@ -256,13 +256,6 @@ elio::coro::task<std::vector<uint8_t>> load_trace_blob_bounded(
                              budget.count());
             co_return std::vector<uint8_t>{};
         }
-        const auto remaining =
-            std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
-        co_await elio::time::sleep_for(
-            std::min(kTraceBlobLoadPoll, remaining));
-    }
-
-    try {
         co_return task.await_resume();
     } catch (const std::exception& e) {
         ELIO_LOG_WARNING("trace layer load failed ({}); prefetch disabled",

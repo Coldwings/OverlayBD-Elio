@@ -794,6 +794,7 @@ commands and monitors to distinct workers. No kernel ublk is required.
 | `supervisor: shutdown wakes an idle accepted client` | An accepted peer sends no bytes and remains open; shutdown cancels the read and closes its stream after completion. |
 | `supervisor: shutdown wakes a partial accepted command` | A peer sends an incomplete JSON line and remains open; shutdown completes without more peer traffic. |
 | `supervisor: startup failure drains already admitted client work` | An injected failure after accept-loop startup cancels and drains the existing idle client before propagating. |
+| `supervisor: client task failure preserves daemon shutdown drain` | A client body failure is logged without cancelling the daemon; its independent activity groups still drain on shutdown. |
 
 Unit tests live in `tests/unit/test_supervisor.cpp`; they exercise the
 protocol codecs and the child lifecycle with fake device binaries, without
@@ -973,12 +974,15 @@ by `destroy`. Only after this work departs does it wake and drain the reaper.
 Recovery publication still takes `op_mu` followed by the registry mutex;
 shutdown takes `op_mu` before choosing the generation to terminate.
 
-Each spawned task has an owned join handle. Shutdown waits asynchronously
-for frame and callable destruction, not merely the task's result or a
+Accepts, clients, monitors and the reaper have separate Elio TaskGroups
+under the ADR-0002 runtime rule. Each stage's join closes its admission and
+waits for frame and callable destruction, not merely a task result or a
 child's exit event. Startup/signal-wait exceptions follow the same drain
-before propagating. Completed handles are reclaimed during admission.
-The reaper remains pinned to worker 0 because its `signal_fd` caches its
-creating worker's I/O context.
+before propagating. Task body failures are logged promptly and do not
+cancel siblings; admission failures are reported after the affected group
+drains. The reaper remains placed on worker 0 using Elio affinity. Test
+client/monitor bodies use workers 2/1 to exercise cross-worker ownership.
+Elio resolves the current worker's I/O context for each `signal_fd` wait.
 
 This is a completion guarantee, not a single global shutdown deadline.
 Readiness, device-reply, stop, and host-mkfs waits retain their existing

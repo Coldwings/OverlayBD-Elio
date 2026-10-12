@@ -43,7 +43,10 @@ target_compile_definitions(obd_core PUBLIC
     OBD_VERSION_STRING="${PROJECT_VERSION}")
 
 if(OBD_BUILD_TESTS)
-    target_compile_definitions(obd_core PUBLIC OBD_TEST_HOOKS=1)
+    # Keep Elio inline definitions consistent across the library and its test
+    # consumers. These hooks expose real observer/notification allocation faults.
+    target_compile_definitions(obd_core PUBLIC
+        OBD_TEST_HOOKS=1 ELIO_RUNTIME_TEST_HOOKS=1)
 endif()
 
 target_link_libraries(obd_core PUBLIC
