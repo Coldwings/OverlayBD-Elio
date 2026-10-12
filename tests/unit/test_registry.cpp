@@ -461,7 +461,7 @@ TEST_CASE("source: registry new URL refreshes a server-rejected cached token", "
         MockGuard guard{mock};
         const bool running = co_await test::wait_server_running(mock);
         REQUIRE(running);
-        auto client = std::make_shared<source::RegistryClient>(test_creds());
+        auto client = std::make_shared<source::RegistryClient>(test_creds(), source::RegistryClientConfig{});
         auto first = co_await source::RegistrySource::open(client, mock.repo_base() + "/auth/x");
         REQUIRE(first->size() == blob.size());
         REQUIRE(mock.token_hits_.load() == 1);
