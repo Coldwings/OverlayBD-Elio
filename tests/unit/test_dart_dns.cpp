@@ -5,6 +5,7 @@
 
 #include <elio/net/resolve_wait.hpp>
 #include <elio/net/tcp.hpp>
+#include <elio/runtime/spawn.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
 
