@@ -622,7 +622,7 @@ prefix is `/dart`).
 - `dart_proxy_reachable(address)` — bounded reachability probe: resolves the
   host with Elio 0.6's owned `resolve_all(host, port, resolve_wait_options,
   token)` outcome, then attempts a cancellable TCP connect. Both stages share
-  the original absolute 1000 ms deadline and `with_timeout` cancellation token,
+  the original absolute 1000 ms deadline and a structured `when_any` timer token,
   so slow DNS observation and a silently-dropping network cannot stall image
   open behind libc lookup or TCP retransmits. Returns `false` on any
   failure (resolution, connect, timeout, exception). Mirrors overlaybd's
@@ -1051,6 +1051,8 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   admission remains held, and late hostname access is safe before reclamation.
 - `source: DART DNS failure and exception fall back to direct reads` — owned
   DNS failures and lookup exceptions produce false and release admission.
+- `source: DART probe spawn rejection falls back without DNS work` — native
+  child-admission failure disables optional acceleration without escaping.
 - `source: DART literal probes bypass DNS and report TCP reachability` —
   loopback literals consume no DNS work; listening and refused ports produce
   true and false respectively.

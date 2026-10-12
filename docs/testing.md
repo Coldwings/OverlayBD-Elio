@@ -569,6 +569,8 @@ Every test, grouped by area, with the property it guards.
   retains its admission lease, and safely finishes after explicit release.
 - `source: DART DNS failure and exception fall back to direct reads` —
   owned resolution failures and exceptions disable acceleration cleanly.
+- `source: DART probe spawn rejection falls back without DNS work` —
+  native child-admission failure returns false without starting a lookup.
 - `source: DART literal probes bypass DNS and report TCP reachability` —
   loopback literals skip DNS; listening/refused peers produce true/false.
 - `source: mock registry refreshes port after bind collision` — forces a

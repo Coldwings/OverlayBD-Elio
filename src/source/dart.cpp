@@ -1,9 +1,10 @@
 // DART proxy integration. See dart.hpp.
 #include "source/dart.hpp"
 
-#include <elio/coro/with_timeout.hpp>
+#include <elio/coro/when_any.hpp>
 #include <elio/net/resolve_wait.hpp>
 #include <elio/net/tcp.hpp>
+#include <elio/time/timer.hpp>
 
 namespace obd::source {
 
@@ -68,14 +69,25 @@ elio::coro::task<bool> dart_proxy_reachable(const DartProxyAddress& address) {
             // Elio owns late libc lookup work after our DNS observer departs.
             auto stream = co_await elio::net::tcp_connect(resolved.addresses.front(),
                                                           std::move(token));
-            co_return stream.has_value();
+            co_return stream.has_value() && std::chrono::steady_clock::now() < deadline;
         } catch (const std::exception&) {
             co_return false;
         }
     };
-    auto outcome = co_await elio::with_timeout(kReachableProbeTimeout,
-                                               std::move(probe));
-    co_return outcome && *outcome;
+    try {
+        auto [winner, reachable] = co_await elio::when_any(
+            std::move(probe),
+            [deadline](elio::coro::cancel_token token) -> elio::coro::task<bool> {
+                // Compute the remaining budget when this child actually runs;
+                // a delayed timer child must not start a fresh one-second wait.
+                co_await elio::time::sleep_for(
+                    deadline - std::chrono::steady_clock::now(), std::move(token));
+                co_return false;
+            });
+        co_return winner == 0 && reachable;
+    } catch (const std::exception&) {
+        co_return false;
+    }
 }
 
 }  // namespace obd::source

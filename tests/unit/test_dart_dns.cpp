@@ -150,6 +150,23 @@ TEST_CASE("source: DART DNS failure and exception fall back to direct reads", "[
     });
 }
 
+TEST_CASE("source: DART probe spawn rejection falls back without DNS work", "[source][dart-dns]") {
+    LookupControl control;
+    control.release.store(true);
+    LookupHook hook(control);
+    obd::test::run_coro([]() -> elio::coro::task<void> {
+        obd::source::DartProxyAddress address;
+        address.host = "rejected-dart-probe.example";
+        address.port = 19145;
+        elio::runtime::detail::reject_next_spawn_for_test.store(true);
+        const auto reachable = co_await obd::source::dart_proxy_reachable(address);
+        REQUIRE_FALSE(reachable);
+        REQUIRE_FALSE(elio::runtime::detail::reject_next_spawn_for_test.load());
+        REQUIRE(elio::net::default_resolve_domain()->outstanding() == 0);
+    });
+    REQUIRE(control.calls.load() == 0);
+}
+
 TEST_CASE("source: DART literal probes bypass DNS and report TCP reachability", "[source][dart-dns]") {
     LookupControl control;
     control.release.store(true);
