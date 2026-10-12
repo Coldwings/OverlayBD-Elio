@@ -3055,3 +3055,24 @@ TEST_CASE("format: lsmt rw setup failures release their descriptors", "[format][
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("format: writable mapped reads reject early file EOF", "[format]") {
+    TempDir dir;
+    const auto input = test::pattern_bytes(1024, 53);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        for (bool sparse : {false, true}) {
+            const auto path = dir / (sparse ? "sparse-eof" : "lsmt-eof");
+            std::unique_ptr<format::WritableLayer> layer;
+            if (sparse) layer = co_await format::SparseRwLayer::open(path, 4096);
+            else layer = co_await format::LsmtRwLayer::create(path, 4096);
+            const auto written = co_await layer->pwrite(input.data(), input.size(), 0);
+            REQUIRE(written == 1024);
+            std::filesystem::resize_file(path, (sparse ? 0 : 4096) + 512);
+            std::vector<uint8_t> buffer(input.size(), 0);
+            const auto read = co_await layer->pread(buffer.data(), buffer.size(), 0);
+            REQUIRE(read == -EIO);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}

@@ -1347,3 +1347,13 @@ populate both metadata and target sources. Upstream trace records address only
 metadata sources, one slot per lower: target offsets are never recorded as
 metadata offsets or inserted as extra layer IDs. Target reads still share the
 device read-admission funnel and registry client.
+
+## Implementation notes
+
+Positional local-file reads and committed LayerStore reads use Elio v0.6.0
+`pread_exactly` over borrowed spans. Elio advances offsets, splits oversized
+requests and preserves transfer progress. LocalFileSource returns a terminal
+error even after progress; LayerStore keeps its POSIX partial-return policy.
+Both return the transferred prefix on early EOF and retain the existing
+source-size clamping. Dedicated writer-thread persistence remains synchronous:
+those operations do not execute in an Elio scheduler coroutine.

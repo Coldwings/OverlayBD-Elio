@@ -4,7 +4,8 @@
 #include "common/errors.hpp"
 #include "format/lsmt_format.hpp"
 
-#include <elio/io/io_awaitables.hpp>
+#include <elio/io/file_transfer.hpp>
+#include <elio/io/file_operations.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 
 #include <fcntl.h>
@@ -296,17 +297,10 @@ public:
         const uint64_t bound = size_->load(std::memory_order_acquire);
         if (offset >= bound) co_return 0;
         if (count > bound - offset) count = static_cast<size_t>(bound - offset);
-        uint8_t* p = static_cast<uint8_t*>(buf);
-        size_t done = 0;
-        while (done < count) {
-            const auto r = co_await elio::io::async_read(
-                fd_, p + done, count - done,
-                static_cast<int64_t>(offset + done));
-            if (r.result < 0) co_return r.result;
-            if (r.result == 0) break;
-            done += static_cast<size_t>(r.result);
-        }
-        co_return static_cast<ssize_t>(done);
+        const auto result = co_await elio::io::pread_exactly(
+            fd_, std::span<std::byte>(static_cast<std::byte*>(buf), count), offset);
+        if (result.error) co_return -result.error.value();
+        co_return static_cast<ssize_t>(result.transferred);
     }
 
     uint64_t size() const noexcept override {
@@ -639,12 +633,11 @@ elio::coro::task<int> SparseRwLayer::publish_data_first_zero_masks_locked() {
         std::vector<bytes::segment_mapping> zeroes;
         uint64_t vsize;
     } snapshot{std::move(zeroes), publish_vsize};
+    const auto status = co_await elio::io::sync_file(fd_, elio::io::file_sync_mode::data_only);
+    if (!status) co_return -status.error_value();
     const int rc = co_await elio::spawn_blocking(
         [self = this, snapshot = &snapshot] {
-            const int sync_rc = self->sync_data_file();
-            if (sync_rc != 0) return sync_rc;
-            return self->persist_zero_masks(snapshot->zeroes, snapshot->vsize)
-                .rc;
+            return self->persist_zero_masks(snapshot->zeroes, snapshot->vsize).rc;
         });
     if (rc != 0) co_return rc;
     {
@@ -865,18 +858,18 @@ elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
         size_t written = 0;
         size_t indexed = 0;
         while (written < piece) {
-            const auto r = co_await elio::io::async_write(
-                fd_, p + done + written, piece - written,
-                static_cast<off_t>(offset + done + written));
-            if (r.result < 0) {
-                write_error = static_cast<int>(r.result);
+            const auto result = co_await elio::io::pwrite_some(
+                fd_, std::as_bytes(std::span(p + done + written, piece - written)),
+                offset + done + written);
+            if (result.error) {
+                write_error = -result.error.value();
                 break;
             }
-            if (r.result == 0) {
+            if (result.transferred == 0) {
                 write_error = -EIO;
                 break;
             }
-            written += static_cast<size_t>(r.result);
+            written += result.transferred;
             if (written > piece) {
                 write_error = -EIO;
                 break;
@@ -948,10 +941,10 @@ elio::coro::task<ssize_t> SparseRwLayer::pread(void* buf, size_t count,
             if (hit.zeroed) {
                 std::memset(out + done, 0, n);
             } else {
-                const auto r = co_await elio::io::async_read(
-                    fd_, out + done, n, static_cast<off_t>(pos));
-                if (r.result < 0) co_return r.result;
-                if (r.result != static_cast<ssize_t>(n)) co_return -EIO;
+                const auto result = co_await elio::io::pread_exactly(
+                    fd_, std::as_writable_bytes(std::span(out + done, n)), pos);
+                if (result.error) co_return -result.error.value();
+                if (result.end != elio::io::transfer_end::complete) co_return -EIO;
             }
             done += n;
         } else {
@@ -1020,15 +1013,9 @@ elio::coro::task<int> SparseRwLayer::discard(uint64_t offset, uint64_t len) {
     // If punch-hole is unsupported or otherwise fails after the mask commit,
     // discard still succeeded semantically; only physical space reclamation is
     // skipped for this request.
-    const int frc = co_await elio::spawn_blocking([this, offset, len] {
-        if (::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                        static_cast<off_t>(offset),
-                        static_cast<off_t>(len)) != 0) {
-            return -errno;
-        }
-        return 0;
-    });
-    (void)frc;
+    const auto reclaim = co_await elio::io::allocate_file_range(
+        fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
+    (void)reclaim;
     co_return 0;
 }
 
@@ -1064,20 +1051,19 @@ elio::coro::task<int> SparseRwLayer::flush_locked() {
             std::vector<bytes::segment_mapping> zeroes;
             uint64_t vsize;
         } snapshot{std::move(zeroes), flush_vsize};
+        if (data_first) {
+            const auto status = co_await elio::io::sync_file(fd_, elio::io::file_sync_mode::data_only);
+            if (!status) co_return -status.error_value();
+        }
         const int rc = co_await elio::spawn_blocking(
-            [self = this, snapshot = &snapshot, data_first] {
-                if (data_first) {
-                    const int sync_rc = self->sync_data_file();
-                    if (sync_rc != 0) return sync_rc;
-                }
-                const ZeroMaskPersistResult mask_rc =
-                    self->persist_zero_masks(snapshot->zeroes,
-                                             snapshot->vsize);
-                if (mask_rc.rc != 0) return mask_rc.rc;
-                if (!data_first) return self->sync_data_file();
-                return 0;
+            [self = this, snapshot = &snapshot] {
+                return self->persist_zero_masks(snapshot->zeroes, snapshot->vsize).rc;
             });
         if (rc != 0) co_return rc;
+        if (!data_first) {
+            const auto status = co_await elio::io::sync_file(fd_, elio::io::file_sync_mode::data_only);
+            if (!status) co_return -status.error_value();
+        }
         {
             std::lock_guard lock(meta_mu_);
             if (zero_masks_generation_ == generation) {
@@ -1086,9 +1072,8 @@ elio::coro::task<int> SparseRwLayer::flush_locked() {
             }
         }
     } else {
-        const int rc = co_await elio::spawn_blocking(
-            [this] { return sync_data_file(); });
-        if (rc != 0) co_return rc;
+        const auto status = co_await elio::io::sync_file(fd_, elio::io::file_sync_mode::data_only);
+        if (!status) co_return -status.error_value();
     }
     co_return 0;
 }
