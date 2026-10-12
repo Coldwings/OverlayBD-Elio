@@ -1496,6 +1496,8 @@ TEST_CASE("source: layer store fill records success when completion interrupts t
         (producer == Producer::QueueRoom ? 2 : 1) * kExtent, 219);
     std::atomic<unsigned> writer_stage{0};
     std::atomic<unsigned> queue_wait_stage{0};
+    std::atomic<bool> final_queue_wait_armed{false};
+    std::atomic<bool> final_queue_wait_seen{false};
     std::atomic<bool> release_first{false};
     std::atomic<bool> release_second{false};
     std::atomic<bool> writer_timed_out{false};
@@ -1503,6 +1505,10 @@ TEST_CASE("source: layer store fill records success when completion interrupts t
     bool complete = false;
     bool terminal = false;
     bool populated = true;
+    bool first_held = false;
+    bool remote_held = false;
+    bool first_wait = false;
+    bool final_wait = false;
     auto final_status = source::LayerStore::FillStatus::kDisabled;
     elio::run_config runtime;
     runtime.num_threads = 1;
@@ -1534,7 +1540,9 @@ TEST_CASE("source: layer store fill records success when completion interrupts t
                 return 0;
             });
             store->set_test_fill_wait_hook([&](bool completion) {
-                if (!completion) queue_wait_stage.store(writer_stage.load());
+                if (completion) return;
+                queue_wait_stage.store(writer_stage.load());
+                if (final_queue_wait_armed.load()) final_queue_wait_seen.store(true);
             });
         }
         gated->start.set();
@@ -1545,20 +1553,25 @@ TEST_CASE("source: layer store fill records success when completion interrupts t
             const auto result = co_await store->populate(0, blob.size());
             populated = result == 0;
         } else {
-            const bool first_held = co_await poll_until(
+            first_held = co_await poll_until(
                 [&] { return writer_stage.load() == 1; }, 5000);
-            const bool remote_held = co_await poll_until(
+            remote_held = co_await poll_until(
                 [&] { return gated->reads_started() >= 2; }, 5000);
             if (producer == Producer::QueueRoom) {
                 // Keep extent 0 uncommitted until the next read reaches the
                 // full queue. Then hold extent 1 while fill queues a duplicate
                 // extent 0 and waits again: the only subsequent wake is commit.
                 gated->further.set();
-                const bool first_wait = co_await poll_until(
+                first_wait = co_await poll_until(
                     [&] { return queue_wait_stage.load() == 1; }, 5000);
+                // Capacity is signaled before the next write hook advances
+                // writer_stage. Track the next full-queue reset independently
+                // so its marker survives that legitimate writer/fill ordering.
+                final_queue_wait_armed.store(true);
                 release_first.store(true);
-                const bool final_wait = co_await poll_until(
-                    [&] { return queue_wait_stage.load() == 2; }, 5000);
+                final_wait = co_await poll_until([&] {
+                    return writer_stage.load() == 2 && final_queue_wait_seen.load();
+                }, 5000);
                 expected_wait = first_held && remote_held && first_wait && final_wait;
                 release_second.store(true);
             } else {
@@ -1586,6 +1599,8 @@ TEST_CASE("source: layer store fill records success when completion interrupts t
         co_return 0;
     }, runtime);
     REQUIRE(rc == 0);
+    CAPTURE(first_held, remote_held, first_wait, final_wait,
+            writer_stage.load(), queue_wait_stage.load(), final_queue_wait_seen.load());
     CHECK(expected_wait);
     CHECK(populated);
     CHECK(complete);
