@@ -131,6 +131,9 @@ bool Queue::try_pop_request(IoRequest& out) {
 void Queue::push_completion(uint16_t tag, int32_t result) {
     {
         std::lock_guard<std::mutex> lk(mu_);
+#ifdef OBD_TEST_HOOKS
+        if (completion_enqueue_hook_for_test_) completion_enqueue_hook_for_test_();
+#endif
         done_.emplace_back(tag, result);
     }
     write_efd(done_efd_);
