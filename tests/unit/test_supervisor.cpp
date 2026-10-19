@@ -5,6 +5,10 @@
 #include "supervisor/protocol.hpp"
 
 #include "../support.hpp"
+#include "../runtime_faults.hpp"
+
+#include <elio/coro/task_group.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,6 +21,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -25,6 +30,20 @@
 #include <vector>
 
 using namespace obd;
+
+namespace {
+
+bool reap_child(supervisor::Child& child) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        child.try_reap();
+        if (child.reaped()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return child.reaped();
+}
+
+}  // namespace
 
 TEST_CASE("supervisor: protocol commands parse and reject garbage",
           "[supervisor]") {
@@ -150,9 +169,7 @@ TEST_CASE("supervisor: child spawn execs and reports through the channel",
     REQUIRE(st.has_value());
     REQUIRE(st->device == "/dev/ublkb9");
 
-    int wstatus = 0;
-    REQUIRE(::waitpid(child->pid(), &wstatus, 0) == child->pid());
-    child->note_reaped(wstatus);
+    REQUIRE(reap_child(*child));
     REQUIRE(child->status().state == "exited");
     REQUIRE(child->status().exit_code == 0);
     ::close(child->release_control_fd());
@@ -337,9 +354,7 @@ TEST_CASE("supervisor: recover spec adds the recover flag to child argv",
     spec.recover = true;
     auto child = supervisor::Child::spawn(spec);
     REQUIRE(child->pid() > 0);
-    int wstatus = 0;
-    REQUIRE(::waitpid(child->pid(), &wstatus, 0) == child->pid());
-    child->note_reaped(wstatus);
+    REQUIRE(reap_child(*child));
     ::close(child->release_control_fd());
 
     struct stat st {};
@@ -361,13 +376,124 @@ TEST_CASE("supervisor: exec failure surfaces as exit 127", "[supervisor]") {
     spec.device_bin = "/definitely/not/a/binary";
     spec.config_path = "/x";
     auto child = supervisor::Child::spawn(spec);
-    int wstatus = 0;
-    REQUIRE(::waitpid(child->pid(), &wstatus, 0) == child->pid());
-    child->note_reaped(wstatus);
+    REQUIRE(reap_child(*child));
     REQUIRE(child->status().exit_code == 127);
     REQUIRE(child->status().error.find("exec failed") !=
             std::string::npos);
     ::close(child->release_control_fd());
+}
+
+TEST_CASE("supervisor: control EOF stays distinct from a confirmed reap", "[supervisor][reap-barrier]") {
+    test::TempDir directory;
+    const std::string script = directory / "eof-device.py";
+    const std::string release = directory / "release";
+    const std::string content = R"(#!/usr/bin/env python3
+import os, sys, time
+os.close(3)
+deadline = time.monotonic() + 5
+while not os.path.exists(sys.argv[2]):
+    if time.monotonic() >= deadline:
+        sys.exit(9)
+    time.sleep(0.001)
+sys.exit(7)
+)";
+    test::write_file(script, std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    supervisor::ChildSpec spec;
+    spec.id = "eof-before-reap";
+    spec.device_bin = script;
+    spec.config_path = release;
+    auto child = supervisor::Child::spawn(spec);
+    pollfd closed{child->control_fd(), POLLIN, 0};
+    REQUIRE(::poll(&closed, 1, 5000) == 1);
+    char byte;
+    REQUIRE(::read(child->control_fd(), &byte, 1) == 0);
+    auto eof = child->status();
+    eof.state = "exited";
+    child->update_status(eof);
+    CHECK(child->exit_event().is_set());
+    CHECK_FALSE(child->reaped_event().is_set());
+    CHECK_FALSE(child->reaped());
+    CHECK_FALSE(child->try_reap());
+
+    auto stale = eof;
+    stale.state = "stopped";
+    test::write_file(release, {});
+    REQUIRE(reap_child(*child));
+    CHECK(child->reaped_event().is_set());
+    CHECK(child->status().exit_code == 7);
+    // A buffered monitor line prepared before waitpid cannot erase its
+    // terminal state or exit code. Repeated reap/signals are safe no-ops.
+    child->update_status(stale);
+    child->terminate();
+    child->kill();
+    CHECK_FALSE(child->try_reap());
+    CHECK(child->status().state == "exited");
+    CHECK(child->status().exit_code == 7);
+}
+
+TEST_CASE("supervisor: confirmed reap retries failed lifecycle notifications", "[supervisor][reap-barrier]") {
+    supervisor::ChildSpec spec;
+    spec.id = "reap-notify-fault";
+    spec.device_bin = "/bin/true";
+    auto child = supervisor::Child::spawn(spec);
+    test::WriterEventFault fault;
+    std::atomic<unsigned> completed{0};
+    bool registered = false;
+    bool reap_fact = false;
+    bool retained_waiter = false;
+    bool pending_notification = false;
+    bool retried = false;
+    elio::run_config runtime;
+    runtime.num_threads = 1;
+    runtime.blocking_threads = 1;
+    const int result = elio::run([&]() -> elio::coro::task<int> {
+        elio::coro::task_group observers;
+        const std::array events{&child->ready_event(), &child->exit_event(),
+                                &child->reaped_event()};
+        for (auto* event : events) {
+            observers.spawn([event, &completed]() -> elio::coro::task<void> {
+                co_await event->wait();
+                completed.fetch_add(1);
+            });
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            registered = std::all_of(events.begin(), events.end(), [](auto* event) {
+                return event->waiter_count_for_test() == 1;
+            });
+            if (registered) break;
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        } while (std::chrono::steady_clock::now() < deadline);
+        // The existing fault seam targets plain threads; collecting here
+        // deterministically fails the first (reaped) event's dispatch reserve.
+        co_await elio::spawn_blocking([&] {
+            while (!child->reaped() && std::chrono::steady_clock::now() < deadline) {
+                child->try_reap();
+                if (!child->reaped()) std::this_thread::yield();
+            }
+            reap_fact = child->reaped();
+            pending_notification = !child->reaped_event().is_set();
+            retained_waiter = child->reaped_event().waiter_count_for_test() == 1;
+            retried = child->try_notify_waiters();
+            if (!reap_fact || !retried) {
+                // Fixture recovery only: no pending observer may survive a
+                // failed assertion or an unexpected process-setup failure.
+                for (auto* event : events) event->release_waiters_for_test();
+            }
+        });
+        co_await observers.join();
+        co_return 0;
+    }, runtime);
+    CHECK(result == 0);
+    CHECK(registered);
+    CHECK(reap_fact);
+    CHECK(pending_notification);
+    CHECK(retained_waiter);
+    CHECK(retried);
+    CHECK(fault.failures() == 1);
+    CHECK(completed.load() == 3);
+    CHECK(child->status().exit_code == 0);
 }
 
 TEST_CASE("supervisor: create blank spec parses and validates size and mkfs",
@@ -576,9 +702,7 @@ TEST_CASE("supervisor: blank spawn argv carries the blank flags and global",
     spec.global_path = "/etc/g.json";
     auto child = supervisor::Child::spawn(spec);
     REQUIRE(child->pid() > 0);
-    int wstatus = 0;
-    REQUIRE(::waitpid(child->pid(), &wstatus, 0) == child->pid());
-    child->note_reaped(wstatus);
+    REQUIRE(reap_child(*child));
     ::close(child->release_control_fd());
 
     struct stat st {};

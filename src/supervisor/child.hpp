@@ -49,7 +49,7 @@ public:
     /// failure through the closed pipe).
     static std::unique_ptr<Child> spawn(const ChildSpec& spec);
 
-    ~Child();  // best-effort SIGKILL + reap if still alive
+    ~Child();  // best-effort SIGKILL + reap if still unreaped
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
 
@@ -74,18 +74,27 @@ public:
     Status status() const;
     /// Called by the monitor/reaper coroutines; publishes the status and
     /// wakes waiters once the state is terminal for creation purposes
-    /// (ready/failed/exited).
+    /// (ready/failed/exited). Ignores late updates after an actual reap.
     void update_status(const Status& st);
 
     /// Fires when the child first reaches ready/failed/exited.
     elio::sync::event& ready_event() noexcept { return ready_event_; }
-    /// Fires when the child has exited (reaped or control channel EOF).
+    /// Fires on control EOF or reap: liveness, not a teardown barrier.
     elio::sync::event& exit_event() noexcept { return exit_event_; }
+    /// Process ownership barrier: only actual waitpid collection fires it.
+    /// EOF may arrive while device/kernel cleanup is still running.
+    elio::sync::event& reaped_event() noexcept { return reaped_event_; }
+    bool reaped() const;
 
     void terminate() noexcept;  // SIGTERM
     void kill() noexcept;       // SIGKILL
-    /// Records a reap result (waitpid). Marks exited.
-    void note_reaped(int wait_status);
+    /// Nonblocking owned-PID wait plus terminal publication, serialized
+    /// against terminate/kill. Returns true only for a newly collected exit.
+    /// Callers must never separately waitpid this Child's PID.
+    bool try_reap();
+    /// Retry sticky lifecycle notifications without discarding waiters on
+    /// dispatch-storage allocation failure. Owners yield and retry false.
+    bool try_notify_waiters();
 
 private:
     explicit Child(std::string id) : id_(std::move(id)) {}
@@ -96,10 +105,12 @@ private:
 
     mutable std::mutex mu_;
     Status st_;
-    bool ready_fired_ = false;
-    bool exit_fired_ = false;
+    bool ready_reached_ = false;
+    bool exit_reached_ = false;
+    bool reaped_ = false;
     elio::sync::event ready_event_;
     elio::sync::event exit_event_;
+    elio::sync::event reaped_event_;
 };
 
 }  // namespace obd::supervisor

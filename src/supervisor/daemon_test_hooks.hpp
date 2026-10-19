@@ -14,6 +14,7 @@
 #include <map>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace obd::supervisor::detail {
 
@@ -25,6 +26,19 @@ public:
         : command_timeout(timeout) {}
     // Internal immutable deadline seam; normal run_daemon still uses 30 s.
     const std::chrono::milliseconds command_timeout;
+
+    // Remember the exact owner before registry publication can expose it to
+    // the reaper. Weak records do not extend production lifetimes; cleanup
+    // can lock a particular generation without looking up a recycled PID.
+    void record_child(std::weak_ptr<Child> child) {
+        std::lock_guard lock(mu);
+        generations.push_back(std::move(child));
+    }
+    std::weak_ptr<Child> spawned_child(size_t generation = 0) {
+        std::lock_guard lock(mu);
+        return generation < generations.size() ? generations[generation]
+                                                : std::weak_ptr<Child>{};
+    }
 
     void mark(std::string point) {
         std::lock_guard lock(mu);
@@ -104,6 +118,7 @@ private:
     bool released = false;
     bool timed_out = false;
     std::weak_ptr<Child> owner;
+    std::vector<std::weak_ptr<Child>> generations;
     std::thread::id worker;
     bool distinct_worker = false;
 };

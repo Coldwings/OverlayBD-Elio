@@ -121,6 +121,7 @@ add_dependencies(obd_unit_tests obd-test-fake-device)
 add_executable(obd_integration_tests
     integration/test_integration.cpp
     integration/test_recovery.cpp
+    integration/test_reap.cpp
     integration/test_commit.cpp
     integration/test_trace_record.cpp
     integration/test_hello.cpp
@@ -136,6 +137,9 @@ add_dependencies(obd_integration_tests obd-test-fake-device)
 if(OBD_ENABLE_UBLK)
     target_sources(obd_integration_tests PRIVATE integration/test_ublk_e2e.cpp)
     target_link_libraries(obd_integration_tests PRIVATE obd_ublk)
+    target_compile_definitions(obd_integration_tests
+        PRIVATE OBD_TEST_DEVICE_BIN="$<TARGET_FILE:obd-device>")
+    add_dependencies(obd_integration_tests obd-device)
 endif()
 catch_discover_tests(obd_integration_tests
     PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
