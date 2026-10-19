@@ -3,6 +3,7 @@
 
 #include "common/errors.hpp"
 #include "ublk/elio_bridge.hpp"
+#include "ublk/recovery.hpp"
 
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn.hpp>
@@ -127,18 +128,27 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
     std::exception_ptr failure;
     try {
         dev->ctrl_ = std::make_unique<Ctrl>();
-        // Announce the replacement server BEFORE parking FETCH commands:
-        // the device sits in QUIESCED while there is no server.
-        co_await elio::spawn_blocking(
-            [&] { dev->ctrl_->start_user_recovery(dev_id); });
-
-        for (uint16_t q = 0; q < params.nr_queues; ++q) {
-            auto queue = std::make_unique<Queue>(dev_id, q,
-                                                 params.queue_depth,
-                                                 params.max_io_buf_bytes);
-            queue->open();
-            dev->queues_.push_back(std::move(queue));
-        }
+        // Death detection/quiesce is asynchronous (not complete at waitpid).
+        // Retry only EBUSY until the driver is QUIESCED and the old cdev has
+        // closed. START must succeed BEFORE opening any replacement cdev:
+        // opening it first would itself keep START busy. See ADR-0010.
+        co_await detail::start_recovery_and_open_queues(
+            [&] {
+                return elio::spawn_blocking(
+                    [&] { dev->ctrl_->start_user_recovery(dev_id); });
+            },
+            [] { return std::chrono::steady_clock::now(); },
+            [](std::chrono::steady_clock::duration delay) {
+                return elio::time::sleep_for(delay);
+            },
+            [&] {
+                for (uint16_t q = 0; q < params.nr_queues; ++q) {
+                    auto queue = std::make_unique<Queue>(
+                        dev_id, q, params.queue_depth, params.max_io_buf_bytes);
+                    queue->open();
+                    dev->queues_.push_back(std::move(queue));
+                }
+            });
         for (auto& queue : dev->queues_) {
             Queue* q = queue.get();
             dev->threads_.emplace_back([q, &stop = dev->stop_] {
@@ -158,44 +168,46 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
             dev->bridge_tasks_.push_back(elio::spawn(
                 run_bridge, queue.get(), dev->src_.get(), &dev->stop_));
         }
-        // END_USER_RECOVERY completes the handshake once every tag has a
-        // parked FETCH (same EBUSY polling as START_DEV).
-        bool recovered = false;
-        for (int attempt = 0; attempt < 100 && !recovered; ++attempt) {
-            try {
-                co_await elio::spawn_blocking(
-                    [&] { dev->ctrl_->end_user_recovery(dev_id); });
-                recovered = true;
-            } catch (const std::system_error& e) {
-                if (e.code().value() != EBUSY) throw;
-            }
-            if (!recovered) {
-                co_await elio::time::sleep_for(
-                    std::chrono::milliseconds(50));
-            }
-        }
-        if (!recovered) {
-            throw error(EBUSY, "ublk END_USER_RECOVERY not ready after 5s");
-        }
-        dev->ctrl_->adopt_dev(dev_id);
-        dev->started_ = true;
-        // D3/FIX-2 grow-only baseline: a recovered device's kernel gendisk
-        // KEEPS the capacity it had when the previous server died
-        // (USER_RECOVERY never resets it, and attach issues no
-        // SET_PARAMS/UPDATE_SIZE), which may be LARGER than the
-        // create-time params. Seeding the baseline from the params would
-        // let a post-recovery "resize" pass the grow-only check and then
-        // actually SHRINK the gendisk via UPDATE_SIZE. Read the kernel's
-        // REAL current capacity (GET_PARAMS) instead; grow-only then
-        // rejects anything at or below it.
-        dev->cur_bytes_.store(
-            co_await elio::spawn_blocking([&]() -> uint64_t {
-                const ublk_params p = dev->ctrl_->get_params(dev_id);
-                return p.basic.dev_sectors * 512;
-            }),
-            std::memory_order_release);
-        ELIO_LOG_INFO("ublk device {} recovered ({}, {} bytes)",
-                      dev_id, dev->bdev_path(), dev->size_bytes());
+        co_await detail::finish_recovery(
+            [&]() -> elio::coro::task<void> {
+                // D3 grow-only baseline: USER_RECOVERY retains the REAL
+                // kernel capacity, which may exceed the create-time params.
+                // Reading it before END is safe: END does not change size.
+                dev->cur_bytes_.store(
+                    co_await elio::spawn_blocking([&]() -> uint64_t {
+                        const ublk_params p = dev->ctrl_->get_params(dev_id);
+                        return p.basic.dev_sectors * 512;
+                    }),
+                    std::memory_order_release);
+                ELIO_LOG_INFO("ublk dev {}: recovery prepared ({}, {} bytes)",
+                              dev_id, dev->bdev_path(), dev->size_bytes());
+            },
+            [&]() -> elio::coro::task<void> {
+                // END completes the handshake once every tag has a parked
+                // FETCH (same EBUSY polling as START_DEV).
+                bool recovered = false;
+                for (int attempt = 0; attempt < 100 && !recovered; ++attempt) {
+                    try {
+                        co_await elio::spawn_blocking(
+                            [&] { dev->ctrl_->end_user_recovery(dev_id); });
+                        recovered = true;
+                    } catch (const std::system_error& e) {
+                        if (e.code().value() != EBUSY) throw;
+                    }
+                    if (!recovered) {
+                        co_await elio::time::sleep_for(
+                            std::chrono::milliseconds(50));
+                    }
+                }
+                if (!recovered) {
+                    throw error(EBUSY,
+                                "ublk END_USER_RECOVERY not ready after 5s");
+                }
+            },
+            [&]() noexcept {
+                dev->ctrl_->adopt_dev(dev_id);
+                dev->started_ = true;
+            });
     } catch (...) {
         failure = std::current_exception();
     }

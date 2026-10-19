@@ -53,6 +53,12 @@ public:
     /// ADD_DEV; returns the driver-assigned device id. Throws obd::error.
     uint32_t add_dev(const DeviceParams& p);
 
+    /// GET_DEV_INFO returns the kernel's actual flags, including whether
+    /// ADD_DEV negotiated recovery support. Does not adopt the device.
+    /// Blocking cold path; coroutine callers must use spawn_blocking.
+    /// Throws obd::error on failure.
+    ublksrv_ctrl_dev_info get_dev_info(uint32_t dev_id);
+
     /// SET_PARAMS (basic + discard). Throws obd::error.
     void set_params(uint32_t dev_id, const DeviceParams& p);
 
@@ -78,7 +84,9 @@ public:
     ublk_params get_params(uint32_t dev_id);
 
     /// ADR-0010 recovery handshake for a replacement server process:
-    /// START_USER_RECOVERY announces the new server, END_USER_RECOVERY
+    /// START_USER_RECOVERY announces the new server (EBUSY until the old
+    /// cdev is closed and the driver is QUIESCED; Device::attach retries
+    /// before opening replacement queues). END_USER_RECOVERY
     /// returns the device to live once every queue re-parked its FETCH
     /// commands (EBUSY until then). Throw obd::error.
     void start_user_recovery(uint32_t dev_id);

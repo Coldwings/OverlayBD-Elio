@@ -41,9 +41,11 @@ public:
 
     /// ADR-0010: attaches to an EXISTING device created with
     /// UBLK_F_USER_RECOVERY after the previous server process died.
-    /// Sequence: START_USER_RECOVERY → open queues → queue threads re-park
-    /// FETCH for every tag → END_USER_RECOVERY (retrying EBUSY). The
-    /// params' queue geometry must match the original device's. Must be
+    /// Sequence: START_USER_RECOVERY (retrying EBUSY for up to 30s) → open
+    /// queues → queue threads re-park FETCH for every tag →
+    /// END_USER_RECOVERY (retrying EBUSY). The replacement must not open a
+    /// queue cdev before START succeeds. The params' queue geometry must
+    /// match the original device's. Must be
     /// awaited on the Elio scheduler. Throws obd::error on failure.
     /// D3: the grow-only resize baseline (`size_bytes`) is seeded from
     /// the kernel's REAL current capacity (Ctrl::get_params), NOT from
