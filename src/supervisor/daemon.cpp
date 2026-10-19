@@ -1534,7 +1534,13 @@ private:
         }
         {
             co_await mu_.lock();
-            children_.erase(id);
+            // Failed-create cleanup may independently remove this entry
+            // while destroy is admitted. A new create can then reuse its id;
+            // remove only the generation whose child we actually stopped.
+            auto it = children_.find(id);
+            if (it != children_.end() && it->second == entry) {
+                children_.erase(it);
+            }
             mu_.unlock();
         }
         co_return reply_ok({{"id", id}});

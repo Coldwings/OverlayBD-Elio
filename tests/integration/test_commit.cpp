@@ -1250,6 +1250,130 @@ TEST_CASE("supervisor: rejected commits preserve crash recovery",
 }
 
 
+TEST_CASE("supervisor: stale destroy leaves a recreated device generation registered",
+          "[supervisor]") {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    auto mock = std::make_shared<MockMkfs>();
+    mock->release = false;
+    mock->fail_rc = 1;
+    auto gate = std::make_shared<supervisor::detail::DaemonTestGate>(5s);
+    gate->arm("destroy_admitted");
+    auto signal_guard = block_daemon_signals();
+    supervisor::DaemonConfig cfg = commit_test_cfg(sock);
+    cfg.blank_dir = dir / "blank";
+    cfg.mkfs_runner = mock;
+    cfg.stop_timeout_sec = 1;
+
+    const int failures = run_daemon_case(cfg,
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            if (!std::filesystem::exists(s)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc = [&](const nlohmann::json& command) {
+                return nlohmann::json::parse(uds_rpc(s, command.dump() + "\n"));
+            };
+            nlohmann::json create_reply;
+            nlohmann::json destroy_reply;
+            std::string create_error;
+            std::string destroy_error;
+            std::thread create_thread;
+            std::thread destroy_thread;
+            std::shared_ptr<supervisor::Child> replacement;
+            auto finish = [&] {
+                mock->release = true;
+                gate->release();
+                if (create_thread.joinable()) create_thread.join();
+                if (destroy_thread.joinable()) destroy_thread.join();
+                if (!replacement) return;
+                // A failing baseline can lose B's registry entry. Clean only
+                // the retained Child generation, using the same synchronized
+                // signal/reap owner as the daemon, never a numeric PID lookup.
+                replacement->kill();
+                const auto deadline = std::chrono::steady_clock::now() + 5s;
+                while (!replacement->reaped() &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    replacement->try_reap();
+                    std::this_thread::sleep_for(1ms);
+                }
+                check(replacement->reaped(), "replacement fixture did not reap");
+            };
+            try {
+                create_thread = std::thread([&] {
+                    try {
+                        create_reply = rpc({{"cmd", "create"}, {"id", "x1"},
+                            {"blank", {{"size", kFakeVsize}, {"mkfs", "ext4"}}}});
+                    } catch (const std::exception& e) {
+                        create_error = e.what();
+                    }
+                });
+                for (int i = 0; i < 500 && mock->calls.load() == 0; ++i) {
+                    std::this_thread::sleep_for(10ms);
+                }
+                const bool in_mkfs = mock->calls.load() == 1;
+                check(in_mkfs, "first create never reached mkfs");
+                if (!in_mkfs) { finish(); return; }
+
+                destroy_thread = std::thread([&] {
+                    try {
+                        destroy_reply = rpc({{"cmd", "destroy"}, {"id", "x1"}});
+                    } catch (const std::exception& e) {
+                        destroy_error = e.what();
+                    }
+                });
+                const bool admitted = gate->wait();
+                check(admitted, "destroy admission gate was not hit");
+                if (!admitted) { finish(); return; }
+
+                // Old destroy retains A but has not begun its stop. Failed
+                // mkfs now stops/removes A independently while destroy is held.
+                mock->release = true;
+                create_thread.join();
+                check(create_error.empty(), "failed-create RPC threw");
+                check(!create_reply.value("ok", true), "mkfs create succeeded");
+                check(create_reply.value("error", "").find("mkfs") != std::string::npos,
+                      "failed-create error did not report mkfs");
+                const bool removed = !rpc({{"cmd", "status"}, {"id", "x1"}})
+                                          .value("ok", true);
+                check(removed, "failed-create cleanup retained A in registry");
+                if (!removed) { finish(); return; }
+
+                const auto fresh = rpc({{"cmd", "create"}, {"id", "x1"},
+                                       {"blank", {{"size", kFakeVsize}}}});
+                check(fresh.value("ok", false), "replacement create failed");
+                replacement = gate->spawned_child(1).lock();
+                check(static_cast<bool>(replacement), "replacement Child owner missing");
+                if (!replacement) { finish(); return; }
+                const int fresh_pid = fresh.value("pid", -1);
+                check(fresh_pid == replacement->pid(), "replacement owner identity mismatch");
+
+                gate->release();
+                destroy_thread.join();
+                check(destroy_error.empty(), "stale destroy RPC threw");
+                check(destroy_reply.value("ok", false), "stale destroy failed");
+                const auto status = rpc({{"cmd", "status"}, {"id", "x1"}});
+                check(status.value("ok", false), "stale destroy erased replacement entry");
+                check(status.value("pid", -1) == fresh_pid, "replacement PID changed");
+                check(status.value("state", "") == "ready", "replacement is not ready");
+                const auto resized = rpc({{"cmd", "resize"}, {"id", "x1"},
+                                          {"size", kFakeVsize + 4096}});
+                check(resized.value("ok", false), "replacement cannot serve resize");
+                check(rpc({{"cmd", "destroy"}, {"id", "x1"}}).value("ok", false),
+                      "replacement cannot be destroyed normally");
+                finish();
+            } catch (...) {
+                finish();
+                throw;
+            }
+        }, gate);
+    CHECK_FALSE(gate->timeout());
+    REQUIRE(failures == 0);
+}
+
 TEST_CASE("supervisor: stale blank-create failure leaves a newer device alone",
           "[supervisor]") {
     // F3 regression: a create can sit inside its (up to 300 s) mkfs step
