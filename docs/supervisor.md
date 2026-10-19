@@ -609,6 +609,10 @@ completion barrier. Reaping proves process exit, not successful kernel
 - `static std::unique_ptr<Child> Child::spawn(const ChildSpec&)` — forks
   and execs per the spawning contract above; the parent end of the channel
   is set `O_NONBLOCK`. Throws `obd::error` on socketpair/fork failure.
+  Argument preparation and owner allocation may also throw. Returning the
+  owner does not confirm exec or readiness: an exec failure is observed
+  after collection through the child's status (`exit_code == 127`), rather
+  than thrown synchronously by `spawn`.
 - `~Child()` — closes the control fd if held; if the process is still
   unreaped: best-effort `SIGKILL` + blocking `waitpid` (retrying `EINTR`).
   Never signals or waits on an already reaped PID. Never throws.
