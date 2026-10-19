@@ -128,9 +128,28 @@ UBLK_F_USER_RECOVERY_REISSUE` when `DeviceParams::enable_recovery` (the
 default, driven by `ublkConfig.enableRecovery`): the kernel then keeps the
 device QUIESCED when its server process dies and reissues outstanding I/O
 to a replacement. `Ctrl::start_user_recovery` / `end_user_recovery` drive
-the handshake and `Device::attach` is the replacement-side path: open
-`/dev/ublkcN`, `START_USER_RECOVERY`, re-park FETCH for every tag on every
-queue, `END_USER_RECOVERY` (same EBUSY polling as `START_DEV`). `ADD_DEV`
+the handshake and `Device::attach` is the replacement-side path:
+`START_USER_RECOVERY`, open `/dev/ublkcN`, re-park FETCH for every tag on
+every queue, then `END_USER_RECOVERY`. Both handshake steps retry `EBUSY`,
+but wait for different conditions:
+
+- `START_USER_RECOVERY` waits for the old server's cdev to close and for
+  the driver to enter **QUIESCED**, using one 30-second monotonic retry
+  budget and waits of at most 50 ms. Process death/reaping does not imply
+  that the driver's asynchronous quiesce has finished: on Linux 6.6 its
+  periodic death detection can delay readiness by about five seconds.
+  The 30-second budget is an application policy allowing margin for that
+  work and scheduler load, not a kernel-mandated timeout. Command time
+  and timer delays consume the same budget; an already-running control
+  command is not preempted. The replacement must not open any queue cdev
+  before START succeeds, as an open cdev itself makes START return `EBUSY`.
+- `END_USER_RECOVERY` waits until every replacement queue tag has a parked
+  FETCH, retrying up to 100 times with 50 ms waits, like `START_DEV`.
+
+Other errors fail immediately; exhausting START's budget reports
+`ublk START_USER_RECOVERY not ready after 30s`. The replacement adopts
+cleanup ownership only after END succeeds, so a failed START does not
+delete the existing kernel device. `ADD_DEV`
 falls back to a non-recoverable device (with a warning) when the kernel
 rejects the flags with `EINVAL`.
 
@@ -318,6 +337,13 @@ Full lifecycle of one image as one ublk device. Non-copyable.
   `obd::error` on any setup failure (partial state is torn down via
   `stop_async()` and off-worker destruction before the original error is
   rethrown).
+- `static elio::coro::task<std::unique_ptr<Device>> attach(uint32_t,
+  const DeviceParams&, source::BlobSourcePtr)` — attach a replacement to
+  an existing recoverable device. Retry START's transient `EBUSY` against
+  a 30-second steady-clock deadline before opening queues; re-park all
+  FETCH commands and retry END's `EBUSY` up to 100 times with 50 ms waits.
+  Queue geometry must match the original device. Other control errors
+  propagate immediately through the same partial-state cleanup as create.
 - `uint64_t size_bytes() const` — the current device capacity in bytes
   (the D3 grow-only resize baseline: params-derived on create, kernel-
   derived via `Ctrl::get_params` on a recovery attach — which may exceed
@@ -434,6 +460,21 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 `OBD_ENABLE_UBLK` is on); the kernel-dependent end-to-end test lives in
 `tests/integration/test_ublk_e2e.cpp`.
 
+- `ublk: recovery waits for quiescence before opening replacement queues` —
+  injected command, steady clock and awaitable sleep return `EBUSY` three
+  times before success; the continuation cannot open queues while START
+  is still busy. No privileged device or actual timer wait is required.
+- `ublk: recovery does not retry nonbusy failures` — `EINVAL`, `EACCES`
+  and `ECANCELED` propagate on the first attempt with no sleep or queue open.
+- `ublk: recovery busy retries share one monotonic deadline` — time spent
+  in each control command consumes the original budget; persistent busy
+  fails with the documented errno/message without opening queues.
+- `ublk: recovery caps its final wait and never retries after expiry` —
+  a final 20 ms budget produces only a 20 ms wait, then timeout with no
+  post-deadline command.
+- `ublk: replacement queue open failure never repeats accepted recovery` —
+  even `EBUSY` from opening replacement queues propagates immediately;
+  START may not be repeated once it has reset the old queue state.
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
   Device destruction, with one worker and one blocking thread.
@@ -490,6 +531,11 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   ENOTSUPP/524 or EOPNOTSUPP/95); unavailable control access fails that step.
   A supported pass and an unsupported skip are reported separately in the
   retained grow log. See `docs/testing.md` for timeouts and CI evidence.
+- `integration: ublk device survives server death via USER_RECOVERY` —
+  privileged E2E: kill and reap the original server, immediately start a
+  replacement without a quiesce delay in the test, then verify source
+  bytes through the surviving block device. This exercises START-before-
+  open ordering and the actual kernel retry/timer path.
 
 Run: `ctest --test-dir build --output-on-failure` (the E2E test requires
 root or `CAP_SYS_ADMIN` plus a loaded `ublk_drv` to actually execute).

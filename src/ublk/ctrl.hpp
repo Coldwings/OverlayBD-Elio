@@ -78,7 +78,9 @@ public:
     ublk_params get_params(uint32_t dev_id);
 
     /// ADR-0010 recovery handshake for a replacement server process:
-    /// START_USER_RECOVERY announces the new server, END_USER_RECOVERY
+    /// START_USER_RECOVERY announces the new server (EBUSY until the old
+    /// cdev is closed and the driver is QUIESCED; Device::attach retries
+    /// before opening replacement queues). END_USER_RECOVERY
     /// returns the device to live once every queue re-parked its FETCH
     /// commands (EBUSY until then). Throw obd::error.
     void start_user_recovery(uint32_t dev_id);

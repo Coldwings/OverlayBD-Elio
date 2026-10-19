@@ -3,6 +3,7 @@
 
 #include "common/errors.hpp"
 #include "ublk/elio_bridge.hpp"
+#include "ublk/recovery.hpp"
 
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn.hpp>
@@ -127,18 +128,27 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
     std::exception_ptr failure;
     try {
         dev->ctrl_ = std::make_unique<Ctrl>();
-        // Announce the replacement server BEFORE parking FETCH commands:
-        // the device sits in QUIESCED while there is no server.
-        co_await elio::spawn_blocking(
-            [&] { dev->ctrl_->start_user_recovery(dev_id); });
-
-        for (uint16_t q = 0; q < params.nr_queues; ++q) {
-            auto queue = std::make_unique<Queue>(dev_id, q,
-                                                 params.queue_depth,
-                                                 params.max_io_buf_bytes);
-            queue->open();
-            dev->queues_.push_back(std::move(queue));
-        }
+        // Death detection/quiesce is asynchronous (not complete at waitpid).
+        // Retry only EBUSY until the driver is QUIESCED and the old cdev has
+        // closed. START must succeed BEFORE opening any replacement cdev:
+        // opening it first would itself keep START busy. See ADR-0010.
+        co_await detail::start_recovery_and_open_queues(
+            [&] {
+                return elio::spawn_blocking(
+                    [&] { dev->ctrl_->start_user_recovery(dev_id); });
+            },
+            [] { return std::chrono::steady_clock::now(); },
+            [](std::chrono::steady_clock::duration delay) {
+                return elio::time::sleep_for(delay);
+            },
+            [&] {
+                for (uint16_t q = 0; q < params.nr_queues; ++q) {
+                    auto queue = std::make_unique<Queue>(
+                        dev_id, q, params.queue_depth, params.max_io_buf_bytes);
+                    queue->open();
+                    dev->queues_.push_back(std::move(queue));
+                }
+            });
         for (auto& queue : dev->queues_) {
             Queue* q = queue.get();
             dev->threads_.emplace_back([q, &stop = dev->stop_] {

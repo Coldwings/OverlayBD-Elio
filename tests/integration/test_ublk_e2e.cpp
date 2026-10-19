@@ -416,13 +416,13 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
     REQUIRE(::kill(child, SIGKILL) == 0);
     int wstatus = 0;
     REQUIRE(::waitpid(child, &wstatus, 0) == child);
-    // Let the kernel settle (quiesce, or teardown without recovery).
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     if (::access(bdev.c_str(), F_OK) != 0) {
         SKIP("kernel without USER_RECOVERY support");
     }
 
-    // Attach a replacement server (this process) and keep reading.
+    // Attach immediately: waitpid does not wait for the driver's delayed
+    // quiesce work (Linux 6.6 can take about five seconds). Device::attach
+    // must wait out EBUSY before opening replacement queue cdevs itself.
     stage("recovery: attach");
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto data = test::pattern_bytes(512 * 64, 84);
