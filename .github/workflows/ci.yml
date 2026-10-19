@@ -56,6 +56,7 @@ jobs:
         run: >
           cmake -S . -B build -G Ninja
           -DOBD_BUILD_TESTS=ON
+          -DOBD_BUILD_BENCHMARKS=ON
           -DOBD_ENABLE_UBLK=ON
           -DOBD_ENABLE_LIBE2FS_BACKEND=ON
           -DOBD_WARNINGS_AS_ERRORS=ON
@@ -96,6 +97,7 @@ jobs:
         run: >
           cmake -S . -B build-builtin -G Ninja
           -DOBD_BUILD_TESTS=ON
+          -DOBD_BUILD_BENCHMARKS=OFF
           -DOBD_ENABLE_UBLK=OFF
           -DOBD_ENABLE_LIBE2FS_BACKEND=OFF
           -DOBD_WARNINGS_AS_ERRORS=ON
@@ -170,6 +172,7 @@ jobs:
         run: >
           cmake -S . -B build -G Ninja
           -DOBD_BUILD_TESTS=ON
+          -DOBD_BUILD_BENCHMARKS=OFF
           -DOBD_ENABLE_UBLK=ON
           -DOBD_ENABLE_LIBE2FS_BACKEND=OFF
 
