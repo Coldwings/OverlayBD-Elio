@@ -5,18 +5,16 @@
 #include "supervisor/daemon_test_hooks.hpp"
 #include "supervisor/protocol.hpp"
 
-#ifdef OBD_TEST_DEVICE_BIN
-#include "ublk/ctrl.hpp"
-#endif
-
 #include "../support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <nlohmann/json.hpp>
 
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -24,8 +22,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #ifndef OBD_TEST_FAKE_DEVICE_BIN
 #define OBD_TEST_FAKE_DEVICE_BIN "obd-test-fake-device"
@@ -35,6 +36,58 @@ using namespace obd;
 using namespace std::chrono_literals;
 
 namespace {
+
+// O_PATH pins pathname identity without invoking a block/character driver's
+// open or doing device I/O. Keeping the inode referenced also prevents inode
+// reuse from making a later generation appear to be the original node.
+class FixtureNodeGeneration {
+public:
+    explicit FixtureNodeGeneration(std::string path) : path_(std::move(path)) {
+        fd_ = ::open(path_.c_str(), O_PATH | O_CLOEXEC);
+        if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "pin " + path_);
+        if (::fstat(fd_, &identity_) != 0) {
+            const int error = errno;
+            ::close(fd_);
+            throw std::system_error(error, std::generic_category(), "identify " + path_);
+        }
+    }
+    ~FixtureNodeGeneration() { if (fd_ >= 0) ::close(fd_); }
+    FixtureNodeGeneration(const FixtureNodeGeneration&) = delete;
+    FixtureNodeGeneration& operator=(const FixtureNodeGeneration&) = delete;
+    FixtureNodeGeneration(FixtureNodeGeneration&& other) noexcept
+        : path_(std::move(other.path_)), fd_(std::exchange(other.fd_, -1)),
+          identity_(other.identity_) {}
+
+    bool present() const {
+        struct stat current{};
+        if (::stat(path_.c_str(), &current) != 0) {
+            if (errno == ENOENT || errno == ENOTDIR) return false;
+            throw std::system_error(errno, std::generic_category(), "observe " + path_);
+        }
+        return current.st_dev == identity_.st_dev && current.st_ino == identity_.st_ino;
+    }
+private:
+    std::string path_;
+    int fd_ = -1;
+    struct stat identity_{};
+};
+
+#ifdef OBD_TEST_DEVICE_BIN
+struct UblkFixtureGeneration {
+    int id;
+    std::vector<FixtureNodeGeneration> nodes;
+    explicit UblkFixtureGeneration(int number) : id(number) {
+        const std::string suffix = std::to_string(id);
+        nodes.emplace_back("/sys/class/ublk-char/ublkc" + suffix);
+        nodes.emplace_back("/dev/ublkc" + suffix);
+        nodes.emplace_back("/dev/ublkb" + suffix);
+    }
+    bool removed() const {
+        for (const auto& node : nodes) if (node.present()) return false;
+        return true;
+    }
+};
+#endif
 
 struct ReapSignalMask {
     sigset_t previous{};
@@ -276,6 +329,23 @@ void check_reap_barrier(const std::string& operation) {
 
 }  // namespace
 
+TEST_CASE("supervisor: released device node checks preserve a replacement generation",
+          "[supervisor][fixture-ownership]") {
+    test::TempDir directory;
+    const std::string path = directory / "ublkc7";
+    test::write_file(path, {1});
+    FixtureNodeGeneration original(path);
+    CHECK(original.present());
+    // Regular files deterministically model pathname reuse without creating
+    // or deleting any host ublk ID. The old O_PATH pin prevents inode reuse.
+    REQUIRE(std::filesystem::remove(path));
+    test::write_file(path, {2});
+    CHECK_FALSE(original.present());
+    CHECK(std::filesystem::exists(path));
+    std::ifstream replacement(path, std::ios::binary);
+    CHECK(replacement.get() == 2);
+}
+
 TEST_CASE("supervisor: destroy waits for reap after control EOF", "[supervisor][reap-barrier]") {
     check_reap_barrier("destroy");
 }
@@ -319,28 +389,16 @@ TEST_CASE("integration: supervisor reaps children before releasing ublk devices"
     std::atomic<int> daemon_result{-1};
     std::vector<std::string> failures;
     std::string daemon_error;
-    std::vector<int> live_ids;
+    std::vector<UblkFixtureGeneration> live_generations;
     auto check = [&](bool condition, std::string error) {
         if (!condition) failures.emplace_back(std::move(error));
     };
-    auto absent = [](int id) {
-        const std::string number = std::to_string(id);
-        return !std::filesystem::exists("/sys/class/ublk-char/ublkc" + number) &&
-               !std::filesystem::exists("/dev/ublkc" + number) &&
-               !std::filesystem::exists("/dev/ublkb" + number);
-    };
-    // This runs on the fixture thread after the child reap, and only for
-    // IDs allocated by this test which have not yet been released. It
-    // prevents a failing regression from polluting the host's ublk state.
-    auto verify_removed = [&](int id) {
-        const bool removed = absent(id);
-        check(removed, "kernel ublk device survived child reap: " + std::to_string(id));
-        if (!removed) {
-            ublk::Ctrl cleanup;
-            cleanup.stop_dev(static_cast<uint32_t>(id));
-            cleanup.del_dev(static_cast<uint32_t>(id));
-            check(wait_for_reap_fixture([&] { return absent(id); }), "owned ublk fixture cleanup failed");
-        }
+    // Observe only the pinned generation. A successful lifecycle operation
+    // releases its numeric ID, so even a failed check cannot authorize a
+    // fallback STOP/DEL of whichever device now occupies that number.
+    auto verify_removed = [&](const UblkFixtureGeneration& generation) {
+        check(generation.removed(), "original kernel ublk nodes survived child reap: " +
+                                    std::to_string(generation.id));
     };
     std::thread client([&] {
         try {
@@ -358,16 +416,16 @@ TEST_CASE("integration: supervisor reaps children before releasing ublk devices"
             };
             for (int cycle = 0; cycle < 5; ++cycle) {
                 const int id = create("cycle");
-                live_ids.push_back(id);
+                live_generations.emplace_back(id);
                 check(rpc({{"cmd", "destroy"}, {"id", "cycle"}}).value("ok", false), "destroy failed");
-                verify_removed(id);
-                live_ids.clear();
+                verify_removed(live_generations.back());
+                live_generations.clear();
             }
             const int committed_id = create("commit");
-            live_ids.push_back(committed_id);
+            live_generations.emplace_back(committed_id);
             check(rpc({{"cmd", "commit"}, {"id", "commit"}}).value("ok", false), "commit failed");
-            verify_removed(committed_id);
-            live_ids.clear();
+            verify_removed(live_generations.back());
+            live_generations.clear();
             check(rpc({{"cmd", "destroy"}, {"id", "commit"}}).value("ok", false), "committed entry removal failed");
 
             // Hold the failed mkfs until the fixture has captured this
@@ -387,16 +445,16 @@ TEST_CASE("integration: supervisor reaps children before releasing ublk devices"
                     failed_id = supervisor::dev_id_from_bdev_path(status.value("device", ""));
                     return failed_id >= 0;
                 }), "failed create did not become ready");
+                if (failed_id >= 0) live_generations.emplace_back(failed_id);
             } catch (const std::exception& e) { check(false, e.what()); }
-            if (failed_id >= 0) live_ids.push_back(failed_id);
             mkfs->release.store(true);
             failing.join();
             check(create_error.empty(), create_error);
             check(!failed_create.value("ok", true), "failed mkfs was reported successful");
-            if (failed_id >= 0) verify_removed(failed_id);
-            live_ids.clear();
+            if (!live_generations.empty()) verify_removed(live_generations.back());
+            live_generations.clear();
             for (int child = 0; child < 3; ++child) {
-                live_ids.push_back(create("shutdown" + std::to_string(child)));
+                live_generations.emplace_back(create("shutdown" + std::to_string(child)));
             }
         } catch (const std::exception& e) { check(false, e.what()); }
         mkfs->release.store(true);
@@ -419,7 +477,7 @@ TEST_CASE("integration: supervisor reaps children before releasing ublk devices"
         });
     } catch (const std::exception& e) { daemon_error = e.what(); }
     client.join();
-    for (const int id : live_ids) verify_removed(id);
+    for (const auto& generation : live_generations) verify_removed(generation);
     INFO(daemon_error);
     for (const auto& failure : failures) WARN(failure);
     CHECK(failures.empty());

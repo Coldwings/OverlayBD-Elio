@@ -782,13 +782,24 @@ pre-parse needed).
 
 ## Testing
 
-The daemon-lifetime fixture waits for a positive fake-child PID to be
-published, signals through a pidfd after checking child ownership, and
-confirms reaping (or that the daemon already reaped it) after the runtime
-and client thread finish. PID publication and final reaping each have a
-five-second fixture deadline; cleanup errors fail the test. The early
-signal also releases monitors left behind by a broken daemon. These waits
-run on fixture threads and do not define a product shutdown deadline.
+The daemon-lifetime fixture records each exact weak `Child` owner before
+registry publication can expose it to the reaper. Cleanup locks that
+generation and uses its synchronized signal/reap methods, never a numeric
+PID lookup or an independent `waitpid`. An already-reaped or expired
+generation cannot authorize a signal to a replacement process. Final
+reaping has a five-second fixture deadline after the runtime and client
+thread finish; cleanup errors fail the test. The early signal also
+releases monitors left behind by a broken daemon. These waits run on
+fixture threads and do not define a product shutdown deadline.
+
+The real-device teardown fixture pins its ready generation's sysfs,
+character and block node identities with `O_PATH` before teardown. These
+handles do not invoke device open or I/O. Post-teardown checks observe
+only that generation; another device appearing at the released numeric ID
+is not an original-node leak. Failed checks remain visible and never
+trigger a numeric fallback `STOP_DEV`/`DEL_DEV` against a possible
+replacement device. A nonprivileged pathname-replacement test covers
+that observation rule without forcing global device-ID reuse.
 
 The controlled recovery tests pause real command/monitor paths on a
 four-worker runtime, while a synchronous client kills the fake child and
@@ -823,6 +834,8 @@ commands and monitors to distinct workers. No kernel ublk is required.
 | `supervisor: trace stop rejects malformed success metadata` | A matching-sequence trace_stop success with wrong-typed metadata fields is returned as a clean error and keeps the live trace recording. |
 | `supervisor: trace stop history survives child EOF` | A completed trace_stop publishes stopped history that child EOF must preserve instead of overwriting as lost. |
 | `supervisor: shutdown drains a monitor after its entry was erased` | Hold EOF cleanup after a successful destroy; shutdown must retain the daemon until the erased entry's monitor departs. |
+| `supervisor: fixture cleanup keeps the original child generation` | Cleanup of a reaped and then expired weak owner leaves a separately owned live replacement untouched; all owned processes drain before assertions. |
+| `supervisor: released device node checks preserve a replacement generation` | A pinned original inode disappears while a new file occupies its old pathname; read-only teardown checks preserve the replacement. |
 | `supervisor: destroy waits for reap after control EOF` | A live fake closes its channel while final cleanup is held; destroy cannot finish or kill it before release. |
 | `supervisor: control EOF stays distinct from a confirmed reap` | EOF fires only the liveness event while the process is alive; actual collection publishes a durable exit code that late monitor lines cannot overwrite. |
 | `supervisor: confirmed reap retries failed lifecycle notifications` | A native dispatch-allocation failure retains the actual reap and pending waiter; retry releases all lifecycle observers. |

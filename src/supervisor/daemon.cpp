@@ -762,6 +762,7 @@ private:
                 // Keep the old owner alive until after mu_ is released:
                 // Child destruction can kill/waitpid and must not block
                 // the registry (nor may spawn or the fd handoff run there).
+                if (test_gate_) test_gate_->record_child(next);
                 std::shared_ptr<Child> previous;
                 co_await mu_.lock();
                 {
@@ -976,6 +977,7 @@ private:
             co_return reply_error(std::string("spawn failed: ") + e.what());
         }
         std::shared_ptr<Child> child = entry->child;
+        if (test_gate_) test_gate_->record_child(child);
         {
             co_await mu_.lock();
             children_[id] = entry;
