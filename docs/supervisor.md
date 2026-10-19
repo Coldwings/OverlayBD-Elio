@@ -684,6 +684,18 @@ Blank-born devices commit exactly like image-born ones: their upper path
 and kind are recorded at create time (from the workspace layout, no config
 pre-parse needed).
 
+Create admission reserves an absent ID before asynchronous configuration or
+child setup. Another create for that ID receives the existing duplicate-ID
+error before spawning a child or initializing a workspace. Unrelated IDs
+continue independently; the registry mutex covers only admission and
+publication. Private reservations never appear in list/status as childless
+entries. Publication checks the reservation owner and inserts a complete
+entry atomically, then releases the reservation. Failed setup invalidates
+only its own token; an unpublished child's final owner kills/reaps it before
+that token expires. Inactive weak reservations are pruned by the next create.
+Once published, ordinary registry ownership and existing failure/teardown
+rules apply, including when the originating create remains inside mkfs.
+
 ## Invariants & Guarantees
 
 - **Isolation**: every device is a separate process; a child crash, hang,
@@ -839,6 +851,9 @@ commands and monitors to distinct workers. No kernel ublk is required.
 | `supervisor: trace stop history survives child EOF` | A completed trace_stop publishes stopped history that child EOF must preserve instead of overwriting as lost. |
 | `supervisor: shutdown drains a monitor after its entry was erased` | Hold EOF cleanup after a successful destroy; shutdown must retain the daemon until the erased entry's monitor departs. |
 | `supervisor: fixture cleanup keeps the original child generation` | Cleanup of a reaped and then expired weak owner leaves a separately owned live replacement untouched; all owned processes drain before assertions. |
+| `supervisor: duplicate create admission cannot spawn or replace an active id` | Hold admitted A before setup; B for the same ID is rejected without a child/workspace, while another ID reaches ready and serves commands. |
+| `supervisor: failed create admission permits retry without publishing a placeholder` | Inject a preparation allocation failure after admission; public lookup stays empty and a later same-ID create succeeds. |
+| `supervisor: unpublished create failure reaps its child before admission reuse` | An early pinned pidfd proves an unpublished child exits before failed-create reply and the next same-ID create. |
 | `supervisor: released device node checks preserve a replacement generation` | A pinned original inode disappears while a new file occupies its old pathname; read-only teardown checks preserve the replacement. |
 | `supervisor: destroy waits for reap after control EOF` | A live fake closes its channel while final cleanup is held; destroy cannot finish or kill it before release. |
 | `supervisor: control EOF stays distinct from a confirmed reap` | EOF fires only the liveness event while the process is alive; actual collection publishes a durable exit code that late monitor lines cannot overwrite. |
