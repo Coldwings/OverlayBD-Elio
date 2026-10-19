@@ -291,18 +291,42 @@ elio::coro::task<void> run_bridge(Queue* q, source::BlobSource* src,
 Runs the bridge loop for one queue against the block source until `stop`
 becomes true (or the efd watch errors out on teardown). Launch an independent
 joinable task from the device process; one bridge per queue. Waits on
-`q->elio_efd()`, drains `try_pop_request`, and fans each request out as its
-own `handle_io` coroutine implementing the op dispatch table above.
+`q->elio_efd()` and drains `try_pop_request`. On a tag's first request, it
+admits one long-lived handler through native TaskGroup and binds that handler
+to the bridge's worker. Later requests for that tag use a native event rather
+than another scheduler admission. Tags remain independent: a source await on
+one tag does not serialize the other tags (ADR-0021).
 `-EINTR` / `-EAGAIN` on the eventfd read are retried.
 Each bridge owns its tag handlers in an Elio collect-all TaskGroup and
 joins them before returning. Ordinary stop wakes the bridge without
-cancelling admitted handlers. An admitted request's completion token posts
-`-EIO` if its child is rejected or cancelled before invocation; a source
-exception also posts `-EIO`. Lifetime ownership stays with Elio, while the
-token records the kernel completion obligation (ADR-0006).
+cancelling admitted source IO; parked handlers are signaled to leave. Each
+handler checks the sticky close predicate before parking again, so a pending
+request and close notification may coalesce without requiring a second wake.
+Accepted source work still finishes before that handler leaves. Each request
+checks the group's cooperative cancellation token before invoking
+the source, including requests on a previously used tag. An admitted request's
+completion token posts `-EIO` if its initial child is rejected or skipped;
+a source exception also posts `-EIO`. A failed initial handler can be admitted
+again for a later request. Lifetime ownership stays with Elio, while the token
+records the kernel completion obligation (ADR-0006).
+The bridge and handlers access tag state on the bridge worker. A source may
+deliberately migrate while running; its handler restores and checks the owner
+before clearing the busy state or publishing completion. Failed/skipped child
+destructors on foreign workers publish only atomic failure facts and notify
+the bridge; they do not mutate owner-only tag state. Failure facts are consumed
+before admitting a reused tag. Native event dispatch allocation failure retains
+the request and retries notification from the same bridge frame, including
+stop notifications. Sustained allocation failure can extend this drain.
 If the fallback completion itself cannot be enqueued, the token marks the
 queue failed and wakes its waiter. The same failure publication is used after
-the bridge drains admitted handlers when a loop exception escapes.
+the bridge drains admitted handlers when a loop exception escapes, and on
+cold handler-pool setup failure.
+
+This placement policy retains the dedicated queue thread and both eventfd
+handoffs in ADR-0006. It does not make the whole request path allocation-free:
+source tasks and unset native event waits can still allocate. Performance issue
+[#120](https://github.com/Coldwings/OverlayBD-Elio/issues/120) also requires
+evaluation of those remaining handoffs and concurrent workload trade-offs.
 
 ### `src/ublk/device.hpp` — `obd::ublk::Device`
 
@@ -434,6 +458,24 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 `OBD_ENABLE_UBLK` is on); the kernel-dependent end-to-end test lives in
 `tests/integration/test_ublk_e2e.cpp`.
 
+- `ublk: repeated tag reads stay on the bridge worker` — four runtime workers
+  retain source entry/resume on the explicitly selected bridge worker.
+- `ublk: a reused tag does not readmit a scheduler child` — after a first
+  successful read, another read succeeds without consuming an armed native
+  scheduler-admission rejection.
+- `ublk: a warm tag rejects new reads after parent cancellation` — the reused
+  handler completes with `-EIO` and does not reenter its source.
+- `ublk: a tag returns to its bridge after source migration` — a source moves
+  to another worker; successive requests still enter on the bridge worker.
+- `ublk: a tag retries after its initial child admission is rejected` — native
+  scheduler rejection completes the first request with `-EIO`; a later request
+  starts a new handler and completes normally.
+- `ublk: tag notification allocation failure retains reads and stop` — actual
+  native event dispatch allocation failures on request delivery and stop are
+  each observed once; the source completes and every handler drains.
+- `ublk: stop drains a request before its tag consumes the wake` — cold and
+  reused tags receive request and close notifications before consuming either;
+  accepted reads complete and shutdown drains without a rescue notification.
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
   Device destruction, with one worker and one blocking thread.

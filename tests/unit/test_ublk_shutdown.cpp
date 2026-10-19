@@ -8,6 +8,7 @@
 #include "../runtime_faults.hpp"
 
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/affinity.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
 #include <elio/sync/event.hpp>
@@ -19,6 +20,7 @@
 #include <poll.h>
 
 #include <cstdlib>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <exception>
@@ -60,6 +62,20 @@ struct DeviceTestAccess {
             run_bridge, q, dev.src_.get(), &dev.stop_));
     }
 
+    static void start_on(Device& dev, size_t owner) {
+        dev.bridge_tasks_.reserve(dev.bridge_tasks_.size() + 1);
+        dev.bridge_tasks_.push_back(
+            elio::runtime::scheduler::current()->go_joinable_to(
+                owner, run_bridge, dev.queues_.front().get(),
+                dev.src_.get(), &dev.stop_));
+    }
+
+    static void clear_completions(Device& dev) {
+        auto& q = *dev.queues_.front();
+        std::lock_guard lock(q.mu_);
+        q.done_.clear();
+    }
+
     static elio::coro::task<void> cleanup_failed(
         std::unique_ptr<Device> dev, std::exception_ptr failure) {
         co_await Device::cleanup_failed(std::move(dev), failure);
@@ -96,6 +112,22 @@ struct DeviceTestAccess {
     static int done_efd(Device& dev) { return queue(dev).done_efd_; }
     static void set_completion_enqueue_hook(Device& dev, std::function<void()> hook) {
         queue(dev).completion_enqueue_hook_for_test_ = std::move(hook);
+    }
+    static void stop_after_admission(Device& dev, bool& admitted) {
+        queue(dev).bridge_admission_hook_for_test_ = [&dev, &admitted] {
+            admitted = true;
+            dev.stop_.store(true);
+            queue(dev).notify_elio();
+        };
+    }
+    static bool rescue_closing_tag(Device& dev) {
+        // Called with no suspension on the sole bridge worker. TagPool clears
+        // this pointer before freeing its events, even before the outer
+        // bridge join handle has reported final destruction.
+        auto* ready = queue(dev).bridge_ready_for_test_;
+        if (!ready) return false;
+        ready->set();
+        return true;
     }
 };
 
@@ -174,7 +206,301 @@ elio::runtime::run_config one_worker() {
     return config;
 }
 
+struct LocalityState {
+    std::atomic<unsigned> calls{0};
+    std::array<size_t, 8> before{};
+    std::array<size_t, 8> after{};
+    LocalityState() {
+        before.fill(elio::coro::NO_AFFINITY);
+        after.fill(elio::coro::NO_AFFINITY);
+    }
+};
+
+class LocalitySource final : public obd::source::BlobSource {
+public:
+    explicit LocalitySource(LocalityState& state, bool migrate = false)
+        : state_(state), migrate_(migrate) {}
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                   uint64_t) override {
+        const auto index = state_.calls.fetch_add(1);
+        if (index >= state_.before.size()) co_return -EIO;
+        state_.before[index] = elio::current_worker_id();
+        if (migrate_) co_await elio::set_affinity(1);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        state_.after[index] = elio::current_worker_id();
+        std::memset(buf, 0x62, count);
+        co_return static_cast<ssize_t>(count);
+    }
+    uint64_t size() const noexcept override { return 4096; }
+    std::string_view label() const noexcept override { return "locality-read"; }
+private:
+    LocalityState& state_;
+    bool migrate_;
+};
+
+elio::coro::task<bool> await_test_completion(obd::ublk::Device& dev) {
+    for (unsigned attempt = 0; attempt != 5000; ++attempt) {
+        if (!obd::ublk::DeviceTestAccess::completions(dev).empty()) co_return true;
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+    }
+    co_return false;
+}
+
 }  // namespace
+
+TEST_CASE("ublk: repeated tag reads stay on the bridge worker", "[ublk][locality]") {
+    using obd::ublk::DeviceTestAccess;
+    LocalityState state;
+    elio::runtime::run_config config;
+    config.num_threads = 4;
+    config.blocking_threads = 1;
+    bool completed = true;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(state));
+        DeviceTestAccess::start_on(*dev, 0);
+        for (unsigned read = 0; read != 4; ++read) {
+            DeviceTestAccess::enqueue_read(*dev);
+            if (!co_await await_test_completion(*dev)) {
+                completed = false;
+                break;
+            }
+            completed = completed && DeviceTestAccess::completed_read(*dev);
+            DeviceTestAccess::clear_completions(*dev);
+        }
+        co_await dev->stop_async();
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, config);
+    CHECK(completed);
+    REQUIRE(state.calls.load() == 4);
+    for (unsigned read = 0; read != 4; ++read) {
+        CAPTURE(read);
+        CHECK(state.before[read] == 0);
+        CHECK(state.after[read] == 0);
+    }
+}
+
+TEST_CASE("ublk: a reused tag does not readmit a scheduler child", "[ublk][locality]") {
+    using obd::ublk::DeviceTestAccess;
+    LocalityState state;
+    elio::runtime::run_config config;
+    config.num_threads = 4;
+    config.blocking_threads = 1;
+    bool primed = false;
+    bool reused = false;
+    bool rejection_unused = false;
+    // Reset before cleanup and on any exceptional test departure so the
+    // global native fault never escapes this case into another spawn.
+    struct RejectionReset {
+        ~RejectionReset() {
+            elio::runtime::detail::reject_next_spawn_for_test.store(false);
+        }
+    } reset;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(state));
+        DeviceTestAccess::start_on(*dev, 0);
+        DeviceTestAccess::enqueue_read(*dev);
+        const bool first = co_await await_test_completion(*dev);
+        primed = first && DeviceTestAccess::completed_read(*dev);
+        DeviceTestAccess::clear_completions(*dev);
+        if (primed) {
+            elio::runtime::detail::reject_next_spawn_for_test.store(true);
+            DeviceTestAccess::enqueue_read(*dev);
+            const bool second = co_await await_test_completion(*dev);
+            reused = second && DeviceTestAccess::completed_read(*dev);
+            rejection_unused =
+                elio::runtime::detail::reject_next_spawn_for_test.exchange(false);
+        }
+        elio::runtime::detail::reject_next_spawn_for_test.store(false);
+        co_await dev->stop_async();
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, config);
+    CHECK(primed);
+    CHECK(reused);
+    CHECK(rejection_unused);
+    CHECK(state.calls.load() == 2);
+}
+
+TEST_CASE("ublk: a warm tag rejects new reads after parent cancellation", "[ublk][locality]") {
+    using obd::ublk::DeviceTestAccess;
+    LocalityState state;
+    elio::runtime::run_config config;
+    config.num_threads = 4;
+    config.blocking_threads = 1;
+    bool primed = false;
+    std::deque<std::pair<uint16_t, int32_t>> completions;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(state));
+        DeviceTestAccess::start_on(*dev, 0);
+        DeviceTestAccess::enqueue_read(*dev);
+        const bool first = co_await await_test_completion(*dev);
+        primed = first && DeviceTestAccess::completed_read(*dev);
+        DeviceTestAccess::clear_completions(*dev);
+        if (primed) {
+            DeviceTestAccess::cancel_bridge(*dev);
+            DeviceTestAccess::enqueue_read(*dev);
+            (void)co_await await_test_completion(*dev);
+        }
+        co_await dev->stop_async();
+        completions = DeviceTestAccess::completions(*dev);
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, config);
+    CHECK(primed);
+    CHECK(state.calls.load() == 1);
+    REQUIRE(completions.size() == 1);
+    CHECK(completions.front().first == 0);
+    CHECK(completions.front().second == -EIO);
+}
+
+TEST_CASE("ublk: a tag returns to its bridge after source migration", "[ublk][locality]") {
+    using obd::ublk::DeviceTestAccess;
+    LocalityState state;
+    elio::runtime::run_config config;
+    config.num_threads = 4;
+    config.blocking_threads = 1;
+    bool completed = true;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(state, true));
+        DeviceTestAccess::start_on(*dev, 0);
+        for (unsigned read = 0; read != 4; ++read) {
+            DeviceTestAccess::enqueue_read(*dev);
+            if (!co_await await_test_completion(*dev)) {
+                completed = false;
+                break;
+            }
+            completed = completed && DeviceTestAccess::completed_read(*dev);
+            DeviceTestAccess::clear_completions(*dev);
+        }
+        co_await dev->stop_async();
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, config);
+    CHECK(completed);
+    REQUIRE(state.calls.load() == 4);
+    for (unsigned read = 0; read != 4; ++read) {
+        CAPTURE(read);
+        CHECK(state.before[read] == 0);
+        CHECK(state.after[read] == 1);
+    }
+}
+
+TEST_CASE("ublk: a tag retries after its initial child admission is rejected", "[ublk][locality]") {
+    using obd::ublk::DeviceTestAccess;
+    LocalityState state;
+    bool first_failed = false;
+    bool retried = false;
+    struct RejectionReset {
+        ~RejectionReset() {
+            elio::runtime::detail::reject_next_spawn_for_test.store(false);
+        }
+    } reset;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(state));
+        DeviceTestAccess::start_on(*dev, 0);
+        while (elio::runtime::worker_thread::current()->io_context()
+                   .pending_count() == 0) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        elio::runtime::detail::reject_next_spawn_for_test.store(true);
+        DeviceTestAccess::enqueue_read(*dev);
+        const bool rejected = co_await await_test_completion(*dev);
+        const auto initial = DeviceTestAccess::completions(*dev);
+        first_failed = rejected && initial.size() == 1 &&
+                       initial.front() == std::pair<uint16_t, int32_t>{0, -EIO};
+        elio::runtime::detail::reject_next_spawn_for_test.store(false);
+        DeviceTestAccess::clear_completions(*dev);
+        DeviceTestAccess::enqueue_read(*dev);
+        const bool next = co_await await_test_completion(*dev);
+        retried = next && DeviceTestAccess::completed_read(*dev);
+        co_await dev->stop_async();
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+    CHECK(first_failed);
+    CHECK(retried);
+    CHECK(state.calls.load() == 1);
+}
+
+TEST_CASE("ublk: tag notification allocation failure retains reads and stop", "[ublk][locality]") {
+    using obd::ublk::DeviceTestAccess;
+    LocalityState state;
+    bool primed = false;
+    bool reused = false;
+    bool stopped = false;
+    unsigned read_failures = 0;
+    unsigned stop_failures = 0;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(state));
+        DeviceTestAccess::start_on(*dev, 0);
+        DeviceTestAccess::enqueue_read(*dev);
+        const bool first = co_await await_test_completion(*dev);
+        primed = first && DeviceTestAccess::completed_read(*dev);
+        DeviceTestAccess::clear_completions(*dev);
+        // On the sole worker, observing a published completion after our timer
+        // resumes means the tag has already reached its next unset event wait.
+        obd::test::WorkerEventFault fault;
+        DeviceTestAccess::enqueue_read(*dev);
+        const bool second = co_await await_test_completion(*dev);
+        reused = second && DeviceTestAccess::completed_read(*dev);
+        read_failures = fault.failures();
+        fault.arm();
+        co_await dev->stop_async();
+        stop_failures = fault.failures() - read_failures;
+        stopped = DeviceTestAccess::running(*dev) == 0;
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+    CHECK(primed);
+    CHECK(reused);
+    CHECK(stopped);
+    CHECK(read_failures == 1);
+    CHECK(stop_failures == 1);
+    CHECK(state.calls.load() == 2);
+}
+
+TEST_CASE("ublk: stop drains a request before its tag consumes the wake", "[ublk][shutdown][locality]") {
+    using obd::ublk::DeviceTestAccess;
+    bool warm = false;
+    SECTION("cold tag") {}
+    SECTION("reused tag") { warm = true; }
+    LocalityState state;
+    bool admitted = false;
+    bool completed = false;
+    bool primed = true;
+    bool drained_without_rescue = false;
+    bool rescued = false;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(state));
+        DeviceTestAccess::start_on(*dev, 0);
+        if (warm) {
+            DeviceTestAccess::enqueue_read(*dev);
+            primed = co_await await_test_completion(*dev);
+            primed = primed && DeviceTestAccess::completed_read(*dev);
+            DeviceTestAccess::clear_completions(*dev);
+        }
+        DeviceTestAccess::stop_after_admission(*dev, admitted);
+        // One worker keeps the bridge's admission and close consecutive,
+        // before either a new or a reused tag consumes its request event.
+        DeviceTestAccess::enqueue_read(*dev);
+        for (unsigned attempt = 0; !admitted && attempt != 1000; ++attempt) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        auto stopped = elio::spawn(dev->stop_async());
+        for (unsigned attempt = 0; !stopped.is_destroyed() && attempt != 1000;
+             ++attempt) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        drained_without_rescue = stopped.is_destroyed();
+        if (!drained_without_rescue) {
+            rescued = DeviceTestAccess::rescue_closing_tag(*dev);
+        }
+        co_await stopped.wait_destroyed_async();
+        completed = DeviceTestAccess::completed_read(*dev);
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+    CHECK(primed);
+    CHECK(admitted);
+    CHECK(completed);
+    CHECK(drained_without_rescue);
+    CHECK_FALSE(rescued);
+    CHECK(state.calls.load() == (warm ? 2 : 1));
+}
 
 TEST_CASE("ublk: async stop drains an idle bridge before source destruction", "[ublk][shutdown]") {
     using obd::ublk::DeviceTestAccess;

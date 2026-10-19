@@ -26,6 +26,7 @@
 #include <mutex>
 #ifdef OBD_TEST_HOOKS
 #include <functional>
+namespace elio::sync { class event; }
 #endif
 
 namespace obd::ublk {
@@ -100,6 +101,16 @@ public:
     bool failed() const noexcept { return failed_.load(); }
     int failure() const noexcept { return failure_.load(); }
 
+#ifdef OBD_TEST_HOOKS
+    void notify_bridge_admission_for_test(elio::sync::event& ready) {
+        bridge_ready_for_test_ = &ready;
+        if (bridge_admission_hook_for_test_) bridge_admission_hook_for_test_();
+    }
+    void clear_bridge_admission_for_test() noexcept {
+        bridge_ready_for_test_ = nullptr;
+    }
+#endif
+
 private:
     friend struct DeviceTestAccess;
     /// Creates the queue io_uring. Must be called on the queue thread
@@ -134,6 +145,8 @@ private:
     // Inject failure before the potentially allocating completion insertion.
     // Private and per-queue; absent from builds with tests disabled.
     std::function<void()> completion_enqueue_hook_for_test_;
+    std::function<void()> bridge_admission_hook_for_test_;
+    elio::sync::event* bridge_ready_for_test_ = nullptr;
 #endif
 
     std::atomic<bool> failed_{false};

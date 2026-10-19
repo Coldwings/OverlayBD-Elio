@@ -35,6 +35,13 @@ inline void fail_writer_event_dispatch() {
         throw std::bad_alloc();
     }
 }
+inline void fail_worker_event_dispatch() {
+    if (elio::runtime::worker_thread::current() != nullptr &&
+        take_failure(event_remaining)) {
+        event_failures.fetch_add(1);
+        throw std::bad_alloc();
+    }
+}
 }  // namespace runtime_fault_detail
 
 class DestroyedWaitFault {
@@ -65,6 +72,26 @@ public:
     ~WriterEventFault() {
         elio::sync::detail::event_dispatch_storage_for_test.store(old_);
         runtime_fault_detail::event_remaining.store(0);
+    }
+    unsigned failures() const { return runtime_fault_detail::event_failures.load(); }
+private:
+    void (*old_)() = nullptr;
+};
+
+class WorkerEventFault {
+public:
+    explicit WorkerEventFault(unsigned failures = 1) {
+        runtime_fault_detail::event_remaining.store(failures);
+        runtime_fault_detail::event_failures.store(0);
+        old_ = elio::sync::detail::event_dispatch_storage_for_test.exchange(
+            runtime_fault_detail::fail_worker_event_dispatch);
+    }
+    ~WorkerEventFault() {
+        elio::sync::detail::event_dispatch_storage_for_test.store(old_);
+        runtime_fault_detail::event_remaining.store(0);
+    }
+    void arm(unsigned failures = 1) {
+        runtime_fault_detail::event_remaining.store(failures);
     }
     unsigned failures() const { return runtime_fault_detail::event_failures.load(); }
 private:
