@@ -941,6 +941,9 @@ needing a real ublk device or root.
 - `supervisor: child ownership handoff retains the process and channel` —
   verifies the successful factory result owns its original PID, nonblocking
   status channel and copied ID, reports normal exit and closes the channel.
+- `supervisor: spawn failure fixture skips signaling a collected process` —
+  covers parent unwind without a retained process pin; fixture cleanup
+  first checks collection and sends no signal to the retired PID.
 - `supervisor: commit command parses and validates its fields` — pins the
   additive `commit` grammar (requires `id`, optional `user_tag`, unknown
   fields ignored) and that the `hello` handshake advertises the `commit`

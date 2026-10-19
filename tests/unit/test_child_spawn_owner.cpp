@@ -29,6 +29,7 @@ struct SpawnFailureProbe {
     struct stat socket_identity {};
     bool identity_known = false;
     bool collected = false;
+    unsigned signal_attempts = 0;
 
     void capture(pid_t child, int channel) {
         pid = child;
@@ -51,31 +52,36 @@ struct SpawnFailureProbe {
                current.st_ino == socket_identity.st_ino;
     }
 
-    bool factory_collected() {
-        if (pid <= 0) return true;
+    pid_t collect_if_exited() noexcept {
         pid_t result;
         do {
             result = ::waitpid(pid, nullptr, WNOHANG);
         } while (result < 0 && errno == EINTR);
-        if (result == pid) {
-            collected = true;  // The fixture, rather than the factory, reaped it.
-            return false;
-        }
-        if (result < 0 && errno == ECHILD) {
+        if (result == pid || (result < 0 && errno == ECHILD)) {
             collected = true;
-            return true;
         }
-        return false;
+        return result;
+    }
+
+    bool factory_collected() {
+        if (pid <= 0) return true;
+        // Returning this PID means the fixture, rather than the factory,
+        // collected it. ECHILD establishes that collection already happened.
+        return collect_if_exited() < 0 && errno == ECHILD;
     }
 
     void cleanup() noexcept {
-        if (pid > 0 && !collected) {
+        // Capture can itself throw before obtaining a pidfd. The factory
+        // may then collect its Child during unwind. Never signal that stale
+        // PID: zero proves it is still our unreaped child. This synchronous
+        // fixture is its sole waiter after the factory call has unwound.
+        if (pid > 0 && !collected && collect_if_exited() == 0) {
+            ++signal_attempts;
             if (pidfd >= 0) {
                 ::syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, nullptr, 0);
             } else {
-                // Capture itself failed before pinning. This synchronous
-                // fixture is the sole creator/waiter of this unreaped PID;
-                // no registry, monitor or reaper has ever received it.
+                // No other fixture thread can fork or reap between the
+                // owned-child check above and this fallback signal.
                 ::kill(pid, SIGKILL);
             }
             pid_t result;
@@ -166,4 +172,36 @@ TEST_CASE("supervisor: child ownership handoff retains the process and channel",
     child.reset();
     const bool closed = ::fcntl(owned_channel, F_GETFD) < 0 && errno == EBADF;
     CHECK(closed);
+}
+
+TEST_CASE("supervisor: spawn failure fixture skips signaling a collected process",
+          "[supervisor][spawn-owner]") {
+    SpawnFailureProbe probe;
+    obd::supervisor::ChildSpawnTestHooks hooks;
+    hooks.parent_forked = [&](pid_t pid, int fd) {
+        probe.capture(pid, fd);
+        // Model capture failure after learning the PID but before retaining
+        // a process pin. Parent ownership cleanup runs before our cleanup.
+        ::close(probe.pidfd);
+        probe.pidfd = -1;
+        throw std::bad_alloc();
+    };
+    obd::supervisor::ChildSpec spec;
+    spec.id = std::string(96, 'z');
+    spec.device_bin = "/bin/true";
+    spec.config_path = "/ignored";
+    spec.spawn_test_hooks = &hooks;
+    bool allocation_failed = false;
+    try {
+        auto unexpected = obd::supervisor::Child::spawn(spec);
+    } catch (const std::bad_alloc&) {
+        allocation_failed = true;
+    }
+    // Do not first call factory_collected(): exercise cleanup with the
+    // stale, unpinned PID and the fixture's collection flag still unset.
+    probe.cleanup();
+    CHECK(allocation_failed);
+    CHECK(probe.pid > 0);
+    CHECK(probe.collected);
+    CHECK(probe.signal_attempts == 0);
 }
