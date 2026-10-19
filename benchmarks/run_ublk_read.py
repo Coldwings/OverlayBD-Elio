@@ -252,7 +252,9 @@ def parse_args(argv=None):
 
 
 def reserve_output(out, variants):
-    if any(Path(binding['source']) in [out, *out.parents] for binding in variants.values()):
+    out = out.resolve()
+    if any(Path(binding['source']).resolve() in [out, *out.parents]
+           for binding in variants.values()):
         raise RuntimeError('output must be outside both source checkouts')
     out.mkdir(parents=True, exist_ok=False)
 

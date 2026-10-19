@@ -42,6 +42,20 @@ class RunnerControls(unittest.TestCase):
                 RUNNER.reserve_output(out / 'nested', {'baseline': {'source': str(out)}})
             self.assertFalse((out / 'nested').exists())
 
+    def test_output_reservation_resolves_source_and_output_aliases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            source = home / 'source'
+            source.mkdir()
+            alias = home / 'source-alias'
+            alias.symlink_to(source, target_is_directory=True)
+            for out, checkout in [(source / 'source-alias-result', alias),
+                                  (alias / 'output-alias-result', source)]:
+                with self.subTest(out=out, checkout=checkout):
+                    with self.assertRaisesRegex(RuntimeError, 'outside'):
+                        RUNNER.reserve_output(out, {'baseline': {'source': str(checkout)}})
+                    self.assertFalse(out.exists())
+
     def test_fixed_input_changes_are_detected_for_each_member(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = [Path(temporary) / name for name in ['raw', 'image', 'fio']]
