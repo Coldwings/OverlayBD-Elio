@@ -58,9 +58,10 @@ struct ChildSpec {
 
 class Child {
 public:
-    /// Forks and execs the device process. Throws obd::error on failure
-    /// (fork/socketpair errors, or the child reporting an early exec
-    /// failure through the closed pipe).
+    /// Forks and attempts to exec the device, returning its process owner.
+    /// Socketpair/fork errors throw obd::error; preparation may also throw.
+    /// Return does not confirm exec or readiness. Exec failure is observed
+    /// after collection as exit_code 127, not as a synchronous exception.
     /// Owner storage is constructed before creating the channel or process.
     static std::unique_ptr<Child> spawn(const ChildSpec& spec);
 
