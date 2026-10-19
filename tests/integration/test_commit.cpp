@@ -1332,6 +1332,18 @@ void check_failed_create_admission(bool after_spawn) {
                     pollfd exited{pidfd, POLLIN, 0};
                     check(::poll(&exited, 1, 0) == 1,
                           "failed create replied before its unpublished child exited");
+                    // Readiness also accepts an exited zombie. Observe the
+                    // pinned process without consuming any owner's status:
+                    // only actual collection makes waitid report ECHILD.
+                    siginfo_t status{};
+                    int waited;
+                    do {
+                        waited = ::waitid(P_PIDFD, static_cast<id_t>(pidfd),
+                                          &status, WEXITED | WNOHANG | WNOWAIT);
+                    } while (waited < 0 && errno == EINTR);
+                    const int wait_error = errno;
+                    check(waited < 0 && wait_error == ECHILD,
+                          "failed create replied before collecting its unpublished child");
                 }
                 check(!rpc({{"cmd", "status"}, {"id", "x"}}).value("ok", true),
                       "failed setup published an entry");
