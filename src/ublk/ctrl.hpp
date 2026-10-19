@@ -53,6 +53,12 @@ public:
     /// ADD_DEV; returns the driver-assigned device id. Throws obd::error.
     uint32_t add_dev(const DeviceParams& p);
 
+    /// GET_DEV_INFO returns the kernel's actual flags, including whether
+    /// ADD_DEV negotiated recovery support. Does not adopt the device.
+    /// Blocking cold path; coroutine callers must use spawn_blocking.
+    /// Throws obd::error on failure.
+    ublksrv_ctrl_dev_info get_dev_info(uint32_t dev_id);
+
     /// SET_PARAMS (basic + discard). Throws obd::error.
     void set_params(uint32_t dev_id, const DeviceParams& p);
 

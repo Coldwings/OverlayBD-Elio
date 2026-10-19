@@ -1,7 +1,7 @@
 // Integration test: ublk end-to-end. Requires /dev/ublk-control and
 // CAP_SYS_ADMIN; self-skips otherwise (CI/dev sandboxes usually lack both).
 // The privileged CI job loads ublk_drv and runs exactly these ([ublk]).
-#include "supervisor/protocol.hpp"
+#include "common/errors.hpp"
 #include "ublk/device.hpp"
 
 #include "../support.hpp"
@@ -15,8 +15,10 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 
+#include <array>
+#include <cerrno>
+#include <csignal>
 #include <system_error>
-#include <thread>
 
 #include <fcntl.h>
 
@@ -61,6 +63,97 @@ void stage(const char* msg) {
 
 bool ublk_available() {
     return ::access("/dev/ublk-control", F_OK) == 0;
+}
+
+// The recovery test reports live kernel state, not the requested ADD_DEV
+// flags. Both processes share this small, fork-local pipe message.
+using RecoveryReport = std::array<uint64_t, 2>;  // dev_id, actual flags
+constexpr uint64_t kRecoveryFlags =
+    UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE;
+
+bool write_recovery_report(int fd, const RecoveryReport& report) {
+    const auto* p = reinterpret_cast<const uint8_t*>(report.data());
+    size_t left = sizeof(report);
+    while (left != 0) {
+        const ssize_t n = ::write(fd, p, left);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n;
+        left -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool read_recovery_report(int fd, RecoveryReport& report) {
+    auto* p = reinterpret_cast<uint8_t*>(report.data());
+    size_t left = sizeof(report);
+    while (left != 0) {
+        const ssize_t n = ::read(fd, p, left);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n;
+        left -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// Own every fixture resource across assertions and failed attach. The
+// kernel device is released here only until a replacement adopts it.
+struct RecoveryServer {
+    RecoveryServer() = default;
+    RecoveryServer(const RecoveryServer&) = delete;
+    RecoveryServer& operator=(const RecoveryServer&) = delete;
+
+    int pipefd[2] = {-1, -1};
+    pid_t child = -1;
+    uint32_t dev_id = UINT32_MAX;
+    int client_fd = -1;
+
+    bool reap(int& status) {
+        if (child <= 0) return false;
+        pid_t result;
+        do {
+            result = ::waitpid(child, &status, 0);
+        } while (result < 0 && errno == EINTR);
+        if (result != child) return false;
+        child = -1;
+        return true;
+    }
+
+    ~RecoveryServer() {
+        for (int fd : pipefd) if (fd >= 0) ::close(fd);
+        if (client_fd >= 0) ::close(client_fd);
+        if (child > 0) {
+            int status = 0;
+            pid_t result;
+            do {
+                result = ::waitpid(child, &status, WNOHANG);
+            } while (result < 0 && errno == EINTR);
+            if (result == 0) {
+                ::kill(child, SIGKILL);
+                (void)reap(status);
+            }
+        }
+        if (dev_id != UINT32_MAX) {
+            try {
+                ublk::Ctrl cleanup;
+                cleanup.adopt_dev(dev_id);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "recovery fixture cleanup: %s\n", e.what());
+            }
+        }
+    }
+};
+
+bool kernel_device_absent(uint32_t dev_id) {
+    ublk::Ctrl probe;
+    try {
+        (void)probe.get_dev_info(dev_id);
+    } catch (const std::system_error& e) {
+        if (e.code() == std::errc::no_such_device) return true;
+        throw;
+    }
+    return false;
 }
 
 /// Kernel ENOTSUPP: the pre-6.15 ublk control-dispatch default for an
@@ -358,67 +451,112 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
     REQUIRE(rc == 0);
 }
 
-TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
-          "[ublk]") {
-    if (!ublk_available()) {
-        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
-    }
+namespace {
+
+void check_recovery(bool request_recovery) {
     // A child process creates and serves the device; the parent kills it
     // and attaches a replacement server (the real kernel handshake,
     // ADR-0010). The block device must survive and keep serving reads.
-    int pipefd[2];
-    REQUIRE(::pipe(pipefd) == 0);
+    RecoveryServer server;
+    REQUIRE(::pipe(server.pipefd) == 0);
     stage("recovery: fork");
-    const pid_t child = ::fork();
-    REQUIRE(child >= 0);
-    if (child == 0) {
+    server.child = ::fork();
+    REQUIRE(server.child >= 0);
+    if (server.child == 0) {
         // Child: serve until killed. No cleanup on SIGKILL — the kernel
-        // keeps the device QUIESCED thanks to UBLK_F_USER_RECOVERY.
-        ::close(pipefd[0]);
-        const int rc = elio::run([](int out) -> elio::coro::task<int> {
-            auto data = test::pattern_bytes(512 * 64, 84);
-            source::BlobSourcePtr src =
-                std::make_unique<test::VectorSource>(data);
-            ublk::DeviceParams params;
-            params.dev_sectors = data.size() / 512;
-            params.enable_recovery = true;
-            auto dev = co_await ublk::Device::create(params, std::move(src));
-            const std::string report = dev->bdev_path() + "\n";
-            const ssize_t w = ::write(out, report.data(), report.size());
-            (void)w;
-            for (;;) {
-                co_await elio::time::sleep_for(std::chrono::hours(1));
-            }
-        }, pipefd[1]);
+        // keeps a recoverable device QUIESCED. Without negotiated recovery,
+        // drain and delete normally BEFORE exiting instead.
+        ::close(server.pipefd[0]);
+        int rc = 1;
+        try {
+            rc = elio::run([](int out, bool requested)
+                -> elio::coro::task<int> {
+                auto data = test::pattern_bytes(512 * 64, 84);
+                source::BlobSourcePtr src =
+                    std::make_unique<test::VectorSource>(data);
+                ublk::DeviceParams params;
+                params.dev_sectors = data.size() / 512;
+                params.enable_recovery = requested;
+                auto dev = co_await ublk::Device::create(params, std::move(src));
+                int unused_fd = -1;
+                co_return co_await with_device_cleanup(dev, unused_fd, [&]()
+                    -> elio::coro::task<int> {
+                    const auto info = co_await bdev_io([&] {
+                        ublk::Ctrl probe;
+                        return probe.get_dev_info(dev->dev_id());
+                    });
+                    verify(info.dev_id == dev->dev_id() &&
+                               info.nr_hw_queues == params.nr_queues &&
+                               info.queue_depth == params.queue_depth,
+                           "GET_DEV_INFO returned unexpected device geometry");
+                    const RecoveryReport report{dev->dev_id(), info.flags};
+                    const bool sent = co_await bdev_io([&] {
+                        return write_recovery_report(out, report);
+                    });
+                    if (!sent) co_return 2;
+                    if (!requested ||
+                        (info.flags & kRecoveryFlags) != kRecoveryFlags) {
+                        co_return 0;
+                    }
+                    for (;;) {
+                        co_await elio::time::sleep_for(std::chrono::hours(1));
+                    }
+                });
+            }, server.pipefd[1], request_recovery);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "recovery child failed: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "recovery child failed\n");
+        }
+        ::close(server.pipefd[1]);
         _exit(rc);
     }
-    ::close(pipefd[1]);
-    std::string bdev;
-    char ch;
-    while (::read(pipefd[0], &ch, 1) == 1 && ch != '\n') bdev += ch;
-    ::close(pipefd[0]);
-    REQUIRE(!bdev.empty());
-    const int dev_id = supervisor::dev_id_from_bdev_path(bdev);
-    REQUIRE(dev_id >= 0);
+    ::close(server.pipefd[1]);
+    server.pipefd[1] = -1;
+    RecoveryReport report{};
+    REQUIRE(read_recovery_report(server.pipefd[0], report));
+    ::close(server.pipefd[0]);
+    server.pipefd[0] = -1;
+    REQUIRE(report[0] < UINT32_MAX);
+    const uint32_t dev_id = static_cast<uint32_t>(report[0]);
+    const auto bdev = ublk::Ctrl::bdev_path(dev_id);
+
+    const bool negotiated = (report[1] & kRecoveryFlags) == kRecoveryFlags;
+    if (!request_recovery || !negotiated) {
+        int status = 0;
+        REQUIRE(server.reap(status));
+        REQUIRE(WIFEXITED(status));
+        REQUIRE(WEXITSTATUS(status) == 0);
+        REQUIRE(kernel_device_absent(dev_id));
+        if (request_recovery) {
+            SKIP("kernel did not negotiate USER_RECOVERY and REISSUE");
+        }
+        REQUIRE((report[1] & kRecoveryFlags) == 0);
+        return;
+    }
+    // The negotiated-recovery child remains alive until we kill it. Arm
+    // the fallback cleanup only here; graceful child teardown already owns
+    // DEL and may have freed its id before the parent receives its report.
+    server.dev_id = dev_id;
 
     // The device answers reads while the first server is alive.
     const auto expected = test::pattern_bytes(512 * 64, 84);
-    int fd = ::open(bdev.c_str(), O_RDONLY);
-    REQUIRE(fd >= 0);
+    server.client_fd = ::open(bdev.c_str(), O_RDONLY);
+    REQUIRE(server.client_fd >= 0);
     std::vector<uint8_t> buf(4096);
-    REQUIRE(::pread(fd, buf.data(), buf.size(), 2048) == 4096);
+    REQUIRE(::pread(server.client_fd, buf.data(), buf.size(), 2048) == 4096);
     REQUIRE(buf == std::vector<uint8_t>(expected.begin() + 2048,
                                         expected.begin() + 2048 + 4096));
-    ::close(fd);
+    ::close(server.client_fd);
+    server.client_fd = -1;
 
-    // Kill the server. If the kernel rejected USER_RECOVERY at ADD_DEV
-    // (fallback path), the device disappears — skip rather than fail.
-    REQUIRE(::kill(child, SIGKILL) == 0);
+    // Only negotiated recovery is crash-tested. Node existence after
+    // process death cannot distinguish recovery from asynchronous stop.
+    REQUIRE(::kill(server.child, SIGKILL) == 0);
     int wstatus = 0;
-    REQUIRE(::waitpid(child, &wstatus, 0) == child);
-    if (::access(bdev.c_str(), F_OK) != 0) {
-        SKIP("kernel without USER_RECOVERY support");
-    }
+    REQUIRE(server.reap(wstatus));
+    REQUIRE(WIFSIGNALED(wstatus));
+    REQUIRE(WTERMSIG(wstatus) == SIGKILL);
 
     // Attach immediately: waitpid does not wait for the driver's delayed
     // quiesce work (Linux 6.6 can take about five seconds). Device::attach
@@ -431,7 +569,8 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
         ublk::DeviceParams params;
         params.dev_sectors = data.size() / 512;
         auto dev = co_await ublk::Device::attach(
-            static_cast<uint32_t>(dev_id), params, std::move(src));
+            dev_id, params, std::move(src));
+        server.dev_id = UINT32_MAX;  // The replacement now owns cleanup.
         int fd2 = -1;
         co_return co_await with_device_cleanup(dev, fd2, [&]()
             -> elio::coro::task<int> {
@@ -450,4 +589,20 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
         });
     });
     REQUIRE(rc == 0);
+    REQUIRE(kernel_device_absent(dev_id));
+}
+
+}  // namespace
+
+TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
+          "[ublk]") {
+    if (!ublk_available()) {
+        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
+    }
+    SECTION("explicitly disabled recovery exits and cleans up normally") {
+        check_recovery(false);
+    }
+    SECTION("recover a device that negotiated USER_RECOVERY") {
+        check_recovery(true);
+    }
 }

@@ -222,6 +222,12 @@ and remembers the added device for best-effort cleanup. Non-copyable.
 - `uint32_t add_dev(const DeviceParams&)` — `UBLK_U_CMD_ADD_DEV` with
   `UBLK_F_URING_CMD_COMP_IN_TASK` and `ublksrv_pid = getpid()`; returns the
   driver-assigned device id. Throws `obd::error`.
+- `ublksrv_ctrl_dev_info get_dev_info(uint32_t dev_id)` —
+  `UBLK_U_CMD_GET_DEV_INFO`, returning the kernel's actual device geometry,
+  state and feature flags. Query `flags` to determine negotiated recovery
+  capability; requested params or block-node existence cannot establish it.
+  Does not adopt cleanup ownership. Throws `obd::error`; run off-worker
+  from coroutine code, like the other blocking control calls.
 - `void set_params(uint32_t dev_id, const DeviceParams&)` —
   `UBLK_U_CMD_SET_PARAMS` with BASIC | DISCARD types (see the params table
   above). Throws `obd::error`.
@@ -532,10 +538,16 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   A supported pass and an unsupported skip are reported separately in the
   retained grow log. See `docs/testing.md` for timeouts and CI evidence.
 - `integration: ublk device survives server death via USER_RECOVERY` —
-  privileged E2E: kill and reap the original server, immediately start a
-  replacement without a quiesce delay in the test, then verify source
-  bytes through the surviving block device. This exercises START-before-
-  open ordering and the actual kernel retry/timer path.
+  privileged E2E: the live child reports actual `GET_DEV_INFO` flags before
+  any crash. Only a device that negotiated both USER_RECOVERY and REISSUE
+  is killed and reaped, then immediately attached without a quiesce delay;
+  source bytes remain readable. A child without those flags instead drains
+  and deletes normally; the parent reaps it and verifies `GET_DEV_INFO`
+  returns `ENODEV` before the precise unsupported-capability skip. A separate
+  section explicitly disables recovery and requires that graceful cleanup
+  path to pass on every kernel with ublk. Fixture guards retain the child,
+  pipe fds, client fd and recoverable device across assertions and failed
+  attaches. Unexpected attach errors, including `EINVAL`, fail the test.
 
 Run: `ctest --test-dir build --output-on-failure` (the E2E test requires
 root or `CAP_SYS_ADMIN` plus a loaded `ublk_drv` to actually execute).

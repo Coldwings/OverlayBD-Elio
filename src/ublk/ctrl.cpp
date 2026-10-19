@@ -137,6 +137,13 @@ uint32_t Ctrl::add_dev(const DeviceParams& p) {
     return info.dev_id;
 }
 
+ublksrv_ctrl_dev_info Ctrl::get_dev_info(uint32_t dev_id) {
+    ublksrv_ctrl_dev_info info {};
+    ctrl_cmd(UBLK_U_CMD_GET_DEV_INFO, dev_id, static_cast<uint16_t>(-1),
+             &info, sizeof(info), 0, "GET_DEV_INFO");
+    return info;
+}
+
 void Ctrl::set_params(uint32_t dev_id, const DeviceParams& p) {
     ublk_params params {};
     params.len = sizeof(params);
