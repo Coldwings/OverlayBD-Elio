@@ -88,6 +88,15 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
     }
     a.argv.push_back(nullptr);
 
+    // Construct all ownership storage before creating a channel or process.
+    // In particular, copying the ID can throw as well as allocating Child.
+#ifdef OBD_TEST_HOOKS
+    if (spec.spawn_test_hooks && spec.spawn_test_hooks->before_owner_allocation) {
+        spec.spawn_test_hooks->before_owner_allocation();
+    }
+#endif
+    auto child = std::unique_ptr<Child>(new Child(spec.id));
+
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
         throw_errno(errno, "socketpair for device child failed");
@@ -112,12 +121,17 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
     }
 
     ::close(sv[1]);
+    // Nonthrowing parent handoff precedes every fallible parent operation.
+    child->pid_ = pid;
+    child->ctl_fd_ = sv[0];
     int flags = ::fcntl(sv[0], F_GETFL, 0);
     ::fcntl(sv[0], F_SETFL, flags | O_NONBLOCK);
 
-    auto child = std::unique_ptr<Child>(new Child(spec.id));
-    child->pid_ = pid;
-    child->ctl_fd_ = sv[0];
+#ifdef OBD_TEST_HOOKS
+    if (spec.spawn_test_hooks && spec.spawn_test_hooks->parent_forked) {
+        spec.spawn_test_hooks->parent_forked(pid, sv[0]);
+    }
+#endif
     return child;
 }
 

@@ -495,10 +495,14 @@ starting ──────(crash)─────→ exited   (reaper fills exit
 
 ### Spawning contract
 
-`Child::spawn` (`src/supervisor/child.cpp`) builds **argv entirely before
-fork**, then: socketpair → fork → in the child, only async-signal-safe
+`Child::spawn` (`src/supervisor/child.cpp`) builds **argv and the Child owner
+entirely before fork**, then: socketpair → fork → in the child, only async-signal-safe
 calls (`close`, `dup2`, `fcntl`, `execve`, `_exit`) because the parent
-hosts a live Elio runtime and anything else is UB. The child argv is:
+hosts a live Elio runtime and anything else is UB. The parent immediately
+attaches the PID and channel to the prepared owner through nonthrowing
+assignments. An allocation failure creates no process or channel; a later
+parent-side exception closes the channel and collects the owned child before
+escaping. The child argv is:
 
 ```
 <device_bin> --config <config.json> [--global <overlaybd.json>] \
@@ -931,6 +935,15 @@ needing a real ublk device or root.
   binary does not exist and guards that the reaped `exit_code` is exactly
   127 and the status error contains "exec failed". This pins the exec-fail
   convention that operators and `cmd_create` rely on.
+- `supervisor: failed child ownership setup leaves no process or channel` —
+  injects an owner-allocation failure and a parent-side exception after fork;
+  no returned `Child` is needed to ensure collection and channel closure.
+- `supervisor: child ownership handoff retains the process and channel` —
+  verifies the successful factory result owns its original PID, nonblocking
+  status channel and copied ID, reports normal exit and closes the channel.
+- `supervisor: spawn failure fixture skips signaling a collected process` —
+  covers parent unwind without a retained process pin; fixture cleanup
+  first checks collection and sends no signal to the retired PID.
 - `supervisor: commit command parses and validates its fields` — pins the
   additive `commit` grammar (requires `id`, optional `user_tag`, unknown
   fields ignored) and that the `hello` handshake advertises the `commit`

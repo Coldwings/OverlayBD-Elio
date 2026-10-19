@@ -15,8 +15,18 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#ifdef OBD_TEST_HOOKS
+#include <functional>
+#endif
 
 namespace obd::supervisor {
+
+#ifdef OBD_TEST_HOOKS
+struct ChildSpawnTestHooks {
+    std::function<void()> before_owner_allocation;
+    std::function<void(pid_t, int)> parent_forked;
+};
+#endif
 
 struct ChildSpec {
     std::string id;
@@ -40,6 +50,10 @@ struct ChildSpec {
     bool blank = false;
     uint64_t blank_size = 0;  // bytes; positive, sector aligned
     std::string blank_dir;    // per-device workspace (device creates files)
+#ifdef OBD_TEST_HOOKS
+    // Borrowed only for the synchronous spawn call; never used by the child.
+    const ChildSpawnTestHooks* spawn_test_hooks = nullptr;
+#endif
 };
 
 class Child {
@@ -47,6 +61,7 @@ public:
     /// Forks and execs the device process. Throws obd::error on failure
     /// (fork/socketpair errors, or the child reporting an early exec
     /// failure through the closed pipe).
+    /// Owner storage is constructed before creating the channel or process.
     static std::unique_ptr<Child> spawn(const ChildSpec& spec);
 
     ~Child();  // best-effort SIGKILL + reap if still unreaped
