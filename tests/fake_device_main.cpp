@@ -425,13 +425,27 @@ elio::coro::task<int> fake_main(Args args) {
             }
         }
         report(channel, DeviceStatus{"stopped", "", ""});
+        // Test-only EOF-before-cleanup fixture. The checkpoint is already
+        // valid, exactly like the real device, but channel EOF precedes
+        // final Device/ublk control teardown. Hold that interval explicitly.
+        const char* cleanup_env = std::getenv("OBD_TEST_CLEANUP_GATE");
+        const std::string cleanup_gate = cleanup_env ? cleanup_env : "";
+        if (!cleanup_gate.empty()) {
+            if (args.control_fd >= 0) ::shutdown(args.control_fd, SHUT_RDWR);
+            obd::test::write_file(cleanup_gate + "/closed", {});
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+            while (!std::filesystem::exists(cleanup_gate + "/release")) {
+                if (std::chrono::steady_clock::now() >= deadline) co_return 3;
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            obd::test::write_file(cleanup_gate + "/cleaned", {});
+        }
         // Unblock the trace control loop (parked in a control-channel
         // read) only AFTER the checkpoint and the stopped report are
-        // out: shutdown(2) gives the supervisor an immediate EOF, and
-        // the supervisor treats EOF as device-gone — an earlier call
-        // would race the checkpoint (a commit seal could observe "no
-        // valid shutdown checkpoint"). A parked coroutine would
-        // otherwise stall the scheduler's teardown drain.
+        // out. The supervisor must wait for actual process exit after
+        // EOF, including any remaining device/kernel teardown. A parked
+        // coroutine would otherwise stall the scheduler's teardown drain.
         if (args.control_fd >= 0) {
             ::shutdown(args.control_fd, SHUT_RDWR);
         }

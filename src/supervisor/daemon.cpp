@@ -523,19 +523,16 @@ public:
             co_await entry->op_mu.lock();
             SyncMutexGuard op_guard{entry->op_mu};
             auto child = entry->child;
-            bool exited = false;
+            bool reaped = false;
             try {
-                const auto outcome = co_await elio::with_timeout(
-                    std::chrono::seconds(cfg_.stop_timeout_sec),
-                    [&child](elio::coro::cancel_token tok)
-                        -> elio::coro::task<void> {
-                        co_await child->exit_event().wait(std::move(tok));
-                    });
-                exited = static_cast<bool>(outcome);
+                reaped = co_await stop_child_and_reap(child);
             } catch (...) {
                 if (!failure) failure = std::current_exception();
             }
-            if (!exited) child->kill();
+            if (!reaped && !failure) {
+                failure = std::make_exception_ptr(std::runtime_error(
+                    "device did not exit after SIGKILL: " + id));
+            }
         }
         // A child (or an inherited socket in its descendants) need not close
         // the channel to let the monitor depart. Cancellation completes the
@@ -666,6 +663,9 @@ private:
                     if (!st->device.empty()) cur.device = st->device;
                     if (!st->error.empty()) cur.error = st->error;
                     entry->child->update_status(cur);
+                    while (!entry->child->try_notify_waiters()) {
+                        co_await elio::time::yield();
+                    }
                     if (st->state == "ready" && entry->dev_id < 0 &&
                         !st->device.empty()) {
                         entry->dev_id = dev_id_from_bdev_path(st->device);
@@ -705,12 +705,15 @@ private:
                     mu_.unlock();
                 }
                 if (test_gate_) test_gate_->mark("device_eof_completed");
-                // EOF: the process is gone (or closing); mark exited if not
-                // reaped yet. The reaper fills in the exit code on SIGCHLD.
+                // EOF reports a lost channel, not completed process cleanup.
+                // Removal/sealing use the separate actual-reap barrier.
                 Child::Status cur = entry->child->status();
                 if (cur.state != "exited") {
                     cur.state = "exited";
                     entry->child->update_status(cur);
+                }
+                while (!entry->child->try_notify_waiters()) {
+                    co_await elio::time::yield();
                 }
                 channel.reset();
             }
@@ -759,6 +762,7 @@ private:
                 // Keep the old owner alive until after mu_ is released:
                 // Child destruction can kill/waitpid and must not block
                 // the registry (nor may spawn or the fd handoff run there).
+                if (test_gate_) test_gate_->record_child(next);
                 std::shared_ptr<Child> previous;
                 co_await mu_.lock();
                 {
@@ -805,12 +809,13 @@ private:
                 }
                 bool reaped_any = false;
                 for (auto& [id, child] : snapshot) {
-                    const pid_t pid = child->pid();
-                    if (pid <= 0) continue;
-                    int wstatus = 0;
-                    const pid_t r = ::waitpid(pid, &wstatus, WNOHANG);
-                    if (r != pid) continue;  // still alive, or already reaped
-                    child->note_reaped(wstatus);
+                    const bool collected = child->try_reap();
+                    // Keep this snapshot owner through notification retry,
+                    // even if a stop handler has already erased the entry.
+                    while (!child->try_notify_waiters()) {
+                        co_await elio::time::yield();
+                    }
+                    if (!collected) continue;
                     ELIO_LOG_INFO("device {} exited (code {})", id,
                                   child->status().exit_code);
                     reaped_any = true;
@@ -972,6 +977,7 @@ private:
             co_return reply_error(std::string("spawn failed: ") + e.what());
         }
         std::shared_ptr<Child> child = entry->child;
+        if (test_gate_) test_gate_->record_child(child);
         {
             co_await mu_.lock();
             children_[id] = entry;
@@ -1023,7 +1029,11 @@ private:
             if (!blank->mkfs.empty()) {
                 if (st.device.empty() ||
                     dev_id_from_bdev_path(st.device) < 0) {
-                    co_await stop_entry_and_erase(entry);
+                    if (!co_await stop_entry_and_erase(entry)) {
+                        co_return reply_error(
+                            "blank create cleanup did not reap device; "
+                            "entry retained: " + id);
+                    }
                     co_return reply_error(
                         "blank device reported no /dev/ublkbN path; "
                         "cannot run mkfs." +
@@ -1033,7 +1043,11 @@ private:
                 const int mkrc = co_await cfg_.mkfs_runner->run(
                     blank->mkfs, st.device, &mkfs_err);
                 if (mkrc != 0) {
-                    co_await stop_entry_and_erase(entry);
+                    if (!co_await stop_entry_and_erase(entry)) {
+                        co_return reply_error(
+                            "mkfs." + blank->mkfs + " failed; device cleanup "
+                            "did not reap child; entry retained: " + id);
+                    }
                     co_return reply_error(
                         "mkfs." + blank->mkfs + " on " + st.device +
                         " failed: " +
@@ -1049,6 +1063,43 @@ private:
         co_return reply_ok(fields);
     }
 
+    /// Shared stop barrier: channel EOF can precede Device/ublk teardown.
+    /// Keep the reaper live through both the graceful and post-kill waits.
+    elio::coro::task<bool> stop_child_and_reap(std::shared_ptr<Child> child) {
+        // A SIGCHLD can predate registry insertion; collect an already
+        // exited child here rather than depending on another signal wake.
+        child->try_reap();
+        if (child->reaped()) {
+            while (!child->try_notify_waiters()) co_await elio::time::yield();
+            co_return true;
+        }
+        child->terminate();
+        auto done = co_await elio::with_timeout(
+            std::chrono::seconds(cfg_.stop_timeout_sec),
+            [&child](elio::coro::cancel_token token) -> elio::coro::task<void> {
+                co_await child->reaped_event().wait(std::move(token));
+            });
+        if (done) co_return true;
+        child->try_reap();
+        if (child->reaped()) {
+            while (!child->try_notify_waiters()) co_await elio::time::yield();
+            co_return true;
+        }
+        child->kill();
+        auto gone = co_await elio::with_timeout(
+            std::chrono::seconds(2),
+            [&child](elio::coro::cancel_token token) -> elio::coro::task<void> {
+                co_await child->reaped_event().wait(std::move(token));
+            });
+        if (!gone) {
+            child->try_reap();
+            if (child->reaped()) {
+                while (!child->try_notify_waiters()) co_await elio::time::yield();
+            }
+        }
+        co_return static_cast<bool>(gone) || child->reaped();
+    }
+
     /// Stops and removes EXACTLY the given device entry (used on
     /// create-time failures such as a failed mode-3 mkfs). The entry is
     /// passed in — not looked up by id — and re-checked under mu_ before
@@ -1058,9 +1109,9 @@ private:
     /// the same id. Mirrors cmd_destroy otherwise: `destroying` set under
     /// mu_ so supervise_entry never respawns, op_mu around the stop, the
     /// entry erased (again identity-checked) at the end.
-    elio::coro::task<void> stop_entry_and_erase(
+    elio::coro::task<bool> stop_entry_and_erase(
         const std::shared_ptr<DeviceEntry>& entry) {
-        if (!entry) co_return;
+        if (!entry) co_return true;
         {
             co_await mu_.lock();
             auto it = children_.find(entry->spec.id);
@@ -1071,7 +1122,7 @@ private:
                 // mark it so a late supervise_entry pass never respawns.
                 entry->destroying = true;
                 mu_.unlock();
-                co_return;
+                co_return true;
             }
             entry->destroying = true;
             mu_.unlock();
@@ -1080,22 +1131,7 @@ private:
         {
             SyncMutexGuard op_guard{entry->op_mu};
             std::shared_ptr<Child> child = entry->child;
-            child->terminate();
-            auto done = co_await elio::with_timeout(
-                std::chrono::seconds(cfg_.stop_timeout_sec),
-                [&child](elio::coro::cancel_token tok)
-                    -> elio::coro::task<void> {
-                    co_await child->exit_event().wait(std::move(tok));
-                });
-            if (!done) {
-                child->kill();
-                co_await elio::with_timeout(
-                    std::chrono::seconds(2),
-                    [&child](elio::coro::cancel_token tok)
-                        -> elio::coro::task<void> {
-                        co_await child->exit_event().wait(std::move(tok));
-                    });
-            }
+            if (!co_await stop_child_and_reap(child)) co_return false;
         }
         {
             co_await mu_.lock();
@@ -1105,7 +1141,7 @@ private:
             }
             mu_.unlock();
         }
-        co_return;
+        co_return true;
     }
 
     /// Routes a device "reply"-discriminated line (ADR-0013): command
@@ -1478,25 +1514,23 @@ private:
 
         // op_mu serializes the stop against a recovery respawn in flight.
         co_await entry->op_mu.lock();
+        bool reaped = false;
+        std::exception_ptr stop_failure;
         {
             SyncMutexGuard op_guard{entry->op_mu};
-            std::shared_ptr<Child> child = entry->child;
-            child->terminate();
-            auto done = co_await elio::with_timeout(
-                std::chrono::seconds(cfg_.stop_timeout_sec),
-                [&child](elio::coro::cancel_token tok)
-                    -> elio::coro::task<void> {
-                    co_await child->exit_event().wait(std::move(tok));
-                });
-            if (!done) {
-                child->kill();
-                co_await elio::with_timeout(
-                    std::chrono::seconds(2),
-                    [&child](elio::coro::cancel_token tok)
-                        -> elio::coro::task<void> {
-                        co_await child->exit_event().wait(std::move(tok));
-                    });
+            try {
+                reaped = co_await stop_child_and_reap(entry->child);
+            } catch (...) {
+                stop_failure = std::current_exception();
             }
+        }
+        if (!reaped) {
+            co_await mu_.lock();
+            entry->destroy_op_in_progress = false;
+            mu_.unlock();
+            if (stop_failure) std::rethrow_exception(stop_failure);
+            co_return reply_error(
+                "device did not exit after SIGKILL; entry retained: " + id);
         }
         {
             co_await mu_.lock();
@@ -1631,31 +1665,14 @@ private:
         // is held no further respawn can install another.
         for (int attempt = 0;; ++attempt) {
             std::shared_ptr<Child> child = entry->child;
-            if (child->status().state == "exited") break;
+            if (child->reaped()) break;
             if (attempt >= 3) {
                 co_return reply_error(
                     "device keeps being replaced; upper not sealed: " + id);
             }
-            child->terminate();
-            auto done = co_await elio::with_timeout(
-                std::chrono::seconds(cfg_.stop_timeout_sec),
-                [&child](elio::coro::cancel_token tok)
-                    -> elio::coro::task<void> {
-                    co_await child->exit_event().wait(std::move(tok));
-                });
-            if (!done) {
-                child->kill();
-                auto gone = co_await elio::with_timeout(
-                    std::chrono::seconds(2),
-                    [&child](elio::coro::cancel_token tok)
-                        -> elio::coro::task<void> {
-                        co_await child->exit_event().wait(std::move(tok));
-                    });
-                if (!gone) {
-                    co_return reply_error(
-                        "device did not stop in time; upper not sealed: " +
-                        id);
-                }
+            if (!co_await stop_child_and_reap(child)) {
+                co_return reply_error(
+                    "device did not stop in time; upper not sealed: " + id);
             }
         }
 
