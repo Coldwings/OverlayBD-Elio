@@ -149,7 +149,13 @@ but wait for different conditions:
 Other errors fail immediately; exhausting START's budget reports
 `ublk START_USER_RECOVERY not ready after 30s`. The replacement adopts
 cleanup ownership only after END succeeds, so a failed START does not
-delete the existing kernel device. `ADD_DEV`
+delete the existing kernel device. It completes all fallible metadata
+preparation (GET_PARAMS, path formatting and the preparation log) before
+END. Successful END is followed immediately by nonthrowing adoption and
+return, so a caller's fallback cleanup guard can hand off ownership when
+attach returns without retaining an id already deleted by failed adopted
+setup. The preparation log does not announce recovery success; readiness
+is published after attach returns. `ADD_DEV`
 falls back to a non-recoverable device (with a warning) when the kernel
 rejects the flags with `EINVAL`.
 
@@ -181,7 +187,9 @@ device keeps its capacity across USER_RECOVERY (the driver never resets
 it, and attach issues no SET_PARAMS/UPDATE_SIZE), so a params-derived
 baseline would let a post-recovery resize pass the grow-only check and
 actually shrink the gendisk. GET_PARAMS returns the same
-`basic.dev_sectors` the driver updated at UPDATE_SIZE time.
+`basic.dev_sectors` the driver updated at UPDATE_SIZE time. The read takes
+place before END while the device is still quiesced; END changes neither
+that capacity nor the parameters.
 
 ## Public API
 
@@ -481,6 +489,16 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 - `ublk: replacement queue open failure never repeats accepted recovery` —
   even `EBUSY` from opening replacement queues propagates immediately;
   START may not be repeated once it has reset the old queue state.
+- `ublk: failed recovery preparation and END retain one cleanup owner` —
+  injected capacity-read, preparation-log allocation and END errors run
+  through the same finish helper as attach. A deletion ledger immediately
+  reuses the numeric id after deletion and verifies that only the caller's
+  fallback deletes the original generation; adopted cleanup cannot delete
+  it first and leave that fallback armed against the new generation.
+- `ublk: recovery adoption is the final nonthrowing ownership transfer` —
+  preparation precedes END and adoption; after successful return the caller
+  disarms its fallback and Device cleanup deletes exactly once. The helper
+  requires the final adoption callback to be `noexcept`.
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
   Device destruction, with one worker and one blocking thread.

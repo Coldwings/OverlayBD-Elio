@@ -1,4 +1,4 @@
-// Unit tests: ublk ABI geometry and recovery retry/open ordering. The
+// Unit tests: ublk ABI geometry, recovery ordering and cleanup ownership. The
 // kernel-dependent E2E lives in tests/integration.
 #include "ublk/ctrl.hpp"
 #include "ublk/queue.hpp"
@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <new>
 #include <system_error>
 #include <vector>
 
@@ -234,4 +235,117 @@ TEST_CASE("ublk: replacement queue open failure never repeats accepted recovery"
     REQUIRE(attempts == 1);
     REQUIRE(opens == 1);
     REQUIRE(sleeps == 0);
+}
+
+namespace {
+
+enum class FinishFailure { None, Capacity, Log, End };
+
+struct FinishOwnership {
+    bool capacity_ready = false;
+    bool log_ready = false;
+    bool end_called = false;
+    bool end_after_preparation = false;
+    bool end_succeeded = false;
+    bool adopted = false;
+    bool adoption_after_preparation = false;
+    bool bad_alloc = false;
+    int error = 0;
+    int device_deletions = 0;
+    int fallback_deletions = 0;
+    int live_generation = 1;
+    bool unrelated_deleted = false;
+};
+
+FinishOwnership observe_recovery_finish(FinishFailure failure) {
+    FinishOwnership state;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        bool fallback_armed = true;
+        try {
+            co_await ublk::detail::finish_recovery(
+                [&]() -> elio::coro::task<void> {
+                    if (failure == FinishFailure::Capacity)
+                        throw error(EIO, "GET_PARAMS failed");
+                    state.capacity_ready = true;
+                    if (failure == FinishFailure::Log) throw std::bad_alloc();
+                    state.log_ready = true;
+                    co_return;
+                },
+                [&]() -> elio::coro::task<void> {
+                    state.end_called = true;
+                    state.end_after_preparation =
+                        state.capacity_ready && state.log_ready;
+                    if (failure == FinishFailure::End)
+                        throw error(EIO, "END_USER_RECOVERY failed");
+                    state.end_succeeded = true;
+                    co_return;
+                },
+                [&]() noexcept {
+                    state.adopted = true;
+                    state.adoption_after_preparation = state.end_succeeded &&
+                        state.capacity_ready && state.log_ready;
+                });
+            fallback_armed = false;
+        } catch (const std::bad_alloc&) {
+            state.bad_alloc = true;
+        } catch (const std::system_error& e) {
+            state.error = e.code().value();
+        }
+        // Model Device cleanup before the caller's guard leaves scope.
+        // Every DEL makes the same numeric id available to a foreign
+        // creator immediately, so a second DEL would delete generation2.
+        const auto delete_id = [&] {
+            if (state.live_generation != 1) state.unrelated_deleted = true;
+            ++state.live_generation;
+        };
+        if (state.adopted) {
+            ++state.device_deletions;
+            delete_id();
+        }
+        if (fallback_armed) {
+            ++state.fallback_deletions;
+            delete_id();
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    return state;
+}
+
+}  // namespace
+
+TEST_CASE("ublk: failed recovery preparation and END retain one cleanup owner",
+          "[ublk][recovery]") {
+    const auto check_failure = [](FinishFailure failure) {
+        const auto state = observe_recovery_finish(failure);
+        if (failure == FinishFailure::Log) {
+            REQUIRE(state.bad_alloc);
+        } else {
+            REQUIRE(state.error == EIO);
+        }
+        CHECK_FALSE(state.adopted);
+        CHECK(state.end_called == (failure == FinishFailure::End));
+        if (state.end_called) CHECK(state.end_after_preparation);
+        CHECK(state.device_deletions == 0);
+        CHECK(state.fallback_deletions == 1);
+        CHECK(state.live_generation == 2);
+        CHECK_FALSE(state.unrelated_deleted);
+    };
+    SECTION("capacity read fails") { check_failure(FinishFailure::Capacity); }
+    SECTION("preparation log allocation fails") { check_failure(FinishFailure::Log); }
+    SECTION("END fails") { check_failure(FinishFailure::End); }
+}
+
+TEST_CASE("ublk: recovery adoption is the final nonthrowing ownership transfer",
+          "[ublk][recovery]") {
+    const auto state = observe_recovery_finish(FinishFailure::None);
+    REQUIRE(state.error == 0);
+    REQUIRE_FALSE(state.bad_alloc);
+    REQUIRE(state.end_after_preparation);
+    REQUIRE(state.adoption_after_preparation);
+    REQUIRE(state.adopted);
+    REQUIRE(state.device_deletions == 1);
+    REQUIRE(state.fallback_deletions == 0);
+    REQUIRE(state.live_generation == 2);
+    REQUIRE_FALSE(state.unrelated_deleted);
 }
