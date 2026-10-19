@@ -883,6 +883,13 @@ needing a real ublk device or root.
   inside its mkfs step while the id is destroyed and re-created: the
   stale mkfs failure must clean up only ITS OWN entry, leaving the newer
   device (and its pid) alive.
+- `supervisor: stale destroy leaves a recreated device generation registered`
+  (integration, `tests/integration/test_commit.cpp`) — hold an admitted destroy
+  on A while failed-mkfs cleanup removes A, then publish B under the same ID.
+  Releasing the stale destroy must leave B registered with the same ready PID,
+  able to serve a resize command and be destroyed normally. Both lifecycle
+  removal paths compare the retained entry identity under the registry mutex;
+  a string ID alone cannot authorize removing a newer generation.
 - `supervisor: obd-device rejects malformed blank flags` — the real
   obd-device binary's `--blank-size`/`--blank-dir` validation: negative,
   zero, unaligned, junk, overflowing and above-bound sizes, the missing
