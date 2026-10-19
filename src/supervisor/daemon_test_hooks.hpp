@@ -39,6 +39,21 @@ public:
         return generation < generations.size() ? generations[generation]
                                                 : std::weak_ptr<Child>{};
     }
+    size_t spawn_count() {
+        std::lock_guard lock(mu);
+        return generations.size();
+    }
+    // A concrete one-shot allocation-failure seam, with no caller callback.
+    void fail_once(std::string point) {
+        std::lock_guard lock(mu);
+        failure_point = std::move(point);
+    }
+    bool take_failure(std::string_view point) {
+        std::lock_guard lock(mu);
+        if (failure_point != point) return false;
+        failure_point.clear();
+        return true;
+    }
 
     void mark(std::string point) {
         std::lock_guard lock(mu);
@@ -114,6 +129,7 @@ private:
     std::mutex mu;
     std::condition_variable cv;
     std::string armed;
+    std::string failure_point;
     bool hit = false;
     bool released = false;
     bool timed_out = false;
