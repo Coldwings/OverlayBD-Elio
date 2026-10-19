@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <new>
 #include <vector>
 
 extern char** environ;
@@ -122,9 +123,10 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
 
 Child::~Child() {
     if (ctl_fd_ >= 0) ::close(ctl_fd_);
-    if (pid_ > 0) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (pid_ > 0 && !reaped_) {
         ::kill(pid_, SIGKILL);
-        ::waitpid(pid_, nullptr, 0);
+        while (::waitpid(pid_, nullptr, 0) < 0 && errno == EINTR) {}
     }
 }
 
@@ -134,50 +136,94 @@ Child::Status Child::status() const {
 }
 
 void Child::update_status(const Status& st) {
-    bool fire_ready = false;
-    bool fire_exit = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        st_ = st;
-        if (!ready_fired_ &&
-            (st.state == "ready" || st.state == "failed" ||
-             st.state == "exited")) {
-            ready_fired_ = true;
-            fire_ready = true;
+        // A monitor may have parsed a buffered status before the reaper
+        // collected the process. Never restore its stale state/exit_code.
+        if (!reaped_) {
+            st_ = st;
         }
-        if (!exit_fired_ && st.state == "exited") {
-            exit_fired_ = true;
-            fire_exit = true;
+        if (st.state == "ready" || st.state == "failed" ||
+            st.state == "exited") {
+            ready_reached_ = true;
+        }
+        if (st.state == "exited") {
+            exit_reached_ = true;
         }
     }
-    if (fire_ready) ready_event_.set();
-    if (fire_exit) exit_event_.set();
+    try_notify_waiters();
 }
 
 void Child::terminate() noexcept {
-    if (pid_ > 0) ::kill(pid_, SIGTERM);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (pid_ > 0 && !reaped_) ::kill(pid_, SIGTERM);
 }
 
 void Child::kill() noexcept {
-    if (pid_ > 0) ::kill(pid_, SIGKILL);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (pid_ > 0 && !reaped_) ::kill(pid_, SIGKILL);
 }
 
-void Child::note_reaped(int wait_status) {
-    Status st = status();
-    if (WIFEXITED(wait_status)) {
-        st.exit_code = WEXITSTATUS(wait_status);
-    } else if (WIFSIGNALED(wait_status)) {
-        st.exit_code = 128 + WTERMSIG(wait_status);
-    } else {
-        st.exit_code = -1;
+bool Child::reaped() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return reaped_;
+}
+
+bool Child::try_reap() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (pid_ <= 0 || reaped_) return false;
+        int wait_status = 0;
+        pid_t result;
+        do {
+            result = ::waitpid(pid_, &wait_status, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result != pid_) return false;
+        // Keep collection and publication inside the signal lock: the PID
+        // can be recycled as soon as waitpid returns, before any separate
+        // note_reaped call could protect terminate()/kill().
+        reaped_ = true;
+        ready_reached_ = true;
+        exit_reached_ = true;
+        st_.state = "exited";
+        if (WIFEXITED(wait_status)) {
+            st_.exit_code = WEXITSTATUS(wait_status);
+        } else if (WIFSIGNALED(wait_status)) {
+            st_.exit_code = 128 + WTERMSIG(wait_status);
+        }
+        if (st_.exit_code == 127 && st_.error.empty()) {
+            st_.error = "exec failed (obd-device not found or not executable)";
+        }
     }
-    // Do not clobber a clean "stopped"/"ready" history with exit detail;
-    // the state transitions to "exited" uniformly for bookkeeping.
-    st.state = "exited";
-    if (st.exit_code == 127 && st.error.empty()) {
-        st.error = "exec failed (obd-device not found or not executable)";
+    try_notify_waiters();
+    return true;
+}
+
+bool Child::try_notify_waiters() {
+    bool ready;
+    bool exited;
+    bool reaped;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ready = ready_reached_;
+        exited = exit_reached_;
+        reaped = reaped_;
     }
-    update_status(st);
+    bool complete = true;
+    auto signal = [&](elio::sync::event& event, bool reached) {
+        if (!reached || event.is_set()) return;
+        try {
+            event.set();
+        } catch (const std::bad_alloc&) {
+            // Native set fails before signalling/claiming waiters. Keep
+            // the sticky fact and let the retained coroutine owner retry.
+            complete = false;
+        }
+    };
+    signal(reaped_event_, reaped);
+    signal(ready_event_, ready);
+    signal(exit_event_, exited);
+    return complete;
 }
 
 }  // namespace obd::supervisor

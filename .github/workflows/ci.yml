@@ -259,6 +259,15 @@ jobs:
               | tee -a "$log"
           fi
 
+      - name: "E2E - supervisor teardown and ublk removal"
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          trap 'rc=$?; echo "ublk supervisor teardown: exit=$rc" | tee -a build/ublk-e2e-supervisor.log' EXIT
+          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests \
+            "integration: supervisor reaps children before releasing ublk devices" -s \
+            2>&1 | tee build/ublk-e2e-supervisor.log
+
       - name: Capture available shutdown diagnostics
         if: failure()
         run: |

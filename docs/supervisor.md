@@ -481,7 +481,11 @@ Status lines (`DeviceStatus` / `make_device_status`):
 omitted when empty. The supervisor additionally maintains one internal
 state, `exited`, which the child never sends: it is assigned when the
 status channel hits EOF or the reaper collects the process
-(`Child::note_reaped`). The externally visible lifecycle is therefore:
+(`Child::try_reap`). EOF only reports loss of the control channel: the
+process can still be checkpointing or destroying its ublk control owner.
+The separate `reaped()` / `reaped_event()` barrier records actual process
+exit and must precede entry removal or offline sealing. The externally
+visible lifecycle is therefore:
 
 ```
 starting → ready → stopped → exited
@@ -508,7 +512,7 @@ empty; `--dev-id` is omitted when negative.
 There is no PATH lookup — the supervisor resolves the binary itself. On
 `execve` failure the child `_exit(127)`s; the parent observes EOF on the
 channel plus exit code 127 and reports "exec failed (obd-device not found
-or not executable)" (`Child::note_reaped`).
+or not executable)" (`Child::try_reap`).
 
 ### Daemon model
 
@@ -529,11 +533,18 @@ Bounded waits: `create` waits up to `ready_timeout_sec` (default 60 s) for
 the child's first terminal-for-creation state (`ready`/`failed`/`exited`)
 via `Child::ready_event`; on timeout or failure the child is SIGTERMed and
 an error reply returned. `destroy` SIGTERMs, waits up to
-`stop_timeout_sec` (default 10 s) for `exit_event`, escalates to SIGKILL
-with a further 2 s grace, then erases the child from the registry.
+`stop_timeout_sec` (default 10 s) for `reaped_event`, escalates to SIGKILL
+with a further 2 s reap grace, then erases the child from the registry.
+If the reap still cannot be confirmed, `destroy` returns an error and
+retains the entry for a later retry; failed mode-3 create cleanup also
+retains an unreaped entry and reports the cleanup failure. `commit` never
+seals while a child remains unreaped, even if status already says `exited`.
 Shutdown (SIGTERM/SIGINT to the daemon) stops accepting, SIGTERMs every
-child, and waits up to `stop_timeout_sec` per child; stragglers are
-SIGKILLed+reaped by `~Child`.
+child, and applies the same reap and post-SIGKILL bounds before stopping
+the reaper. A failed reap makes shutdown fail; the last-owner destructor
+remains a best-effort SIGKILL/blocking-wait fallback, not the normal
+completion barrier. Reaping proves process exit, not successful kernel
+`STOP_DEV`/`DEL_DEV`; real-device tests check the kernel nodes separately.
 
 ## Public API
 
@@ -595,7 +606,8 @@ SIGKILLed+reaped by `~Child`.
   and execs per the spawning contract above; the parent end of the channel
   is set `O_NONBLOCK`. Throws `obd::error` on socketpair/fork failure.
 - `~Child()` — closes the control fd if held; if the process is still
-  tracked: best-effort `SIGKILL` + blocking `waitpid`. Never throws.
+  unreaped: best-effort `SIGKILL` + blocking `waitpid` (retrying `EINTR`).
+  Never signals or waits on an already reaped PID. Never throws.
 - `const std::string& id() const`, `pid_t pid() const`.
 - `int control_fd() const` — parent end of the status channel.
 - `int release_control_fd() noexcept` — detaches the fd (the monitor
@@ -607,14 +619,29 @@ SIGKILLed+reaped by `~Child`.
 - `void update_status(const Status&)` — publishes a status; fires
   `ready_event` the first time the state becomes `ready` / `failed` /
   `exited`, and `exit_event` on `exited`. Each event fires at most once.
+  Late monitor updates cannot overwrite a confirmed reap's terminal state
+  or exit code.
 - `elio::sync::event& ready_event()`, `elio::sync::event& exit_event()`.
+- `bool reaped() const`, `elio::sync::event& reaped_event()` — actual
+  process-reap state and its one-shot event. EOF never fires this event.
 - `void terminate() noexcept` — SIGTERM. `void kill() noexcept` — SIGKILL.
-  Both are no-ops on an untracked pid.
-- `void note_reaped(int wait_status)` — records a `waitpid` result:
+  Both are no-ops on an untracked or already reaped PID.
+- `bool try_reap()` — performs owned-PID `waitpid(..., WNOHANG)` and
+  records a newly confirmed reap, returning true only for that transition:
   `exit_code` = `WEXITSTATUS`, or `128 + WTERMSIG` when signaled; state
   becomes `"exited"` (a clean `stopped`/`ready` history is deliberately not
   preserved — the state is bookkeeping, the detail lives in `exit_code`);
-  exit code 127 with no prior error gets the "exec failed" message.
+  exit code 127 with no prior error gets the "exec failed" message. It
+  fires `reaped_event` after publishing the result. Callers must never
+  independently `waitpid` a live `Child`'s PID; this method owns collection
+  and prevents a reap-to-publication interval in which another thread
+  could signal a recycled PID.
+- `bool try_notify_waiters()` — retries sticky ready/exit/reap notifications.
+  Returns false if native event dispatch storage allocation fails, leaving
+  that event's waiters registered. Attempts all events independently.
+  Coroutine owners retain the child, yield and retry before abandoning
+  their observation; the monitor, reaper and stop helper apply this rule.
+  Reap facts and exit codes remain committed if notification needs retry.
 
 ### `src/supervisor/daemon.hpp`
 
@@ -659,26 +686,31 @@ pre-parse needed).
   or exec failure is detected (EOF on fd 3 and/or SIGCHLD), recorded, and
   reported — siblings and the daemon are unaffected (ADR-0004).
 - **Reaping completeness**: every spawned child is reaped exactly once —
-  by the SIGCHLD reaper during normal operation, by `~Child` (SIGKILL +
-  blocking `waitpid`) on teardown paths. No zombies survive the daemon.
+  by the SIGCHLD reaper or a stop path through `Child::try_reap`, with
+  `~Child` (SIGKILL + blocking `waitpid`) as a last-owner fallback.
+  Removal and sealing wait for actual reap. No zombies survive the daemon.
 - **One-shot control channel**: an admitted command produces at most one
   reply before the connection closes. Malformed commands map to a
   `{"ok":false,...}` reply; shutdown or I/O failure can prevent delivery
   (see "Daemon shutdown").
-- **Bounded waits**: `create` never blocks longer than `ready_timeout_sec`
-  waiting for readiness; `destroy` never blocks longer than
-  `stop_timeout_sec` + 2 s SIGKILL grace.
+- **Bounded process waits**: readiness waits use `ready_timeout_sec`;
+  graceful and post-SIGKILL reap waits use `stop_timeout_sec` + 2 s.
+  Required notification retries retain their owners through allocation
+  failure, as do task drains; these are process-wait bounds, not a global
+  wall-clock deadline under sustained memory exhaustion.
 - **Line discipline**: both channels cap a line at 64 KiB; a peer that
   exceeds the cap is treated as disconnected (`LineReader` returns EOF).
   Anchor: `src/supervisor/protocol.hpp::kMaxMessageBytes`.
 - **Fork safety**: between fork and execve the child executes only
   async-signal-safe calls. Anchor: `src/supervisor/child.cpp::Child::spawn`.
 - **Status monotonicity**: `ready_event` fires at most once, on the first
-  creation-terminal state; `exit_event` fires at most once, on `exited`.
+  creation-terminal state; `exit_event` fires at most once, on `exited`;
+  `reaped_event` fires at most once, only after actual `waitpid` collection.
+  Monitor lines cannot replace a confirmed reap's terminal status.
   Anchor: `src/supervisor/child.cpp::Child::update_status`.
 - **Exit-code convention**: 127 means exec failure and is translated into a
   human-readable error; signaled exits are reported as `128 + signo`.
-  Anchor: `src/supervisor/child.cpp::Child::note_reaped`.
+  Anchor: `src/supervisor/child.cpp::Child::try_reap`.
 
 ## Concurrency & Call Permissions
 
@@ -697,11 +729,13 @@ pre-parse needed).
   cold path. After spawn, all interaction with the child is coroutine-based
   (monitor reads, event waits) except `terminate`/`kill`, which are
   signal-only and safe from any thread.
-- `Child`'s mutable state (`st_`, event-fired flags) is protected by a
-  plain `std::mutex`; `status()` / `update_status()` / `note_reaped()` are
+- `Child`'s mutable state (`st_`, event-fired flags, reap state) is protected
+  by a plain `std::mutex`; `status()` / `update_status()` / `try_reap()` are
   safe to call from the monitor coroutine, the reaper coroutine, and
-  command handlers concurrently. Event publication happens outside the
-  mutex.
+  command handlers concurrently. Signals and nonblocking collection plus
+  terminal-state publication take the same mutex, so a numeric PID cannot
+  be signalled after another thread has reaped it. Event publication
+  happens outside the mutex.
 - The control fd passes ownership exactly once via `release_control_fd()`
   into a shared stream retained by the monitor and in-flight writers.
   Monitor EOF removes channel availability from the registry; the fd closes
@@ -789,6 +823,13 @@ commands and monitors to distinct workers. No kernel ublk is required.
 | `supervisor: trace stop rejects malformed success metadata` | A matching-sequence trace_stop success with wrong-typed metadata fields is returned as a clean error and keeps the live trace recording. |
 | `supervisor: trace stop history survives child EOF` | A completed trace_stop publishes stopped history that child EOF must preserve instead of overwriting as lost. |
 | `supervisor: shutdown drains a monitor after its entry was erased` | Hold EOF cleanup after a successful destroy; shutdown must retain the daemon until the erased entry's monitor departs. |
+| `supervisor: destroy waits for reap after control EOF` | A live fake closes its channel while final cleanup is held; destroy cannot finish or kill it before release. |
+| `supervisor: control EOF stays distinct from a confirmed reap` | EOF fires only the liveness event while the process is alive; actual collection publishes a durable exit code that late monitor lines cannot overwrite. |
+| `supervisor: confirmed reap retries failed lifecycle notifications` | A native dispatch-allocation failure retains the actual reap and pending waiter; retry releases all lifecycle observers. |
+| `supervisor: commit waits for reap before sealing` | A checkpoint exists before EOF, but commit waits for held final teardown and actual process exit before sealing. |
+| `supervisor: failed blank create waits for reap before removal` | Failed mode-3 mkfs cleanup keeps its child alive through held cleanup and reaps it before removal. |
+| `supervisor: shutdown waits for reap after control EOF` | Daemon shutdown retains its reaper until an EOF-reporting child completes held cleanup and actually exits. |
+| `integration: supervisor reaps children before releasing ublk devices` | Privileged real-device create/destroy cycles, commit, failed mkfs cleanup and three-child shutdown leave no owned sysfs, block or character nodes. |
 | `supervisor: shutdown drains an admitted create and its late monitor` | Hold an admitted create across shutdown; drain its handler and the monitor it spawns before returning. |
 | `supervisor: shutdown drains an accept racing handler registration` | Hold an accepted socket before handler registration; cancellation and draining include the late handler. |
 | `supervisor: shutdown wakes an idle accepted client` | An accepted peer sends no bytes and remains open; shutdown cancels the read and closes its stream after completion. |
@@ -849,7 +890,7 @@ needing a real ublk device or root.
   a fake `obd-device` (a `/bin/sh` script that echoes a `ready` JSON line
   to **fd 3**) and guards: the child is exec'd, the parent receives the
   line on the control fd, it parses as `ready` with the right `device`,
-  and `note_reaped` transitions the child to `exited` with `exit_code` 0.
+  and `try_reap` transitions the child to `exited` with `exit_code` 0.
   This pins the fd-3 spawning contract end to end.
 - `supervisor: exec failure surfaces as exit 127` — spawns a child whose
   binary does not exist and guards that the reaped `exit_code` is exactly
@@ -968,7 +1009,8 @@ successful command execution or response delivery.
 The daemon drains accepted handlers first, with device monitors and the
 SIGCHLD reaper still running: an already admitted command may finish a
 create, spawn its monitor, or wait for a device reply or exit. It then stops
-the stable set of registered children, cancels remaining monitor reads, and
+the stable set of registered children, waits for actual reaps (including
+the 2 s post-SIGKILL grace), cancels remaining monitor reads, and
 drains **all** admitted monitors, including those whose entry was removed
 by `destroy`. Only after this work departs does it wake and drain the reaper.
 Recovery publication still takes `op_mu` followed by the registry mutex;

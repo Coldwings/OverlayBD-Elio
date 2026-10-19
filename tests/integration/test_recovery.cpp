@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1326,9 +1327,9 @@ bool fixture_child_exited(pid_t pid, std::chrono::steady_clock::time_point deadl
 }
 
 void terminate_fixture_child(pid_t pid) {
-    // Pin the signal target before checking child ownership: the daemon's
-    // reaper may collect it between waitpid and signalling. Never signal a
-    // numeric PID that could have been recycled in that interval.
+    // Pin and observe the signal target without waitpid: while the daemon
+    // is alive, its Child owns the reap and terminal-status publication.
+    // Fixture reaping happens only after daemon task drain below.
     const int pidfd = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
     if (pidfd < 0) {
         const int error = errno;
@@ -1336,8 +1337,12 @@ void terminate_fixture_child(pid_t pid) {
         throw std::system_error(error, std::generic_category(), "fixture pidfd_open");
     }
     try {
-        if (!fixture_child_exited(pid, std::chrono::steady_clock::now() +
-                                       std::chrono::seconds(5))) {
+        pollfd exited{pidfd, POLLIN, 0};
+        const int result = ::poll(&exited, 1, 0);
+        if (result < 0) {
+            throw std::system_error(errno, std::generic_category(), "fixture pidfd poll");
+        }
+        if (result == 0) {
             if (::syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, nullptr, 0) < 0 &&
                 errno != ESRCH) {
                 throw std::system_error(errno, std::generic_category(), "fixture pidfd_send_signal");
