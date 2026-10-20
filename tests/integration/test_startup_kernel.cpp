@@ -220,6 +220,18 @@ public:
                 (event.value == ETIMEDOUT || event.value == ECANCELED)) return true;
         return false;
     }
+    bool control_succeeded(uint32_t opcode) const {
+        uint64_t original = 0;
+        for (const auto& event : events()) {
+            if (event.opcode != opcode) continue;
+            if (event.kind == Kind::control_original && event.result == 0)
+                original = event.cookie;
+            if (original && event.kind == Kind::control_finished &&
+                event.cookie == original && event.result == 0)
+                return true;
+        }
+        return false;
+    }
     void dump() const {
         Json document;
         document["source_path"] = path_;
@@ -390,6 +402,18 @@ public:
         require_fixture(replacement_log_->header().recovery == 1 &&
                         generation_ != original_generation, "replacement identity is not recovery");
         require_fixture(original_->reaped(), "old serving generation was replaced before actual reap");
+        // Reaping the old process does not finish the driver's delayed
+        // quiesce work. Linux 6.6 checks dying servers every five seconds;
+        // observe the separate production START_RECOVERY retry (30 seconds)
+        // before applying the queue-publication observation deadline.
+        wait_for([&] {
+            const auto current = call({{"cmd", "status"}, {"id", "partial"}});
+            require_fixture(current.value("pid", pid_t{-1}) == replacement_pid_ &&
+                current.contains("startup_owner") &&
+                current.at("startup_owner").at("generation") == generation_,
+                "replacement changed while waiting for START_RECOVERY");
+            return replacement_log_->control_succeeded(UBLK_U_CMD_START_USER_RECOVERY);
+        }, 35s, "original START_RECOVERY did not succeed; fixture remains retained");
         wait_for([&] {
             return replacement_log_->has(Kind::initial_gate_enter, 1) &&
                    replacement_log_->has(Kind::initial_issued, 0);
@@ -703,6 +727,17 @@ private:
                         "STOP/DEL/caller terminal ordering or count invalid");
         require_fixture(controls.size() == originals.size() && controls.size() == finished.size(),
                         "control commands lack original completion/settlement evidence");
+        size_t recovery_started = events.size();
+        unsigned recovery_successes = 0;
+        for (const auto& [cookie, index] : originals) {
+            (void)cookie;
+            if (events[index].opcode == UBLK_U_CMD_START_USER_RECOVERY &&
+                events[index].result == 0) {
+                recovery_started = index;
+                ++recovery_successes;
+            }
+        }
+        require_fixture(recovery_successes == 1, "recovery requires exactly one successful START original");
         for (const auto& [cookie, index] : controls) {
             require_fixture(originals.contains(cookie) && finished.contains(cookie), "missing control original/settlement");
             const auto original_index = originals.at(cookie), finish_index = finished.at(cookie);
@@ -712,8 +747,12 @@ private:
                 original.opcode == events[index].opcode && finish.opcode == original.opcode &&
                 original.result == finish.result && (original.flags & IORING_CQE_F_MORE) == 0,
                 "control original and settlement disagree");
-            if (original.opcode == UBLK_U_CMD_START_USER_RECOVERY || original.opcode == UBLK_U_CMD_STOP_DEV)
-                require_fixture(original.result == 0, "START_RECOVERY/STOP original failed");
+            if (original.opcode == UBLK_U_CMD_START_USER_RECOVERY)
+                require_fixture(original.result == 0 ||
+                    (original.result == -EBUSY && original_index < recovery_started),
+                    "START_RECOVERY has an unexpected failure or retried after success");
+            if (original.opcode == UBLK_U_CMD_STOP_DEV)
+                require_fixture(original.result == 0, "STOP original failed");
             if (original.opcode == UBLK_U_CMD_DEL_DEV)
                 require_fixture(original.result == 0 || original.result == -ENODEV, "DEL original failed");
         }
@@ -730,6 +769,7 @@ private:
         require_fixture(prepared.size() == completed.size(), "prepared raw cookies lack terminal original CQEs");
         unsigned fetches[2] = {0, 0};
         for (const auto& [key, index] : prepared) {
+            require_fixture(recovery_started < index, "raw command preceded successful START_RECOVERY");
             const auto completion = completed.find(key);
             require_fixture(completion != completed.end() && completion->second.first > index,
                             "raw completion missing or precedes preparation");
@@ -777,6 +817,7 @@ TEST_CASE("integration: supervisor retains failed partial ublk recovery until ex
     if (!failure.empty()) fixture.attempt_supported_cleanup();
     const bool exported = fixture.finish_report(failure);
     INFO("preserved fixture evidence: " << fixture.directory());
+    INFO("fixture failure: " << failure);
     CHECK(exported);
     CHECK(failure.empty());
 }

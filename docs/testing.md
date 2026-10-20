@@ -1501,6 +1501,11 @@ Every test, grouped by area, with the property it guards.
   pinned kernel node identities. Issuance alone is not acceptance evidence:
   each parked data FETCH must return its original `-ENODEV` after authorized STOP.
   This stage does not cover pending remote fills or post-END source-buffer loans.
+  Before observing queue publication, the fixture waits for the correlated
+  successful START_RECOVERY original and settlement. Its 35-second observation
+  allowance covers the production 30-second retry budget: reaping alone does
+  not finish Linux 6.6's delayed quiesce work. Queue publication and END failure
+  then have separate observation deadlines; none authorizes forced cleanup.
 
   The explicit `OBD_TEST_STARTUP_FIXTURE_DIR` environment in the spawned process
   enables this fixture only in `OBD_TEST_HOOKS` builds. The directory must contain
