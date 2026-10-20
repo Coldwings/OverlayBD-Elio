@@ -7,6 +7,7 @@
 #include <elio/io/io_awaitables.hpp>
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/time/timer.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -75,6 +76,9 @@ public:
                 }
                 continue;
             }
+            // Preserve every consumed byte when command parsing is retried
+            // after allocation failure.
+            buf_.reserve(buf_.size() + 4096);
             char tmp[4096];
             const auto r =
                 co_await elio::io::async_read(fd_, tmp, sizeof(tmp), -1);
@@ -243,6 +247,15 @@ elio::coro::task<void> run_device_control(
     ControlChannelWriterPtr channel,
     std::shared_ptr<image::TraceRecorder> recorder,
     DeviceControlHooks hooks) {
+    co_await run_device_control_with_session(
+        std::move(channel), std::move(recorder), std::move(hooks), {});
+}
+
+elio::coro::task<void> run_device_control_with_session(
+    ControlChannelWriterPtr channel,
+    std::shared_ptr<image::TraceRecorder> recorder,
+    DeviceControlHooks hooks,
+    std::shared_ptr<DeviceControlSession> session) {
     // The channel is required by every path below; dereferencing a null
     // here would crash the detached coroutine. Refuse loudly instead.
     // `recorder` may be null on devices without one (read-only or
@@ -255,15 +268,59 @@ elio::coro::task<void> run_device_control(
     }
     LineReader reader(channel->fd());
     for (;;) {
-        auto line = co_await reader.next();
-        if (!line) co_return;  // supervisor closed or died
-        nlohmann::json j = nlohmann::json::parse(*line, nullptr, false);
-        if (j.is_discarded() || !j.is_object() || !j.contains("cmd") ||
-            !j["cmd"].is_string()) {
-            ELIO_LOG_WARNING("malformed device control line ignored");
-            continue;
+        std::optional<std::string> line;
+        nlohmann::json j;
+        std::string cmd;
+        bool parsed = false;
+        while (!parsed) {
+            try {
+                if (!line) line = co_await reader.next();
+                if (!line) co_return;  // supervisor closed or died
+                j = nlohmann::json::parse(*line, nullptr, false);
+                if (j.is_discarded() || !j.is_object() || !j.contains("cmd") ||
+                    !j["cmd"].is_string()) {
+                    line.reset();
+                    try { ELIO_LOG_WARNING("malformed device control line ignored"); }
+                    catch (...) {}
+                    continue;
+                }
+                cmd = j["cmd"].get<std::string>();
+                parsed = true;
+            } catch (...) {
+                // In startup this reader is the release service. Retain its
+                // buffer/current record; restarting the coroutine would lose
+                // an already-consumed command prefix.
+                try { ELIO_LOG_WARNING("device control read deferred"); } catch (...) {}
+            }
+            if (!parsed) {
+                try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+                catch (...) {}
+            }
         }
-        const std::string cmd = j["cmd"].get<std::string>();
+        if (session) {
+            try {
+                auto response = session->lifecycle(j);
+                if (response) {
+                    (*response)["reply"] = cmd;
+                    echo_seq(j, *response);
+                    channel->write_line(*response);
+                    continue;
+                }
+                if (!session->load(recorder, hooks)) {
+                    nlohmann::json response = {
+                        {"reply", cmd}, {"ok", false},
+                        {"error", "device startup has not completed"}};
+                    echo_seq(j, response);
+                    channel->write_line(response);
+                    continue;
+                }
+            } catch (...) {
+                // Diagnostics/control allocation cannot unwind the startup
+                // owner. No lifecycle operation depends on reply delivery.
+                try { ELIO_LOG_WARNING("device lifecycle command failed"); } catch (...) {}
+                continue;
+            }
+        }
         if (cmd == "trace_start") {
             // A recorder-less device (or one mid-teardown) cannot record:
             // answer cleanly instead of dereferencing a null recorder.

@@ -106,8 +106,11 @@ in (writes) and out (reads).
    `UBLK_U_IO_COMMIT_AND_FETCH_REQ` per finished tag — committing the result
    *and* re-parking the fetch for the next IO in one command.
 
-`user_data` encoding on the ring (`src/ublk/queue.cpp`): bit 63 = done_efd
-poll marker, bit 62 = commit cqe, low 16 bits = tag.
+`user_data` encoding on the ring (`src/ublk/queue.cpp`): data cookies combine
+an increasing command generation with the low 16-bit tag; bit 63 reserves a
+separate namespace for done_efd polls. Each original completion must match its
+pending cookie. Duplicate, foreign or ambiguous completion facts make debt
+unknown rather than retiring a different command.
 
 ### Op dispatch table
 
@@ -132,7 +135,7 @@ contract) and `max_discard_sectors`/`max_write_zeroes_sectors` =
 `max_sectors`, one segment; for read-only devices all discard limits stay
 0 so the kernel never issues the commands (ADR-0009).
 
-### Crash recovery (ADR-0010)
+### Crash recovery (ADR-0010, ADR-0022)
 
 Devices are created with `UBLK_F_USER_RECOVERY |
 UBLK_F_USER_RECOVERY_REISSUE` when `DeviceParams::enable_recovery` (the
@@ -154,21 +157,50 @@ but wait for different conditions:
   and timer delays consume the same budget; an already-running control
   command is not preempted. The replacement must not open any queue cdev
   before START succeeds, as an open cdev itself makes START return `EBUSY`.
-- `END_USER_RECOVERY` waits until every replacement queue tag has a parked
-  FETCH, retrying up to 100 times with 50 ms waits, like `START_DEV`.
+- `END_USER_RECOVERY` and `START_DEV` share a five-second monotonic startup
+  budget with queue/bridge preparation. Transient `EBUSY` retries yield between
+  attempts. Queue failure, deadline or explicit release can request control
+  cancellation; an original result must still settle before cleanup proceeds.
 
-Other errors fail immediately; exhausting START's budget reports
-`ublk START_USER_RECOVERY not ready after 30s`. The replacement adopts
-cleanup ownership only after END succeeds, so a failed START does not
-delete the existing kernel device. It completes all fallible metadata
-preparation (GET_PARAMS, path formatting and the preparation log) before
-END. Successful END is followed immediately by nonthrowing adoption and
-return, so a caller's fallback cleanup guard can hand off ownership when
-attach returns without retaining an id already deleted by failed adopted
-setup. The preparation log does not announce recovery success; readiness
-is published after attach returns. `ADD_DEV`
-falls back to a non-recoverable device (with a warning) when the kernel
-rejects the flags with `EINVAL`.
+Other START errors fail its preparation; exhausting its retry budget reports
+`ublk START_USER_RECOVERY not ready after 30s`. Successful original END adopts
+the old device immediately, including success after cancellation intent.
+A subsequent queue-health failure therefore follows adopted cleanup, not an
+unadopted failed-recovery path. Ready publication additionally requires healthy
+owners and atomic closure of startup-release admission. `ADD_DEV` falls back
+to a non-recoverable device when the kernel rejects recovery flags with EINVAL.
+
+### Failed startup ownership and explicit release (ADR-0022)
+
+All queue rings and native bridges must become ready before the coordinator
+opens initial FETCH publication. After publication, a failed queue enters
+maintenance on its original issuing thread rather than destroying the ring.
+Original raw command cookies and terminal CQEs account for kernel loans;
+cancellation CQEs and native coroutine completion are separate facts.
+
+A failed pre-END recovery with published work retains the old device and the
+complete startup/caller/source/runtime graph. `StartupControl` exposes facts
+and release admission; it owns none of those resources. Reporting failure or
+cancelling an observer cannot unwind the owning startup task. Successful ADD
+or original END supplies cleanup authority; failed unadopted recovery does not.
+
+Explicit release settles startup control work, stops new source admission and
+awaits native bridge/handler frame destruction while retaining queue owners.
+Initial FETCH issuance must be fenced before the authorized STOP cancellation
+pass: a prepared request must not be submitted afterward. The current fence
+relies on synchronous, non-SQPOLL owner submission with no ASYNC/LINK/DRAIN
+flags; Linux 6.6 FETCH has no io-wq EAGAIN retry path. SQ consumption under
+these constraints is an issuance boundary, not proof of driver acceptance or
+readiness. Each original CQE still has to be observed.
+
+STOP does not replace the retirement ledger. Queue owners remain runnable to
+COMMIT delivered requests and consume original completions. Only known raw
+retirement, native-frame retirement and owner exit permit thread joins and
+ring/mapping/cdev closure. All queue cdev references close before one DEL;
+its cached result prevents blind deletion of a reused numeric device ID.
+Refused or unknown outcomes retain the owner and attempt ledger. The supervisor
+also requires correlated release and actual process reap before erasing its
+entry; see [supervisor.md](./supervisor.md).
 
 ### Online resize (D3)
 
@@ -236,8 +268,9 @@ and remembers the added device for best-effort cleanup. Non-copyable.
 
 - `Ctrl()` — opens `/dev/ublk-control` (`O_RDWR | O_CLOEXEC`); throws
   `obd::error` when unavailable (driver not loaded / no permission).
-- `~Ctrl()` — if a device was added: best-effort `STOP_DEV` + `DEL_DEV`,
-  then closes the fd. Never throws.
+- `~Ctrl()` — retains pending control ownership until original/cancellation
+  records settle. Unmanaged instances retain the legacy best-effort cleanup;
+  Device disables it and performs explicit retirement/close-before-DEL.
 - `uint32_t add_dev(const DeviceParams&)` — `UBLK_U_CMD_ADD_DEV` with
   `UBLK_F_URING_CMD_COMP_IN_TASK` and `ublksrv_pid = getpid()`; returns the
   driver-assigned device id. Throws `obd::error`.
@@ -265,12 +298,25 @@ and remembers the added device for best-effort cleanup. Non-copyable.
   Throws `obd::error`. Blocking; see the spawn_blocking rule below.
 - `void stop_dev(uint32_t) noexcept`, `void del_dev(uint32_t) noexcept` —
   best-effort teardown commands; errors are deliberately ignored.
+- `void set_observer(CtrlObserver) noexcept` — installs cold-path cancellation,
+  original-completion and progress callbacks; callbacks cannot throw or outlive
+  their borrowed context. Successful original completion commits ownership
+  before fallible reporting.
+- `void disable_destructor_cleanup() noexcept` — makes the Device coordinator
+  responsible for explicit teardown.
+- `bool command_pending() const noexcept`, `int added_dev_id() const noexcept`
+  — pending-command and added/adopted-ID facts.
+- `int stop_dev_result(uint32_t) noexcept` — STOP with a retained result.
+- `int delete_dev_once(uint32_t) noexcept` — one DEL attempt, returning the cached
+  result on later calls; zero or negative errno.
 - `static std::string cdev_path(uint32_t)` → `/dev/ublkc<N>`;
   `static std::string bdev_path(uint32_t)` → `/dev/ublkb<N>`.
 
 All `Ctrl` commands are blocking cold-path calls. Coroutine callers
-(`Device::create` / `Device::attach`) run them through
-`elio::spawn_blocking`: kernel control commands may sleep on our own
+use the cold controller executor for startup/teardown. It runs each action
+on an owned thread and retains its frame until join, leaving the sole source
+blocking worker available. Other cold operations such as resize use
+`elio::spawn_blocking`. Kernel control commands may sleep on our own
 data plane — START_DEV's `add_disk` partition scan issues device reads
 serviced by the bridges, and END_USER_RECOVERY waits for reissued IO.
 A synchronous control call on a scheduler worker deadlocks it (the
@@ -325,9 +371,25 @@ Queue thread side:
 
 - `void run(std::atomic<bool>& stop)` — the blocking queue loop: parks the
   per-tag FETCH commands, then waits on the ring, dispatching new requests
-  to `pending_` and committing finished ones. Returns when `stop` becomes
-  true (call `wakeup()` to interrupt the wait) or when the ring fails
-  (check `failed()`).
+  to `pending_` and committing finished ones. Stop/failure enters maintenance;
+  return requires owner-exit permission and positive raw retirement. Before
+  publication, aborting setup can leave without publishing commands.
+- `bool setup_ready() const noexcept`, `bool bridge_ready() const noexcept`,
+  `void mark_bridge_ready() noexcept` — owner/bridge preparation handshake.
+- `void publish_initial_fetches() noexcept`, `void abort_setup() noexcept` —
+  release or abort the pre-publication gate.
+- `void request_release() noexcept`, `void kernel_stopped() noexcept`,
+  `void request_owner_exit() noexcept` — coordinator facts/intent; none alone
+  proves original-command retirement.
+- `bool owner_exited() const noexcept`,
+  `bool initial_fetches_issued() const noexcept` — owner exit and initial-batch
+  issuance observations. Issuance orders STOP; it is not driver readiness.
+- `Retirement retirement() const noexcept` — `published`, `retired`,
+  `delivered`, `known`, `complete`; unknown debt prevents safe release.
+- `void sources_drained() noexcept` — publish only after transitive native
+  source frames retire, permitting repair of missing completion publication.
+- `void close_retired() noexcept` — after owner-thread join and positive raw
+  retirement, close ring/mapping/cdev before DEL; retain diagnostic buffers.
 - `void wakeup() noexcept` — interrupts the `run()` wait.
 - `bool failed() const`, `int failure() const` — sticky ring-failure flag
   and errno. `-ENODEV` / `-EINTR` / `-ECANCELED` cqes are treated as normal
@@ -398,23 +460,33 @@ guarantee the same performance trade-off for every source or queue geometry
 
 Full lifecycle of one image as one ublk device. Non-copyable.
 
-- `static elio::coro::task<std::unique_ptr<Device>> create(const
-  DeviceParams&, source::BlobSourcePtr src)` — **must be awaited on the
-  Elio scheduler** (bridge coroutines are independently joinable). Order:
-  open `Ctrl` → `ADD_DEV` → `SET_PARAMS` → open all queues → launch queue
-  threads (they park the FETCH commands) → spawn one bridge coroutine per
-  queue → `START_DEV`, retrying `EBUSY` up to 100 × 50 ms (5 s). Throws
-  `obd::error(EINVAL)` for a null source or `dev_sectors == 0`, and
-  `obd::error` on any setup failure (partial state is torn down via
-  `stop_async()` and off-worker destruction before the original error is
-  rethrown).
+- `using FailureCleanup = std::function<elio::coro::task<void>()>` — caller
+  cleanup hook for parking image fills after native source drainage. Its
+  captures must outlive the awaited startup, including retained failure.
+- `static elio::coro::task<std::unique_ptr<Device>> create(const DeviceParams&,
+  source::BlobSourcePtr, FailureCleanup = {})` and the overload with
+  `StartupControl&` before `FailureCleanup` — await on the Elio scheduler.
+  Open Ctrl, ADD/SET_PARAMS, prepare all queue/bridge owners, publish FETCH,
+  then START with the shared startup deadline. Null source, zero sectors or
+  zero queues fail with EINVAL. Failures return only after eligible cleanup;
+  unresolved ownership keeps the operation and its callers alive.
 - `static elio::coro::task<std::unique_ptr<Device>> attach(uint32_t,
-  const DeviceParams&, source::BlobSourcePtr)` — attach a replacement to
-  an existing recoverable device. Retry START's transient `EBUSY` against
-  a 30-second steady-clock deadline before opening queues; re-park all
-  FETCH commands and retry END's `EBUSY` up to 100 times with 50 ms waits.
-  Queue geometry must match the original device. Other control errors
-  propagate immediately through the same partial-state cleanup as create.
+  const DeviceParams&, source::BlobSourcePtr, StartupControl&,
+  FailureCleanup = {})` — prepare recovery before opening cdev,
+  preserve actual capacity via GET_PARAMS, prepare owners, publish FETCH,
+  then END. Queue geometry must match the old device. Published unadopted
+  failure is retained until explicit supported release.
+- Recovery requires a caller-supplied `StartupControl` accessible to a
+  concurrent status/release service. Keep the controller and runtime alive
+  until attach finishes, including retained failure. After an exception,
+  disarm fallback deletion only with positive deletion/absence evidence
+  (original DEL success/ENODEV or STOP ENODEV and released phase). END may
+  have adopted the device before a later failure caused automatic cleanup;
+  conversely, released phase alone can mean only that an unadopted,
+  pre-publication frame has retired without deleting the old device. Destroying a suspended task or its runtime
+  is not cleanup. The create convenience overload retains automatic cleanup
+  authority over its newly added device and does not need operator permission
+  to release it; supply a controller when external startup observation is needed.
 - `uint64_t size_bytes() const` — the current device capacity in bytes
   (the D3 grow-only resize baseline: params-derived on create, kernel-
   derived via `Ctrl::get_params` on a recovery attach — which may exceed
@@ -438,7 +510,33 @@ Full lifecycle of one image as one ublk device. Non-copyable.
   occupying a worker or the blocking
   pool, then joins queue threads off-worker. Retain the Device until the
   await completes. Use this from coroutines, including setup-error cleanup.
-- `~Device()` — `stop()`, then `STOP_DEV` / `DEL_DEV` via `~Ctrl`.
+- `StartupSnapshot released_snapshot() const noexcept` — final queue/control
+  ledger; read only after stop/stop_async completes.
+- `~Device()` — blocking stop and explicit proven teardown. Managed Ctrl
+  destruction does not replay STOP/DEL.
+
+### `src/ublk/startup_control.hpp` — startup observation/admission
+
+- `explicit StartupControl(uint64_t generation)` — rejects zero; non-copyable.
+- `StartupSnapshot snapshot() const noexcept` — allocation-free coherent facts:
+  phase/operation, identity/revision, original/cancel results and known flags,
+  control/raw debt, and release sequence/result. It transfers no ownership.
+- `ReleaseRequestResult request_release(uint64_t generation, uint64_t sequence)
+  noexcept` — one outstanding increasing sequence in `[1, 2^63)`; returns
+  accepted, stale, busy or not_startup. Ready closure and acceptance use one
+  atomic decision.
+- `bool release_before_start() noexcept` — owner-only completion before any
+  Device invocation/publication. On true the caller must leave startup and
+  never create a device afterward.
+- `bool owner_entered() const noexcept` — the Device body accepted responsibility;
+  constructing its coroutine task alone does not establish that handoff.
+- `StartupReleased` — exception indicating completed explicit startup release;
+  it carries no resource graph and is thrown only after safe release.
+
+Retain StartupControl and all caller captures through the awaited startup.
+Concurrent snapshot/request operations are permitted; publication is a cold
+single-writer coordinator responsibility. Successful ready handoff closes the
+startup mailbox; the returned Device's ordinary owner handles later shutdown.
 
 ## Invariants & Guarantees
 
@@ -452,12 +550,14 @@ Full lifecycle of one image as one ublk device. Non-copyable.
 - **Sector math**: all offsets/lengths crossing the bridge are 512-byte
   sector based (`IoRequest::byte_offset` / `byte_len`); sources see
   byte-granular positional IO. Anchor: `src/ublk/queue.hpp::IoRequest`.
-- **START_DEV ordering**: `START_DEV` is issued only after every queue tag
-  has a parked FETCH; `EBUSY` is retried, never propagated, within the 5 s
-  bound. Anchor: `src/ublk/device.cpp::Device::create`.
-- **Teardown safety**: `stop()` is idempotent and noexcept; `~Ctrl`
-  best-effort unregisters a still-registered device. Destroying a `Device`
-  never leaks a kernel device.
+- **Startup ordering**: queue/bridge preparation precedes FETCH publication.
+  START/END readiness is decided by the original kernel control result;
+  publication or SQ consumption alone is not readiness. EBUSY retries share
+  the startup budget. Anchor: `src/ublk/device.cpp::Device::create`.
+- **Teardown ownership**: stop is idempotent and retains unresolved loans.
+  Failure may intentionally retain a device/process indefinitely (ADR-0022).
+  Original CQEs and native-frame retirement precede resource closure; elapsed
+  time, STOP completion or a cancellation result cannot replace those fences.
 - **Error discipline**: setup/cold paths throw `obd::error`; the per-IO hot
   path never throws — failures are negative-errno completions.
 - **Result contract**: bridge results follow the ublk convention —
@@ -470,7 +570,7 @@ Three distinct execution contexts, with strict permissions:
 
 | Context | Threads | May touch |
 |---|---|---|
-| Control path | caller of `Device::create` (an Elio coroutine) | `Ctrl` control commands (blocking; cold path only) |
+| Control path | owned cold-controller thread, coordinated by the startup coroutine | Ctrl commands and their original/cancel ledger; blocking, cold path only |
 | ublk queue threads | one `std::thread` per `Queue` | **exclusively** their ring, the read-only mmap window, `pending_` push, `done_` drain |
 | Elio scheduler threads | bridge + per-tag `handle_io` coroutines | `try_pop_request`, tag IO buffers, `BlobSource` stack, `push_completion` |
 
@@ -498,8 +598,9 @@ Three distinct execution contexts, with strict permissions:
   order: stop drains bridges and handlers and joins queue threads before
   members die). The daemon retains its owner until the control task body and
   captures are destroyed, then releases the Device off-worker. Its successful
-  shutdown drains resize, drains device I/O, finalizes recording, checkpoints,
-  parks fills, reports stopped, and closes/joins the control loop in that order.
+  shutdown closes command admission and retires the private reader before
+  destroying its hooks, drains device/source work, completes image cleanup,
+  destroys Device off-worker and only then emits terminal ownership facts.
 
 ## Stability Contract
 
@@ -526,6 +627,24 @@ Three distinct execution contexts, with strict permissions:
   types — free to change without notice.
 
 ## Testing
+
+Startup-specific ordinary tests include:
+
+- `ublk: ready closure wins after release has read open admission` and
+  `ublk: release wins after ready has read idle admission` pin both atomic
+  handoff interleavings.
+- `ublk: startup observations distinguish cancellation from retirement`
+  keeps original and cancellation facts separate.
+- `ublk: cold controller leaves the sole blocking worker available` checks
+  controller/source progress with one worker of each kind.
+
+These helper/process tests are not kernel retirement proof. The Linux 6.6
+START-cancellation and single-FETCH probes cover only their individual cases.
+Complete failed multi-queue recovery, late END success, native source loans,
+original CQEs, cdev-close-before-DEL and actual process reap require separate
+owned-fixture evidence on Linux 6.6 and a current kernel before ADR-0022 is
+accepted. No full validation result is asserted here.
+
 
 Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 `OBD_ENABLE_UBLK` is on); the kernel-dependent end-to-end test lives in
@@ -571,22 +690,46 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 - `ublk: replacement queue open failure never repeats accepted recovery` —
   even `EBUSY` from opening replacement queues propagates immediately;
   START may not be repeated once it has reset the old queue state.
-- `ublk: failed recovery preparation and END retain one cleanup owner` —
-  injected capacity-read, preparation-log allocation and END errors run
-  through the same finish helper as attach. A deletion ledger immediately
-  reuses the numeric id after deletion and verifies that only the caller's
-  fallback deletes the original generation; adopted cleanup cannot delete
-  it first and leave that fallback armed against the new generation.
-- `ublk: recovery adoption is the final nonthrowing ownership transfer` —
-  preparation precedes END and adoption; after successful return the caller
-  disarms its fallback and Device cleanup deletes exactly once. The helper
-  requires the final adoption callback to be `noexcept`.
+- `ublk: failed startup drains sources before propagating its original error` —
+  the production failure coordinator drains partial bridge registration and
+  publishes released state before rethrowing the original failure. Source
+  graph destruction remains with the owner after the operation resolves.
+
+- `ublk: retained recovery waits for source drain and explicit release` —
+  the production Device failure coordinator, bridge and Ctrl command loop
+  retain an outstanding source-buffer loan. Neither source completion nor
+  cleanup callback exceptions grant release authority. An admitted release
+  drains the native frames, performs STOP, closes the stand-in cdev, then
+  issues one DEL. A refused STOP retains the graph until another release.
+- `ublk: retained release waits for every queue to issue and retire originals` —
+  two real queue threads/rings publish URING_CMD against rejecting eventfds.
+  Pausing one queue before submission prevents the real Device coordinator
+  from issuing STOP; after submission, both original-CQE ledgers must retire,
+  both owners must exit, and cdev stand-ins must close before one scripted DEL.
+  This proves the coordinator's issuance/retirement ordering with real rings;
+  it does not prove ublk-driver STOP behavior.
+- `ublk: startup failure keeps the admitted cleanup callback without copying` —
+  the public create API handles a pre-admitted release without opening a kernel
+  device, invoking a movable callback whose copy constructor throws. The
+  original startup frame retains it through failure coordination.
+- `ublk: original END completion decides recovery adoption` — scripted CQEs
+  through the real Ctrl loop invoke Device's original-completion callback;
+  success adopts the old device, failure does not. These composed tests use
+  synthetic queue delivery and control transport, not a kernel FETCH ledger.
+- `ublk: actual control loop waits for original and cancellation CQEs` —
+  actual command-loop tests distinguish original and cancellation CQEs,
+  including cancellation ENOENT and original success before cancellation.
+- `ublk: actual control loop retains payload across ambiguous and short submissions` —
+  scripted submit results preserve the actual command payload until terminal
+  completions, including an error after publication and short submission.
+- `ublk: actual control loop retains poisoned completion ownership` — unknown,
+  duplicate and multishot CQEs cannot end command ownership even after both
+  expected completions arrive; bounded kernel-free subprocesses observe this
+  intentional retention without unwinding live resources.
+
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
   Device destruction, with one worker and one blocking thread.
-- `ublk: failed setup drains partial state before rethrowing its error` —
-  the create/attach cleanup routine preserves the original exception and
-  destroys partial state off-worker, before and after bridge registration.
 - `ublk: blocking stop waits for a slow source to finish` — a normal read
   completes after eight seconds while a dedicated off-worker caller drains;
   stop must not return before completion, and owners remain valid throughout.
@@ -684,12 +827,14 @@ user namespace, and a loaded `ublk_drv` to actually execute).
   recovery while a sparse upper recovers via fiemap (ADR-0008, ADR-0010).
 - **Single device per `Ctrl` instance**: the class remembers one added
   device; multi-device processes would need one `Ctrl` each.
-- **START_DEV polling**: fixed 100 × 50 ms bound rather than an event-driven
-  readiness signal; sufficient in practice, worth revisiting if queue counts
-  grow large.
-- **Failure blast radius**: a queue ring failure sets the sticky
-  `failed_` flag and stops that queue's loop, but there is no automatic
-  device-level teardown cascade yet — operators should treat
-  `Queue::failed()` as fatal for the device.
+- **Startup deadline**: owner preparation and START/END retries share a
+  five-second monotonic budget. Expiry requests cancellation; it does not
+  bound original-command retirement or retained-owner lifetime.
+- **Queue failure**: a published queue fault keeps its original owner in
+  maintenance. Release can remain unresolved if the original terminal CQEs
+  cannot be proven; a sticky failure is not permission to free its resources.
+- **Release ingress**: library recovery requires a reachable `StartupControl`.
+  Standalone `obd-device` uses the startup control endpoint documented in
+  [binaries.md](binaries.md); supervised recovery uses its private channel.
 - The supervisor-facing readiness signaling around a started device lives in
   `obd-device` (`src/cmd`), not in this module.

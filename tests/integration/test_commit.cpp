@@ -23,6 +23,7 @@
 #include <elio/time/timer.hpp>
 
 #include "../support.hpp"
+#include "../scripted_startup.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -214,9 +215,8 @@ std::string write_slow_ready_device(const test::TempDir& dir,
                                     const std::string& name) {
     const std::string script = dir / name;
     const std::string content =
-        "#!/usr/bin/env python3\n"
-        "import os, time\n"
-        "os.write(3, b'{\"state\":\"ready\",\"device\":\"/dev/ublkb70\"}\\n')\n"
+        "#!/usr/bin/env python3\n" + test::python_startup_handshake(70) +
+        "import time\n"
         "while True:\n"
         "    time.sleep(1)\n";
     test::write_file(script,

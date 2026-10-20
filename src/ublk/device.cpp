@@ -4,6 +4,7 @@
 #include "common/errors.hpp"
 #include "ublk/elio_bridge.hpp"
 #include "ublk/recovery.hpp"
+#include "ublk/control_task.hpp"
 
 #include <elio/log/macros.hpp>
 #include <elio/runtime/spawn.hpp>
@@ -31,201 +32,339 @@ void Device::open_queues() {
     }
 }
 
+namespace {
+int exception_errno(const std::exception_ptr& failure) noexcept {
+    try {
+        if (failure) std::rethrow_exception(failure);
+    } catch (const std::system_error& e) {
+        return e.code().value() ? e.code().value() : EIO;
+    } catch (const std::bad_alloc&) {
+        return ENOMEM;
+    } catch (...) {
+        return EIO;
+    }
+    return 0;
+}
+} // namespace
+
 elio::coro::task<std::unique_ptr<Device>> Device::create(
     const DeviceParams& params, source::BlobSourcePtr src,
     FailureCleanup failure_cleanup) {
-    if (!src) throw error(EINVAL, "ublk device with null block source");
-    if (params.dev_sectors == 0) {
-        throw error(EINVAL, "ublk device with zero size");
-    }
-    auto dev = std::unique_ptr<Device>(new Device());
-    dev->params_ = params;
-    dev->src_ = std::move(src);
+    StartupControl startup(1);
+    co_return co_await create(params, std::move(src), startup,
+                              std::move(failure_cleanup));
+}
 
-    std::exception_ptr failure;
-    try {
-        dev->ctrl_ = std::make_unique<Ctrl>();
-        // Kernel control calls run off-scheduler (spawn_blocking): they
-        // may block in the kernel — START_DEV's add_disk partition scan
-        // issues reads serviced by OUR bridges, so a synchronous control
-        // call on a worker deadlocks the data plane (worker stalls, the
-        // bridge coroutine never runs). See ublk.md control plane.
-        dev->dev_id_ = co_await elio::spawn_blocking([&]() -> uint32_t {
-            const uint32_t id = dev->ctrl_->add_dev(params);
-            dev->ctrl_->set_params(id, params);
-            return id;
-        });
-
-        dev->open_queues();
-        ELIO_LOG_INFO("ublk dev {}: add_dev+set_params done, opening queues",
-                      dev->dev_id_);
-        // Queue threads first: they park the per-tag FETCH commands the
-        // driver requires before START_DEV.
-        for (auto& queue : dev->queues_) {
-            Queue* q = queue.get();
-            dev->threads_.emplace_back([q, &stop = dev->stop_] {
-                try {
-                    q->run(stop);
-                } catch (const std::exception& e) {
-                    // Never let a queue-thread exception terminate the
-                    // process; surface it as a queue failure instead.
-                    ELIO_LOG_ERROR("ublk queue {} thread died: {}",
-                                   q->q_id(), e.what());
-                    q->fail(EIO);
-                }
-            });
-        }
-        // Bridge coroutines on the Elio scheduler, one per queue.
-        dev->bridge_tasks_.reserve(dev->queues_.size());
-        for (auto& queue : dev->queues_) {
-            dev->bridge_tasks_.push_back(elio::spawn(
-                run_bridge, queue.get(), dev->src_.get(), &dev->stop_));
-        }
-        ELIO_LOG_INFO("ublk dev {}: bridges started, START_DEV poll",
-                      dev->dev_id_);
-        // START_DEV: the driver answers EBUSY until every queue tag has a
-        // parked FETCH; poll briefly. (co_await is not allowed inside a
-        // catch block, hence the flag-based loop.)
-        bool started = false;
-        for (int attempt = 0; attempt < 100 && !started; ++attempt) {
-            try {
-                co_await elio::spawn_blocking(
-                    [&] { dev->ctrl_->start_dev(dev->dev_id_); });
-                started = true;
-            } catch (const std::system_error& e) {
-                if (e.code().value() != EBUSY) throw;
-            }
-            if (!started) {
-                for (const auto& q : dev->queues_) {
-                    if (q->failed()) {
-                        throw_errno(q->failure() ? q->failure() : EIO,
-                                    "ublk queue failed before START_DEV");
-                    }
-                }
-                co_await elio::time::sleep_for(
-                    std::chrono::milliseconds(50));
-            }
-        }
-        if (!started) {
-            throw error(EBUSY, "ublk START_DEV not ready after 5s");
-        }
-        dev->started_ = true;
-        dev->cur_bytes_.store(params.dev_sectors * 512,
-                              std::memory_order_release);
-        ELIO_LOG_INFO("ublk device {} ready ({})", dev->dev_id_,
-                      dev->bdev_path());
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    if (failure) {
-        co_await cleanup_failed(std::move(dev), failure,
-                                std::move(failure_cleanup));
-    }
-    co_return dev;
+elio::coro::task<std::unique_ptr<Device>> Device::create(
+    const DeviceParams& params, source::BlobSourcePtr src,
+    StartupControl& startup, FailureCleanup failure_cleanup) {
+    co_return co_await start_impl(false, UINT32_MAX, params, std::move(src),
+                                  startup, std::move(failure_cleanup));
 }
 
 elio::coro::task<std::unique_ptr<Device>> Device::attach(
     uint32_t dev_id, const DeviceParams& params, source::BlobSourcePtr src,
+    StartupControl& startup, FailureCleanup failure_cleanup) {
+    co_return co_await start_impl(true, dev_id, params, std::move(src),
+                                  startup, std::move(failure_cleanup));
+}
+
+void Device::publish_startup() noexcept {
+    if (!startup_) return;
+    startup_state_.device_id = dev_id_;
+    startup_state_.raw_published = 0;
+    startup_state_.raw_retired = 0;
+    startup_state_.kernel_debt_known = true;
+    for (const auto& q : queues_) {
+        const auto debt = q->retirement();
+        startup_state_.raw_published += debt.published;
+        startup_state_.raw_retired += debt.retired;
+        startup_state_.kernel_debt_known &= debt.known;
+        if (q->failed() && startup_state_.reason_errno == 0) {
+            startup_state_.reason_errno = q->failure() ? q->failure() : EIO;
+            startup_state_.queue_id = q->q_id();
+        }
+    }
+    startup_->publish(startup_state_);
+}
+
+int Device::cancel_control(void* opaque, uint32_t opcode) noexcept {
+    auto& dev = *static_cast<Device*>(opaque);
+    if (opcode != UBLK_U_CMD_START_DEV &&
+        opcode != UBLK_U_CMD_END_USER_RECOVERY) return 0;
+    if (dev.startup_ && dev.startup_->release_request()) return ECANCELED;
+    for (const auto& q : dev.queues_)
+        if (q->failed()) return q->failure() ? q->failure() : EIO;
+    if (std::chrono::steady_clock::now() >= dev.startup_deadline_)
+        return ETIMEDOUT;
+    return 0;
+}
+
+void Device::complete_control(void* opaque, uint32_t opcode, int result) noexcept {
+    auto& dev = *static_cast<Device*>(opaque);
+    if (result != 0) return;
+    if (opcode == UBLK_U_CMD_ADD_DEV) {
+        dev.dev_id_ = static_cast<uint32_t>(dev.ctrl_->added_dev_id());
+        dev.owns_id_ = true;
+    } else if (opcode == UBLK_U_CMD_START_USER_RECOVERY) {
+        dev.recovery_started_ = true;
+    } else if (opcode == UBLK_U_CMD_START_DEV ||
+               opcode == UBLK_U_CMD_END_USER_RECOVERY) {
+        // Commit at the original CQE, even if cancellation is still pending.
+        dev.ctrl_->adopt_dev(dev.dev_id_);
+        dev.owns_id_ = true;
+        dev.started_ = true;
+    }
+}
+
+void Device::observe_control(void* opaque, const CtrlProgress& progress) noexcept {
+    auto& dev = *static_cast<Device*>(opaque);
+    if (!dev.startup_) return;
+    auto& state = dev.startup_state_;
+    switch (progress.opcode) {
+    case UBLK_U_CMD_START_DEV: state.operation = StartupOperation::start; break;
+    case UBLK_U_CMD_END_USER_RECOVERY: state.operation = StartupOperation::end; break;
+    case UBLK_U_CMD_STOP_DEV: state.operation = StartupOperation::stop; break;
+    case UBLK_U_CMD_DEL_DEV: state.operation = StartupOperation::remove; break;
+    default: state.operation = StartupOperation::none; break;
+    }
+    state.control_pending = progress.pending;
+    state.original_known = progress.original_known;
+    state.original_result = progress.original_result;
+    state.cancel_known = progress.cancel_known;
+    state.cancel_result = progress.cancel_result;
+    if (progress.reason_errno) state.reason_errno = progress.reason_errno;
+    if (state.phase != StartupPhase::releasing) {
+        state.phase = state.reason_errno ? StartupPhase::retained
+                     : progress.pending ? StartupPhase::control_pending
+                                        : StartupPhase::preparing;
+    }
+    dev.publish_startup();
+}
+
+elio::coro::task<void> Device::prepare_owners() {
+    open_queues();
+    threads_.reserve(queues_.size());
+    bridge_tasks_.reserve(queues_.size());
+    for (auto& queue : queues_) {
+        Queue* q = queue.get();
+        threads_.emplace_back([this, q]() noexcept {
+            try { q->run(stop_); }
+            catch (...) { q->fail(EIO); }
+        });
+        bridge_tasks_.push_back(elio::spawn(run_bridge, q, src_.get(), &stop_));
+    }
+    for (;;) {
+        if (startup_->release_request())
+            throw error(ECANCELED, "release requested before queue publication");
+        bool ready = true;
+        for (size_t i = 0; i < queues_.size(); ++i) {
+            const auto& q = queues_[i];
+            if (q->failed() || bridge_tasks_[i].is_ready())
+                throw error(q->failure() ? q->failure() : EIO,
+                            "ublk owner failed before FETCH publication");
+            ready &= q->setup_ready() && q->bridge_ready();
+        }
+        if (ready) break;
+        if (std::chrono::steady_clock::now() >= startup_deadline_)
+            throw error(ETIMEDOUT, "ublk owner setup deadline expired");
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+    }
+    // Only after all queue rings and source bridges are ready may any FETCH
+    // be published. A later failure is handled by the observed controller.
+    publication_released_ = true;
+    for (auto& q : queues_) q->publish_initial_fetches();
+}
+
+elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
+    bool recovery, uint32_t dev_id, const DeviceParams& params,
+    source::BlobSourcePtr src, StartupControl& startup,
     FailureCleanup failure_cleanup) {
-    if (!src) throw error(EINVAL, "ublk recovery with null block source");
+    if (!src) throw error(EINVAL, "ublk startup with null block source");
+    if (!params.dev_sectors || !params.nr_queues)
+        throw error(EINVAL, "ublk startup with zero size or queue count");
     auto dev = std::unique_ptr<Device>(new Device());
+    if (startup.owner_entered_.exchange(true))
+        throw error(EALREADY, "startup control already has an owner");
     dev->params_ = params;
     dev->src_ = std::move(src);
     dev->dev_id_ = dev_id;
-
+    dev->startup_ = &startup;
+    dev->startup_deadline_ = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(5);
+    dev->publish_startup();
     std::exception_ptr failure;
     try {
-        dev->ctrl_ = std::make_unique<Ctrl>();
-        // Death detection/quiesce is asynchronous (not complete at waitpid).
-        // Retry only EBUSY until the driver is QUIESCED and the old cdev has
-        // closed. START must succeed BEFORE opening any replacement cdev:
-        // opening it first would itself keep START busy. See ADR-0010.
-        co_await detail::start_recovery_and_open_queues(
-            [&] {
-                return elio::spawn_blocking(
-                    [&] { dev->ctrl_->start_user_recovery(dev_id); });
-            },
-            [] { return std::chrono::steady_clock::now(); },
-            [](std::chrono::steady_clock::duration delay) {
-                return elio::time::sleep_for(delay);
-            },
-            [&] { dev->open_queues(); });
-        for (auto& queue : dev->queues_) {
-            Queue* q = queue.get();
-            dev->threads_.emplace_back([q, &stop = dev->stop_] {
-                try {
-                    q->run(stop);
-                } catch (const std::exception& e) {
-                    // Never let a queue-thread exception terminate the
-                    // process; surface it as a queue failure instead.
-                    ELIO_LOG_ERROR("ublk queue {} thread died: {}",
-                                   q->q_id(), e.what());
-                    q->fail(EIO);
-                }
-            });
-        }
-        dev->bridge_tasks_.reserve(dev->queues_.size());
-        for (auto& queue : dev->queues_) {
-            dev->bridge_tasks_.push_back(elio::spawn(
-                run_bridge, queue.get(), dev->src_.get(), &dev->stop_));
-        }
-        co_await detail::finish_recovery(
-            [&]() -> elio::coro::task<void> {
-                // D3 grow-only baseline: USER_RECOVERY retains the REAL
-                // kernel capacity, which may exceed the create-time params.
-                // Reading it before END is safe: END does not change size.
+        if (startup.release_request()) throw StartupReleased{};
+        co_await detail::run_control([&] {
+            dev->ctrl_ = std::make_unique<Ctrl>();
+            dev->ctrl_->disable_destructor_cleanup();
+            dev->ctrl_->set_observer({dev.get(), cancel_control,
+                                      complete_control, observe_control});
+        });
+        if (recovery) {
+            co_await detail::start_recovery_and_open_queues(
+                [&] {
+                    return detail::run_control([&] {
+                        if (startup.release_request())
+                            throw error(ECANCELED, "recovery release requested");
+                        dev->ctrl_->start_user_recovery(dev_id);
+                    });
+                },
+                [] { return std::chrono::steady_clock::now(); },
+                [](std::chrono::steady_clock::duration delay) {
+                    return elio::time::sleep_for(delay);
+                }, [] {});
+            co_await detail::run_control([&] {
                 dev->cur_bytes_.store(
-                    co_await elio::spawn_blocking([&]() -> uint64_t {
-                        const ublk_params p = dev->ctrl_->get_params(dev_id);
-                        return p.basic.dev_sectors * 512;
-                    }),
+                    dev->ctrl_->get_params(dev_id).basic.dev_sectors * 512,
                     std::memory_order_release);
-                ELIO_LOG_INFO("ublk dev {}: recovery prepared ({}, {} bytes)",
-                              dev_id, dev->bdev_path(), dev->size_bytes());
-            },
-            [&]() -> elio::coro::task<void> {
-                // END completes the handshake once every tag has a parked
-                // FETCH (same EBUSY polling as START_DEV).
-                bool recovered = false;
-                for (int attempt = 0; attempt < 100 && !recovered; ++attempt) {
-                    try {
-                        co_await elio::spawn_blocking(
-                            [&] { dev->ctrl_->end_user_recovery(dev_id); });
-                        recovered = true;
-                    } catch (const std::system_error& e) {
-                        if (e.code().value() != EBUSY) throw;
-                    }
-                    if (!recovered) {
-                        co_await elio::time::sleep_for(
-                            std::chrono::milliseconds(50));
-                    }
-                }
-                if (!recovered) {
-                    throw error(EBUSY,
-                                "ublk END_USER_RECOVERY not ready after 5s");
-                }
-            },
-            [&]() noexcept {
-                dev->ctrl_->adopt_dev(dev_id);
-                dev->started_ = true;
             });
+        } else {
+            co_await detail::run_control([&] {
+                dev->dev_id_ = dev->ctrl_->add_dev(params);
+                dev->ctrl_->set_params(dev->dev_id_, params);
+            });
+            dev->cur_bytes_.store(params.dev_sectors * 512,
+                                  std::memory_order_release);
+        }
+        dev->startup_deadline_ = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(5);
+        co_await dev->prepare_owners();
+        for (;;) {
+            const int reason = cancel_control(dev.get(), recovery
+                ? UBLK_U_CMD_END_USER_RECOVERY : UBLK_U_CMD_START_DEV);
+            if (reason) throw error(reason, "ublk startup prerequisite failed");
+            bool busy = false;
+            try {
+                co_await detail::run_control([&] {
+                    if (recovery) dev->ctrl_->end_user_recovery(dev_id);
+                    else dev->ctrl_->start_dev(dev->dev_id_);
+                });
+            } catch (const std::system_error& e) {
+                if (e.code().value() != EBUSY) throw;
+                busy = true;
+            }
+            if (!busy) break;
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        for (size_t i = 0; i < dev->queues_.size(); ++i) {
+            const auto& q = dev->queues_[i];
+            if (q->failed() || dev->bridge_tasks_[i].is_ready())
+                throw error(q->failure() ? q->failure() : EIO,
+                            "ublk owner failed during startup control");
+        }
     } catch (...) {
         failure = std::current_exception();
     }
-    if (failure) {
-        co_await cleanup_failed(std::move(dev), failure,
-                                std::move(failure_cleanup));
+    if (!failure && startup.close_release_admission()) {
+        dev->startup_state_.phase = StartupPhase::ready;
+        dev->startup_state_.control_pending = false;
+        dev->publish_startup();
+        dev->ctrl_->set_observer({});
+        dev->startup_ = nullptr;
+        co_return dev; // Ownership transfer after this point is nonthrowing.
     }
-    co_return dev;
+
+    // Allocate/await the failure coordinator without allowing an allocation
+    // failure at this boundary to unwind a published, unadopted owner. Keep
+    // the cleanup callback here so a failed frame allocation can retry it.
+    for (;;) {
+        try {
+            co_return co_await dev->fail_startup(recovery, failure, failure_cleanup);
+        } catch (...) {
+            if (dev->released_) throw;
+        }
+        try { co_await elio::time::sleep_for(std::chrono::milliseconds(10)); }
+        catch (...) {}
+    }
 }
 
-elio::coro::task<void> Device::cleanup_failed(
-    std::unique_ptr<Device> dev, std::exception_ptr failure,
-    FailureCleanup failure_cleanup) {
-    co_await dev->stop_async();
-    if (failure_cleanup) co_await failure_cleanup();
-    co_await elio::spawn_blocking([&] { dev.reset(); });
-    std::rethrow_exception(failure);
+elio::coro::task<std::unique_ptr<Device>> Device::fail_startup(
+    bool recovery, std::exception_ptr failure, FailureCleanup& failure_cleanup) {
+    startup_state_.reason_errno = exception_errno(failure);
+    startup_state_.phase = StartupPhase::retained;
+    publish_startup();
+    // Keep the whole source graph and this frame on failures of the native
+    // destruction observer. A timeout cannot convert a borrowed buffer to free.
+    bool drained = false;
+    while (!drained) {
+        try { co_await drain_sources(); drained = true; }
+        catch (...) { startup_state_.reason_errno = ENOMEM; }
+    }
+    if (failure_cleanup) {
+        bool parked = false;
+        while (!parked) {
+            try { co_await failure_cleanup(); parked = true; }
+            catch (...) { startup_state_.reason_errno = EIO; }
+        }
+    }
+    // A newly added/adopted device has cleanup authority. An unadopted old
+    // recovery with published FETCH commands must await explicit permission.
+    const bool preserve = recovery && publication_released_ && !owns_id_;
+    if (preserve || !startup_->close_release_admission()) {
+        bool complete = false;
+        while (!complete) {
+            try { co_await retained_startup(); complete = true; }
+            catch (...) { startup_state_.reason_errno = ENOMEM; }
+        }
+        throw StartupReleased{};
+    }
+    while (!released_) {
+        try {
+            co_await detail::run_control([&] { (void)release_once(); });
+        } catch (...) {
+            release_error_ = ENOMEM;
+        }
+        if (!released_) {
+            publish_startup();
+            try { co_await elio::time::sleep_for(std::chrono::milliseconds(10)); }
+            catch (...) {}
+        }
+    }
+    startup_state_.phase = StartupPhase::released;
+    publish_startup();
+    if (failure) std::rethrow_exception(failure);
+    throw StartupReleased{};
+}
+
+elio::coro::task<void> Device::retained_startup() {
+    for (;;) {
+        const auto sequence = startup_->release_request();
+        if (sequence) {
+            release_authorized_ = true;
+            startup_state_.phase = StartupPhase::releasing;
+            startup_state_.release_sequence = sequence;
+            startup_state_.release = StartupRelease::pending;
+            startup_state_.release_errno = 0;
+            publish_startup();
+            try {
+                co_await detail::run_control([&] { (void)release_once(); });
+            } catch (...) {
+                release_error_ = ENOMEM;
+            }
+            if (released_) {
+                startup_->finish_release_admission(sequence);
+                startup_state_.phase = StartupPhase::released;
+                startup_state_.release = StartupRelease::released;
+                startup_state_.release_errno = 0;
+                publish_startup();
+                co_return;
+            }
+            // EAGAIN means STOP has settled but raw/native retirement has
+            // not. Continue observing the same attempt without resending it.
+            if (release_error_ != EAGAIN) {
+                startup_state_.phase = StartupPhase::retained;
+                startup_state_.release = StartupRelease::refused;
+                startup_state_.release_errno = release_error_;
+                publish_startup();
+                startup_->acknowledge_release(sequence);
+            }
+        }
+        publish_startup();
+        try { co_await elio::time::sleep_for(std::chrono::milliseconds(10)); }
+        catch (...) {}
+    }
 }
 
 uint64_t Device::resize_blocking(uint64_t bytes) {
@@ -254,59 +393,164 @@ uint64_t Device::resize_blocking(uint64_t bytes) {
 
 void Device::request_stop() noexcept {
     stop_.store(true, std::memory_order_relaxed);
-    for (auto& q : queues_) q->wakeup();
-    // Also wake the bridge coroutines: each is parked in an eventfd
-    // async_read, and nothing will write that eventfd again once the
-    // queue threads exit — a parked detached bridge outlives stop()
-    // and hangs scheduler teardown.
-    for (auto& q : queues_) q->notify_elio();
+    for (auto& q : queues_) {
+        if (ctrl_) q->request_release();
+        if (!publication_released_) q->abort_setup();
+        q->wakeup();
+        q->notify_elio();
+    }
+}
+
+void Device::collect_bridge_results() noexcept {
+    std::lock_guard lock(bridge_result_mu_);
+    if (bridge_results_reported_) return;
+    bridge_results_reported_ = true;
+    for (auto& bridge : bridge_tasks_) {
+        try { bridge.await_resume(); }
+        catch (...) {
+            // Destruction, not result delivery, is the ownership fence.
+            try { ELIO_LOG_ERROR("ublk bridge failed while draining"); }
+            catch (...) {}
+        }
+    }
+}
+
+elio::coro::task<void> Device::drain_sources() {
+    request_stop();
+    for (auto& bridge : bridge_tasks_) {
+        while (!bridge.is_destroyed()) {
+            try { co_await bridge.wait_destroyed_async(); }
+            catch (...) {}
+        }
+    }
+    collect_bridge_results();
+    for (auto& q : queues_) q->sources_drained();
+}
+
+bool Device::release_once() noexcept {
+    std::lock_guard lock(release_mu_);
+    if (released_) return true;
+    if (publication_released_ && !owns_id_ && !release_authorized_) {
+        release_error_ = EPERM;
+        return false;
+    }
+    const bool has_target = dev_id_ != UINT32_MAX;
+    if (!ctrl_ && release_authorized_ && has_target) {
+        try {
+            ctrl_ = std::make_unique<Ctrl>();
+            ctrl_->disable_destructor_cleanup();
+            ctrl_->set_observer({this, cancel_control, complete_control,
+                                 observe_control});
+        } catch (...) {
+            release_error_ = exception_errno(std::current_exception());
+            return false;
+        }
+    }
+    // This routine runs off-worker, after every accepted source frame has
+    // retired. Queue owners remain runnable to COMMIT delivered requests and
+    // collect original FETCH completions while STOP is in progress.
+    for (auto& q : queues_) {
+        if (ctrl_) q->request_release();
+        if (!publication_released_) q->abort_setup();
+    }
+    // STOP only cancels commands the driver has already seen. A queue paused
+    // after preparing an initial FETCH must finish its synchronous submission
+    // before that cancellation pass; otherwise FETCH can park after STOP.
+    // Source drain is a different fence and does not establish this ordering.
+    if (publication_released_) {
+        for (size_t i = 0; i < threads_.size(); ++i) {
+            const auto& q = queues_[i];
+            if (!q->owner_exited() && !q->initial_fetches_issued()) {
+                release_error_ = EAGAIN;
+                return false;
+            }
+        }
+    }
+    if (ctrl_ && has_target && (owns_id_ || release_authorized_) && !stop_completed_) {
+        const int rc = ctrl_->stop_dev_result(dev_id_);
+        if (rc != 0 && rc != -ENODEV) {
+            release_error_ = -rc;
+            return false;
+        }
+        device_absent_ = rc == -ENODEV;
+        stop_completed_ = true;
+        for (auto& q : queues_) q->kernel_stopped();
+    }
+    for (auto& q : queues_) q->request_owner_exit();
+    // An initial snapshot can precede actual FETCH preparation. Require the
+    // owner thread's exit assertion as well, then re-read its final ledger.
+    for (size_t i = 0; i < threads_.size(); ++i) {
+        if (!queues_[i]->owner_exited()) {
+            release_error_ = EAGAIN;
+            return false;
+        }
+    }
+    for (const auto& q : queues_) {
+        if (!q->retirement().complete) {
+            release_error_ = EAGAIN;
+            return false;
+        }
+    }
+    for (auto& thread : threads_) if (thread.joinable()) thread.join();
+    threads_.clear();
+    for (auto& q : queues_) q->close_retired();
+    // No cdev descriptor remains. A terminal ambiguous DEL result is retained
+    // in Ctrl and cannot cause another deletion of the same numeric ID.
+    if (ctrl_ && has_target && (owns_id_ || release_authorized_) && !device_absent_) {
+        const int rc = ctrl_->delete_dev_once(dev_id_);
+        if (rc != 0 && rc != -ENODEV) {
+            release_error_ = -rc;
+            return false;
+        }
+    }
+    release_error_ = 0;
+    released_ = true;
+    return true;
 }
 
 elio::coro::task<void> Device::stop_async() {
-    request_stop();
-    // A source may itself await spawn_blocking. Do not occupy the pool
-    // while draining: even one worker and one blocking thread must progress.
-    for (auto& bridge : bridge_tasks_) {
-        while (!bridge.is_destroyed()) {
-            try {
-                co_await bridge.wait_destroyed_async();
-            } catch (const std::bad_alloc&) {
-            }
-            if (!bridge.is_destroyed()) co_await elio::time::yield();
+    co_await drain_sources();
+    while (!released_) {
+        try {
+            co_await detail::run_control([this] { (void)release_once(); });
+        } catch (...) {}
+        if (!released_) {
+            try { co_await elio::time::sleep_for(std::chrono::milliseconds(10)); }
+            catch (...) {}
         }
     }
-    co_await elio::spawn_blocking([this] { stop(); });
 }
 
 void Device::stop() noexcept {
     request_stop();
-    // Blocking callers must leave the scheduler/source executors running.
-    // Elapsed time cannot end the lifetime of an outstanding source IO.
+    // Blocking callers must leave source executors and the scheduler alive.
     for (auto& bridge : bridge_tasks_) bridge.wait_destroyed();
-    {
-        std::lock_guard lock(bridge_result_mu_);
-        if (!bridge_results_reported_) {
-            bridge_results_reported_ = true;
-            for (auto& bridge : bridge_tasks_) {
-                try {
-                    bridge.await_resume();
-                } catch (const std::exception& e) {
-                    ELIO_LOG_ERROR("ublk bridge failed during stop: {}", e.what());
-                } catch (...) {
-                    ELIO_LOG_ERROR("ublk bridge failed during stop: unknown exception");
-                }
-            }
-        }
-    }
-    for (auto& t : threads_) {
-        if (t.joinable()) t.join();
-    }
-    threads_.clear();
+    collect_bridge_results();
+    for (auto& q : queues_) q->sources_drained();
+    while (!release_once())
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
 Device::~Device() {
     stop();
-    // STOP_DEV/DEL_DEV happen in ~Ctrl (added_dev_).
 }
 
-}  // namespace obd::ublk
+StartupSnapshot Device::released_snapshot() const noexcept {
+    auto result = startup_state_;
+    result.device_id = dev_id_;
+    result.phase = released_ ? StartupPhase::released : StartupPhase::retained;
+    result.control_pending = ctrl_ && ctrl_->command_pending();
+    result.raw_published = 0;
+    result.raw_retired = 0;
+    result.kernel_debt_known = true;
+    for (const auto& q : queues_) {
+        const auto ledger = q->retirement();
+        result.raw_published += ledger.published;
+        result.raw_retired += ledger.retired;
+        result.kernel_debt_known &= ledger.known;
+        if (!ledger.complete) result.phase = StartupPhase::retained;
+    }
+    return result;
+}
+
+} // namespace obd::ublk

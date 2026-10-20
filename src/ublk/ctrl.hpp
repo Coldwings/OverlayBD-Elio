@@ -15,6 +15,7 @@
 #include <liburing.h>
 
 #include <cstdint>
+#include <atomic>
 #include <string>
 
 namespace obd::ublk {
@@ -40,12 +41,48 @@ struct DeviceParams {
 /// without a kernel).
 uint64_t dev_info_flags(const DeviceParams& p);
 
+struct CtrlProgress {
+    uint32_t opcode = 0;
+    int original_result = 0;
+    int cancel_result = 0;
+    int reason_errno = 0;
+    bool original_known = false;
+    bool cancel_known = false;
+    bool pending = false;
+};
+struct CtrlObserver {
+    void* context = nullptr;
+    int (*cancel_reason)(void*, uint32_t) noexcept = nullptr;
+    void (*completed)(void*, uint32_t, int) noexcept = nullptr;
+    void (*progress)(void*, const CtrlProgress&) noexcept = nullptr;
+};
+
+namespace detail {
+/// Injectable control-ring boundary for deterministic lifecycle tests. The
+/// implementation must provide SQE128 storage and remain alive until Ctrl and
+/// all pending commands are gone. No callback may unwind the command loop.
+/// Production Ctrl instances use their own liburing ring directly.
+class CtrlTransport {
+public:
+    virtual ~CtrlTransport() = default;
+    virtual io_uring_sqe* get_sqe() noexcept = 0;
+    virtual unsigned sq_ready() noexcept = 0;
+    virtual int submit() noexcept = 0;
+    virtual int enter() noexcept = 0;
+    virtual int peek_cqe(io_uring_cqe** cqe) noexcept = 0;
+    virtual void cqe_seen(io_uring_cqe* cqe) noexcept = 0;
+    virtual void idle() noexcept = 0;
+};
+} // namespace detail
+
 /// One instance per device process; owns the /dev/ublk-control fd and
 /// remembers the added device for best-effort cleanup on destruction.
 class Ctrl {
 public:
     /// Opens /dev/ublk-control. Throws obd::error when unavailable.
     Ctrl();
+    /// Borrows a test transport; does not open a kernel fd or ring.
+    explicit Ctrl(detail::CtrlTransport& transport) noexcept;
     ~Ctrl();
     Ctrl(const Ctrl&) = delete;
     Ctrl& operator=(const Ctrl&) = delete;
@@ -94,6 +131,13 @@ public:
 
     /// Remembers an existing (recovered) device for ~Ctrl cleanup.
     void adopt_dev(uint32_t dev_id) noexcept { added_dev_ = static_cast<int>(dev_id); }
+    void set_observer(CtrlObserver observer) noexcept { observer_ = observer; }
+    /// Device performs explicit, proven retirement before closing cdev/DEL.
+    void disable_destructor_cleanup() noexcept { managed_lifetime_ = true; }
+    int added_dev_id() const noexcept { return added_dev_; }
+    bool command_pending() const noexcept { return pending_.load(); }
+    int stop_dev_result(uint32_t dev_id) noexcept;
+    int delete_dev_once(uint32_t dev_id) noexcept;
 
     void stop_dev(uint32_t dev_id) noexcept;
     void del_dev(uint32_t dev_id) noexcept;
@@ -110,6 +154,13 @@ private:
 
     int fd_ = -1;
     int added_dev_ = -1;
+    bool managed_lifetime_ = false;
+    bool delete_attempted_ = false;
+    int delete_result_ = 0;
+    uint64_t next_cookie_ = 1;
+    std::atomic<bool> pending_{false};
+    CtrlObserver observer_;
+    detail::CtrlTransport* transport_ = nullptr;
     // ublk-control has never had an unlocked_ioctl handler: control
     // commands go through IORING_OP_URING_CMD, and the driver requires
     // SQE128 (ublk_ctrl_uring_cmd checks IO_URING_F_SQE128).

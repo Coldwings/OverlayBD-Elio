@@ -27,6 +27,7 @@
 #include <chrono>
 #include <filesystem>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <thread>
 #include <stdexcept>
@@ -78,6 +79,119 @@ elio::coro::task<bool> rpc_read_line(int fd, std::string& rbuf,
 }
 
 }  // namespace
+
+TEST_CASE("supervisor: startup control survives a transient lifecycle exception",
+          "[supervisor][startup-supervisor]") {
+    struct SocketPair {
+        int fds[2]{-1, -1};
+        ~SocketPair() {
+            for (const int fd : fds) if (fd >= 0) ::close(fd);
+        }
+    } sockets;
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                         sockets.fds) == 0);
+    struct State {
+        std::atomic<unsigned> calls{0};
+        std::atomic<bool> released{false};
+    };
+    const auto state = std::make_shared<State>();
+    auto session = std::make_shared<supervisor::DeviceControlSession>(
+        [state](const nlohmann::json& cmd)
+            -> std::optional<nlohmann::json> {
+            if (state->calls.fetch_add(1) == 0) throw std::bad_alloc();
+            const auto name = cmd.at("cmd").get<std::string>();
+            if (name == "startup_release") state->released.store(true);
+            else if (name != "startup_status") return std::nullopt;
+            return nlohmann::json{
+                {"ok", true}, {"generation", cmd.at("generation")},
+                {"phase", state->released.load() ? "released" : "retained"}};
+        });
+    const std::weak_ptr<supervisor::DeviceControlSession> session_lifetime = session;
+    auto channel =
+        std::make_shared<supervisor::ControlChannelWriter>(sockets.fds[1]);
+
+    // If dispatch dies before answering the next request, wake both readers
+    // rather than leave a scheduler shutdown waiting on an unbounded socket IO.
+    // The watchdog never closes an fd; native joins precede descriptor cleanup.
+    std::atomic<bool> deadline_expired{false};
+    std::jthread watchdog([&](std::stop_token stop) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!stop.stop_requested()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                deadline_expired.store(true);
+                ::shutdown(sockets.fds[0], SHUT_RDWR);
+                ::shutdown(sockets.fds[1], SHUT_RDWR);
+                return;
+            }
+            std::this_thread::sleep_for(5ms);
+        }
+    });
+    nlohmann::json status_reply, release_reply, terminal_reply;
+    bool session_destroyed = false;
+    bool terminal_written = false;
+    bool terminal_read = false;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto control = elio::spawn(supervisor::run_device_control_with_session,
+                                  channel, nullptr,
+                                  supervisor::DeviceControlHooks{}, session);
+        session.reset(); // Only the running control frame retains the session.
+        std::exception_ptr failure;
+        try {
+            // The failed callback need not produce a reply. Send its request
+            // without waiting for one; the next response must correlate to 2.
+            const std::string first =
+                "{\"cmd\":\"startup_status\",\"generation\":41,\"seq\":1}\n";
+            const auto written = co_await elio::io::async_write(
+                sockets.fds[0], first.data(), first.size(), -1);
+            if (written.result != static_cast<ssize_t>(first.size()))
+                throw std::runtime_error("startup test command write failed");
+            nlohmann::json status = {
+                {"cmd", "startup_status"}, {"generation", 41}, {"seq", 2}};
+            status_reply = co_await rpc_exchange(sockets.fds[0], status);
+            nlohmann::json release = {
+                {"cmd", "startup_release"}, {"generation", 41}, {"seq", 3}};
+            release_reply = co_await rpc_exchange(sockets.fds[0], release);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        // Match production: stop only the reader, wait for the complete native
+        // frame (including the session capture), then emit the terminal status.
+        ::shutdown(sockets.fds[1], SHUT_RD);
+        co_await control.wait_destroyed_async();
+        session_destroyed = session_lifetime.expired();
+        co_await control;
+        if (failure) std::rethrow_exception(failure);
+        const nlohmann::json terminal = {{"state", "stopped"}};
+        terminal_written = channel->write_line(terminal);
+        if (terminal_written) {
+            std::string buffered;
+            terminal_read = co_await rpc_read_line(
+                sockets.fds[0], buffered, terminal_reply);
+        }
+        ::shutdown(sockets.fds[1], SHUT_WR);
+        co_return 0;
+    });
+    watchdog.request_stop();
+    watchdog.join();
+
+    REQUIRE(rc == 0);
+    REQUIRE_FALSE(deadline_expired.load());
+    REQUIRE(state->calls.load() == 3);
+    REQUIRE(status_reply.value("ok", false));
+    REQUIRE(status_reply.value("reply", "") == "startup_status");
+    REQUIRE(status_reply.value("seq", 0) == 2);
+    REQUIRE(status_reply.value("generation", 0) == 41);
+    REQUIRE(status_reply.value("phase", "") == "retained");
+    REQUIRE(release_reply.value("ok", false));
+    REQUIRE(release_reply.value("reply", "") == "startup_release");
+    REQUIRE(release_reply.value("seq", 0) == 3);
+    REQUIRE(release_reply.value("phase", "") == "released");
+    REQUIRE(state->released.load());
+    REQUIRE(session_destroyed);
+    REQUIRE(terminal_written);
+    REQUIRE(terminal_read);
+    REQUIRE(terminal_reply.value("state", "") == "stopped");
+}
 
 TEST_CASE("supervisor: device trace control answers malformed-typed fields with clean errors",
           "[supervisor]") {

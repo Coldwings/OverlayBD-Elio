@@ -21,6 +21,7 @@
 #include "support.hpp"
 
 #include <elio/log/macros.hpp>
+#include <elio/net/uds.hpp>
 #include <elio/runtime/async_main.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
@@ -103,6 +104,7 @@ private:
 struct Args {
     std::string config;
     int control_fd = -1;
+    uint64_t startup_generation = 0;
     /// D3 create-time headroom override (bytes; 0 = none), validated
     /// against the fake's declared image size with the same single-source
     /// rule (image::device_capacity_bytes) the real device uses.
@@ -121,7 +123,8 @@ void report(const obd::supervisor::ControlChannelWriterPtr& channel,
     channel->write_line(obd::supervisor::make_device_status(st));
 }
 
-elio::coro::task<int> fake_main(Args args) {
+elio::coro::task<int> fake_body(
+    Args args, obd::supervisor::StartupOwnerStatus* owner = nullptr) {
     using obd::supervisor::DeviceStatus;
     // ONE serialized writer for every channel writer (status reports,
     // trace replies, the expiry event) — see ControlChannelWriter.
@@ -130,7 +133,12 @@ elio::coro::task<int> fake_main(Args args) {
             ? std::make_shared<obd::supervisor::ControlChannelWriter>(
                   args.control_fd)
             : nullptr;
-    report(channel, DeviceStatus{"starting", "", ""});
+    auto publish = [&](const obd::supervisor::ControlChannelWriterPtr& writer,
+                       DeviceStatus status) {
+        if (owner && !status.startup_owner) status.startup_owner = *owner;
+        report(writer, status);
+    };
+    publish(channel, DeviceStatus{"starting", "", ""});
     try {
         // The stack served while the fake is "ready". Blank mode and the
         // record-path image mode assemble through the REAL image module so
@@ -170,7 +178,7 @@ elio::coro::task<int> fake_main(Args args) {
             auto* w = dynamic_cast<obd::source::WritableBlobSource*>(
                 opened->root.get());
             if (w == nullptr) {
-                report(channel, DeviceStatus{"failed", "",
+                publish(channel, DeviceStatus{"failed", "",
                                           "blank root is not writable"});
                 co_return 1;
             }
@@ -182,7 +190,7 @@ elio::coro::task<int> fake_main(Args args) {
             if (zr != static_cast<ssize_t>(zero_buf.size()) ||
                 !std::all_of(zero_buf.begin(), zero_buf.end(),
                              [](uint8_t b) { return b == 0; })) {
-                report(channel, DeviceStatus{"failed", "",
+                publish(channel, DeviceStatus{"failed", "",
                                           "blank unwritten read not zero"});
                 co_return 1;
             }
@@ -191,7 +199,7 @@ elio::coro::task<int> fake_main(Args args) {
             const ssize_t wrc =
                 co_await w->pwrite(payload.data(), payload.size(), 0);
             if (wrc != static_cast<ssize_t>(payload.size())) {
-                report(channel, DeviceStatus{"failed", "",
+                publish(channel, DeviceStatus{"failed", "",
                                           "blank payload write failed"});
                 co_return 1;
             }
@@ -200,14 +208,14 @@ elio::coro::task<int> fake_main(Args args) {
                 co_await w->pread(back.data(), back.size(), 0);
             if (brc != static_cast<ssize_t>(back.size()) ||
                 std::memcmp(back.data(), payload.data(), back.size()) != 0) {
-                report(channel, DeviceStatus{"failed", "",
+                publish(channel, DeviceStatus{"failed", "",
                                           "blank payload readback mismatch"});
                 co_return 1;
             }
             auto* mw = dynamic_cast<obd::format::MergedWritable*>(
                 opened->root.get());
             if (mw == nullptr) {
-                report(channel, DeviceStatus{"failed", "",
+                publish(channel, DeviceStatus{"failed", "",
                                           "blank root is not merged writable"});
                 co_return 1;
             }
@@ -252,7 +260,7 @@ elio::coro::task<int> fake_main(Args args) {
                     const uint64_t cap = obd::image::device_capacity_bytes(
                         declared, args.virtual_size, &cap_error);
                     if (cap == 0) {
-                        report(channel, DeviceStatus{"failed", "", cap_error});
+                        publish(channel, DeviceStatus{"failed", "", cap_error});
                         co_return 1;
                     }
                 }
@@ -276,7 +284,7 @@ elio::coro::task<int> fake_main(Args args) {
                 const ssize_t w = co_await lsmt->pwrite(
                     payload.data(), payload.size(), 0);
                 if (w != static_cast<ssize_t>(payload.size())) {
-                    report(channel, DeviceStatus{"failed", "",
+                    publish(channel, DeviceStatus{"failed", "",
                                               "payload write failed"});
                     co_return 1;
                 }
@@ -290,7 +298,15 @@ elio::coro::task<int> fake_main(Args args) {
                 upper = std::move(sparse);
             }
         }
-        report(channel, DeviceStatus{"ready", "/dev/ublkb70", ""});
+        obd::supervisor::StartupOwnerStatus ready_owner;
+        ready_owner.generation = args.startup_generation;
+        ready_owner.revision = 2;
+        ready_owner.phase = "ready";
+        ready_owner.device_id = 70;
+        if (owner) *owner = ready_owner;
+        publish(channel, DeviceStatus{"ready", "/dev/ublkb70", "",
+            args.startup_generation
+                ? std::optional{ready_owner} : std::nullopt});
 
         // Serve the supervisor's device commands on the control channel
         // (trace record path + D3 resize), exactly like the real
@@ -411,7 +427,7 @@ elio::coro::task<int> fake_main(Args args) {
         if (upper != nullptr) {
             const int crc = co_await upper->checkpoint();
             if (crc != 0) {
-                report(channel, DeviceStatus{"failed", "",
+                publish(channel, DeviceStatus{"failed", "",
                                           "checkpoint failed"});
                 co_return 1;
             }
@@ -419,12 +435,12 @@ elio::coro::task<int> fake_main(Args args) {
         if (blank_top != nullptr) {
             const int crc = co_await blank_top->checkpoint();
             if (crc != 0) {
-                report(channel, DeviceStatus{"failed", "",
+                publish(channel, DeviceStatus{"failed", "",
                                           "blank checkpoint failed"});
                 co_return 1;
             }
         }
-        report(channel, DeviceStatus{"stopped", "", ""});
+        publish(channel, DeviceStatus{"stopped", "", ""});
         // Test-only EOF-before-cleanup fixture. The checkpoint is already
         // valid, exactly like the real device, but channel EOF precedes
         // final Device/ublk control teardown. Hold that interval explicitly.
@@ -451,9 +467,99 @@ elio::coro::task<int> fake_main(Args args) {
         }
         co_return 0;
     } catch (const std::exception& e) {
-        report(channel, DeviceStatus{"failed", "", e.what()});
+        publish(channel, DeviceStatus{"failed", "", e.what()});
         co_return 1;
     }
+}
+
+// The test child implements the same mandatory pre-publication grant. Read
+// one byte at a time during the handoff so no bytes for the later sole
+// command reader are consumed and discarded.
+elio::coro::task<std::optional<nlohmann::json>> startup_command(
+    elio::net::uds_stream& stream) {
+    std::string line;
+    for (;;) {
+        char byte;
+        auto read = co_await stream.read(&byte, 1);
+        if (read.result != 1) co_return std::nullopt;
+        if (byte == '\n') break;
+        if (line.size() >= obd::supervisor::kMaxMessageBytes)
+            co_return std::nullopt;
+        line.push_back(byte);
+    }
+    auto command = nlohmann::json::parse(line, nullptr, false);
+    if (!command.is_object()) co_return std::nullopt;
+    co_return command;
+}
+
+elio::coro::task<int> fake_main(Args args) {
+    using namespace obd::supervisor;
+    if (args.startup_generation == 0) co_return co_await fake_body(std::move(args));
+    auto channel = std::make_shared<ControlChannelWriter>(args.control_fd);
+    elio::net::uds_stream reader(::dup(args.control_fd));
+    StartupOwnerStatus owner;
+    owner.generation = args.startup_generation;
+    report(channel, DeviceStatus{"starting", "", "", owner});
+    bool granted = false;
+    bool retained = std::getenv("OBD_TEST_STARTUP_RETAIN") != nullptr;
+    bool refuse_once = std::getenv("OBD_TEST_STARTUP_REFUSE_ONCE") != nullptr;
+    for (;;) {
+        auto command = co_await startup_command(reader);
+        if (!command) co_return 2;
+        const auto name = command->value("cmd", "");
+        nlohmann::json reply{{"reply", name}, {"ok", true},
+                             {"generation", owner.generation}};
+        if (command->value("generation", uint64_t{0}) != owner.generation) {
+            reply["ok"] = false;
+        } else if (name == "startup_begin" &&
+                   command->value("version", 0) == kStartupOwnerVersion) {
+            granted = true;
+        } else if (name == "startup_release") {
+            const auto sequence = command->value("seq", uint64_t{0});
+            if (sequence == 0 || sequence <= owner.release_sequence) {
+                reply["ok"] = false;
+            } else {
+                owner.release_sequence = sequence;
+                owner.revision += 2;
+                if (refuse_once) {
+                    refuse_once = false;
+                    owner.phase = "retained";
+                    owner.release = "refused";
+                    owner.release_errno = EIO;
+                } else {
+                    owner.phase = "released";
+                    owner.release = "released";
+                    owner.release_errno = 0;
+                    owner.raw_retired = owner.raw_published;
+                }
+            }
+        } else if (name != "startup_status") {
+            reply["ok"] = false;
+        }
+        reply["startup_owner"] = startup_owner_json(owner);
+        channel->write_line(reply.dump() + "\n");
+        if (owner.phase == "released") {
+            report(channel, DeviceStatus{"stopped", "", "", owner});
+            co_return 0;
+        }
+        if (!granted) continue;
+        if (!retained) break;
+        if (owner.phase != "retained") {
+            owner.phase = "retained";
+            owner.reason_errno = EIO;
+            owner.raw_published = 2; // simulated debt; no kernel device exists
+            owner.revision += 2;
+        }
+        report(channel, DeviceStatus{"failed", "",
+            "injected retained startup failure", owner});
+    }
+    reader.close();
+    const int result = co_await fake_body(args, &owner);
+    // Early body errors before ready have no ublk loans in this fake.
+    owner.phase = "released";
+    owner.revision += 2;
+    report(channel, DeviceStatus{result ? "failed" : "stopped", "", "", owner});
+    co_return result;
 }
 
 }  // namespace
@@ -503,6 +609,8 @@ int main(int argc, char** argv) {
         } else if (a == "--blank-dir") args.blank_dir = next("--blank-dir");
         else if (a == "--control-fd")
             args.control_fd = std::stoi(next("--control-fd"));
+        else if (a == "--startup-generation")
+            args.startup_generation = std::stoull(next("--startup-generation"));
         else if (a == "--global") (void)next("--global");  // accepted, unused
         else if (a == "--dev-id") (void)next("--dev-id");  // accepted, unused
         else if (a == "--virtual-size") {

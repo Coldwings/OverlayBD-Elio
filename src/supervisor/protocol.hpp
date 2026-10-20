@@ -54,7 +54,10 @@ inline constexpr size_t kMaxMessageBytes = 64 * 1024;
 ///       `virtual_size` fields (D3 grow-only resize chain; feature
 ///       "resize"), and the additive create "blank" object: blank (raw)
 ///       device creation modes 2/3 of ADR-0014 (feature "blank").
-inline constexpr int kProtocolVersion = 4;
+///   5 — retained startup owners and explicit release (ADR-0022; feature
+///       "startup_owner"). The private child channel requires a start grant
+///       before the child may acquire ublk command obligations.
+inline constexpr int kProtocolVersion = 5;
 
 /// Project version string, wired from CMake `project(... VERSION ...)` so
 /// it cannot drift; "dev" is the fallback for non-CMake builds.
@@ -205,10 +208,38 @@ std::string reply_hello();
 
 // --- obd-device → supervisor status ----------------------------------------
 
+/// Additive startup ownership facts. These describe one child generation;
+/// receipt of a status line is not itself proof of kernel retirement or reap.
+struct StartupOwnerStatus {
+    uint64_t generation = 0;
+    uint64_t revision = 0;
+    std::string phase = "preparing";
+    int device_id = -1;
+    int reason_errno = 0;
+    bool control_pending = false;
+    bool kernel_debt_known = true;
+    uint64_t raw_published = 0;
+    uint64_t raw_retired = 0;
+    uint64_t release_sequence = 0;
+    std::string release = "none";
+    int release_errno = 0;
+
+    bool operator==(const StartupOwnerStatus&) const = default;
+};
+
+/// Versioned private-channel capability. An old parent cannot grant it by
+/// merely ignoring the additive status field.
+inline constexpr int kStartupOwnerVersion = 1;
+nlohmann::json startup_owner_json(const StartupOwnerStatus& owner);
+/// Coherent facts only; request admission and monotonicity belong to Child.
+bool valid_startup_owner(const StartupOwnerStatus& owner) noexcept;
+std::optional<StartupOwnerStatus> parse_startup_owner(const nlohmann::json& value);
+
 struct DeviceStatus {
     std::string state;   // starting | ready | failed | stopped
     std::string device;  // /dev/ublkb<N> when ready
     std::string error;   // when failed
+    std::optional<StartupOwnerStatus> startup_owner = std::nullopt;
 };
 
 /// Parses a status line from a device child; nullopt on malformed input.

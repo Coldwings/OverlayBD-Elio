@@ -111,8 +111,10 @@ obdctl destroy myimg
 Each `create` spawns one isolated obd-device child process (ADR-0004); the
 reply to `create` carries the kernel block device path. The device node is
 `/dev/ublkb<N>` — partition scanning, udev rules and mounts operate on that
-path as with any other block device. `destroy` stops the child (SIGTERM,
-SIGKILL after the stop timeout) and the node disappears.
+path as with any other block device. For a ready device, `destroy` uses the
+normal TERM/reap policy, with KILL escalation after the stop timeout. For a
+protected startup owner it requests explicit release and can return a refusal
+or unresolved error while retaining the entry; see below.
 
 To produce a local test image without a registry, use obd-mkimage and paste
 its stdout snippet into a per-image `config.json`:
@@ -274,7 +276,8 @@ obdctl commit myimg --tag "build-2026-09-08"
 
 Contract and runbook notes:
 
-- **The device is stopped, then sealed.** A live device is SIGTERMed and
+- **The device is stopped, then sealed.** Protected startup owners are refused.
+  An eligible live device is SIGTERMed and
   reaped (bounded; SIGKILL on timeout) before any byte is sealed — there
   is no live seal. The device entry remains afterwards (`obdctl status`
   still works, state `exited`); `destroy` removes it as usual.
@@ -455,6 +458,93 @@ Contract and runbook notes:
   accepts the command). Create-time headroom and commit re-baseline need
   no kernel support.
 
+## Retained startup and shutdown maintenance (ADR-0022)
+
+A failed create/recovery can keep its process and resources alive. Inspect
+`obdctl status <id>` or `obdctl list`: `startup_protected` identifies a protected
+generation, and `startup_owner` reports its phase, errno, raw command counts,
+control debt and release result. `failed` does not imply reaped; equal raw
+counts alone do not establish source-frame retirement or successful deletion.
+
+`obdctl destroy <id>` explicitly authorizes release of that generation. The
+child must settle startup control work, issue authorized STOP, observe original
+raw CQEs and native-frame retirement, close queue/cdev references, and issue
+one DEL before reporting completion. The supervisor also requires actual reap
+before erasing the entry. A pending/refused/timed-out release keeps the entry;
+repeat status to inspect it and retry destroy where supported. A retry does
+not blindly repeat an ambiguous DEL. Unavailable channel or unknown retirement
+can require subsequent recovery/operator investigation; do not infer success
+from EOF, an expired timeout or external process termination.
+
+SIGTERM/SIGINT to the supervisor sets `shutdown_pending`. While protected
+owners remain, the daemon keeps its socket and runtime available for
+hello/list/status/destroy, rejects other new work, and does not TERM/KILL those
+owners. After their release/reap it completes normal shutdown. `commit` refuses
+a retained startup owner even if its process was externally reaped. External
+SIGKILL and host loss are outside the retention guarantee.
+
+Upgrade supervisor and device binaries as a compatible protocol-v5 pair.
+Supervised devices require `--startup-generation`; supported mixed old/new
+pairs fail before device publication. A custom `--device-bin` must implement
+the same grant and ownership protocol.
+
+### Standalone recovery control
+
+Without a supervisor, `obd-device --recover --dev-id N --config image.json`
+creates a startup-control socket before assembling the image. The default is
+`@obd-device-<effective-uid>-<pid>`; set `--startup-socket @NAME` for a stable
+operator-selected name. The name is Linux abstract AF_UNIX, not a filesystem
+path. Binding is exclusive, no existing entry is removed, and only the device's
+effective UID or root may issue commands. The address and fresh owner generation
+are printed to stderr. Endpoint setup failure aborts before device publication.
+
+Query status and explicitly release a failed startup with Python (replace the
+example socket name). This authorizes STOP/retirement/DEL for this owner; it is
+not an instruction to kill the process or delete a numeric device independently:
+
+```python
+import json
+import socket
+
+address = "\0obd-device-0-12345"  # printed @NAME, with @ replaced by NUL
+
+def connection():
+    peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    peer.connect(address)
+    return peer
+
+with connection() as peer:
+    peer.sendall(b'{"cmd":"startup_status"}\n')
+    status = json.loads(peer.makefile("r").readline())
+    print(status)
+owner = status["startup_owner"]
+
+with connection() as peer:
+    command = {"cmd": "startup_release", "generation": owner["generation"],
+               "seq": owner["release_sequence"] + 1}
+    peer.sendall((json.dumps(command) + "\n").encode())
+    for line in peer.makefile("r"):
+        print(json.loads(line))  # pending, then refused/released/superseded
+```
+
+Release admission requires the current generation and an increasing nonzero
+sequence below `2^63`. A concurrent unresolved request returns `busy`; a reused
+sequence returns `stale`. A refused attempt may be retried with a fresh sequence.
+`pending` is only acknowledgement. The final correlated `release:"released"`
+record follows full caller cleanup; a status snapshot's
+`startup_owner.phase:"released"` alone does not establish outer image/fill
+retirement. The device also prints a terminal JSON ownership report to stderr. A disconnected client can reconnect for status while the owner remains;
+EOF or disappearance without a terminal report does not prove safe retirement.
+Slow/partial request clients have bounded deadlines and do not occupy the
+acceptor. A retained startup continues servicing this endpoint despite TERM/INT;
+a ready device instead uses ordinary TERM/INT shutdown.
+
+Kernel evidence is a separate gate: the existing Linux 6.6 START-cancellation
+and single-FETCH probes do not establish complete multi-queue failed recovery
+or release. Validation needs owned fixtures on Linux 6.6 and a current kernel,
+original CQE accounting, native retirement, cdev-close-before-DEL and actual
+child reap. Ordinary process/helper tests cannot replace those checks.
+
 ## Logging
 
 Logging goes to stderr (journald when run under systemd). The level comes
@@ -467,11 +557,11 @@ correlate by device id and by the supervisor's spawn logs.
 | Symptom | Likely cause / action |
 |---|---|
 | `obdctl: cannot connect to /run/overlaybd-elio/supervisor.sock` | Supervisor not running, or wrong `--socket` on either side. Both default to the same path; check the socket directory exists. |
-| `create` returns `{"ok":false,...}` with an assembly error | The child failed to assemble the image (bad `config.json`, unreadable blob, registry auth). The child reports `{"state":"failed","error":...}` and exits 1; the supervisor relays the error string in the reply. Fix the config and retry — the failed child is already gone. |
+| `create` returns `{"ok":false,...}` with an assembly error | The child failed to assemble the image (bad `config.json`, unreadable blob, registry auth). The supervisor returns failure. Inspect `status` before retrying: a safe pre-publication failure can exit, while a protected startup failure can retain the process and resources (ADR-0022). |
 | `create` fails with "virtual size not sector aligned" | The merged image size is zero or not a multiple of 512 bytes; the image is malformed for block serving. |
 | No `/dev/ublkb<N>` after a successful `create` | `ublk_drv` not loaded or missing udev; check `/dev/ublk-control` and `lsmod`. |
 | Slow first reads, DART warnings in the log | DART proxy configured but unreachable. This is handled: the source logs a warning and falls back to direct registry reads (guarded by `integration: enabled-but-unreachable DART falls back to direct reads`). Fix the `p2pConfig` address or disable P2P. |
-| A device child crashed | Siblings and the supervisor are unaffected (ADR-0004), and the device itself survives: the supervisor respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection (`destroy` + `create`). Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008); offline `commit` only has input if graceful shutdown already wrote a valid checkpoint before the child died. |
+| A device child crashed | Siblings and the supervisor are isolated (ADR-0004). For an ordinary ready-device crash, the supervisor attempts bounded recovery and respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection. A retained startup generation blocks further replacement; inspect ownership status and use explicit `destroy` before recreating. Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008); offline `commit` only has input if graceful shutdown already wrote a valid checkpoint before the child died. |
 | `commit` fails with "no valid shutdown checkpoint" | No graceful-shutdown checkpoint reached disk before the child died, for example a crash or SIGKILL before `checkpoint()` completed. The unsealed upper is unsealable (ADR-0014); start over from the lowers. |
 | `commit` fails with "sparse uppers cannot be sealed" | Sparse uppers never seal (upstream parity, ADR-0014). Use `type: "lsmt"` uppers for content you intend to commit. |
 | `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard reaches only writable devices; writable uppers satisfy ADR-0009 zero-mask semantics. LSMT-RW records zeroed segments, while sparse uppers publish protective sidecar zero masks before punching holes. |

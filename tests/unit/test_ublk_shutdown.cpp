@@ -78,10 +78,63 @@ struct DeviceTestAccess {
         q.done_.clear();
     }
 
-    static elio::coro::task<void> cleanup_failed(
-        std::unique_ptr<Device> dev, std::exception_ptr failure) {
-        co_await Device::cleanup_failed(std::move(dev), failure);
+    static elio::coro::task<std::unique_ptr<Device>> fail_startup(
+        Device& dev, StartupControl& startup, std::exception_ptr failure,
+        bool recovery = false, Device::FailureCleanup cleanup = {}) {
+        dev.startup_ = &startup;
+        // Without a control transport this fixture has no device identity.
+        if (!dev.ctrl_) dev.dev_id_ = UINT32_MAX;
+        co_return co_await dev.fail_startup(recovery, failure, cleanup);
     }
+
+    static void recovering(Device& dev, StartupControl& startup,
+                           detail::CtrlTransport& transport) {
+        dev.startup_ = &startup;
+        dev.dev_id_ = 42;
+        dev.publication_released_ = true;
+        dev.ctrl_ = std::make_unique<Ctrl>(transport);
+        dev.ctrl_->disable_destructor_cleanup();
+        dev.ctrl_->set_observer({&dev, Device::cancel_control,
+                                 Device::complete_control, Device::observe_control});
+        if (!dev.queues_.empty()) {
+            // This stand-in descriptor is closed by real release_once, not by
+            // the scripted control transport. No kernel device is created.
+            dev.queues_.front()->ublkc_fd_ = ::eventfd(0, EFD_CLOEXEC);
+            if (dev.queues_.front()->ublkc_fd_ < 0)
+                throw std::runtime_error("test cdev stand-in failed");
+        }
+    }
+    static void start_rejecting_queues(Device& dev, std::function<void()> pause_second) {
+        dev.queues_.reserve(2);
+        dev.threads_.reserve(2);
+        for (uint16_t index = 0; index < 2; ++index) {
+            auto q = std::make_unique<Queue>(42, index, 2, 4096);
+            // Real queue rings submit to an eventfd, which rejects uring_cmd.
+            // This exercises publication/retirement without a kernel device.
+            q->ublkc_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+            q->elio_efd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+            q->done_efd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+            q->io_bufs_ = static_cast<uint8_t*>(std::calloc(2, 4096));
+            if (q->ublkc_fd_ < 0 || q->elio_efd_ < 0 || q->done_efd_ < 0 || !q->io_bufs_)
+                throw std::runtime_error("rejecting queue fixture setup failed");
+            if (index == 1) q->initial_submit_hook_for_test_ = pause_second;
+            dev.queues_.push_back(std::move(q));
+        }
+        for (auto& q : dev.queues_) {
+            dev.threads_.emplace_back([&dev, queue = q.get()] { queue->run(dev.stop_); });
+        }
+        for (auto& q : dev.queues_) q->publish_initial_fetches();
+    }
+    static Queue& queue_at(Device& dev, size_t index) { return *dev.queues_[index]; }
+    static bool all_tags_retired(const Queue& queue) {
+        if (queue.raw_.size() != queue.depth_) return false;
+        for (const auto& tag : queue.raw_)
+            if (tag.pending || tag.delivered || tag.reply_ready) return false;
+        return true;
+    }
+
+    static void end_recovery(Device& dev) { dev.ctrl_->end_user_recovery(dev.dev_id_); }
+    static bool owns_id(const Device& dev) { return dev.owns_id_; }
 
     static bool stopping(const Device& dev) { return dev.stop_.load(); }
     static int running(const Device& dev) {
@@ -156,6 +209,74 @@ struct ReadState {
     std::atomic<bool> finished{false};
     std::atomic<bool> destroyed{false};
     std::atomic<bool> destroyed_off_worker{false};
+};
+
+// Immediate scripted control CQEs exercise the real Ctrl/Device ownership
+// callbacks. Queue delivery below still uses the ordinary bridge fixture;
+// this is not proof of raw FETCH retirement on a real ublk driver.
+class LifecycleTransport final : public obd::ublk::detail::CtrlTransport {
+public:
+    ReadState* source = nullptr;
+    obd::ublk::Queue* queue = nullptr;
+    obd::ublk::Device* device = nullptr;
+    std::atomic<bool> native_frames_gone_at_stop{false};
+    std::atomic<unsigned> stops{0}, deletions{0};
+    std::atomic<bool> source_finished_at_stop{false}, cdev_closed_at_delete{false};
+    bool refuse_first_stop = false;
+    int end_result = 0;
+
+    io_uring_sqe* get_sqe() noexcept override { prepared_ = true; return sqes_.data(); }
+    unsigned sq_ready() noexcept override { return prepared_ ? 1 : 0; }
+    int submit() noexcept override {
+        if (!prepared_) return 0;
+        prepared_ = false;
+        cqe_ = {};
+        cqe_.user_data = sqes_[0].user_data;
+        switch (sqes_[0].cmd_op) {
+        case UBLK_U_CMD_STOP_DEV:
+            source_finished_at_stop.store(!source || source->finished.load());
+            native_frames_gone_at_stop.store(!device ||
+                obd::ublk::DeviceTestAccess::running(*device) == 0);
+            if (stops.fetch_add(1) == 0 && refuse_first_stop) cqe_.res = -EIO;
+            break;
+        case UBLK_U_CMD_DEL_DEV:
+            cdev_closed_at_delete.store(!queue || queue->cdev_fd() == -1);
+            deletions.fetch_add(1);
+            break;
+        case UBLK_U_CMD_END_USER_RECOVERY: cqe_.res = end_result; break;
+        default: cqe_.res = -EINVAL; break;
+        }
+        available_ = true;
+        return 1;
+    }
+    int enter() noexcept override { return 0; }
+    int peek_cqe(io_uring_cqe** cqe) noexcept override {
+        *cqe = available_ ? &cqe_ : nullptr;
+        return available_ ? 0 : -EAGAIN;
+    }
+    void cqe_seen(io_uring_cqe*) noexcept override { available_ = false; }
+    void idle() noexcept override { std::this_thread::yield(); }
+private:
+    std::array<io_uring_sqe, 2> sqes_{};
+    bool prepared_ = false, available_ = false;
+    io_uring_cqe cqe_{};
+};
+
+struct CleanupWithoutCopies {
+    unsigned* calls;
+    unsigned* copies;
+    CleanupWithoutCopies(unsigned& call_count, unsigned& copy_count)
+        : calls(&call_count), copies(&copy_count) {}
+    CleanupWithoutCopies(CleanupWithoutCopies&&) = default;
+    CleanupWithoutCopies(const CleanupWithoutCopies& other)
+        : calls(other.calls), copies(other.copies) {
+        ++*copies;
+        throw std::runtime_error("cleanup must not be copied after admission");
+    }
+    elio::coro::task<void> operator()() {
+        ++*calls;
+        co_return;
+    }
 };
 
 class CompletingSource final : public obd::source::BlobSource {
@@ -941,7 +1062,7 @@ TEST_CASE("ublk: control task releases its device owner before final destruction
     REQUIRE(state.destroyed_off_worker.load());
 }
 
-TEST_CASE("ublk: failed setup drains partial state before rethrowing its error", "[ublk][shutdown]") {
+TEST_CASE("ublk: failed startup drains sources before propagating its original error", "[ublk][shutdown]") {
     using obd::ublk::DeviceTestAccess;
     bool bridge = false;
     SECTION("before queue setup") { bridge = false; }
@@ -954,16 +1075,228 @@ TEST_CASE("ublk: failed setup drains partial state before rethrowing its error",
         auto dev = DeviceTestAccess::make(
             std::make_unique<CompletingSource>(state), bridge);
         if (bridge) DeviceTestAccess::start(*dev);
+        obd::ublk::StartupControl startup(1);
         try {
-            // The same cleanup routine is used by create and attach catches.
-            co_await DeviceTestAccess::cleanup_failed(std::move(dev), original);
+            (void)co_await DeviceTestAccess::fail_startup(*dev, startup, original);
         } catch (...) {
             observed = std::current_exception();
         }
+        const auto status = startup.snapshot();
+        CHECK(status.phase == obd::ublk::StartupPhase::released);
+        CHECK(DeviceTestAccess::running(*dev) == 0);
+        CHECK_FALSE(state.destroyed.load());
+        co_await elio::spawn_blocking([&] { dev.reset(); });
         CHECK(state.destroyed.load());
     }, one_worker());
     REQUIRE(observed == original);
     REQUIRE(state.destroyed_off_worker.load());
+}
+
+TEST_CASE("ublk: startup failure keeps the admitted cleanup callback without copying",
+          "[ublk][shutdown]") {
+    using namespace obd::ublk;
+    ReadState state;
+    StartupControl startup(23);
+    // A release accepted before create prevents any kernel control open.
+    // The public API still runs start_impl and its actual failure coordinator.
+    REQUIRE(startup.request_release(23, 1) == ReleaseRequestResult::accepted);
+    unsigned calls = 0, copies = 0;
+    Device::FailureCleanup cleanup{CleanupWithoutCopies(calls, copies)};
+    bool released = false;
+    elio::run([&]() -> elio::coro::task<void> {
+        DeviceParams params;
+        params.dev_sectors = 8;
+        try {
+            (void)co_await Device::create(params,
+                std::make_unique<CompletingSource>(state), startup, std::move(cleanup));
+        } catch (const StartupReleased&) { released = true; }
+    }, one_worker());
+    CHECK(released);
+    CHECK(calls == 1);
+    CHECK(copies == 0);
+    CHECK(startup.snapshot().phase == StartupPhase::released);
+    CHECK(state.destroyed.load());
+}
+
+TEST_CASE("ublk: retained recovery waits for source drain and explicit release",
+          "[ublk][shutdown]") {
+    using namespace obd::ublk;
+    using namespace std::chrono_literals;
+    bool early_release = false;
+    bool refuse = false;
+    SECTION("release admitted while source still borrows the buffer") { early_release = true; }
+    SECTION("drained source does not authorize release") {}
+    SECTION("refused STOP preserves the owner until a new release request") { refuse = true; }
+    ReadState state;
+    LifecycleTransport transport;
+    transport.source = &state;
+    transport.refuse_first_stop = refuse;
+    StartupControl startup(17);
+    bool released = false;
+    unsigned cleanup_attempts = 0;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<CompletingSource>(state));
+        DeviceTestAccess::recovering(*dev, startup, transport);
+        transport.queue = &DeviceTestAccess::queue(*dev);
+        transport.device = dev.get();
+        DeviceTestAccess::start(*dev, true);
+        while (!state.entered.load()) co_await elio::time::sleep_for(1ms);
+        auto failure = std::make_exception_ptr(
+            std::system_error(EIO, std::generic_category(), "failed replacement"));
+        auto cleanup = [&]() -> elio::coro::task<void> {
+            // Exercise failure of ancillary fill parking without losing the
+            // retained Device/source or returning to the caller prematurely.
+            if (++cleanup_attempts < 3) throw std::bad_alloc();
+            co_return;
+        };
+        auto failed = elio::spawn(DeviceTestAccess::fail_startup(
+            *dev, startup, failure, true, cleanup));
+        while (!DeviceTestAccess::stopping(*dev)) co_await elio::time::sleep_for(1ms);
+        CHECK(startup.snapshot().phase == StartupPhase::retained);
+        CHECK_FALSE(failed.is_ready());
+        CHECK_FALSE(state.finished.load());
+        CHECK(transport.stops.load() == 0);
+        if (early_release) {
+            CHECK(startup.request_release(17, 1) == ReleaseRequestResult::accepted);
+        }
+        state.release.store(true);
+        while (cleanup_attempts < 3) co_await elio::time::sleep_for(1ms);
+        if (!early_release) {
+            CHECK(transport.stops.load() == 0);
+            CHECK_FALSE(failed.is_ready());
+            CHECK(startup.request_release(17, 1) == ReleaseRequestResult::accepted);
+        }
+        if (refuse) {
+            while (startup.snapshot().release != StartupRelease::refused)
+                co_await elio::time::sleep_for(1ms);
+            CHECK(transport.stops.load() == 1);
+            CHECK(transport.deletions.load() == 0);
+            CHECK(transport.queue->cdev_fd() >= 0);
+            CHECK_FALSE(state.destroyed.load());
+            CHECK_FALSE(failed.is_ready());
+            CHECK(startup.request_release(17, 2) == ReleaseRequestResult::accepted);
+        }
+        try { (void)co_await failed; }
+        catch (const StartupReleased&) { released = true; }
+        co_await failed.wait_destroyed_async();
+        const auto final = startup.snapshot();
+        CHECK(final.phase == StartupPhase::released);
+        CHECK(final.release == StartupRelease::released);
+        CHECK(final.release_sequence == (refuse ? 2 : 1));
+        CHECK(DeviceTestAccess::running(*dev) == 0);
+        CHECK_FALSE(state.destroyed.load());
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+    CHECK(released);
+    CHECK(transport.stops.load() == (refuse ? 2 : 1));
+    CHECK(transport.deletions.load() == 1);
+    CHECK(transport.source_finished_at_stop.load());
+    CHECK(transport.native_frames_gone_at_stop.load());
+    CHECK(transport.cdev_closed_at_delete.load());
+    CHECK(state.destroyed.load());
+    CHECK(state.destroyed_off_worker.load());
+}
+
+TEST_CASE("ublk: retained release waits for every queue to issue and retire originals",
+          "[ublk][shutdown]") {
+    using namespace obd::ublk;
+    using namespace std::chrono_literals;
+    ReadState state;
+    LifecycleTransport transport;
+    StartupControl startup(29);
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> paused{false};
+    bool resume = false, resumed_by_test = false;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<CompletingSource>(state), false);
+        DeviceTestAccess::recovering(*dev, startup, transport);
+        DeviceTestAccess::start_rejecting_queues(*dev, [&] {
+            std::unique_lock lock(mutex);
+            paused.store(true);
+            resumed_by_test = cv.wait_for(lock, 5s, [&] { return resume; });
+        });
+        transport.queue = &DeviceTestAccess::queue_at(*dev, 0);
+        transport.device = dev.get();
+        auto& second = DeviceTestAccess::queue_at(*dev, 1);
+        while (!paused.load() || !transport.queue->initial_fetches_issued())
+            co_await elio::time::sleep_for(1ms);
+        auto failure = std::make_exception_ptr(
+            std::system_error(EIO, std::generic_category(), "partial queue publication"));
+        auto failed = elio::spawn(DeviceTestAccess::fail_startup(*dev, startup, failure, true));
+        while (startup.snapshot().phase != StartupPhase::retained)
+            co_await elio::time::sleep_for(1ms);
+        CHECK(startup.request_release(29, 1) == ReleaseRequestResult::accepted);
+        while (startup.snapshot().phase != StartupPhase::releasing)
+            co_await elio::time::sleep_for(1ms);
+        CHECK_FALSE(second.initial_fetches_issued());
+        CHECK_FALSE(failed.is_ready());
+        CHECK(transport.stops.load() == 0);
+        CHECK(transport.deletions.load() == 0);
+        {
+            std::lock_guard lock(mutex);
+            resume = true;
+            cv.notify_one();
+        }
+        bool released = false;
+        try { (void)co_await failed; }
+        catch (const StartupReleased&) { released = true; }
+        co_await failed.wait_destroyed_async();
+        CHECK(released);
+        for (size_t i = 0; i != 2; ++i) {
+            const auto& queue = DeviceTestAccess::queue_at(*dev, i);
+            const auto ledger = queue.retirement();
+            CHECK(queue.initial_fetches_issued());
+            CHECK(queue.owner_exited());
+            CHECK(queue.cdev_fd() == -1);
+            CHECK(ledger.known);
+            CHECK(ledger.complete);
+            // The raw ledger also counts the completion-eventfd poll if this
+            // owner armed it before observing failure. Verify both tag slots
+            // and every published cookie rather than assuming only FETCH exists.
+            CHECK(DeviceTestAccess::all_tags_retired(queue));
+            CHECK(ledger.published >= 2);
+            CHECK(ledger.retired == ledger.published);
+        }
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+    CHECK(resumed_by_test);
+    CHECK(transport.stops.load() == 1);
+    CHECK(transport.deletions.load() == 1);
+    CHECK(transport.cdev_closed_at_delete.load());
+}
+
+TEST_CASE("ublk: original END completion decides recovery adoption",
+          "[ublk][shutdown]") {
+    using namespace obd::ublk;
+    bool success = true;
+    SECTION("original success adopts before returning from Ctrl") {}
+    SECTION("original failure leaves the old device unadopted") { success = false; }
+    ReadState state;
+    LifecycleTransport transport;
+    transport.end_result = success ? 0 : -EIO;
+    StartupControl startup(19);
+    auto dev = DeviceTestAccess::make(std::make_unique<CompletingSource>(state), false);
+    DeviceTestAccess::recovering(*dev, startup, transport);
+    bool threw = false;
+    try { DeviceTestAccess::end_recovery(*dev); }
+    catch (const std::system_error&) { threw = true; }
+    CHECK(threw == !success);
+    CHECK(DeviceTestAccess::owns_id(*dev) == success);
+    CHECK(dev->started() == success);
+    CHECK(startup.snapshot().original_known);
+    CHECK(startup.snapshot().original_result == transport.end_result);
+    // Even the failed-original branch needs explicit release: the fixture
+    // represents a recovery that has already published its queue owners.
+    CHECK(startup.request_release(19, 1) == ReleaseRequestResult::accepted);
+    elio::run([&]() -> elio::coro::task<void> {
+        try {
+            (void)co_await DeviceTestAccess::fail_startup(*dev, startup, {}, true);
+        } catch (const StartupReleased&) {}
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+    CHECK(transport.stops.load() == 1);
+    CHECK(transport.deletions.load() == 1);
 }
 
 TEST_CASE("ublk: blocking stop waits for a slow source to finish", "[ublk][shutdown]") {

@@ -131,7 +131,7 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0007](./0007-readonly-first-scope.md) | Read-only first: writable layers and TurboOCI are out of scope | superseded by ADR-0008 |
 | [0008](./0008-writable-upper-layers.md) | Writable upper layers: sparse file and in-place-edit LSMT-RW | superseded by ADR-0020 |
 | [0009](./0009-discard-punch-hole.md) | Discard/punch-hole with mask-with-zeroes semantics | accepted |
-| [0010](./0010-ublk-user-recovery.md) | ublk USER_RECOVERY crash recovery with bounded respawn | accepted |
+| [0010](./0010-ublk-user-recovery.md) | ublk USER_RECOVERY crash recovery with bounded respawn | superseded by ADR-0022 |
 | [0011](./0011-sparse-layer-store.md) | Unify layer persistence into a sparse-file LayerStore with sidecar bitmap and per-extent CRC | accepted |
 | [0012](./0012-read-admission-funnel.md) | Admit all remote reads through one priority funnel with scavenger-class prefetch | accepted |
 | [0013](./0013-trace-prefetch.md) | Record and replay prefetch traces in upstream-compatible format without a photon dependency | accepted |
@@ -143,3 +143,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0019](./0019-streaming-tar-converter.md) | Build tar streams into deterministic device-free LSMT layers | accepted |
 | [0020](./0020-native-turbooci.md) | Read TurboOCI natively and build its metadata locally | accepted |
 | [0021](./0021-reuse-tag-handlers-on-the-bridge-worker.md) | Reuse tag handlers on their bridge worker | accepted |
+| [0022](./0022-retain-failed-startup-owners.md) | Retain failed startup owners until positive retirement | proposed |

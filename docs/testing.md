@@ -997,9 +997,18 @@ Every test, grouped by area, with the property it guards.
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
   Device destruction, with one worker and one blocking thread.
-- `ublk: failed setup drains partial state before rethrowing its error` —
-  the create/attach cleanup routine preserves the original exception and
-  destroys partial state off-worker, before and after bridge registration.
+- `ublk: failed startup drains sources before propagating its original error` —
+  the production startup failure coordinator drains partial bridge state,
+  publishes release, and preserves the original exception. The test owner
+  then destroys the retained source graph off-worker.
+- `ublk: retained recovery waits for source drain and explicit release` —
+  source loans and ancillary cleanup must finish before explicit STOP;
+  refused STOP preserves ownership, retry closes the stand-in cdev before
+  a single DEL. Uses actual Device/bridge/Ctrl code with scripted control
+  CQEs, without a real ublk device or raw FETCH retirement proof.
+- `ublk: original END completion decides recovery adoption` — actual Ctrl
+  completion dispatch adopts only original-success; cleanup runs through
+  the production Device failure coordinator.
 - `ublk: blocking stop waits for a slow source to finish` — a normal read
   completes after eight seconds while a dedicated off-worker caller drains;
   stop must not return before completion, and owners remain valid throughout.

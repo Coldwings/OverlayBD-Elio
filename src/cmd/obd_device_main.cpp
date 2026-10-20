@@ -7,6 +7,7 @@
 #include "common/errors.hpp"
 #include "supervisor/device_control.hpp"
 #include "supervisor/protocol.hpp"
+#include "cmd/startup_socket.hpp"
 
 #if defined(OBD_HAVE_UBLK) && OBD_HAVE_UBLK
 #include "ublk/device.hpp"
@@ -23,8 +24,10 @@
 #include <elio/sync/mutex.hpp>
 
 #include <sys/socket.h>
+#include <sys/random.h>
 
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -42,7 +45,8 @@ void usage(const char* argv0) {
                  "usage: %s (--config PATH | --blank-size BYTES --blank-dir "
                  "PATH)\n"
                  "          [--global PATH] [--control-fd N] [--dev-id N] "
-                 "[--recover] [--virtual-size BYTES]\n",
+                 "[--recover] [--virtual-size BYTES]\n"
+                 "          [--startup-socket @NAME]\n",
                  argv0);
 }
 
@@ -52,6 +56,8 @@ struct Args {
     int control_fd = -1;
     int dev_id = -1;
     bool recover = false;  // ADR-0010: attach to an existing device
+    uint64_t startup_generation = 0;
+    std::string startup_socket;
     /// D3 create-time headroom: dev_size override in bytes (0 = derive
     /// from the image's declared virtual size). Only meaningful for an
     /// image device; a blank device sizes itself to blank_size.
@@ -64,15 +70,34 @@ struct Args {
     std::string blank_dir;
 };
 
-void report(const obd::supervisor::ControlChannelWriterPtr& channel,
-            const obd::supervisor::DeviceStatus& st) {
+void write_status(const obd::supervisor::ControlChannelWriterPtr& channel,
+            const obd::supervisor::DeviceStatus& st) noexcept {
     if (!channel) return;
     // Serialized with the trace control loop's writes (SOCK_STREAM has
     // no PIPE_BUF rule — see ControlChannelWriter).
-    channel->write_line(obd::supervisor::make_device_status(st));
+    try {
+        channel->write_line(obd::supervisor::make_device_status(st));
+    } catch (...) {
+        // Reporting is best-effort; it never transfers the resource owner.
+    }
+}
+
+using obd::cmd::startup_status;
+
+void report_failure(
+    const obd::supervisor::ControlChannelWriterPtr& channel,
+    const char* message, const obd::ublk::StartupSnapshot& snapshot) noexcept {
+    // Include construction of the status strings in the exception boundary.
+    // An allocation failure in a catch handler must not skip awaited cleanup.
+    try {
+        write_status(channel, obd::supervisor::DeviceStatus{
+            "failed", "", message, startup_status(snapshot)});
+    } catch (...) {
+    }
 }
 
 struct ReportedDeviceFailure {};
+
 
 elio::coro::task<int> device_main(Args args) {
     using obd::supervisor::DeviceStatus;
@@ -83,16 +108,39 @@ elio::coro::task<int> device_main(Args args) {
             ? std::make_shared<obd::supervisor::ControlChannelWriter>(
                   args.control_fd)
             : nullptr;
-    report(channel, DeviceStatus{"starting", "", ""});
+    obd::ublk::StartupControl startup(args.startup_generation == 0
+                                        ? 1 : args.startup_generation);
+    auto report = [&](const obd::supervisor::ControlChannelWriterPtr& writer,
+                      DeviceStatus status) noexcept {
+        try {
+            if (!status.startup_owner)
+                status.startup_owner = startup_status(startup.snapshot());
+            write_status(writer, status);
+        } catch (...) {}
+    };
+    std::atomic<bool> granted{!channel};
+    std::atomic<bool> serving{false};
+    std::atomic<bool> observer_done{false};
+    std::atomic<bool> shutdown_requested{false};
+    elio::signal::signal_set term_set;
+    term_set.add(SIGTERM).add(SIGINT);
+    elio::signal::signal_fd term_fd(term_set);
     // Owners survive the protected body, so exceptions use the same awaited
     // cleanup as a normal shutdown instead of destructing on this worker.
     std::shared_ptr<obd::ublk::Device> dev;
+    std::unique_ptr<obd::ublk::Device> unshared_dev;
+    std::optional<obd::ublk::StartupSnapshot> retired_device;
     obd::image::OpenedImage opened;
     auto stopping = std::make_shared<std::atomic<bool>>(false);
     auto resize_gate = std::make_shared<std::mutex>();
     auto trace_start_stopping = std::make_shared<std::atomic<bool>>(false);
     auto trace_start_gate = std::make_shared<elio::sync::mutex>();
     std::optional<elio::coro::join_handle<void>> control;
+    std::optional<elio::coro::join_handle<void>> observer;
+    std::optional<obd::cmd::StartupSocket> standalone_socket;
+    std::optional<elio::coro::join_handle<void>> standalone_control;
+    std::shared_ptr<obd::supervisor::DeviceControlSession> session;
+    bool explicitly_released = false;
     int result = 0;
     auto close_trace_start_admission = [&]() -> elio::coro::task<void> {
         trace_start_stopping->store(true, std::memory_order_release);
@@ -110,10 +158,125 @@ elio::coro::task<int> device_main(Args args) {
     bool fills_parked = false;
     auto park_opened_fills = [&]() -> elio::coro::task<void> {
         if (fills_parked) co_return;
-        fills_parked = true;
         co_await obd::image::park_image_fills(opened);
+        fills_parked = true;
     };
     try {
+        if (!channel) {
+            standalone_socket.emplace(args.startup_socket, startup);
+            standalone_control.emplace(elio::spawn([&]() -> elio::coro::task<void> {
+                co_await standalone_socket->run();
+            }));
+            // Binding alone is insufficient: the acceptor must have installed
+            // its client-frame owner before any kernel publication is allowed.
+            while (!standalone_socket->started()) {
+                if (standalone_control->is_ready())
+                    throw std::runtime_error("startup socket service failed before admission");
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            std::fprintf(stderr, "startup control: %s generation=%llu\n",
+                         args.startup_socket.c_str(),
+                         static_cast<unsigned long long>(startup.snapshot().generation));
+        }
+        if (channel) {
+            session = std::make_shared<obd::supervisor::DeviceControlSession>(
+                [&](const nlohmann::json& command)
+                    -> std::optional<nlohmann::json> {
+                    const auto name = command.at("cmd").get<std::string>();
+                    if (name != "startup_begin" && name != "startup_release" &&
+                        name != "startup_status") return std::nullopt;
+                    const auto generation = command.find("generation");
+                    if (generation == command.end() ||
+                        !generation->is_number_unsigned() ||
+                        generation->get<uint64_t>() != args.startup_generation) {
+                        return nlohmann::json{{"ok", false},
+                            {"error", "startup owner generation mismatch"}};
+                    }
+                    nlohmann::json reply = {
+                        {"ok", true}, {"generation", args.startup_generation}};
+                    if (name == "startup_begin") {
+                        const auto version = command.find("version");
+                        if (version == command.end() ||
+                            !version->is_number_integer() ||
+                            *version != obd::supervisor::kStartupOwnerVersion) {
+                            reply["ok"] = false;
+                            reply["error"] = "unsupported startup owner version";
+                        } else {
+                            // Publication is allowed only after the parent has
+                            // installed its durable, protected Child owner.
+                            granted.store(true);
+                        }
+                    } else if (name == "startup_release") {
+                        const auto seq = command.find("seq");
+                        const auto result = seq != command.end() &&
+                                seq->is_number_unsigned()
+                            ? startup.request_release(args.startup_generation,
+                                                      seq->get<uint64_t>())
+                            : obd::ublk::ReleaseRequestResult::stale;
+                        reply["ok"] = result == obd::ublk::ReleaseRequestResult::accepted;
+                        switch (result) {
+                        case obd::ublk::ReleaseRequestResult::accepted:
+                            reply["release"] = "pending"; break;
+                        case obd::ublk::ReleaseRequestResult::stale:
+                            reply["release"] = "stale"; break;
+                        case obd::ublk::ReleaseRequestResult::busy:
+                            reply["release"] = "busy"; break;
+                        case obd::ublk::ReleaseRequestResult::not_startup:
+                            reply["release"] = "not_startup"; break;
+                        }
+                    }
+                    reply["startup_owner"] = obd::supervisor::startup_owner_json(
+                        startup_status(startup.snapshot()));
+                    return reply;
+                });
+            control.emplace(elio::spawn(
+                obd::supervisor::run_device_control_with_session, channel,
+                std::shared_ptr<obd::image::TraceRecorder>{},
+                obd::supervisor::DeviceControlHooks{}, session));
+        }
+        // Cold observer only: no per-IO work or extra handoff. Reporting and
+        // signal handling remain available while attach retains its frame.
+        observer.emplace(elio::spawn([&]() -> elio::coro::task<void> {
+            while (!observer_done.load()) {
+                try {
+                    while (auto signal = term_fd.try_read()) {
+                        if (serving.load()) shutdown_requested.store(true);
+                        else ELIO_LOG_WARNING(
+                            "startup owner retained: automatic shutdown refused");
+                    }
+                    if (!stopping->load()) {
+                        auto owner = startup_status(startup.snapshot());
+                        const bool failed = owner.phase == "retained" ||
+                                            owner.phase == "releasing";
+                        DeviceStatus status;
+                        status.state = serving.load() ? "ready" :
+                            failed ? "failed" : "starting";
+                        if (serving.load() && owner.device_id >= 0)
+                            status.device = "/dev/ublkb" + std::to_string(owner.device_id);
+                        if (failed) status.error =
+                            "startup failed; owner retained pending explicit release";
+                        status.startup_owner = std::move(owner);
+                        report(channel, status);
+                    }
+                } catch (...) {
+                    // Observation failure cannot discard the owning startup
+                    // coroutine or authorize its parent's force cleanup.
+                }
+                try {
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+                } catch (...) {
+                }
+            }
+        }));
+        while (!granted.load()) {
+            if (startup.release_before_start()) {
+                throw obd::ublk::StartupReleased{};
+            }
+            if (control && control->is_ready()) {
+                throw std::runtime_error("parent channel closed before startup grant");
+            }
+            co_await elio::time::sleep_for(std::chrono::milliseconds(10));
+        }
         obd::image::GlobalConfig global =
             args.global.empty()
                 ? obd::image::GlobalConfig{}
@@ -213,15 +376,17 @@ elio::coro::task<int> device_main(Args args) {
                                           "--recover requires --dev-id"});
                 throw ReportedDeviceFailure{};
             }
-            dev = co_await obd::ublk::Device::attach(
+            unshared_dev = co_await obd::ublk::Device::attach(
                 static_cast<uint32_t>(args.dev_id), params,
-                std::move(opened.root), park_opened_fills);
+                std::move(opened.root), startup, park_opened_fills);
         } else {
-            dev = co_await obd::ublk::Device::create(params,
+            unshared_dev = co_await obd::ublk::Device::create(params,
                                                      std::move(opened.root),
-                                                     park_opened_fills);
+                                                     startup, park_opened_fills);
         }
-        report(channel, DeviceStatus{"ready", dev->bdev_path(), ""});
+        // Conversion can allocate a shared control block. Its failure leaves
+        // this outer unique owner intact for awaited cleanup off the worker.
+        dev = std::shared_ptr<obd::ublk::Device>(std::move(unshared_dev));
 
         // Serve the supervisor's device commands (ADR-0013 trace record
         // path, D3 resize) on the control channel (EOF = supervisor
@@ -274,20 +439,14 @@ elio::coro::task<int> device_main(Args args) {
                 [dev](uint64_t bytes) { return dev->resize_blocking(bytes); });
             hooks.trace_start_stopping = trace_start_stopping;
             hooks.trace_start_gate = trace_start_gate;
-            control.emplace(elio::spawn(obd::supervisor::run_device_control,
-                                        channel, opened.recorder,
-                                        std::move(hooks)));
+            session->publish_ready(opened.recorder, std::move(hooks));
         }
 
-        // Serve until SIGTERM/SIGINT.
-        elio::signal::signal_set term_set;
-        term_set.add(SIGTERM).add(SIGINT);
-        elio::signal::signal_fd term_fd(term_set);
-        for (;;) {
-            auto info = co_await term_fd.wait();
-            if (info && (info->signo == SIGTERM || info->signo == SIGINT)) {
-                break;
-            }
+        serving.store(true);
+        report(channel, DeviceStatus{"ready", dev->bdev_path(), "",
+                                     startup_status(startup.snapshot())});
+        while (!shutdown_requested.load()) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(50));
         }
         ELIO_LOG_INFO("device {} shutting down", dev->bdev_path());
         // Refuse further resizes from here on: the checkpoint below
@@ -328,72 +487,161 @@ elio::coro::task<int> device_main(Args args) {
         // Keep our owning reference until the control task's captures have
         // been destroyed; its last reference must not destroy Device on a worker.
         report(channel, DeviceStatus{"stopped", "", ""});
-        // Unblock the trace control loop only AFTER the checkpoint and
-        // the stopped report are out: it is parked in a control-channel
-        // read that only EOF/error can end, and a parked coroutine
-        // stalls the scheduler's teardown drain — but shutdown(2) gives
-        // the supervisor an immediate EOF, and EOF marks the device
-        // gone, so an earlier call would race the checkpoint (a commit
-        // seal could observe "no valid shutdown checkpoint").
+        // End the reader while retaining the write side for the final
+        // ownership report after all control captures have been destroyed.
         if (args.control_fd >= 0) {
-            ::shutdown(args.control_fd, SHUT_RDWR);
+            ::shutdown(args.control_fd, SHUT_RD);
         }
+    } catch (const obd::ublk::StartupReleased&) {
+        explicitly_released = true;
     } catch (const ReportedDeviceFailure&) {
         result = 1;
     } catch (const std::system_error& e) {
-        ELIO_LOG_ERROR("device failed: {}", e.what());
-        report(channel, DeviceStatus{"failed", "", e.what()});
+        try { ELIO_LOG_ERROR("device failed: {}", e.what()); } catch (...) {}
+        report_failure(channel, e.what(), startup.snapshot());
         result = 1;
     } catch (const std::exception& e) {
-        ELIO_LOG_ERROR("device failed: {}", e.what());
-        report(channel, DeviceStatus{"failed", "", e.what()});
+        try { ELIO_LOG_ERROR("device failed: {}", e.what()); } catch (...) {}
+        report_failure(channel, e.what(), startup.snapshot());
         result = 1;
     } catch (...) {
-        ELIO_LOG_ERROR("device failed: unknown exception");
-        report(channel, DeviceStatus{"failed", "", "unknown exception"});
+        try { ELIO_LOG_ERROR("device failed: unknown exception"); } catch (...) {}
+        report_failure(channel, "unknown exception", startup.snapshot());
         result = 1;
     }
-    // Also covers exceptions after successful create/attach. First exclude
-    // resizes, then finish the control body before waiting for frame teardown:
-    // the body may need the sole blocking thread to complete a resize.
+    // Every cleanup await can fail before it installs its observer/work item.
+    // Retain this frame (including the locals borrowed by control/observer)
+    // and retry that stage. Completed stages are never replayed. In particular,
+    // an allocation failure cannot invoke Device's blocking destructor here.
     stopping->store(true, std::memory_order_release);
-    co_await elio::spawn_blocking([&] {
-        std::lock_guard<std::mutex> drain(*resize_gate);
-    });
-    co_await close_trace_start_admission();
-    if (control) {
-        ::shutdown(args.control_fd, SHUT_RDWR);
-        auto& control_task = *control;
+    enum class Cleanup {
+        resize, trace_admission, control, session, device, trace, fills,
+        destroy_device, observer, done,
+    };
+    auto cleanup = Cleanup::resize;
+    while (cleanup != Cleanup::done) {
         try {
-            co_await control_task;
-        } catch (const std::exception& e) {
-            ELIO_LOG_ERROR("device control failed during shutdown: {}", e.what());
-            result = 1;
-        } catch (...) {
-            ELIO_LOG_ERROR("device control failed during shutdown: unknown exception");
-            result = 1;
-        }
-        // Keep the existing owner frame on observer allocation failure: a
-        // ready result still does not authorize releasing control captures.
-        while (!control->is_destroyed()) {
-            try {
-                co_await control->wait_destroyed_async();
-            } catch (const std::bad_alloc&) {
+            switch (cleanup) {
+            case Cleanup::resize:
+                co_await elio::spawn_blocking([&] {
+                    std::lock_guard<std::mutex> drain(*resize_gate);
+                });
+                cleanup = Cleanup::trace_admission;
+                break;
+            case Cleanup::trace_admission:
+                co_await close_trace_start_admission();
+                cleanup = Cleanup::control;
+                break;
+            case Cleanup::control:
+                if (control) {
+                    ::shutdown(args.control_fd, SHUT_RD);
+                    // Native destruction includes body completion and capture
+                    // destruction. This async observer leaves the sole blocking
+                    // worker available to a resize still finishing its body.
+                    co_await control->wait_destroyed_async();
+                    try { control->await_resume(); }
+                    catch (...) { result = 1; }
+                    control.reset();
+                }
+                cleanup = Cleanup::session;
+                break;
+            case Cleanup::session:
+                // Reader hooks are gone before Device destruction.
+                session.reset();
+                if (startup.finish_before_start())
+                    explicitly_released = startup.snapshot().release ==
+                        obd::ublk::StartupRelease::released;
+                cleanup = Cleanup::device;
+                break;
+            case Cleanup::device:
+                if (dev) co_await dev->stop_async();
+                else if (unshared_dev) co_await unshared_dev->stop_async();
+                cleanup = Cleanup::trace;
+                break;
+            case Cleanup::trace:
+                co_await finish_trace_recording();
+                cleanup = Cleanup::fills;
+                break;
+            case Cleanup::fills:
+                co_await park_opened_fills();
+                cleanup = Cleanup::destroy_device;
+                break;
+            case Cleanup::destroy_device:
+                if (dev) retired_device = dev->released_snapshot();
+                else if (unshared_dev)
+                    retired_device = unshared_dev->released_snapshot();
+                co_await elio::spawn_blocking([&] {
+                    dev.reset();
+                    unshared_dev.reset();
+                });
+                cleanup = Cleanup::observer;
+                break;
+            case Cleanup::observer:
+                observer_done.store(true);
+                if (observer) {
+                    co_await observer->wait_destroyed_async();
+                    try { observer->await_resume(); }
+                    catch (...) { result = 1; }
+                    observer.reset();
+                }
+                cleanup = Cleanup::done;
+                break;
+            case Cleanup::done:
+                break;
             }
-            if (!control->is_destroyed()) co_await elio::time::yield();
+        } catch (...) {
+            result = 1;
+            try { ELIO_LOG_ERROR("device cleanup deferred; resource owners retained"); }
+            catch (...) {}
         }
-        control.reset();
+        // Failure of even the retry delay must not unwind the owning frame.
+        if (cleanup != Cleanup::done) {
+            try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+            catch (...) {}
+        }
     }
-    if (dev) {
-        co_await dev->stop_async();
-        co_await finish_trace_recording();
-        // The normal path already parks fills before reporting stopped.
-        // Retain the same owners during exceptional cleanup as well.
-        if (result != 0) co_await park_opened_fills();
-        co_await elio::spawn_blocking([&] { dev.reset(); });
-    } else if (result != 0) {
-        co_await park_opened_fills();
+    // No startup owner can reach here with outstanding obligations. For
+    // pre-publication errors this also releases the parent's conservative
+    // protection; absent this report the parent must remain conservative.
+    auto facts = startup.snapshot();
+    {
+        if (retired_device) {
+            const auto generation = facts.generation;
+            const auto version = facts.version;
+            facts = *retired_device;
+            facts.generation = generation;
+            facts.version = version;
+        } else if (!startup.owner_entered()) {
+            // No Device invocation acquired resource ownership.
+            facts.phase = obd::ublk::StartupPhase::released;
+        }
+        facts.version += 2;
+        if (!explicitly_released) facts.release = obd::ublk::StartupRelease::none;
     }
+    try {
+        const DeviceStatus terminal{result ? "failed" : "stopped", "", "",
+                                    startup_status(facts)};
+        report(channel, terminal);
+        if (!channel)
+            std::fprintf(stderr, "%s", obd::supervisor::make_device_status(terminal).c_str());
+    } catch (...) {}
+    if (args.control_fd >= 0) ::shutdown(args.control_fd, SHUT_WR);
+    if (standalone_socket) standalone_socket->finish(facts);
+    while (standalone_control) {
+        try {
+            co_await standalone_control->wait_destroyed_async();
+            try { standalone_control->await_resume(); } catch (...) { result = 1; }
+            standalone_control.reset();
+        } catch (...) {
+            // An observer allocation failure cannot destroy a serving socket's
+            // frame or the StartupControl borrowed by its client handlers.
+        }
+        if (standalone_control) {
+            try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+            catch (...) {}
+        }
+    }
+    standalone_socket.reset();
     co_return result;
 }
 
@@ -471,6 +719,15 @@ int main(int argc, char** argv) {
             }
             args.virtual_size = b;
         }
+        else if (a == "--startup-generation") {
+            const auto value = next("--startup-generation");
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                return 2;
+            try { args.startup_generation = std::stoull(value); }
+            catch (const std::exception&) { return 2; }
+            if (args.startup_generation == 0) return 2;
+        }
+        else if (a == "--startup-socket") args.startup_socket = next("--startup-socket");
         else if (a == "--recover") args.recover = true;
         else if (a == "--help" || a == "-h") {
             usage(argv[0]);
@@ -497,6 +754,36 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    if (args.control_fd >= 0 && args.startup_generation == 0) {
+        std::fprintf(stderr, "supervised startup requires --startup-generation\n");
+        return 2;
+    }
+    if (args.control_fd >= 0 && !args.startup_socket.empty()) {
+        std::fprintf(stderr, "--startup-socket and --control-fd are mutually exclusive\n");
+        return 2;
+    }
+    if (args.control_fd < 0) {
+        if (args.startup_socket.empty())
+            args.startup_socket = "@obd-device-" + std::to_string(::geteuid()) +
+                                  "-" + std::to_string(::getpid());
+        if (!obd::cmd::StartupSocket::valid_name(args.startup_socket)) {
+            std::fprintf(stderr, "--startup-socket requires @NAME (at most 107 name bytes)\n");
+            return 2;
+        }
+        if (args.startup_generation == 0) {
+            // Fresh invocation identity prevents a delayed command aimed at a
+            // reused PID/socket name from releasing a later owner.
+            do {
+                const auto n = ::getrandom(&args.startup_generation,
+                                          sizeof(args.startup_generation), GRND_NONBLOCK);
+                if (n < 0 && errno == EINTR) continue;
+                if (n != static_cast<ssize_t>(sizeof(args.startup_generation))) {
+                    std::fprintf(stderr, "cannot generate startup owner identity\n");
+                    return 1;
+                }
+            } while (args.startup_generation == 0);
+        }
+    }
     elio::signal::signal_set sigs;
     sigs.add(SIGTERM).add(SIGINT);
     if (!sigs.block_all_threads()) {

@@ -10,6 +10,7 @@
 #include <elio/time/timer.hpp>
 
 #include "../support.hpp"
+#include "../scripted_startup.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -132,7 +133,7 @@ TEST_CASE("supervisor: crashed device child is recovered with bounded respawns",
     {
         const std::string content =
             "#!/bin/sh\necho \"$@\" >> \"" + argv_log +
-            "\"\necho '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+            "\"\n" + test::shell_startup_handshake(7) +
             "sleep 0.2\nexit 1\n";
         test::write_file(script,
                          std::vector<uint8_t>(content.begin(), content.end()));
@@ -253,9 +254,8 @@ void check_recovery_observation(const std::string& point) {
     // Stay alive until the client explicitly kills this generation. The
     // tiny protocol peer supports trace_start so EOF mutates real trace
     // metadata while a status/list reply is paused. No privileged ublk.
-    const std::string content = R"(#!/bin/sh
-printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
-while IFS= read -r line <&3; do
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) + R"(while IFS= read -r line <&3; do
     seq=$(printf '%s\n' "$line" | sed -n 's/.*"seq":\([0-9][0-9]*\).*/\1/p')
     printf '{"reply":"trace_start","seq":%s,"ok":true,"path":"trace","duration_sec":60}\n' "$seq" >&3
 done
@@ -404,9 +404,8 @@ void check_delayed_trace_start_metadata_ownership(
     // The fake accepts trace_start immediately but stays alive so the
     // supervisor can park the client handler after route_device_reply. That
     // recreates the #65 window: reply accepted, client reply not yet built.
-    const std::string content = R"SH(#!/bin/sh
-printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
-while IFS= read -r line <&3; do
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) + R"SH(while IFS= read -r line <&3; do
     seq=$(printf '%s\n' "$line" | sed -n 's/.*"seq":\([0-9][0-9]*\).*/\1/p')
     cmd=$(printf '%s\n' "$line" | sed -n 's/.*"cmd":"\([^"]*\)".*/\1/p')
     if [ "$cmd" = trace_start ]; then
@@ -588,9 +587,8 @@ void check_trace_stop_history_survives_eof() {
     const std::string config = test::write_file(
         dir / "config.json", std::vector<uint8_t>{'{', '}'});
     const std::string script = dir / "device.sh";
-    const std::string content = R"SH(#!/bin/sh
-printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
-while IFS= read -r line <&3; do
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) + R"SH(while IFS= read -r line <&3; do
     seq=$(printf '%s\n' "$line" | sed -n 's/.*"seq":\([0-9][0-9]*\).*/\1/p')
     cmd=$(printf '%s\n' "$line" | sed -n 's/.*"cmd":"\([^"]*\)".*/\1/p')
     if [ "$cmd" = trace_start ]; then
@@ -711,8 +709,8 @@ void check_timed_out_trace_start_reply_does_not_publish() {
     const std::string commands = dir / "commands";
     const std::string control = dir / "control";
     REQUIRE(::mkfifo(control.c_str(), 0600) == 0);
-    const std::string content = "#!/bin/sh\n"
-        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) +
         "while IFS= read -r line <&3; do\n"
         "    printf '%s\\n' \"$line\" >> \"" + commands + "\"\n"
         "    seq=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"seq\":\\([0-9][0-9]*\\).*/\\1/p')\n"
@@ -874,8 +872,8 @@ void check_malformed_trace_start_success_reply(const std::string& scenario) {
         scenario == "wrong_kind"
             ? "printf '{\"reply\":\"resize\",\"seq\":%s,\"ok\":true,\"size\":4096}\\n' \"$seq\" >&3\n"
             : "printf '{\"reply\":\"trace_start\",\"seq\":%s,\"ok\":true}\\n' \"$seq\" >&3\n";
-    const std::string content = "#!/bin/sh\n"
-        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) +
         "while IFS= read -r line <&3; do\n"
         "    seq=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"seq\":\\([0-9][0-9]*\\).*/\\1/p')\n"
         "    cmd=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"cmd\":\"\\([^\"]*\\)\".*/\\1/p')\n"
@@ -976,9 +974,8 @@ void check_delayed_trace_stop_metadata_ownership() {
     const std::string config = test::write_file(
         dir / "config.json", std::vector<uint8_t>{'{', '}'});
     const std::string script = dir / "device.sh";
-    const std::string content = R"SH(#!/bin/sh
-printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
-while IFS= read -r line <&3; do
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) + R"SH(while IFS= read -r line <&3; do
     seq=$(printf '%s\n' "$line" | sed -n 's/.*"seq":\([0-9][0-9]*\).*/\1/p')
     cmd=$(printf '%s\n' "$line" | sed -n 's/.*"cmd":"\([^"]*\)".*/\1/p')
     if [ "$cmd" = trace_start ]; then
@@ -1134,8 +1131,8 @@ void check_malformed_trace_stop_success_reply(const std::string& scenario) {
         scenario == "wrong_kind"
             ? "printf '{\"reply\":\"resize\",\"seq\":%s,\"ok\":true,\"size\":4096}\\n' \"$seq\" >&3\n"
             : "printf '{\"reply\":\"trace_stop\",\"seq\":%s,\"ok\":true,\"path\":false,\"sha256\":42,\"size\":\"big\",\"records\":0,\"dropped\":0}\\n' \"$seq\" >&3\n";
-    const std::string content = "#!/bin/sh\n"
-        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) +
         "while IFS= read -r line <&3; do\n"
         "    seq=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"seq\":\\([0-9][0-9]*\\).*/\\1/p')\n"
         "    cmd=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"cmd\":\"\\([^\"]*\\)\".*/\\1/p')\n"
@@ -1390,8 +1387,8 @@ void check_command_rejection(bool close_channel) {
     const std::string commands = dir / "commands";
     const std::string control = dir / "control";
     REQUIRE(::mkfifo(control.c_str(), 0600) == 0);
-    const std::string content = "#!/bin/sh\n"
-        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) +
         "while IFS= read -r line <&3; do\n"
         "    printf '%s\\n' \"$line\" >> \"" + commands + "\"\n"
         "    seq=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"seq\":\\([0-9][0-9]*\\).*/\\1/p')\n"
@@ -1565,8 +1562,8 @@ void check_command_ownership(const std::string& scenario) {
     const std::string commands = dir / "commands";
     const std::string control = dir / "control";
     REQUIRE(::mkfifo(control.c_str(), 0600) == 0);
-    const std::string content = "#!/bin/sh\n"
-        "printf '%s\\n' '{\"state\":\"ready\",\"device\":\"/dev/ublkb7\"}' >&3\n"
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) +
         "while IFS= read -r line <&3; do\n"
         "    printf '%s\\n' \"$line\" >> \"" + commands + "\"\n"
         "    while IFS= read -r action < \"" + control + "\"; do\n"
@@ -1845,8 +1842,8 @@ void check_daemon_lifetime(const std::string& point) {
     const std::string config = test::write_file(
         dir / "config.json", std::vector<uint8_t>{'{', '}'});
     const std::string script = dir / "device.sh";
-    const std::string content = "#!/bin/sh\n" R"(printf '%s\n' '{"state":"ready","device":"/dev/ublkb7"}' >&3
-while IFS= read -r line <&3; do :; done
+    const std::string content = "#!/bin/sh\n" +
+        test::shell_startup_handshake(7) + R"(while IFS= read -r line <&3; do :; done
 )";
     test::write_file(script, std::vector<uint8_t>(content.begin(), content.end()));
     REQUIRE(::chmod(script.c_str(), 0755) == 0);
@@ -1918,7 +1915,7 @@ while IFS= read -r line <&3; do :; done
                         sent += static_cast<size_t>(n);
                     }
                 };
-                if (point == "command") {
+                if (point == "command" || point == "create_before_publish") {
                     const std::string command = nlohmann::json(
                         {{"cmd", "create"}, {"id", "late"}, {"config", config}}).dump() + "\n";
                     send_all(command);
@@ -1947,10 +1944,14 @@ while IFS= read -r line <&3; do :; done
                 check(::kill(::getpid(), SIGTERM) == 0, "cannot signal shutdown");
             }
             signalled = true;
-            if (!wait_until([&] { return gate->count("shutdown") != 0; })) {
+            if (!wait_until([&] {
+                    return gate->count(point == "create_before_publish"
+                                           ? "shutdown_pending" : "shutdown") != 0;
+                })) {
                 throw std::runtime_error("shutdown did not start");
             }
-            if (point == "monitor_eof" || point == "command" || point == "accepted") {
+            if (point == "monitor_eof" || point == "command" ||
+                point == "create_before_publish" || point == "accepted") {
                 // The held task has genuinely reached a known boundary. A
                 // shutdown already observed by the daemon cannot return until
                 // that admitted task's final frame/captures have departed.
@@ -1967,12 +1968,22 @@ while IFS= read -r line <&3; do :; done
                 char byte;
                 ssize_t received;
                 do { received = ::recv(fd, &byte, 1, 0); } while (received < 0 && errno == EINTR);
+                // An admitted create can report its pre-grant failure while
+                // shutdown is still in maintenance. Drain that bounded reply
+                // before checking that the accepted connection was closed.
+                if (point == "create_before_publish") {
+                    size_t bytes = 0;
+                    while (received > 0 && ++bytes < supervisor::kMaxMessageBytes) {
+                        do { received = ::recv(fd, &byte, 1, 0); }
+                        while (received < 0 && errno == EINTR);
+                    }
+                }
                 check(received == 0 || (received < 0 && errno == ECONNRESET), "shutdown left an accepted socket open");
             }
             if (point == "accepted") {
                 check(gate->count("client_read") == 1, "late registered handler did not observe cancelled admission");
             }
-            if (point == "monitor_eof" || point == "command") {
+            if (point == "monitor_eof" || point == "create_before_publish") {
                 check(wait_until([&] { return gate->count("monitor_started") == 1; }), "expected monitor did not start");
                 check(gate->count("monitor_departed") == 1, "daemon returned before monitor departure");
             }
@@ -2030,9 +2041,10 @@ while IFS= read -r line <&3; do :; done
     CHECK(daemon_error == (point == "startup_failure" ? "injected daemon startup failure" : ""));
     CHECK(gate->count("client_worker_2") >= 1);
     if (point != "startup_failure") CHECK(gate->count("reaper_worker_0") == 1);
-    if (point == "monitor_eof" || point == "command") {
+    if (point == "monitor_eof" || point == "create_before_publish") {
         CHECK(gate->count("monitor_worker_1") == 1);
     }
+    if (point == "command") CHECK(gate->spawn_count() == 0);
     CHECK(mask_rc == 0);
 }
 
@@ -2091,6 +2103,10 @@ TEST_CASE("supervisor: shutdown drains a monitor after its entry was erased", "[
 }
 
 TEST_CASE("supervisor: shutdown drains an admitted create and its late monitor", "[supervisor][daemon-lifetime]") {
+    check_daemon_lifetime("create_before_publish");
+}
+
+TEST_CASE("supervisor: shutdown rejects a create before admission", "[supervisor][daemon-lifetime]") {
     check_daemon_lifetime("command");
 }
 

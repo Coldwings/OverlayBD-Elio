@@ -63,6 +63,10 @@ add_executable(obd_unit_tests
     unit/test_child_spawn_owner.cpp
     unit/test_create_device_id.cpp
     unit/test_ublk_prerequisites.cpp
+    unit/test_startup_protocol.cpp
+    unit/test_startup_control.cpp
+    unit/test_startup_socket.cpp
+    unit/test_startup_supervisor.cpp
     unit/test_supervisor.cpp)
 obd_target_warnings(obd_unit_tests)
 target_include_directories(obd_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -101,7 +105,9 @@ catch_discover_tests(obd_dart_dns_tests
 
 if(OBD_ENABLE_UBLK)
     target_sources(obd_unit_tests PRIVATE
-        unit/test_ublk.cpp unit/test_ublk_shutdown.cpp)
+        unit/test_ublk.cpp unit/test_ublk_shutdown.cpp
+        unit/test_ublk_control_task.cpp unit/test_ublk_retirement.cpp
+        unit/test_ublk_ctrl_loop.cpp)
     target_link_libraries(obd_unit_tests PRIVATE obd_ublk)
     catch_discover_tests(obd_unit_tests TEST_SPEC "[shutdown]"
         PROPERTIES TIMEOUT 30)
@@ -122,8 +128,9 @@ target_link_libraries(obd-test-fake-device PRIVATE obd_core)
 # The unit tests execute the fake binary directly for the CLI-parity
 # checks (its flags must reject exactly what obd-device rejects).
 target_compile_definitions(obd_unit_tests
-    PRIVATE OBD_TEST_FAKE_DEVICE_BIN="$<TARGET_FILE:obd-test-fake-device>")
-add_dependencies(obd_unit_tests obd-test-fake-device)
+    PRIVATE OBD_TEST_FAKE_DEVICE_BIN="$<TARGET_FILE:obd-test-fake-device>"
+            OBD_TEST_SUPERVISOR_BIN="$<TARGET_FILE:obd-supervisor>")
+add_dependencies(obd_unit_tests obd-test-fake-device obd-supervisor)
 
 add_executable(obd_integration_tests
     integration/test_integration.cpp
