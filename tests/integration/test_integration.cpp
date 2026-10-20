@@ -2,8 +2,8 @@
 // -> tar adapter -> zfile -> lsmt merge), image assembly via open_image
 // (remote layers served through the LayerStore, ADR-0011), DART
 // optional-accelerator fallback, and background fill through image
-// assembly. No kernel dependencies (ublk E2E lives in test_ublk_e2e.cpp
-// and self-skips). See docs/testing.md.
+// assembly. The backend-gated multi-queue case also uses a real ublk device
+// and self-skips without kernel support. See docs/testing.md.
 #include "common/errors.hpp"
 #include "common/bytes.hpp"
 #include "common/sha256.hpp"
@@ -16,6 +16,17 @@
 #include "source/layer_store.hpp"
 #include "source/registry.hpp"
 #include "source/tar_offset.hpp"
+
+#if OBD_TEST_HAVE_UBLK
+#include "ublk/device.hpp"
+#include <elio/coro/task_group.hpp>
+#include <elio/runtime/affinity.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
+#include <sched.h>
+#include <array>
+#include <condition_variable>
+#include <thread>
+#endif
 
 #include "../support.hpp"
 
@@ -35,6 +46,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -97,6 +109,9 @@ public:
         server_->stop();
     }
     bool is_running() const noexcept { return server_->is_running(); }
+    size_t active_connections() const noexcept {
+        return server_->active_connections();
+    }
     void set_before_listen_hook(std::function<void(uint16_t)> hook) {
         before_listen_ = std::move(hook);
     }
@@ -602,6 +617,353 @@ TEST_CASE("integration: layered stack stages over a mock registry",
     });
     REQUIRE(rc == 0);
 }
+
+#if OBD_TEST_HAVE_UBLK
+namespace {
+
+constexpr size_t kLocalityReadBytes = 4096;
+constexpr size_t kLocalityQueues = 2;
+constexpr size_t kLocalityDepth = 4;
+constexpr size_t kLocalityWaves = 4;
+
+struct QueueReadObservation {
+    std::set<size_t> entry_workers;
+    unsigned calls = 0;
+    unsigned active = 0;
+    unsigned peak = 0;
+};
+
+struct RemoteReadObservation {
+    std::mutex mutex;
+    std::array<std::array<QueueReadObservation, kLocalityQueues>,
+               kLocalityWaves> waves;
+};
+
+// Observe the actual bridge-to-image boundary. Successful reads still traverse
+// MergedLsmt -> LsmtLayer -> RegistrySource; EIO is injected here, not by HTTP.
+class SlowRemoteLsmt final : public source::BlobSource {
+public:
+    SlowRemoteLsmt(source::BlobSourcePtr inner, RemoteReadObservation& observed)
+        : inner_(std::move(inner)), observed_(observed) {}
+
+    void begin_wave(size_t wave) { wave_.store(wave); }
+    elio::coro::task<ssize_t> pread(void* buf, size_t count,
+                                   uint64_t offset) override {
+        const size_t wave = wave_.load();
+        // START_DEV's partition scan is real IO, but precedes client waves.
+        if (wave >= kLocalityWaves) {
+            co_return co_await inner_->pread(buf, count, offset);
+        }
+        const size_t queue =
+            (offset / (kLocalityReadBytes * kLocalityDepth)) % kLocalityQueues;
+        auto& observation = observed_.waves[wave][queue];
+        {
+            std::lock_guard lock(observed_.mutex);
+            observation.entry_workers.insert(elio::current_worker_id());
+            ++observation.calls;
+            observation.peak = std::max(observation.peak, ++observation.active);
+        }
+        struct ReadGuard {
+            RemoteReadObservation& observed;
+            QueueReadObservation& observation;
+            ~ReadGuard() {
+                std::lock_guard lock(observed.mutex);
+                --observation.active;
+            }
+        } guard{observed_, observation};
+        co_await elio::time::sleep_for(std::chrono::milliseconds(20));
+        if (wave == 2) co_return -EIO;
+        co_return co_await inner_->pread(buf, count, offset);
+    }
+    uint64_t size() const noexcept override { return inner_->size(); }
+    std::string_view label() const noexcept override { return inner_->label(); }
+
+private:
+    source::BlobSourcePtr inner_;
+    RemoteReadObservation& observed_;
+    std::atomic<size_t> wave_{kLocalityWaves};
+};
+
+// A queue's CPU map is the kernel's routing contract for client submissions.
+// Only short-lived client threads change their own affinity; Elio workers and
+// the blocking pool retain the masks with which they entered the test.
+std::array<int, kLocalityQueues> queue_client_cpus(
+    const std::string& bdev, const cpu_set_t& allowed) {
+    std::array<int, kLocalityQueues> selected;
+    selected.fill(-1);
+    const auto name = std::filesystem::path(bdev).filename();
+    for (size_t queue = 0; queue != kLocalityQueues; ++queue) {
+        std::ifstream input(std::filesystem::path("/sys/block") / name / "mq" /
+                            std::to_string(queue) / "cpu_list");
+        std::string list;
+        std::getline(input, list);
+        size_t pos = 0;
+        while (pos < list.size() && selected[queue] < 0) {
+            const size_t comma = list.find(',', pos);
+            const std::string item = list.substr(pos, comma - pos);
+            const size_t dash = item.find('-');
+            const unsigned first = static_cast<unsigned>(std::stoul(item));
+            const unsigned last = dash == std::string::npos ? first :
+                static_cast<unsigned>(std::stoul(item.substr(dash + 1)));
+            for (unsigned cpu = first; cpu <= last && cpu < CPU_SETSIZE; ++cpu) {
+                if (CPU_ISSET(cpu, &allowed)) {
+                    selected[queue] = static_cast<int>(cpu);
+                    break;
+                }
+            }
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+    }
+    return selected;
+}
+
+struct DirectReadResult {
+    int affinity_error = 0;
+    int read_error = 0;
+    ssize_t bytes = -1;
+    bool contents_match = false;
+    bool thread_exception = false;
+};
+
+struct DirectReadWave {
+    std::array<DirectReadResult, kLocalityQueues * kLocalityDepth> reads;
+    int launch_error = 0;
+};
+
+DirectReadWave direct_read_wave(int fd, const std::array<int, 2>& cpus,
+                                size_t wave, const std::vector<uint8_t>& raw) {
+    DirectReadWave result;
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool start = false;
+    std::array<std::jthread, kLocalityQueues * kLocalityDepth> clients;
+    try {
+        for (size_t lane = 0; lane != clients.size(); ++lane) {
+            clients[lane] = std::jthread([&, lane] {
+                auto& read = result.reads[lane];
+                try {
+                    cpu_set_t mask;
+                    CPU_ZERO(&mask);
+                    CPU_SET(cpus[lane / kLocalityDepth], &mask);
+                    if (::sched_setaffinity(0, sizeof(mask), &mask) < 0) {
+                        read.affinity_error = errno;
+                    }
+                    {
+                        std::unique_lock lock(mutex);
+                        ready.wait(lock, [&] { return start; });
+                    }
+                    if (read.affinity_error != 0) return;
+                    alignas(kLocalityReadBytes)
+                        std::array<uint8_t, kLocalityReadBytes> buffer{};
+                    const size_t offset =
+                        (wave * clients.size() + lane) * buffer.size();
+                    do {
+                        read.bytes = ::pread(fd, buffer.data(), buffer.size(),
+                                             static_cast<off_t>(offset));
+                    } while (read.bytes < 0 && errno == EINTR);
+                    if (read.bytes < 0) read.read_error = errno;
+                    read.contents_match = read.bytes ==
+                        static_cast<ssize_t>(buffer.size()) &&
+                        std::equal(buffer.begin(), buffer.end(),
+                                   raw.begin() + offset);
+                } catch (...) {
+                    read.thread_exception = true;
+                }
+            });
+        }
+    } catch (const std::system_error& e) {
+        result.launch_error = e.code().value();
+    } catch (...) {
+        result.launch_error = EIO;
+    }
+    // Also release and join already-created clients when thread creation fails.
+    {
+        std::lock_guard lock(mutex);
+        start = true;
+    }
+    ready.notify_all();
+    for (auto& client : clients) if (client.joinable()) client.join();
+    return result;
+}
+
+}  // namespace
+
+TEST_CASE("integration: two ublk queues reuse tags over slow remote LSMT reads",
+          "[integration][ublk][locality]") {
+    if (::access("/dev/ublk-control", F_OK) != 0) {
+        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
+    }
+    cpu_set_t allowed;
+    REQUIRE(::sched_getaffinity(0, sizeof(allowed), &allowed) == 0);
+    if (CPU_COUNT(&allowed) < static_cast<int>(kLocalityQueues)) {
+        SKIP("two kernel queues lack distinct allowed client CPUs");
+    }
+    TempDir dir;
+    const auto raw = test::pattern_bytes(256 * 1024, 120);
+    const auto raw_path = test::write_file(dir / "raw.img", raw);
+    const std::string lsmt_path = dir / "remote.lsmt";
+    const int input = ::open(raw_path.c_str(), O_RDONLY | O_CLOEXEC);
+    REQUIRE(input >= 0);
+    try {
+        format::write_lsmt_single_layer(input, raw.size(), lsmt_path, {});
+    } catch (...) {
+        ::close(input);
+        throw;
+    }
+    REQUIRE(::close(input) == 0);
+    std::ifstream lsmt(lsmt_path, std::ios::binary);
+    std::vector<uint8_t> blob((std::istreambuf_iterator<char>(lsmt)), {});
+    REQUIRE_FALSE(blob.empty());
+
+    std::string skip_reason;
+    // These owners stay on the synchronous test stack through runtime shutdown.
+    // If cleanup admission fails, graceful shutdown retains them while pending
+    // native tasks drain; no live Device can unwind on a scheduler worker.
+    BlobServer server(std::move(blob));
+    RemoteReadObservation observed;
+    std::unique_ptr<ublk::Device> dev;
+    int fd = -1;
+    std::exception_ptr run_failure;
+    elio::runtime::run_config config;
+    config.num_threads = 4;
+    config.blocking_threads = 1;
+    config.shutdown_timeout = std::chrono::milliseconds::max();
+    try {
+        elio::run([&]() -> elio::coro::task<void> {
+            elio::coro::task_group server_tasks;
+            std::exception_ptr failure;
+            try {
+                server_tasks.spawn([](BlobServer* hosted) -> elio::coro::task<void> {
+                    co_await hosted->run();
+                }, &server);
+                const bool running = co_await test::wait_server_running(server);
+                REQUIRE(running);
+                auto client = std::make_shared<source::RegistryClient>(
+                    nullptr, source::RegistryClientConfig{});
+                auto remote = co_await source::RegistrySource::open(
+                    client, server.url("plain-lsmt"));
+                auto layer = co_await format::LsmtLayer::open(std::move(remote));
+                std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+                layers.push_back(std::move(layer));
+                auto merged = co_await format::MergedLsmt::open(std::move(layers));
+                auto root = std::make_unique<SlowRemoteLsmt>(std::move(merged), observed);
+                auto* recording = root.get();
+                ublk::DeviceParams params;
+                params.nr_queues = kLocalityQueues;
+                params.queue_depth = kLocalityDepth;
+                params.dev_sectors = raw.size() / 512;
+                std::fprintf(stderr, "[e2e-stage] remote LSMT: create queues=2 depth=4\n");
+                dev = co_await ublk::Device::create(params, std::move(root));
+                const auto cpus = co_await elio::spawn_blocking([&] {
+                    return queue_client_cpus(dev->bdev_path(), allowed);
+                });
+                CAPTURE(cpus[0], cpus[1]);
+                std::fprintf(stderr, "[e2e-stage] remote LSMT: queue CPUs=%d,%d\n",
+                             cpus[0], cpus[1]);
+                if (cpus[0] < 0 || cpus[1] < 0 || cpus[0] == cpus[1]) {
+                    skip_reason = "two kernel queues lack distinct allowed client CPUs";
+                } else {
+                    fd = co_await elio::spawn_blocking([&] {
+                        return ::open(dev->bdev_path().c_str(),
+                                      O_RDONLY | O_DIRECT | O_CLOEXEC);
+                    });
+                    REQUIRE(fd >= 0);
+                    std::array<std::set<size_t>, kLocalityQueues> owners;
+                    for (size_t wave = 0; wave != kLocalityWaves; ++wave) {
+                        CAPTURE(wave);
+                        recording->begin_wave(wave);
+                        const auto before = server.data_gets();
+                        const auto result = co_await elio::spawn_blocking([&] {
+                            return direct_read_wave(fd, cpus, wave, raw);
+                        });
+                        REQUIRE(result.launch_error == 0);
+                        for (size_t lane = 0; lane != result.reads.size(); ++lane) {
+                            CAPTURE(lane);
+                            const auto& read = result.reads[lane];
+                            CHECK_FALSE(read.thread_exception);
+                            CHECK(read.affinity_error == 0);
+                            if (wave == 2) {
+                                CHECK(read.bytes == -1);
+                                CHECK(read.read_error == EIO);
+                            } else {
+                                CHECK(read.bytes == static_cast<ssize_t>(kLocalityReadBytes));
+                                CHECK(read.contents_match);
+                            }
+                        }
+                        if (wave == 2) {
+                            CHECK(server.data_gets() == before);
+                        } else {
+                            CHECK(server.data_gets() >= before + result.reads.size());
+                        }
+                        for (size_t queue = 0; queue != kLocalityQueues; ++queue) {
+                            CAPTURE(queue);
+                            QueueReadObservation entry;
+                            {
+                                std::lock_guard lock(observed.mutex);
+                                entry = observed.waves[wave][queue];
+                            }
+                            CAPTURE(entry.calls, entry.peak);
+                            CHECK(entry.calls >= kLocalityDepth);
+                            CHECK(entry.active == 0);
+                            CHECK(entry.peak >= 2);
+                            CHECK(entry.peak <= kLocalityDepth);
+                            REQUIRE(entry.entry_workers.size() == 1);
+                            std::fprintf(stderr,
+                                "[e2e-stage] remote LSMT: wave=%zu queue=%zu "
+                                "cpu=%d worker=%zu calls=%u peak=%u HTTP_GETs=%llu\n",
+                                wave, queue, cpus[queue], *entry.entry_workers.begin(),
+                                entry.calls, entry.peak, static_cast<unsigned long long>(
+                                    server.data_gets() - before));
+                            owners[queue].insert(entry.entry_workers.begin(),
+                                                 entry.entry_workers.end());
+                        }
+                    }
+                    CHECK(owners[0].size() == 1);
+                    CHECK(owners[1].size() == 1);
+                    std::set<size_t> workers = owners[0];
+                    workers.insert(owners[1].begin(), owners[1].end());
+                    std::fprintf(stderr, "[e2e-stage] remote LSMT: observed owners=%zu\n",
+                                 workers.size());
+                }
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            // Keep the source graph and mock alive through the normal bridge drain,
+            // including assertion failures. Never unwind a live Device on a worker.
+            co_await test::finish_with_async_cleanup(failure, [&]()
+                -> elio::coro::task<void> {
+                if (fd >= 0) {
+                    co_await elio::spawn_blocking([&] { return ::close(fd); });
+                    fd = -1;
+                }
+                if (dev) co_await dev->stop_async();
+                server.stop();
+                std::exception_ptr server_failure;
+                try {
+                    co_await server_tasks.join();
+                } catch (...) {
+                    server_failure = std::current_exception();
+                }
+                // Native HTTP sessions may outlive the listener's return. The mock
+                // still owns their handlers until every accepted session has ended.
+                while (server.active_connections() != 0) {
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (server_failure) std::rethrow_exception(server_failure);
+            });
+        }, config);
+    } catch (...) {
+        run_failure = std::current_exception();
+    }
+    // run() has joined the scheduler using public, unbounded graceful shutdown.
+    // Owner destruction and any exceptional-path fd close are now off-worker.
+    if (fd >= 0) ::close(fd);
+    dev.reset();
+    if (run_failure) std::rethrow_exception(run_failure);
+    if (!skip_reason.empty()) SKIP(skip_reason);
+}
+#endif
 
 TEST_CASE("integration: cancelled connect probe does not break later io",
           "[integration]") {

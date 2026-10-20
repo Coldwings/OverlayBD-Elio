@@ -16,8 +16,9 @@ each guards.
 | `tests/fixtures/` | (reserved for on-disk fixtures) | — |
 
 The ublk tests (`tests/unit/test_ublk.cpp`,
-`tests/integration/test_ublk_e2e.cpp`) compile only when
-`OBD_ENABLE_UBLK` is on; everything else builds everywhere.
+`tests/integration/test_ublk_e2e.cpp`) and the multi-queue remote-LSMT
+case in `tests/integration/test_integration.cpp` compile only when
+`OBD_ENABLE_UBLK` is on; other integration cases build without that backend.
 
 ### Fixtures (`tests/support.hpp`)
 
@@ -178,7 +179,8 @@ filters directly:
 `integration: ublk device serves sector reads from a blob`,
 `integration: ublk writable device serves writes and discard`,
 `integration: ublk device survives server death via USER_RECOVERY`,
-`integration: ublk device grows online and serves the new capacity`)
+`integration: ublk device grows online and serves the new capacity`,
+`integration: two ublk queues reuse tags over slow remote LSMT reads`)
 need `/dev/ublk-control` and root (or `CAP_SYS_ADMIN` in a suitable
 user namespace) with `ublk_drv` loaded. They **self-skip** via Catch2
 `SKIP()` when the kernel facility is absent, and
@@ -188,7 +190,9 @@ depend on privileged kernel state** — new privileged tests must
 self-skip the same way. The privileged CI job
 (`build-test-ublk-privileged` in `.github/workflows/ci.yml`) loads
 `ublk_drv` and runs these tests individually by exact name under `sudo`,
-with a separate bounded step and log for each. The online-grow step has a
+with a separate bounded step and log for each. The remote-LSMT step accepts
+only its explicit unsupported CPU-map skip, with a warning and retained log.
+The online-grow step has a
 120-second process timeout and records the commit, kernel, command exit status
 and the test-output `tee` exit status in `build/ublk-e2e-grow.log`, included
 in the `ublk-e2e-logs` artifact. On a supported driver it must verify capacity,
@@ -1436,6 +1440,29 @@ Every test, grouped by area, with the property it guards.
   privileged E2E: a real ublk device backed by an in-memory blob
   returns correct sectors through `/dev/ublkb<N>` (self-skips without
   `/dev/ublk-control`).
+- `integration: two ublk queues reuse tags over slow remote LSMT reads` — a
+  real two-queue/depth-four device serves direct reads through writer-produced
+  plain LSMT, `MergedLsmt`, `LsmtLayer`, and `RegistrySource` over the existing
+  range-capable `BlobServer`. Four dedicated client threads per queue bind to
+  distinct allowed CPUs selected from the kernel's `/sys/block/<device>/mq/*/cpu_list`.
+  Distinct client-offset cohorts infer routing to both queues from that CPU map;
+  this is not direct kernel queue tracing. A wrapper at the merged source
+  boundary records stable entry worker IDs and overlapping reads per cohort,
+  delays through native asynchronous timers, injects `-EIO`, and verifies later
+  reads recover with correct bytes after more operations than available tags.
+  The failure is a source-boundary injection, not an HTTP failure. Successful
+  waves must perform real HTTP data GETs. Initial bridge placement can give the
+  queues one or two distinct worker owners; both are valid. Device/source
+  ownership survives assertion failures through asynchronous drain; a native
+  TaskGroup owns and joins the mock listener before its active sessions drain.
+  Device, observation state, and mock owners stay in synchronous test scope
+  through public unbounded graceful runtime shutdown, and Device destruction
+  happens off-worker after shutdown returns. If cleanup task admission fails,
+  pending tasks may retain these owners until the external test timeout; the
+  fixture never forces teardown or destroys a live Device on coroutine unwind.
+  Self-skips without ublk, or after normal cleanup if the two queue maps lack
+  distinct CPUs allowed to the test. Logs preserve selected CPUs, observed
+  owners, overlap, and HTTP counts; an unsupported CPU-map skip is not coverage.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with

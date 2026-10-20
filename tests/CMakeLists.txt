@@ -137,7 +137,8 @@ target_include_directories(obd_integration_tests
 target_link_libraries(obd_integration_tests
     PRIVATE obd_core Catch2::Catch2WithMain)
 target_compile_definitions(obd_integration_tests
-    PRIVATE OBD_TEST_FAKE_DEVICE_BIN="$<TARGET_FILE:obd-test-fake-device>")
+    PRIVATE OBD_TEST_FAKE_DEVICE_BIN="$<TARGET_FILE:obd-test-fake-device>"
+            OBD_TEST_HAVE_UBLK=$<BOOL:${OBD_ENABLE_UBLK}>)
 add_dependencies(obd_integration_tests obd-test-fake-device)
 if(OBD_ENABLE_UBLK)
     target_sources(obd_integration_tests PRIVATE integration/test_ublk_e2e.cpp)
