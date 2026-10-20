@@ -137,14 +137,22 @@ bool Queue::try_pop_request(IoRequest& out) {
 }
 
 void Queue::push_completion(uint16_t tag, int32_t result) {
+    bool notify;
     {
         std::lock_guard<std::mutex> lk(mu_);
 #ifdef OBD_TEST_HOOKS
         if (completion_enqueue_hook_for_test_) completion_enqueue_hook_for_test_();
 #endif
+        notify = done_.empty();
         done_.emplace_back(tag, result);
     }
-    write_efd(done_efd_);
+    if (notify) {
+#ifdef OBD_TEST_HOOKS
+        if (completion_notify_hook_for_test_)
+            completion_notify_hook_for_test_(CompletionNotifyPoint::before_write);
+#endif
+        write_efd(done_efd_);
+    }
 }
 
 void Queue::notify_elio() noexcept {
@@ -190,16 +198,31 @@ void Queue::arm_done_poll() {
     poll_armed_ = true;
 }
 
-void Queue::drain_done() {
+std::deque<std::pair<uint16_t, int32_t>> Queue::take_done_batch() {
+    // Read before swapping: a producer after the swap must leave its wake
+    // pending for the next poll. A delayed earlier write is only a spurious
+    // wake; its completion has already been included in this batch.
     uint64_t cnt;
     const ssize_t r = ::read(done_efd_, &cnt, sizeof(cnt));
     (void)r;
+#ifdef OBD_TEST_HOOKS
+    if (completion_notify_hook_for_test_)
+        completion_notify_hook_for_test_(CompletionNotifyPoint::counter_read);
+#endif
     std::deque<std::pair<uint16_t, int32_t>> batch;
     {
         std::lock_guard<std::mutex> lk(mu_);
         batch.swap(done_);
     }
-    for (const auto& [tag, result] : batch) {
+#ifdef OBD_TEST_HOOKS
+    if (completion_notify_hook_for_test_)
+        completion_notify_hook_for_test_(CompletionNotifyPoint::batch_taken);
+#endif
+    return batch;
+}
+
+void Queue::drain_done() {
+    for (const auto& [tag, result] : take_done_batch()) {
         prep_io_cmd(UBLK_U_IO_COMMIT_AND_FETCH_REQ, tag, result);
     }
 }

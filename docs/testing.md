@@ -1771,3 +1771,23 @@ The default build-test CI configuration enables the optional target so it is
 compiled; other configurations leave it OFF and no privileged performance CI
 is introduced. Direct driver configs can request `fail_after_warmup` to validate
 real-body-failure drain without treating that diagnostic as a measured sample.
+
+Completion notification coalescing uses the production consumer read/swap helper
+with real nonblocking eventfds, without registering a ublk device or creating a
+queue ring. Its deterministic hooks cover the user-space readiness protocol,
+not kernel POLL_ADD execution or a throughput claim.
+
+- `ublk: completion bursts share a wake and new batches wake again` — real
+  nonblocking eventfds verify one notification per undrained batch, all tag
+  results exactly once, and a new wake after the batch is consumed.
+- `ublk: completion publication across counter drain and batch swap keeps progress`
+  — deterministic publications on both sides of the production consumer's swap
+  verify current-batch inclusion and next-poll readability respectively.
+- `ublk: delayed completion wake after batch drain is harmless` — a controlled
+  producer thread delays its write across the consumer drain; its late wake
+  produces an empty batch and subsequent tag reuse still wakes normally.
+- `ublk: saturated completion counter retains published results` — a real
+  saturated eventfd rejects the notification write with `EAGAIN` while remaining
+  readable; the published result is consumed once and later batches wake again.
+- `ublk: lifecycle wakes remain unconditional with pending completions` — stop,
+  failure and request eventfd notifications remain independent of batch occupancy.

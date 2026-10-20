@@ -46,6 +46,8 @@ struct IoRequest {
 
 #ifdef OBD_TEST_HOOKS
 // Deterministic boundary injection, not a claim that a steal was observed.
+enum class CompletionNotifyPoint { before_write, counter_read, batch_taken };
+
 enum class BridgeResumePoint {
     tag_wait, source_return, bridge_read, request_retry, cleanup, close_retry,
     handlers_join, rejected_return,
@@ -85,7 +87,7 @@ public:
     bool try_pop_request(IoRequest& out);
 
     /// Completes a request: result >= 0 = bytes transferred, < 0 = -errno.
-    /// Wakes the queue thread via done_efd.
+    /// Signals done_efd when the completion batch becomes non-empty.
     void push_completion(uint16_t tag, int32_t result);
 
     // --- queue thread -------------------------------------------------------
@@ -139,6 +141,7 @@ private:
     void prep_io_cmd(uint32_t cmd_op, uint16_t tag, int32_t result);
     void arm_done_poll();
     void drain_done();
+    std::deque<std::pair<uint16_t, int32_t>> take_done_batch();
     void dispatch_cqe(const io_uring_cqe* cqe);
 
     uint32_t dev_id_;
@@ -164,6 +167,7 @@ private:
     // Inject failure before the potentially allocating completion insertion.
     // Private and per-queue; absent from builds with tests disabled.
     std::function<void()> completion_enqueue_hook_for_test_;
+    std::function<void(CompletionNotifyPoint)> completion_notify_hook_for_test_;
     std::function<void()> bridge_admission_hook_for_test_;
     std::function<elio::coro::task<void>(BridgeResumePoint)> bridge_resume_hook_for_test_;
     std::function<void(BridgeResumePoint)> bridge_resume_observer_for_test_;

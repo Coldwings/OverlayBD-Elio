@@ -101,10 +101,20 @@ in (writes) and out (reads).
    (each tag in its own coroutine, so per-tag IO overlaps; ublk does not
    care about cross-tag completion ordering), and calls
    `Queue::push_completion(tag, result)`, which appends to `done_` and
-   writes `done_efd`.
+   writes `done_efd` only for an empty-to-nonempty batch transition.
 4. The queue thread's parked poll wakes; it drains `done_` and issues
    `UBLK_U_IO_COMMIT_AND_FETCH_REQ` per finished tag — committing the result
    *and* re-parking the fetch for the next IO in one command.
+
+Completion publication tests `done_.empty()` and appends under the same mutex.
+The consumer reads the eventfd counter **before** swapping out the pending batch:
+a publication between those operations joins the current batch, while a
+publication after the swap creates a new batch and leaves a wake for the next
+poll. An earlier producer whose write is delayed until after its batch was
+taken causes only an extra empty drain. Stop and sticky-failure wakes remain
+unconditional, independently of the completion batch. Request notifications are
+unchanged. This reduces writes for bursts; it retains the lone QD1 handshake
+and both queue/worker handoffs.
 
 `user_data` encoding on the ring (`src/ublk/queue.cpp`): bit 63 = done_efd
 poll marker, bit 62 = commit cqe, low 16 bits = tag.
@@ -315,7 +325,8 @@ Elio side (any Elio worker thread):
   when empty. Short mutex section; safe against the queue thread.
 - `void push_completion(uint16_t tag, int32_t result)` — completes a
   request: `result >= 0` = bytes transferred, `< 0` = `-errno`. Wakes the
-  queue thread via `done_efd`.
+  queue thread via `done_efd` when the pending completion batch becomes
+  non-empty; completions already covered by that batch share its wake.
 - `void fail(int err) noexcept` — publishes the failure errno and sticky
   flag, then wakes the queue thread through the same `done_efd`. A completion
   that cannot be enqueued can therefore end the ring wait without another
@@ -531,6 +542,20 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 `OBD_ENABLE_UBLK` is on); the kernel-dependent end-to-end test lives in
 `tests/integration/test_ublk_e2e.cpp`.
 
+- `ublk: completion bursts share a wake and new batches wake again` — real
+  nonblocking eventfds verify one notification per undrained batch, all tag
+  results exactly once, and a new wake after the batch is consumed.
+- `ublk: completion publication across counter drain and batch swap keeps progress`
+  — deterministic publications on both sides of the production consumer's swap
+  verify current-batch inclusion and next-poll readability respectively.
+- `ublk: delayed completion wake after batch drain is harmless` — a controlled
+  producer thread delays its write across the consumer drain; its late wake
+  produces an empty batch and subsequent tag reuse still wakes normally.
+- `ublk: saturated completion counter retains published results` — a real
+  saturated eventfd rejects the notification write with `EAGAIN` while remaining
+  readable; the published result is consumed once and later batches wake again.
+- `ublk: lifecycle wakes remain unconditional with pending completions` — stop,
+  failure and request eventfd notifications remain independent of batch occupancy.
 - `ublk: repeated tag reads stay on the bridge worker` — four runtime workers
   retain source entry/resume on the explicitly selected bridge worker.
 - `ublk: a reused tag does not readmit a scheduler child` — after a first

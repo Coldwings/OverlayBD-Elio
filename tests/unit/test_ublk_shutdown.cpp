@@ -14,6 +14,7 @@
 #include <elio/sync/event.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -49,6 +50,21 @@ struct DeviceTestAccess {
             dev->queues_.push_back(std::move(q));
         }
         return dev;
+    }
+
+    static std::unique_ptr<Queue> completion_queue() {
+        auto q = std::make_unique<Queue>(0, 0, 8, 4096);
+        q->done_efd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        q->elio_efd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (q->done_efd_ < 0 || q->elio_efd_ < 0)
+            throw std::runtime_error("test completion eventfd failed");
+        return q;
+    }
+    static auto take_done(Queue& q) { return q.take_done_batch(); }
+    static int done_fd(Queue& q) { return q.done_efd_; }
+    static void completion_hook(
+        Queue& q, std::function<void(CompletionNotifyPoint)> hook) {
+        q.completion_notify_hook_for_test_ = std::move(hook);
     }
 
     static void start(Device& dev, bool read = false, uint16_t reads = 1) {
@@ -261,6 +277,197 @@ elio::coro::task<bool> await_test_completion(obd::ublk::Device& dev) {
 }
 
 }  // namespace
+
+namespace {
+
+bool completion_readable(obd::ublk::Queue& q) {
+    pollfd fd{obd::ublk::DeviceTestAccess::done_fd(q), POLLIN, 0};
+    return ::poll(&fd, 1, 0) == 1 && (fd.revents & POLLIN);
+}
+
+uint64_t completion_counter(obd::ublk::Queue& q) {
+    uint64_t count = 0;
+    const auto n = ::read(obd::ublk::DeviceTestAccess::done_fd(q),
+                          &count, sizeof(count));
+    if (n != static_cast<ssize_t>(sizeof(count))) throw std::runtime_error("missing completion wake");
+    return count;
+}
+
+}  // namespace
+
+TEST_CASE("ublk: completion bursts share a wake and new batches wake again",
+          "[ublk][completion-notify]") {
+    using obd::ublk::DeviceTestAccess;
+    auto q = DeviceTestAccess::completion_queue();
+    for (uint16_t tag = 0; tag < 8; ++tag)
+        q->push_completion(tag, tag % 2 ? -EIO : 4096);
+    REQUIRE(completion_readable(*q));
+    REQUIRE(completion_counter(*q) == 1);
+    const auto first = DeviceTestAccess::take_done(*q);
+    REQUIRE(first.size() == 8);
+    for (uint16_t tag = 0; tag < 8; ++tag) {
+        REQUIRE(first[tag].first == tag);
+        REQUIRE(first[tag].second == (tag % 2 ? -EIO : 4096));
+    }
+    REQUIRE_FALSE(completion_readable(*q));
+    REQUIRE(DeviceTestAccess::take_done(*q).empty());
+    q->push_completion(2, 512);
+    REQUIRE(completion_counter(*q) == 1);
+    const auto second = DeviceTestAccess::take_done(*q);
+    REQUIRE(second.size() == 1);
+    REQUIRE(second.front() == std::pair<uint16_t, int32_t>{2, 512});
+    REQUIRE(DeviceTestAccess::take_done(*q).empty());
+}
+
+TEST_CASE("ublk: completion publication across counter drain and batch swap keeps progress",
+          "[ublk][completion-notify]") {
+    using namespace obd::ublk;
+    auto q = DeviceTestAccess::completion_queue();
+    q->push_completion(0, 4096);
+    bool injected = false;
+    SECTION("publication between read and swap joins the current batch") {
+        DeviceTestAccess::completion_hook(*q, [&](CompletionNotifyPoint point) {
+            if (point == CompletionNotifyPoint::counter_read && !injected) {
+                injected = true;
+                q->push_completion(1, -EIO);
+            }
+        });
+        const auto batch = DeviceTestAccess::take_done(*q);
+        REQUIRE(injected);
+        REQUIRE(batch.size() == 2);
+        REQUIRE(batch[0] == std::pair<uint16_t, int32_t>{0, 4096});
+        REQUIRE(batch[1] == std::pair<uint16_t, int32_t>{1, -EIO});
+        REQUIRE_FALSE(completion_readable(*q));
+        REQUIRE(DeviceTestAccess::take_done(*q).empty());
+    }
+    SECTION("publication after swap survives for the next poll") {
+        DeviceTestAccess::completion_hook(*q, [&](CompletionNotifyPoint point) {
+            if (point == CompletionNotifyPoint::batch_taken && !injected) {
+                injected = true;
+                q->push_completion(1, -EIO);
+            }
+        });
+        const auto batch = DeviceTestAccess::take_done(*q);
+        REQUIRE(injected);
+        REQUIRE(batch.size() == 1);
+        REQUIRE(batch.front() == std::pair<uint16_t, int32_t>{0, 4096});
+        REQUIRE(completion_readable(*q));
+        const auto next = DeviceTestAccess::take_done(*q);
+        REQUIRE(next.size() == 1);
+        REQUIRE(next.front() == std::pair<uint16_t, int32_t>{1, -EIO});
+        REQUIRE_FALSE(completion_readable(*q));
+        REQUIRE(DeviceTestAccess::take_done(*q).empty());
+    }
+}
+
+TEST_CASE("ublk: delayed completion wake after batch drain is harmless",
+          "[ublk][completion-notify]") {
+    using namespace obd::ublk;
+    auto q = DeviceTestAccess::completion_queue();
+    std::mutex mutex;
+    std::condition_variable_any changed;
+    bool published = false;
+    bool release = false;
+    std::stop_token producer_stop;
+    std::atomic<int> writes{0};
+    DeviceTestAccess::completion_hook(*q, [&](CompletionNotifyPoint point) {
+        if (point != CompletionNotifyPoint::before_write) return;
+        if (writes.fetch_add(1) != 0) return;
+        std::unique_lock lock(mutex);
+        published = true;
+        changed.notify_all();
+        // jthread destruction releases this wait even if the consumer throws.
+        changed.wait(lock, producer_stop, [&] { return release; });
+    });
+    std::exception_ptr failure;
+    std::jthread producer([&](std::stop_token stop) {
+        producer_stop = stop;
+        try { q->push_completion(3, 4096); }
+        catch (...) { failure = std::current_exception(); }
+    });
+    bool reached;
+    {
+        std::unique_lock lock(mutex);
+        reached = changed.wait_for(lock, std::chrono::seconds(5),
+                                   [&] { return published; });
+    }
+    REQUIRE(reached);
+    REQUIRE_FALSE(completion_readable(*q));
+    // A second producer joins the batch while the first notifier is paused.
+    // The lifecycle wake lets the real queue consumer observe that batch.
+    q->push_completion(4, -EIO);
+    REQUIRE_FALSE(completion_readable(*q));
+    q->wakeup();
+    REQUIRE(completion_readable(*q));
+    const auto batch = DeviceTestAccess::take_done(*q);
+    REQUIRE(batch.size() == 2);
+    REQUIRE(batch[0] == std::pair<uint16_t, int32_t>{3, 4096});
+    REQUIRE(batch[1] == std::pair<uint16_t, int32_t>{4, -EIO});
+    REQUIRE_FALSE(completion_readable(*q));
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    changed.notify_all();
+    producer.join();
+    if (failure) std::rethrow_exception(failure);
+    REQUIRE(completion_readable(*q));
+    REQUIRE(DeviceTestAccess::take_done(*q).empty());
+    REQUIRE_FALSE(completion_readable(*q));
+    DeviceTestAccess::completion_hook(*q, {});
+    q->push_completion(3, 512);
+    REQUIRE(completion_readable(*q));
+    const auto next = DeviceTestAccess::take_done(*q);
+    REQUIRE(next.size() == 1);
+    REQUIRE(next.front() == std::pair<uint16_t, int32_t>{3, 512});
+}
+
+TEST_CASE("ublk: saturated completion counter retains published results",
+          "[ublk][completion-notify]") {
+    using obd::ublk::DeviceTestAccess;
+    auto q = DeviceTestAccess::completion_queue();
+    const uint64_t saturated = UINT64_MAX - 1;
+    REQUIRE(::write(DeviceTestAccess::done_fd(*q), &saturated, sizeof(saturated)) ==
+            static_cast<ssize_t>(sizeof(saturated)));
+    // The production notification write receives EAGAIN; a wake already exists.
+    q->push_completion(5, 4096);
+    REQUIRE(completion_readable(*q));
+    const auto batch = DeviceTestAccess::take_done(*q);
+    REQUIRE(batch.size() == 1);
+    REQUIRE(batch.front() == std::pair<uint16_t, int32_t>{5, 4096});
+    REQUIRE_FALSE(completion_readable(*q));
+    REQUIRE(DeviceTestAccess::take_done(*q).empty());
+    q->push_completion(5, -EIO);
+    REQUIRE(completion_counter(*q) == 1);
+    const auto next = DeviceTestAccess::take_done(*q);
+    REQUIRE(next.size() == 1);
+    REQUIRE(next.front() == std::pair<uint16_t, int32_t>{5, -EIO});
+}
+
+TEST_CASE("ublk: lifecycle wakes remain unconditional with pending completions",
+          "[ublk][completion-notify]") {
+    using obd::ublk::DeviceTestAccess;
+    auto q = DeviceTestAccess::completion_queue();
+    const bool pending = GENERATE(false, true);
+    if (pending) {
+        q->push_completion(0, 4096);
+        REQUIRE(completion_counter(*q) == 1);
+    }
+    SECTION("stop wake") { q->wakeup(); }
+    SECTION("failure wake") {
+        q->fail(EIO);
+        REQUIRE(q->failed());
+        REQUIRE(q->failure() == EIO);
+    }
+    REQUIRE(completion_counter(*q) == 1);
+    q->notify_elio();
+    q->notify_elio();
+    uint64_t requests = 0;
+    REQUIRE(::read(q->elio_efd(), &requests, sizeof(requests)) == static_cast<ssize_t>(sizeof(requests)));
+    REQUIRE(requests == 2);
+    REQUIRE(DeviceTestAccess::take_done(*q).size() == (pending ? 1 : 0));
+    REQUIRE(DeviceTestAccess::take_done(*q).empty());
+}
 
 TEST_CASE("ublk: repeated tag reads stay on the bridge worker", "[ublk][locality]") {
     using obd::ublk::DeviceTestAccess;
