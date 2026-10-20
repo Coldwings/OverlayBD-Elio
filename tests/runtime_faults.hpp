@@ -98,6 +98,27 @@ private:
     void (*old_)() = nullptr;
 };
 
+// Native enqueue pressure is global. Tests must release it from an owned OS
+// thread, so recovery cannot depend on an Elio admission that it rejects.
+class WorkerEnqueueFault {
+public:
+    WorkerEnqueueFault()
+        : old_inbox_(elio::runtime::detail::force_task_inbox_full_for_test.load()),
+          old_overflow_(elio::runtime::detail::fail_task_overflow_allocation_for_test.load()) {}
+    ~WorkerEnqueueFault() { release(); }
+    void arm() {
+        elio::runtime::detail::fail_task_overflow_allocation_for_test.store(true);
+        elio::runtime::detail::force_task_inbox_full_for_test.store(true);
+    }
+    void release() {
+        elio::runtime::detail::force_task_inbox_full_for_test.store(old_inbox_);
+        elio::runtime::detail::fail_task_overflow_allocation_for_test.store(old_overflow_);
+    }
+private:
+    bool old_inbox_;
+    bool old_overflow_;
+};
+
 class WakeStateFault {
 public:
     WakeStateFault()

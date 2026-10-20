@@ -23,7 +23,9 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <condition_variable>
 #include <exception>
+#include <mutex>
 #include <functional>
 #include <system_error>
 #include <thread>
@@ -98,6 +100,11 @@ struct DeviceTestAccess {
         }
         q.notify_elio();
     }
+    static size_t completion_count(Device& dev) {
+        auto& q = *dev.queues_.front();
+        std::lock_guard lock(q.mu_);
+        return q.done_.size();
+    }
     static auto completions(Device& dev) {
         auto& q = *dev.queues_.front();
         std::lock_guard lock(q.mu_);
@@ -112,6 +119,13 @@ struct DeviceTestAccess {
     static int done_efd(Device& dev) { return queue(dev).done_efd_; }
     static void set_completion_enqueue_hook(Device& dev, std::function<void()> hook) {
         queue(dev).completion_enqueue_hook_for_test_ = std::move(hook);
+    }
+    static void set_resume_hooks(
+        Device& dev,
+        std::function<elio::coro::task<void>(BridgeResumePoint)> resume,
+        std::function<void(BridgeResumePoint)> observe) {
+        queue(dev).bridge_resume_hook_for_test_ = std::move(resume);
+        queue(dev).bridge_resume_observer_for_test_ = std::move(observe);
     }
     static void stop_after_admission(Device& dev, bool& admitted) {
         queue(dev).bridge_admission_hook_for_test_ = [&dev, &admitted] {
@@ -379,6 +393,167 @@ TEST_CASE("ublk: a tag returns to its bridge after source migration", "[ublk][lo
         CAPTURE(read);
         CHECK(state.before[read] == 0);
         CHECK(state.after[read] == 1);
+    }
+}
+
+TEST_CASE("ublk: foreign resumptions retain tag state until owner restoration",
+          "[ublk][locality]") {
+    using obd::ublk::BridgeResumePoint;
+    using obd::ublk::DeviceTestAccess;
+    auto point = BridgeResumePoint::tag_wait;
+    SECTION("warm tag event wait") {}
+    SECTION("source return") { point = BridgeResumePoint::source_return; }
+    SECTION("request notification retry") { point = BridgeResumePoint::request_retry; }
+    SECTION("stop notification retry") { point = BridgeResumePoint::close_retry; }
+    LocalityState reads;
+    obd::test::WorkerEnqueueFault pressure;
+    struct Observation {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::atomic<bool> armed{false};
+        bool accepting_pressure = true;
+        bool foreign = false;
+        bool released = false;
+        bool rejection_observed = false;
+        unsigned rejections = 0;
+        unsigned calls_during_pressure = 0;
+        size_t completions_during_pressure = 0;
+        size_t restored_worker = elio::coro::NO_AFFINITY;
+        bool boundary_observed = false;
+        bool accessed_before_release = false;
+        std::atomic<bool> release_owner{false};
+        std::atomic<bool> owner_held{false};
+        std::atomic<size_t> held_worker{elio::coro::NO_AFFINITY};
+        std::atomic<bool> controller_failed{false};
+    } observed;
+    std::optional<elio::coro::join_handle<void>> owner_hold;
+    // All borrowed state and the Device owner remain outside the runtime.
+    auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(reads));
+    DeviceTestAccess::set_resume_hooks(*dev,
+        [&](BridgeResumePoint resumed) -> elio::coro::task<void> {
+            if (resumed != point || !observed.armed.exchange(false)) co_return;
+            // This is deterministic boundary injection using public migration,
+            // not a claim that the runtime steal fallback itself was observed.
+            co_await elio::set_affinity(1);
+            owner_hold.emplace(elio::runtime::scheduler::current()->go_joinable_to(
+                0, [&]() -> elio::coro::task<void> {
+                    observed.held_worker.store(elio::current_worker_id());
+                    observed.owner_held.store(true);
+                    // Intentional fixture-only owner hold. The OS controller
+                    // releases it without requiring scheduler admission.
+                    while (!observed.release_owner.load()) {
+                        observed.release_owner.wait(false);
+                    }
+                    co_return;
+                }));
+            while (!observed.owner_held.load()) co_await elio::time::yield();
+            {
+                std::lock_guard lock(observed.mutex);
+                if (!observed.accepting_pressure) co_return;
+                pressure.arm();
+                observed.foreign = elio::current_worker_id() == 1;
+            }
+            observed.changed.notify_all();
+        },
+        [&](BridgeResumePoint resumed) {
+            std::lock_guard lock(observed.mutex);
+            if (resumed == BridgeResumePoint::rejected_return) {
+                ++observed.rejections;
+                observed.changed.notify_all();
+            } else if (resumed == point && observed.foreign &&
+                       !observed.boundary_observed) {
+                observed.boundary_observed = true;
+                observed.restored_worker = elio::current_worker_id();
+                observed.accessed_before_release = !observed.released;
+            }
+        });
+    // This controller never needs an Elio task, timer or queue admission to
+    // release the faults or owner hold, including a guarded red control.
+    std::jthread controller([&] {
+        try {
+            std::unique_lock lock(observed.mutex);
+            if (observed.changed.wait_for(lock, std::chrono::seconds(5),
+                                         [&] { return observed.foreign; })) {
+                observed.rejection_observed = observed.changed.wait_for(
+                    lock, std::chrono::seconds(2),
+                    [&] { return observed.rejections >= 1; });
+                observed.calls_during_pressure = reads.calls.load();
+                observed.completions_during_pressure =
+                    DeviceTestAccess::completion_count(*dev);
+            }
+        } catch (...) {
+            observed.controller_failed.store(true);
+        }
+        // Serialize final release with hook arming, even after an exception.
+        std::lock_guard lock(observed.mutex);
+        observed.accepting_pressure = false;
+        observed.released = true;
+        pressure.release();
+        observed.release_owner.store(true);
+        observed.release_owner.notify_all();
+    });
+    bool primed = false;
+    bool completed = false;
+    bool stopped = false;
+    std::exception_ptr failure;
+    elio::runtime::run_config config;
+    config.num_threads = 4;
+    config.blocking_threads = 1;
+    config.shutdown_timeout = std::chrono::milliseconds::max();
+    try {
+        elio::run([&]() -> elio::coro::task<void> {
+            co_await elio::set_affinity(2);
+            DeviceTestAccess::start_on(*dev, 0);
+            DeviceTestAccess::enqueue_read(*dev);
+            primed = co_await await_test_completion(*dev);
+            primed = primed && DeviceTestAccess::completed_read(*dev);
+            DeviceTestAccess::clear_completions(*dev);
+            if (primed) {
+                obd::test::WorkerEventFault dispatch(0);
+                if (point == BridgeResumePoint::request_retry ||
+                    point == BridgeResumePoint::close_retry) dispatch.arm();
+                observed.armed.store(true);
+                if (point == BridgeResumePoint::close_retry) {
+                    co_await dev->stop_async();
+                    completed = true;
+                } else {
+                    DeviceTestAccess::enqueue_read(*dev);
+                    completed = co_await await_test_completion(*dev);
+                    completed = completed && DeviceTestAccess::completed_read(*dev);
+                    co_await dev->stop_async();
+                }
+            } else {
+                co_await dev->stop_async();
+            }
+            stopped = DeviceTestAccess::running(*dev) == 0;
+            if (owner_hold) co_await owner_hold->wait_destroyed_async();
+        }, config);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    controller.join();
+    pressure.release();
+    dev.reset();
+    if (failure) std::rethrow_exception(failure);
+    CAPTURE(static_cast<int>(point), observed.rejections);
+    CHECK(primed);
+    CHECK(completed);
+    CHECK(stopped);
+    CHECK(observed.foreign);
+    CHECK_FALSE(observed.controller_failed.load());
+    CHECK(observed.held_worker.load() == 0);
+    CHECK(observed.rejection_observed);
+    CHECK(observed.boundary_observed);
+    CHECK(observed.restored_worker == 0);
+    CHECK_FALSE(observed.accessed_before_release);
+    CHECK(observed.completions_during_pressure == 0);
+    CHECK(observed.calls_during_pressure ==
+          (point == BridgeResumePoint::source_return ? 2 : 1));
+    const unsigned expected_reads = point == BridgeResumePoint::close_retry ? 1 : 2;
+    REQUIRE(reads.calls.load() == expected_reads);
+    for (unsigned read = 0; read != expected_reads; ++read) {
+        CAPTURE(read);
+        CHECK(reads.before[read] == 0);
     }
 }
 

@@ -1658,6 +1658,19 @@ Unmodified upstream-produced metadata and gzip fixture compatibility.
 
 Elio task-ownership and notification migration regressions:
 
+- `ublk: foreign resumptions retain tag state until owner restoration` — warm
+  tag-wait, source-return, request-notification and stop-notification boundaries
+  deliberately migrate through the public native API. A joinable native task
+  holds the owner, while an owned OS thread applies/releases actual native
+  inbox-full and overflow-allocation rejection independently of scheduler
+  admission. The resumed frame must retain its request and avoid owner-only
+  state until actual owner return; source reads and shutdown still complete.
+  This is boundary injection, not a claim that the steal race was observed.
+  The guarded negative control records placement before a red-only owner rescue
+  so it never executes the subsequent plain-state race. Historical invalid
+  fixtures/signals are retained separately and establish no drain/pass result.
+
+
 - `supervisor: client task failure preserves daemon shutdown drain` —
   log-and-continue policy and worker placement alongside staged group joins.
 - `ublk: task group drains every admitted tag including source failures` —

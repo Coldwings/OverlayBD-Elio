@@ -342,9 +342,16 @@ completion token posts `-EIO` if its initial child is rejected or skipped;
 a source exception also posts `-EIO`. A failed initial handler can be admitted
 again for a later request. Lifetime ownership stays with Elio, while the token
 records the kernel completion obligation (ADR-0006).
-The bridge and handlers access tag state on the bridge worker. A source may
-deliberately migrate while running; its handler restores and checks the owner
-before clearing the busy state or publishing completion. Failed/skipped child
+The bridge and handlers access tag state on the bridge worker. Elio user
+affinity is best effort: a stolen continuation can execute on another worker
+when owner re-enqueue fails. Every relevant suspension return therefore
+restores affinity and verifies the actual worker before accessing tag state:
+request-event wakes, source returns, bridge reads, notification retry yields,
+cleanup entry, and the handler join. Rejected migration retains the same frame,
+request and pool, yielding and retrying until the owner is reached. The native
+already-local affinity awaitable allocates no helper frame or scheduler task.
+A source may deliberately migrate while running; the same restoration applies
+before clearing busy state or publishing completion. Failed/skipped child
 destructors on foreign workers publish only atomic failure facts and notify
 the bridge; they do not mutate owner-only tag state. Failure facts are consumed
 before admitting a reused tag. Native event dispatch allocation failure retains
@@ -517,6 +524,13 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 - `ublk: a tag retries after its initial child admission is rejected` — native
   scheduler rejection completes the first request with `-EIO`; a later request
   starts a new handler and completes normally.
+- `ublk: foreign resumptions retain tag state until owner restoration` —
+  deterministic native-migration injection at warm event wakes, source returns,
+  request retries and stop retries; real inbox-full/overflow-allocation rejection
+  holds each continuation away from owner-only state until an independent OS
+  controller releases pressure and its owned native owner-hold task. Hooks
+  absent from normal use create no helper task/frame. This checks restoration
+  boundaries, not an observed native steal or sanitizer race.
 - `ublk: tag notification allocation failure retains reads and stop` — actual
   native event dispatch allocation failures on request delivery and stop are
   each observed once; the source completes and every handler drains.

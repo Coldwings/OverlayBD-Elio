@@ -213,12 +213,18 @@ elio::coro::task<int32_t> handle_io(Queue* q, source::BlobSource* src,
 elio::coro::task<void> run_tag(TagPool* pool, source::BlobSource* src,
                                uint16_t tag, size_t owner,
                                TagHandlerGuard guard) {
-    // Native TaskGroup still owns admission, cancellation and joining. This
-    // migration is paid once per active tag, rather than on every request.
-    co_await elio::set_affinity(owner);
-    if (elio::current_worker_id() != owner) {
-        throw std::runtime_error("ublk tag could not reach its bridge worker");
-    }
+    // Native TaskGroup owns admission and lifetime. User affinity can fall
+    // back to a foreign worker, so check actual placement after suspension.
+    // Already-local set_affinity checks allocate and schedule nothing.
+    do {
+        co_await elio::set_affinity(owner);
+        if (elio::current_worker_id() != owner) {
+#ifdef OBD_TEST_HOOKS
+            pool->queue->observe_bridge_resume_for_test(BridgeResumePoint::rejected_return);
+#endif
+            co_await elio::time::yield();
+        }
+    } while (elio::current_worker_id() != owner);
     auto& slot = pool->tags[tag];
     for (;;) {
         // Request and close notifications may coalesce. Finish an accepted
@@ -228,6 +234,23 @@ elio::coro::task<void> run_tag(TagPool* pool, source::BlobSource* src,
             co_return;
         }
         co_await slot.ready.wait();
+#ifdef OBD_TEST_HOOKS
+        if (const auto& hook = pool->queue->bridge_resume_hook_for_test(); hook) {
+            co_await hook(BridgeResumePoint::tag_wait);
+        }
+#endif
+        do {
+            co_await elio::set_affinity(owner);
+            if (elio::current_worker_id() != owner) {
+#ifdef OBD_TEST_HOOKS
+                pool->queue->observe_bridge_resume_for_test(BridgeResumePoint::rejected_return);
+#endif
+                co_await elio::time::yield();
+            }
+        } while (elio::current_worker_id() != owner);
+#ifdef OBD_TEST_HOOKS
+        pool->queue->observe_bridge_resume_for_test(BridgeResumePoint::tag_wait);
+#endif
         slot.ready.reset();
         if (!slot.completion) {
             if (slot.closing) {
@@ -246,12 +269,25 @@ elio::coro::task<void> run_tag(TagPool* pool, source::BlobSource* src,
             if (!elio::coro::this_coro::cancel_token().is_cancelled()) {
                 result = co_await handle_io(pool->queue, src, request);
             }
+#ifdef OBD_TEST_HOOKS
+            if (const auto& hook = pool->queue->bridge_resume_hook_for_test(); hook) {
+                co_await hook(BridgeResumePoint::source_return);
+            }
+#endif
             // A source may deliberately change its execution affinity. Restore
             // both placement and context before touching owner-only tag state.
-            co_await elio::set_affinity(owner);
-            if (elio::current_worker_id() != owner) {
-                throw std::runtime_error("ublk tag could not return to its bridge worker");
-            }
+            do {
+                co_await elio::set_affinity(owner);
+                if (elio::current_worker_id() != owner) {
+#ifdef OBD_TEST_HOOKS
+                    pool->queue->observe_bridge_resume_for_test(BridgeResumePoint::rejected_return);
+#endif
+                    co_await elio::time::yield();
+                }
+            } while (elio::current_worker_id() != owner);
+#ifdef OBD_TEST_HOOKS
+            pool->queue->observe_bridge_resume_for_test(BridgeResumePoint::source_return);
+#endif
             slot.busy = false;
             completion.publish(result);
         } catch (...) {
@@ -278,6 +314,23 @@ elio::coro::task<void> run_bridge_local(Queue* q, source::BlobSource* src,
         while (!stop->load(std::memory_order_relaxed)) {
             const auto r = co_await elio::io::async_read(efd, &cnt, sizeof(cnt),
                                                          -1);
+#ifdef OBD_TEST_HOOKS
+            if (const auto& hook = q->bridge_resume_hook_for_test(); hook) {
+                co_await hook(BridgeResumePoint::bridge_read);
+            }
+#endif
+            do {
+                co_await elio::set_affinity(owner);
+                if (elio::current_worker_id() != owner) {
+#ifdef OBD_TEST_HOOKS
+                    q->observe_bridge_resume_for_test(BridgeResumePoint::rejected_return);
+#endif
+                    co_await elio::time::yield();
+                }
+            } while (elio::current_worker_id() != owner);
+#ifdef OBD_TEST_HOOKS
+            q->observe_bridge_resume_for_test(BridgeResumePoint::bridge_read);
+#endif
             if (r.result < 0) {
                 if (r.result == -EINTR || r.result == -EAGAIN) continue;
                 if (stop->load(std::memory_order_relaxed)) break;
@@ -311,7 +364,26 @@ elio::coro::task<void> run_bridge_local(Queue* q, source::BlobSource* src,
                         signaled = true;
                     } catch (const std::bad_alloc&) {
                     }
-                    if (!signaled) co_await elio::time::yield();
+                    if (!signaled) {
+                        co_await elio::time::yield();
+#ifdef OBD_TEST_HOOKS
+                        if (const auto& hook = q->bridge_resume_hook_for_test(); hook) {
+                            co_await hook(BridgeResumePoint::request_retry);
+                        }
+#endif
+                        do {
+                            co_await elio::set_affinity(owner);
+                            if (elio::current_worker_id() != owner) {
+#ifdef OBD_TEST_HOOKS
+                                q->observe_bridge_resume_for_test(BridgeResumePoint::rejected_return);
+#endif
+                                co_await elio::time::yield();
+                            }
+                        } while (elio::current_worker_id() != owner);
+#ifdef OBD_TEST_HOOKS
+                        q->observe_bridge_resume_for_test(BridgeResumePoint::request_retry);
+#endif
+                    }
                 }
 #ifdef OBD_TEST_HOOKS
                 q->notify_bridge_admission_for_test(slot.ready);
@@ -321,6 +393,23 @@ elio::coro::task<void> run_bridge_local(Queue* q, source::BlobSource* src,
     } catch (...) {
         failure = std::current_exception();
     }
+#ifdef OBD_TEST_HOOKS
+    if (const auto& hook = q->bridge_resume_hook_for_test(); hook) {
+        co_await hook(BridgeResumePoint::cleanup);
+    }
+#endif
+    do {
+        co_await elio::set_affinity(owner);
+        if (elio::current_worker_id() != owner) {
+#ifdef OBD_TEST_HOOKS
+            q->observe_bridge_resume_for_test(BridgeResumePoint::rejected_return);
+#endif
+            co_await elio::time::yield();
+        }
+    } while (elio::current_worker_id() != owner);
+#ifdef OBD_TEST_HOOKS
+    q->observe_bridge_resume_for_test(BridgeResumePoint::cleanup);
+#endif
     // Ordinary stop closes bridge admission through stop/efd, without
     // cancelling handler bodies: accepted source IO must finish normally.
     for (uint16_t tag = 0; tag < q->depth(); ++tag) {
@@ -334,7 +423,26 @@ elio::coro::task<void> run_bridge_local(Queue* q, source::BlobSource* src,
                 signaled = true;
             } catch (const std::bad_alloc&) {
             }
-            if (!signaled) co_await elio::time::yield();
+            if (!signaled) {
+                co_await elio::time::yield();
+#ifdef OBD_TEST_HOOKS
+                if (const auto& hook = q->bridge_resume_hook_for_test(); hook) {
+                    co_await hook(BridgeResumePoint::close_retry);
+                }
+#endif
+                do {
+                    co_await elio::set_affinity(owner);
+                    if (elio::current_worker_id() != owner) {
+#ifdef OBD_TEST_HOOKS
+                        q->observe_bridge_resume_for_test(BridgeResumePoint::rejected_return);
+#endif
+                        co_await elio::time::yield();
+                    }
+                } while (elio::current_worker_id() != owner);
+#ifdef OBD_TEST_HOOKS
+                q->observe_bridge_resume_for_test(BridgeResumePoint::close_retry);
+#endif
+            }
         }
     }
     try {
@@ -344,6 +452,23 @@ elio::coro::task<void> run_bridge_local(Queue* q, source::BlobSource* src,
     } catch (...) {
         ELIO_LOG_ERROR("ublk queue {} handler failed: unknown exception", q->q_id());
     }
+#ifdef OBD_TEST_HOOKS
+    if (const auto& hook = q->bridge_resume_hook_for_test(); hook) {
+        co_await hook(BridgeResumePoint::handlers_join);
+    }
+#endif
+    do {
+        co_await elio::set_affinity(owner);
+        if (elio::current_worker_id() != owner) {
+#ifdef OBD_TEST_HOOKS
+            q->observe_bridge_resume_for_test(BridgeResumePoint::rejected_return);
+#endif
+            co_await elio::time::yield();
+        }
+    } while (elio::current_worker_id() != owner);
+#ifdef OBD_TEST_HOOKS
+    q->observe_bridge_resume_for_test(BridgeResumePoint::handlers_join);
+#endif
     pool.collect_failures();
     if (failure) {
         std::rethrow_exception(failure);
