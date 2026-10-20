@@ -288,12 +288,20 @@ max_io_buf_bytes)` — throws `obd::error(EINVAL)` for `depth == 0` or
 `depth > UBLK_MAX_QUEUE_DEPTH`. Non-copyable; destructor tears down ring,
 mapping, buffers, fds.
 
-- `void open()` — opens `/dev/ublkc<N>`, mmaps the command buffer at
+- `void open(int shared_cdev_fd = -1)` — opens `/dev/ublkc<N>` when the
+  argument is negative; otherwise owns a `F_DUPFD_CLOEXEC` duplicate of the
+  borrowed descriptor without closing or adopting that argument. The caller
+  keeps the borrowed descriptor valid through this call. Mmaps the command buffer at
   `q_id * cmd_buf_stride(...)` with length `cmd_buf_size(depth, 24)`
   (PROT_READ, MAP_SHARED | MAP_POPULATE), allocates and zeroes the per-tag
   IO buffers, creates the two eventfds (`EFD_CLOEXEC | EFD_NONBLOCK`), and
-  initializes the ring with `depth * 2` entries. Throws `obd::error`.
+  leaves ring creation to `run()` on the issuing queue thread. Throws
+  `obd::error`.
 - `uint16_t q_id() const`, `uint16_t depth() const`.
+- `int cdev_fd() const noexcept` — borrows the queue's owned descriptor for
+  subsequent queue setup; returns `-1` before descriptor acquisition. Do not
+  close it or retain it past Queue destruction;
+  duplicate it when independent ownership is needed.
 - `void* io_buf(uint16_t tag) noexcept` — the tag's kernel-shared payload
   buffer (`tag * max_io_buf_bytes` into the allocation). Read handlers write
   into it; write handlers read from it. No bounds check — `tag < depth` is a
