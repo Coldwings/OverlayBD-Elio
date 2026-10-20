@@ -52,6 +52,17 @@ The queue thread parks a `POLL_ADD` on `done_efd` inside its own ring, so
 Elio-side completions wake its `io_uring_submit_and_wait` without a separate
 poll thread.
 
+`Device::create` and `Device::attach` open `/dev/ublkc<N>` once for the
+device: the driver's open exclusion applies to the whole device, including
+all hardware queues. The first `Queue` owns that descriptor; each additional
+queue owns a close-on-exec duplicate sharing its open file description.
+Every queue still has its own command-buffer mapping, tag buffers, eventfds,
+ring and issuer thread. Queue destruction closes only its owned descriptor;
+the existing mapping and command lifetime barriers still apply. Final kernel
+file release waits for all references, including mappings and accepted
+io_uring commands. Recovery opens the first descriptor only after
+`START_USER_RECOVERY` succeeds.
+
 ### Command buffer mmap geometry
 
 The kernel shares per-tag `ublksrv_io_desc` records with the daemon through
@@ -277,12 +288,20 @@ max_io_buf_bytes)` — throws `obd::error(EINVAL)` for `depth == 0` or
 `depth > UBLK_MAX_QUEUE_DEPTH`. Non-copyable; destructor tears down ring,
 mapping, buffers, fds.
 
-- `void open()` — opens `/dev/ublkc<N>`, mmaps the command buffer at
+- `void open(int shared_cdev_fd = -1)` — opens `/dev/ublkc<N>` when the
+  argument is negative; otherwise owns a `F_DUPFD_CLOEXEC` duplicate of the
+  borrowed descriptor without closing or adopting that argument. The caller
+  keeps the borrowed descriptor valid through this call. Mmaps the command buffer at
   `q_id * cmd_buf_stride(...)` with length `cmd_buf_size(depth, 24)`
   (PROT_READ, MAP_SHARED | MAP_POPULATE), allocates and zeroes the per-tag
   IO buffers, creates the two eventfds (`EFD_CLOEXEC | EFD_NONBLOCK`), and
-  initializes the ring with `depth * 2` entries. Throws `obd::error`.
+  leaves ring creation to `run()` on the issuing queue thread. Throws
+  `obd::error`.
 - `uint16_t q_id() const`, `uint16_t depth() const`.
+- `int cdev_fd() const noexcept` — borrows the queue's owned descriptor for
+  subsequent queue setup; returns `-1` before descriptor acquisition. Do not
+  close it or retain it past Queue destruction;
+  duplicate it when independent ownership is needed.
 - `void* io_buf(uint16_t tag) noexcept` — the tag's kernel-shared payload
   buffer (`tag * max_io_buf_bytes` into the allocation). Read handlers write
   into it; write handlers read from it. No bounds check — `tag < depth` is a
@@ -598,13 +617,20 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   descriptor, `cmd_buf_size(128, …)` = 4096, `cmd_buf_size(4096, …)` =
   98304. Guards against regressions in `cmd_buf_stride` / `cmd_buf_size`
   that would make `ublk_ch_mmap` reject our mappings.
+- `ublk: queues own close-on-exec duplicates of one open file description` —
+  uses a real temporary file and both queue-offset mappings to verify distinct
+  owned descriptors, close-on-exec flags, shared file offsets, survival after
+  the first queue and borrowed original close, and final descriptor closure.
+  This is descriptor-lifetime coverage; it does not register a ublk device or
+  exercise the kernel's ublk commands.
 - `ublk: IoRequest byte math is sector based` — pins the 512-byte sector
   conversion (`start_sector 100` → offset 51200; 8 sectors → 4096 bytes)
   that every bridge handler relies on.
 - `integration: ublk device serves sector reads from a blob` — privileged
   E2E: creates a real `Device` over an in-memory source, opens
   `/dev/ublkb<N>`, and verifies a 4 KiB `pread` at byte offset 1024 returns
-  the exact source bytes. Guards the whole path: control plane, queue
+  the exact source bytes with one and two hardware queues. Guards the whole
+  path: control plane, queue
   thread, bridge dispatch, zero-copy buffer addressing, and teardown. It
   **self-skips** when `/dev/ublk-control` is unavailable (no root /
   `ublk_drv` not loaded); the integration test target is registered with
@@ -626,7 +652,8 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   and deletes normally; the parent reaps it and verifies `GET_DEV_INFO`
   returns `ENODEV` before the precise unsupported-capability skip. A separate
   section explicitly disables recovery and requires that graceful cleanup
-  path to pass on every kernel with ublk. Fixture guards retain the child,
+  path to pass on every kernel with ublk. Both sections run with one and two
+  hardware queues. Fixture guards retain the child,
   pipe fds, client fd and recoverable device across assertions and failed
   attaches. Unexpected attach errors, including `EINVAL`, fail the test.
 

@@ -17,6 +17,20 @@
 
 namespace obd::ublk {
 
+void Device::open_queues() {
+    int shared_cdev_fd = -1;
+    for (uint16_t q = 0; q < params_.nr_queues; ++q) {
+        auto queue = std::make_unique<Queue>(dev_id_, q, params_.queue_depth,
+                                             params_.max_io_buf_bytes);
+        // The driver's open exclusion is device-wide, not per queue.
+        // Duplicate the first queue's descriptor so each queue retains
+        // independent ownership without opening a second server session.
+        queue->open(shared_cdev_fd);
+        if (shared_cdev_fd < 0) shared_cdev_fd = queue->cdev_fd();
+        queues_.push_back(std::move(queue));
+    }
+}
+
 elio::coro::task<std::unique_ptr<Device>> Device::create(
     const DeviceParams& params, source::BlobSourcePtr src,
     FailureCleanup failure_cleanup) {
@@ -42,13 +56,7 @@ elio::coro::task<std::unique_ptr<Device>> Device::create(
             return id;
         });
 
-        for (uint16_t q = 0; q < params.nr_queues; ++q) {
-            auto queue = std::make_unique<Queue>(dev->dev_id_, q,
-                                                 params.queue_depth,
-                                                 params.max_io_buf_bytes);
-            queue->open();
-            dev->queues_.push_back(std::move(queue));
-        }
+        dev->open_queues();
         ELIO_LOG_INFO("ublk dev {}: add_dev+set_params done, opening queues",
                       dev->dev_id_);
         // Queue threads first: they park the per-tag FETCH commands the
@@ -141,14 +149,7 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
             [](std::chrono::steady_clock::duration delay) {
                 return elio::time::sleep_for(delay);
             },
-            [&] {
-                for (uint16_t q = 0; q < params.nr_queues; ++q) {
-                    auto queue = std::make_unique<Queue>(
-                        dev_id, q, params.queue_depth, params.max_io_buf_bytes);
-                    queue->open();
-                    dev->queues_.push_back(std::move(queue));
-                }
-            });
+            [&] { dev->open_queues(); });
         for (auto& queue : dev->queues_) {
             Queue* q = queue.get();
             dev->threads_.emplace_back([q, &stop = dev->stop_] {

@@ -60,13 +60,17 @@ public:
     Queue(const Queue&) = delete;
     Queue& operator=(const Queue&) = delete;
 
-    /// Opens the queue char device, mmaps the command buffer and
-    /// allocates the buffers. Throws obd::error on failure. The ring is
-    /// NOT created here: see run().
-    void open();
+    /// Opens the device char node, or duplicates the borrowed descriptor
+    /// shared_cdev_fd. Each queue owns its descriptor, while all queues of
+    /// a Device share one open file description (the driver permits only
+    /// one open). Mmaps this queue's command buffer and allocates its
+    /// buffers. Throws obd::error on failure. The ring is NOT created here:
+    /// see run().
+    void open(int shared_cdev_fd = -1);
 
     uint16_t q_id() const noexcept { return q_id_; }
     uint16_t depth() const noexcept { return depth_; }
+    int cdev_fd() const noexcept { return ublkc_fd_; }
 
     /// Per-tag IO buffer (daemon vm space; the kernel copies request data
     /// in/out of it). Written by Elio workers for reads.
