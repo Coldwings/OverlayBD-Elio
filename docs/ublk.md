@@ -632,8 +632,16 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   the exact source bytes with one and two hardware queues. Guards the whole
   path: control plane, queue
   thread, bridge dispatch, zero-copy buffer addressing, and teardown. It
-  **self-skips** when `/dev/ublk-control` is unavailable (no root /
-  `ublk_drv` not loaded); the integration test target is registered with
+  **self-skips** when the shared prerequisite probe finds the control node
+  missing/unavailable, an `O_RDWR` open denied, or effective `CAP_SYS_ADMIN`
+  absent. All privileged ublk tests perform this check before constructing
+  fixtures or devices. It uses actual open access and effective capabilities,
+  not UID: a nonroot process with the required access and capability is
+  admitted, while root without the capability skips. The probe issues no
+  kernel device commands. Unexpected probe errors (such as `EMFILE` or
+  `EIO`) fail, as do subsequent device setup or I/O errors; the probe does
+  not guarantee authority in the kernel's required user namespace. The
+  integration test target is registered with
   CTest property `SKIP_RETURN_CODE 4` ("all selected tests skipped"), so an
   unprivileged run stays green. See `tests/CMakeLists.txt`.
 - `integration: ublk device grows online and serves the new capacity` —
@@ -656,9 +664,17 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
   hardware queues. Fixture guards retain the child,
   pipe fds, client fd and recoverable device across assertions and failed
   attaches. Unexpected attach errors, including `EINVAL`, fail the test.
+- `ublk prerequisites: missing access or capability skips before setup` —
+  deterministic, unprivileged classification coverage for missing control
+  nodes, denied read/write opens, and effective capability masks.
+- `ublk prerequisites: unexpected probe errors remain failures` — verifies
+  that resource exhaustion and unexpected open errors are not hidden as
+  missing prerequisites. These two tests use synthetic observations and do
+  not open a control device or create a kernel device.
 
 Run: `ctest --test-dir build --output-on-failure` (the E2E test requires
-root or `CAP_SYS_ADMIN` plus a loaded `ublk_drv` to actually execute).
+control-node read/write access, effective `CAP_SYS_ADMIN` in the required
+user namespace, and a loaded `ublk_drv` to actually execute).
 
 ## Limitations & TODO
 

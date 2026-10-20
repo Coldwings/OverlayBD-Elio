@@ -62,6 +62,7 @@ add_executable(obd_unit_tests
     unit/test_convert.cpp
     unit/test_child_spawn_owner.cpp
     unit/test_create_device_id.cpp
+    unit/test_ublk_prerequisites.cpp
     unit/test_supervisor.cpp)
 obd_target_warnings(obd_unit_tests)
 target_include_directories(obd_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

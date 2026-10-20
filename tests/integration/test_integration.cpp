@@ -30,6 +30,7 @@
 #endif
 
 #include "../support.hpp"
+#include "../ublk_prerequisites.hpp"
 
 #include <elio/http/http_server.hpp>
 #include <elio/runtime/spawn.hpp>
@@ -910,8 +911,9 @@ DirectReadWave direct_read_wave(int fd, const std::array<int, 2>& cpus,
 
 TEST_CASE("integration: two ublk queues reuse tags over slow remote LSMT reads",
           "[integration][ublk][locality]") {
-    if (::access("/dev/ublk-control", F_OK) != 0) {
-        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
+    if (const auto reason = test::ublk_prerequisite_skip_reason();
+        !reason.empty()) {
+        SKIP(reason);
     }
     cpu_set_t allowed;
     REQUIRE(::sched_getaffinity(0, sizeof(allowed), &allowed) == 0);

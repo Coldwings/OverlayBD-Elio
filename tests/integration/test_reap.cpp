@@ -6,6 +6,7 @@
 #include "supervisor/protocol.hpp"
 
 #include "../support.hpp"
+#include "../ublk_prerequisites.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <elio/runtime/spawn.hpp>
@@ -364,8 +365,9 @@ TEST_CASE("supervisor: shutdown waits for reap after control EOF", "[supervisor]
 
 #ifdef OBD_TEST_DEVICE_BIN
 TEST_CASE("integration: supervisor reaps children before releasing ublk devices", "[ublk][supervisor]") {
-    if (::geteuid() != 0 || ::access("/dev/ublk-control", F_OK) != 0) {
-        SKIP("requires root and /dev/ublk-control");
+    if (const auto reason = test::ublk_prerequisite_skip_reason();
+        !reason.empty()) {
+        SKIP(reason);
     }
     test::TempDir directory;
     const std::string socket = directory / "s.sock";
