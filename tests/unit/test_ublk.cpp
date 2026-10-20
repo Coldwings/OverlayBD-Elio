@@ -1,5 +1,5 @@
-// Unit tests: ublk ABI geometry, recovery ordering and cleanup ownership. The
-// kernel-dependent E2E lives in tests/integration.
+// Unit tests: ublk ABI geometry, descriptor ownership, recovery ordering and
+// cleanup ownership. The kernel-dependent E2E lives in tests/integration.
 #include "ublk/ctrl.hpp"
 #include "ublk/queue.hpp"
 #include "ublk/recovery.hpp"
@@ -9,7 +9,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <fcntl.h>
+
 #include <chrono>
+#include <memory>
 #include <new>
 #include <system_error>
 #include <vector>
@@ -23,6 +26,52 @@ TEST_CASE("ublk: command buffer geometry matches the driver layout",
     REQUIRE(ublk::cmd_buf_stride(sizeof(ublksrv_io_desc)) == 98304);
     REQUIRE(ublk::cmd_buf_size(128, sizeof(ublksrv_io_desc)) == 4096);
     REQUIRE(ublk::cmd_buf_size(4096, sizeof(ublksrv_io_desc)) == 98304);
+}
+
+TEST_CASE("ublk: queues own close-on-exec duplicates of one open file description",
+          "[ublk]") {
+    // A regular file exercises the real dup/mmap/close path without
+    // pretending to register a kernel device or submit any ublk commands.
+    test::TempDir tmp;
+    const uint64_t bytes = ublk::cmd_buf_stride(sizeof(ublksrv_io_desc)) +
+                           ublk::cmd_buf_size(4, sizeof(ublksrv_io_desc));
+    const auto path = test::write_file(tmp / "command-buffers",
+                                      std::vector<uint8_t>(bytes));
+    struct CloseFd {
+        int fd;
+        ~CloseFd() { if (fd >= 0) ::close(fd); }
+    } original{::open(path.c_str(), O_RDWR)};
+    REQUIRE(original.fd >= 0);
+    REQUIRE((::fcntl(original.fd, F_GETFD) & FD_CLOEXEC) == 0);
+
+    auto first = std::make_unique<ublk::Queue>(0, 0, 4, 4096);
+    first->open(original.fd);
+    const int first_fd = first->cdev_fd();
+    auto second = std::make_unique<ublk::Queue>(0, 1, 4, 4096);
+    second->open(first_fd);
+    const int second_fd = second->cdev_fd();
+    REQUIRE(first_fd != original.fd);
+    REQUIRE(second_fd != original.fd);
+    REQUIRE(second_fd != first_fd);
+    REQUIRE((::fcntl(first_fd, F_GETFD) & FD_CLOEXEC) != 0);
+    REQUIRE((::fcntl(second_fd, F_GETFD) & FD_CLOEXEC) != 0);
+
+    // Shared offsets distinguish duplication from separate open() calls.
+    REQUIRE(::lseek(original.fd, 17, SEEK_SET) == 17);
+    REQUIRE(::lseek(first_fd, 0, SEEK_CUR) == 17);
+    REQUIRE(::lseek(second_fd, 29, SEEK_SET) == 29);
+    REQUIRE(::lseek(original.fd, 0, SEEK_CUR) == 29);
+
+    first.reset();
+    REQUIRE(::fcntl(first_fd, F_GETFD) == -1);
+    REQUIRE(errno == EBADF);
+    REQUIRE(::fcntl(original.fd, F_GETFD) >= 0);
+    REQUIRE(::close(original.fd) == 0);
+    original.fd = -1;
+    REQUIRE(::lseek(second_fd, 0, SEEK_CUR) == 29);
+    second.reset();
+    REQUIRE(::fcntl(second_fd, F_GETFD) == -1);
+    REQUIRE(errno == EBADF);
 }
 
 TEST_CASE("ublk: IoRequest byte math is sector based", "[ublk]") {

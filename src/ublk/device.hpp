@@ -102,6 +102,7 @@ public:
 private:
     friend struct DeviceTestAccess;
     Device() = default;
+    void open_queues();
     void request_stop() noexcept;
     static elio::coro::task<void> cleanup_failed(
         std::unique_ptr<Device> dev, std::exception_ptr failure,

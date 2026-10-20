@@ -10,6 +10,7 @@
 #include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <linux/fs.h>
 #include <sys/ioctl.h>
@@ -217,12 +218,15 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
     if (!ublk_available()) {
         SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
     }
-    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+    const uint16_t nr_queues = GENERATE(1, 2);
+    INFO("nr_queues=" << nr_queues);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto data = test::pattern_bytes(512 * 64, 81);
         source::BlobSourcePtr src =
             std::make_unique<test::VectorSource>(data);
         ublk::DeviceParams params;
         params.dev_sectors = data.size() / 512;
+        params.nr_queues = nr_queues;
         stage("reads: create");
         auto dev = co_await ublk::Device::create(params, std::move(src));
         int fd = -1;
@@ -453,7 +457,7 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
 
 namespace {
 
-void check_recovery(bool request_recovery) {
+void check_recovery(bool request_recovery, uint16_t nr_queues) {
     // A child process creates and serves the device; the parent kills it
     // and attaches a replacement server (the real kernel handshake,
     // ADR-0010). The block device must survive and keep serving reads.
@@ -469,7 +473,7 @@ void check_recovery(bool request_recovery) {
         ::close(server.pipefd[0]);
         int rc = 1;
         try {
-            rc = elio::run([](int out, bool requested)
+            rc = elio::run([](int out, bool requested, uint16_t queue_count)
                 -> elio::coro::task<int> {
                 auto data = test::pattern_bytes(512 * 64, 84);
                 source::BlobSourcePtr src =
@@ -477,6 +481,7 @@ void check_recovery(bool request_recovery) {
                 ublk::DeviceParams params;
                 params.dev_sectors = data.size() / 512;
                 params.enable_recovery = requested;
+                params.nr_queues = queue_count;
                 auto dev = co_await ublk::Device::create(params, std::move(src));
                 int unused_fd = -1;
                 co_return co_await with_device_cleanup(dev, unused_fd, [&]()
@@ -502,7 +507,7 @@ void check_recovery(bool request_recovery) {
                         co_await elio::time::sleep_for(std::chrono::hours(1));
                     }
                 });
-            }, server.pipefd[1], request_recovery);
+            }, server.pipefd[1], request_recovery, nr_queues);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "recovery child failed: %s\n", e.what());
         } catch (...) {
@@ -568,6 +573,7 @@ void check_recovery(bool request_recovery) {
             std::make_unique<test::VectorSource>(data);
         ublk::DeviceParams params;
         params.dev_sectors = data.size() / 512;
+        params.nr_queues = nr_queues;
         auto dev = co_await ublk::Device::attach(
             dev_id, params, std::move(src));
         server.dev_id = UINT32_MAX;  // The replacement now owns cleanup.
@@ -599,10 +605,12 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
     if (!ublk_available()) {
         SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
     }
+    const uint16_t nr_queues = GENERATE(1, 2);
+    INFO("nr_queues=" << nr_queues);
     SECTION("explicitly disabled recovery exits and cleans up normally") {
-        check_recovery(false);
+        check_recovery(false, nr_queues);
     }
     SECTION("recover a device that negotiated USER_RECOVERY") {
-        check_recovery(true);
+        check_recovery(true, nr_queues);
     }
 }
