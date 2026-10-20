@@ -19,6 +19,10 @@ add_test(NAME test-await-assertions
 add_test(NAME test-await-assertions-selftest
     COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_test_awaits.py)
+add_test(NAME benchmark-runner-controls
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_benchmark_runner.py)
+set_tests_properties(benchmark-runner-controls PROPERTIES TIMEOUT 30)
 add_test(NAME ctest-timeout-coverage-selftest
     COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_ctest_timeouts.py)

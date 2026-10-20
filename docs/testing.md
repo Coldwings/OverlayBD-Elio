@@ -1665,3 +1665,55 @@ Elio positional-transfer adapter regressions:
   size clamping, zero-length reads, partial EOF and untouched buffer suffixes.
 - `format: writable mapped reads reject early file EOF` — sparse and LSMT
   mapped reads retain strict format-level EOF errors after partial progress.
+
+## Optional ublk performance controls
+
+Configure `OBD_BUILD_BENCHMARKS=ON` with `OBD_ENABLE_UBLK=ON` to build
+`obd-bench-ublk-read`; the benchmark option defaults to OFF. The developer
+runner and full operating procedure are in
+[`benchmarks/README.md`](../benchmarks/README.md). These controls use fio and
+explicit device permissions; they are outside the default test/CTest path.
+For example, after configuring equivalent isolated revisions:
+
+```sh
+python3 benchmarks/run_ublk_read.py \
+  --baseline-build /path/to/baseline/build-bench \
+  --candidate-build /path/to/candidate/build-bench \
+  --out /path/to/new-results --workers 8 --rebuild-before-run
+```
+
+The worker count and paths are operator choices. Results must live outside
+both source checkouts. The optional explicit `--sudo` launcher applies only
+to the owned driver. The runner never loads modules, deletes unrelated devices
+or kills a live owner after an observation timeout. It retains ownership/log
+records and stops admitting more trials; the public unbounded graceful drain
+can remain live indefinitely if cleanup cannot start or finish. Device ownership
+stays in synchronous main, so worker-frame failure does not destroy the Device.
+
+The runner supports Unix Makefiles and single-configuration Ninja; unsupported
+generators are rejected before Device admission. The initial sources are
+minimal zero and a dense plain LSMT artifact produced
+by the real `obd-mkimage`. One artifact is shared by both variants. The runner
+interleaves repetitions and retains fio individual latency/IOPS/achieved depth,
+server user+system CPU per completed IO, switches, independent process ticks
+and raw outputs. Raw/image/fio input hashes are frozen and rechecked before
+and after each completed trial. Reciprocal throughput is not individual request latency.
+Prewarming by reading is not residency verification; retain external per-trial
+residency evidence before making fully-cached claims.
+
+Provenance labels checkout HEAD, build artifacts, compile commands and native
+Elio headers as observations. Header-only source overrides are identified from
+the actual benchmark compile include path. `--rebuild-before-run` records a
+public incremental build before measurement, freezing source/cache/HEAD/native
+headers across it and rechecking post-build artifacts through the matrix. It
+is not a clean rebuild or a generic cryptographic build proof. These controls
+neither decide the default source-execution policy nor represent full TurboOCI
+or CPU-heavy gzip workloads.
+
+The unprivileged `benchmark-runner-controls` CTest entry checks duplicate/nonfinite
+arguments, output preservation, generator handling, observed-input changes and
+an ordinary child retained after observation timeout. It creates no Device.
+The default build-test CI configuration enables the optional target so it is
+compiled; other configurations leave it OFF and no privileged performance CI
+is introduced. Direct driver configs can request `fail_after_warmup` to validate
+real-body-failure drain without treating that diagnostic as a measured sample.
