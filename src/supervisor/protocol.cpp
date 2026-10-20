@@ -79,15 +79,18 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
                     "'dev_id' an integer";
             return std::nullopt;
         }
-        // 'dev_id' is an OPTIONAL kernel device id (-1/absent = auto). The
-        // range check belongs here, with the other type validation: a JSON
-        // integer is 'is_number_integer' even when it cannot fit an int, and
-        // the handler's get<int>() would then throw out of the handler (an
-        // "internal error" reply) instead of a clean parse error.
+        // 'dev_id' is an OPTIONAL kernel device id (-1/absent = auto).
+        // Validate in the JSON integer's original domain before narrowing:
+        // UINT64_MAX would otherwise become -1 and request automatic
+        // allocation instead of reporting an invalid explicit device ID.
         if (j.contains("dev_id")) {
-            const int64_t dev_id = j["dev_id"].get<int64_t>();
-            if (dev_id < -1 || dev_id > INT32_MAX) {
-                error = "create 'dev_id' must be an integer >= -1";
+            const auto& value = j["dev_id"];
+            const bool in_range = value.is_number_unsigned()
+                ? value.get<uint64_t>() <= uint64_t{INT32_MAX}
+                : value.get<int64_t>() >= -1 &&
+                  value.get<int64_t>() <= INT32_MAX;
+            if (!in_range) {
+                error = "create 'dev_id' must be an integer in [-1, INT32_MAX]";
                 return std::nullopt;
             }
         }

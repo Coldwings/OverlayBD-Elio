@@ -75,9 +75,9 @@ string `path`, and an integer `duration_sec`; `trace_stop` requires a
 string `id`; `resize` requires a string `id` and a non-negative integer
 `size`; `create` and `commit` accept optional non-negative integer
 `virtual_size` fields; `create`'s optional `dev_id` must be an integer
-in `[-1, INT32_MAX]` (an out-of-range JSON integer is rejected here — the
-handler reads it as an `int`, and letting it through would surface as an
-"internal error" instead of a clean parse error); `hello` and `list` take
+in `[-1, INT32_MAX]`. Unsigned values are range-checked before conversion,
+so an oversized explicit ID cannot wrap to the `-1` automatic-allocation
+sentinel. Invalid IDs return a protocol error; `hello` and `list` take
 no fields; anything else is "unknown cmd". Field TYPES are validated at
 parse time (value-level
 blank rules — positive, 512-aligned, within the sanity bound, safe
@@ -801,6 +801,11 @@ rules apply, including when the originating create remains inside mkfs.
   choice, monitor/reaper coroutine structure.
 
 ## Testing
+
+`supervisor: create validates device ids before integer narrowing` exercises
+image and blank create requests at both valid endpoints and signed/unsigned
+overflow boundaries, including `UINT64_MAX`. It checks the parser directly
+and does not create a device.
 
 The daemon-lifetime fixture records each exact weak `Child` owner before
 registry publication can expose it to the reaper. Cleanup locks that
