@@ -1445,13 +1445,25 @@ Every test, grouped by area, with the property it guards.
   plain LSMT, `MergedLsmt`, `LsmtLayer`, and `RegistrySource` over the existing
   range-capable `BlobServer`. Four dedicated client threads per queue bind to
   distinct allowed CPUs selected from the kernel's `/sys/block/<device>/mq/*/cpu_list`.
-  Distinct client-offset cohorts infer routing to both queues from that CPU map;
-  this is not direct kernel queue tracing. A wrapper at the merged source
-  boundary records stable entry worker IDs and overlapping reads per cohort,
-  delays through native asynchronous timers, injects `-EIO`, and verifies later
-  reads recover with correct bytes after more operations than available tags.
+  The existing test friend snapshots immutable queue buffer addresses, so a
+  wrapper at the merged source boundary identifies each actual queue and tag;
+  the CPU map selects clients but does not supply the observed queue identity.
+  Thirty-two exact offset/count signatures use nonadjacent interior reads to
+  avoid client request merging. Missing, duplicate, wrong-wave, or misrouted
+  selected requests fail the case. A zero-inflight predicate and wave arming
+  share one mutex; no fixed startup settling delay is used. Startup and late
+  unmatched reads remain recorded and always delegate normally. All reads must
+  keep one stable entry worker per actual queue and stay within its tag depth;
+  each selected wave also requires overlapping reads, and actual tag IDs prove
+  reuse across waves. Selected reads delay through native asynchronous timers;
+  the third wave injects `-EIO` before delegation, and the fourth verifies correct
+  recovery bytes. Each selected request checks its delegate/result outcome.
   The failure is a source-boundary injection, not an HTTP failure. Successful
-  waves must perform real HTTP data GETs. Initial bridge placement can give the
+  waves must perform real HTTP data GETs; unrelated reads may also issue GETs
+  during the error wave, so a global zero-GET assertion would be invalid.
+  Matching background traffic cannot be distinguished by originating process;
+  a collision with the selected manifest fails rather than being ignored.
+  Initial bridge placement can give the
   queues one or two distinct worker owners; both are valid. Device/source
   ownership survives assertion failures through asynchronous drain; a native
   TaskGroup owns and joins the mock listener before its active sessions drain.
@@ -1462,7 +1474,9 @@ Every test, grouped by area, with the property it guards.
   fixture never forces teardown or destroys a live Device on coroutine unwind.
   Self-skips without ublk, or after normal cleanup if the two queue maps lack
   distinct CPUs allowed to the test. Logs preserve selected CPUs, observed
-  owners, overlap, and HTTP counts; an unsupported CPU-map skip is not coverage.
+  owners, overlap, actual qid/tag/offset/count and delegate results for selected
+  and unmatched reads after drain, and HTTP counts; an unsupported CPU-map skip
+  is not coverage.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with
