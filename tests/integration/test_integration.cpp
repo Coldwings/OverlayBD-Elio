@@ -649,7 +649,9 @@ constexpr size_t kLocalityClients = kLocalityQueues * kLocalityDepth;
 // Interior, nonadjacent requests cannot merge with one another. The manifest
 // identifies selected reads, never their queue: only io_buf identifies qid/tag.
 constexpr uint64_t locality_offset(size_t wave, size_t lane) {
-    return 256 * 1024 + (wave * kLocalityClients + lane) * 32 * 1024;
+    // Unselected reads have included power-of-two offsets; keep signatures apart.
+    return 256 * 1024 + kLocalityReadBytes +
+           (wave * kLocalityClients + lane) * 32 * 1024;
 }
 
 struct QueueReadObservation {
