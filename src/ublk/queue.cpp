@@ -56,11 +56,19 @@ Queue::~Queue() {
     if (done_efd_ >= 0) ::close(done_efd_);
 }
 
-void Queue::open() {
-    const std::string path = Ctrl::cdev_path(dev_id_);
-    ublkc_fd_ = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
-    if (ublkc_fd_ < 0) {
-        throw_errno(errno, "cannot open " + path);
+void Queue::open(int shared_cdev_fd) {
+    if (shared_cdev_fd >= 0) {
+        ublkc_fd_ = ::fcntl(shared_cdev_fd, F_DUPFD_CLOEXEC, 0);
+        if (ublkc_fd_ < 0) {
+            throw_errno(errno, "cannot duplicate ublk char device for queue " +
+                                   std::to_string(q_id_));
+        }
+    } else {
+        const std::string path = Ctrl::cdev_path(dev_id_);
+        ublkc_fd_ = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        if (ublkc_fd_ < 0) {
+            throw_errno(errno, "cannot open " + path);
+        }
     }
 
     cmd_buf_len_ = cmd_buf_size(depth_, sizeof(ublksrv_io_desc));
