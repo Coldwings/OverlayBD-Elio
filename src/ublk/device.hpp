@@ -127,7 +127,9 @@ private:
     elio::coro::task<void> retained_startup();
     void collect_bridge_results() noexcept;
     bool release_once() noexcept;
+    void refresh_startup() noexcept;
     void publish_startup() noexcept;
+    bool try_publish_ready();
     static int cancel_control(void*, uint32_t) noexcept;
     static void complete_control(void*, uint32_t, int) noexcept;
     static void observe_control(void*, const CtrlProgress&) noexcept;

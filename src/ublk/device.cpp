@@ -69,8 +69,7 @@ elio::coro::task<std::unique_ptr<Device>> Device::attach(
                                   startup, std::move(failure_cleanup));
 }
 
-void Device::publish_startup() noexcept {
-    if (!startup_) return;
+void Device::refresh_startup() noexcept {
     startup_state_.device_id = dev_id_;
     startup_state_.raw_published = 0;
     startup_state_.raw_retired = 0;
@@ -85,7 +84,37 @@ void Device::publish_startup() noexcept {
             startup_state_.queue_id = q->q_id();
         }
     }
+}
+
+void Device::publish_startup() noexcept {
+    if (!startup_) return;
+    refresh_startup();
     startup_->publish(startup_state_);
+}
+
+bool Device::try_publish_ready() {
+    refresh_startup();
+    for (size_t i = 0; i < queues_.size(); ++i) {
+        const auto& q = queues_[i];
+        if (q->failed() || bridge_tasks_[i].is_ready())
+            throw error(q->failure() ? q->failure() : EIO,
+                        "ublk owner failed during startup control");
+    }
+    if (!startup_state_.kernel_debt_known)
+        throw error(EPROTO, "ublk startup command ownership is unknown");
+    if (!startup_->close_release_admission()) return false;
+
+    // Original START/END success wins over earlier cancellation intent.
+    // All failure checks precede admission closure. Publish this successful
+    // handoff without rescanning queues and mixing a later runtime failure
+    // into the ready record: the receiver requires a coherent ready state.
+    startup_state_.phase = StartupPhase::ready;
+    startup_state_.reason_errno = 0;
+    startup_state_.control_pending = false;
+    startup_->publish(startup_state_);
+    ctrl_->set_observer({});
+    startup_ = nullptr;
+    return true;
 }
 
 int Device::cancel_control(void* opaque, uint32_t opcode) noexcept {
@@ -248,22 +277,10 @@ elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
             if (!busy) break;
             co_await elio::time::sleep_for(std::chrono::milliseconds(1));
         }
-        for (size_t i = 0; i < dev->queues_.size(); ++i) {
-            const auto& q = dev->queues_[i];
-            if (q->failed() || dev->bridge_tasks_[i].is_ready())
-                throw error(q->failure() ? q->failure() : EIO,
-                            "ublk owner failed during startup control");
-        }
+        if (dev->try_publish_ready())
+            co_return dev; // Ownership transfer after this point is nonthrowing.
     } catch (...) {
         failure = std::current_exception();
-    }
-    if (!failure && startup.close_release_admission()) {
-        dev->startup_state_.phase = StartupPhase::ready;
-        dev->startup_state_.control_pending = false;
-        dev->publish_startup();
-        dev->ctrl_->set_observer({});
-        dev->startup_ = nullptr;
-        co_return dev; // Ownership transfer after this point is nonthrowing.
     }
 
     // Allocate/await the failure coordinator without allowing an allocation

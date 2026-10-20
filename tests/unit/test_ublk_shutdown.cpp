@@ -1,6 +1,8 @@
 // Ordinary lifecycle tests use real Device/bridge code and eventfds. Only
 // /dev/ublkc registration, its command mapping and queue ring are bypassed.
 #include "supervisor/device_control.hpp"
+#include "supervisor/child.hpp"
+#include "cmd/startup_socket.hpp"
 #include "ublk/device.hpp"
 #include "ublk/elio_bridge.hpp"
 
@@ -134,6 +136,8 @@ struct DeviceTestAccess {
     }
 
     static void end_recovery(Device& dev) { dev.ctrl_->end_user_recovery(dev.dev_id_); }
+    static void start_device(Device& dev) { dev.ctrl_->start_dev(dev.dev_id_); }
+    static bool publish_ready(Device& dev) { return dev.try_publish_ready(); }
     static bool owns_id(const Device& dev) { return dev.owns_id_; }
 
     static bool stopping(const Device& dev) { return dev.stop_.load(); }
@@ -211,8 +215,9 @@ struct ReadState {
     std::atomic<bool> destroyed_off_worker{false};
 };
 
-// Immediate scripted control CQEs exercise the real Ctrl/Device ownership
-// callbacks. Queue delivery below still uses the ordinary bridge fixture;
+// Scripted control CQEs exercise the real Ctrl/Device ownership callbacks.
+// The optional delayed START/END waits for actual cancellation submission before
+// delivering original success. Queue delivery uses the ordinary bridge fixture;
 // this is not proof of raw FETCH retirement on a real ublk driver.
 class LifecycleTransport final : public obd::ublk::detail::CtrlTransport {
 public:
@@ -224,6 +229,11 @@ public:
     std::atomic<bool> source_finished_at_stop{false}, cdev_closed_at_delete{false};
     bool refuse_first_stop = false;
     int end_result = 0;
+    bool delay_start_success = false;
+    obd::ublk::StartupControl* startup = nullptr;
+    unsigned cancellations = 0;
+    bool timed_out_before_success = false;
+    bool cancellation_target_matches = false;
 
     io_uring_sqe* get_sqe() noexcept override { prepared_ = true; return sqes_.data(); }
     unsigned sq_ready() noexcept override { return prepared_ ? 1 : 0; }
@@ -232,6 +242,27 @@ public:
         prepared_ = false;
         cqe_ = {};
         cqe_.user_data = sqes_[0].user_data;
+        if (sqes_[0].opcode == IORING_OP_ASYNC_CANCEL) {
+            ++cancellations;
+            cancellation_target_matches = sqes_[0].addr == delayed_cookie_;
+            if (startup) {
+                const auto facts = startup->snapshot();
+                timed_out_before_success = facts.reason_errno == ETIMEDOUT &&
+                    facts.control_pending && !facts.original_known;
+            }
+            cqe_.res = -ENOENT;
+            available_ = true;
+            original_after_cancel_ = true;
+            return 1;
+        }
+        if (delay_start_success && (sqes_[0].cmd_op == UBLK_U_CMD_START_DEV ||
+                                   sqes_[0].cmd_op == UBLK_U_CMD_END_USER_RECOVERY)) {
+            delayed_cookie_ = cqe_.user_data;
+            delayed_result_ = sqes_[0].cmd_op == UBLK_U_CMD_END_USER_RECOVERY
+                ? end_result : 0;
+            available_ = false;
+            return 1;
+        }
         switch (sqes_[0].cmd_op) {
         case UBLK_U_CMD_STOP_DEV:
             source_finished_at_stop.store(!source || source->finished.load());
@@ -243,6 +274,7 @@ public:
             cdev_closed_at_delete.store(!queue || queue->cdev_fd() == -1);
             deletions.fetch_add(1);
             break;
+        case UBLK_U_CMD_START_DEV: break;
         case UBLK_U_CMD_END_USER_RECOVERY: cqe_.res = end_result; break;
         default: cqe_.res = -EINVAL; break;
         }
@@ -254,11 +286,24 @@ public:
         *cqe = available_ ? &cqe_ : nullptr;
         return available_ ? 0 : -EAGAIN;
     }
-    void cqe_seen(io_uring_cqe*) noexcept override { available_ = false; }
+    void cqe_seen(io_uring_cqe*) noexcept override {
+        if (original_after_cancel_) {
+            cqe_ = {};
+            cqe_.user_data = delayed_cookie_;
+            cqe_.res = delayed_result_;
+            original_after_cancel_ = false;
+            available_ = true;
+        } else {
+            available_ = false;
+        }
+    }
     void idle() noexcept override { std::this_thread::yield(); }
 private:
     std::array<io_uring_sqe, 2> sqes_{};
     bool prepared_ = false, available_ = false;
+    uint64_t delayed_cookie_ = 0;
+    int delayed_result_ = 0;
+    bool original_after_cancel_ = false;
     io_uring_cqe cqe_{};
 };
 
@@ -1297,6 +1342,155 @@ TEST_CASE("ublk: original END completion decides recovery adoption",
     }, one_worker());
     CHECK(transport.stops.load() == 1);
     CHECK(transport.deletions.load() == 1);
+}
+
+TEST_CASE("ublk: late successful startup produces an accepted ready handoff",
+          "[ublk][shutdown][startup-handoff]") {
+    using namespace obd::ublk;
+    using namespace obd::supervisor;
+    using namespace std::chrono_literals;
+    bool recovery = false;
+    bool operator_release = false;
+    SECTION("original START succeeds after deadline cancellation") {}
+    SECTION("original END succeeds after deadline cancellation") { recovery = true; }
+    SECTION("operator release wins the START handoff") { operator_release = true; }
+    SECTION("operator release wins the END handoff") {
+        recovery = true;
+        operator_release = true;
+    }
+
+    ChildSpec spec;
+    spec.id = "late-startup-success";
+    // This process exits by itself even when a regression keeps protection
+    // installed. The test owns and collects it through Child, never raw waitpid.
+    spec.device_bin = "/bin/true";
+    spec.startup_generation = 19;
+    auto child = Child::spawn(spec);
+    REQUIRE(child->protect_startup(19));
+
+    ReadState state;
+    LifecycleTransport transport;
+    StartupControl startup(19);
+    transport.delay_start_success = true;
+    transport.startup = &startup;
+    bool handed_off = false;
+    bool protected_after_handoff = false;
+    bool decoded_ready = false;
+    bool accepted_ready = false;
+    bool released_on_request = false;
+    std::exception_ptr failure;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto dev = DeviceTestAccess::make(std::make_unique<CompletingSource>(state));
+        DeviceTestAccess::recovering(*dev, startup, transport);
+        transport.queue = &DeviceTestAccess::queue(*dev);
+        transport.device = dev.get();
+        DeviceTestAccess::start(*dev);
+        try {
+            const auto bridge_deadline = std::chrono::steady_clock::now() + 2s;
+            while (!DeviceTestAccess::queue(*dev).bridge_ready() &&
+                   std::chrono::steady_clock::now() < bridge_deadline)
+                co_await elio::time::sleep_for(1ms);
+            CHECK(DeviceTestAccess::queue(*dev).bridge_ready());
+            // The fixture's default deadline is already expired. Delaying the
+            // original CQE forces Ctrl through Device::cancel_control and its
+            // progress observer; no timeout/reason fields are fabricated here.
+            co_await elio::spawn_blocking([&] {
+                if (recovery) DeviceTestAccess::end_recovery(*dev);
+                else DeviceTestAccess::start_device(*dev);
+            });
+            const auto before_handoff = startup.snapshot();
+            CHECK(before_handoff.reason_errno == ETIMEDOUT);
+            CHECK(before_handoff.phase == StartupPhase::retained);
+            CHECK(before_handoff.original_known);
+            CHECK(before_handoff.original_result == 0);
+            CHECK(before_handoff.cancel_known);
+            CHECK(before_handoff.cancel_result == -ENOENT);
+            CHECK_FALSE(before_handoff.control_pending);
+            CHECK(DeviceTestAccess::owns_id(*dev));
+            CHECK(dev->started());
+            CHECK(DeviceTestAccess::running(*dev) == 1);
+            const auto pending = parse_device_status(make_device_status(DeviceStatus{
+                "failed", "", "deadline cancellation intent",
+                obd::cmd::startup_status(before_handoff)}));
+            CHECK(pending.has_value());
+            if (pending && pending->startup_owner)
+                CHECK(child->observe_startup(*pending->startup_owner, false));
+            CHECK(child->startup_protected());
+
+            if (operator_release) {
+                const auto sequence = child->admit_startup_release();
+                CHECK(sequence == 1);
+                CHECK(startup.request_release(19, 1) == ReleaseRequestResult::accepted);
+            }
+            handed_off = DeviceTestAccess::publish_ready(*dev);
+            const auto after_handoff = startup.snapshot();
+            if (handed_off) {
+                CHECK(after_handoff.reason_errno == 0);
+                CHECK(after_handoff.phase == StartupPhase::ready);
+                CHECK_FALSE(after_handoff.control_pending);
+                CHECK(after_handoff.original_known);
+                CHECK(after_handoff.original_result == 0);
+                CHECK(after_handoff.cancel_known);
+                CHECK(after_handoff.cancel_result == -ENOENT);
+                CHECK(startup.request_release(19, 1) == ReleaseRequestResult::not_startup);
+                // Exercise the exact codec consumed by the supervisor, then
+                // actual Child admission. Parsing alone would miss protection.
+                const auto ready = parse_device_status(make_device_status(DeviceStatus{
+                    "ready", dev->bdev_path(), "", obd::cmd::startup_status(after_handoff)}));
+                decoded_ready = ready && ready->startup_owner.has_value();
+                if (decoded_ready) {
+                    accepted_ready = child->observe_startup(*ready->startup_owner, true);
+                    if (accepted_ready)
+                        child->update_status({ready->state, ready->device, ready->error, -1});
+                }
+            } else {
+                CHECK(after_handoff.phase != StartupPhase::ready);
+            }
+            protected_after_handoff = child->startup_protected();
+            if (operator_release) {
+                try {
+                    (void)co_await DeviceTestAccess::fail_startup(
+                        *dev, startup, {}, recovery);
+                } catch (const StartupReleased&) { released_on_request = true; }
+                const auto released = parse_device_status(make_device_status(DeviceStatus{
+                    "stopped", "", "", obd::cmd::startup_status(startup.snapshot())}));
+                CHECK(released.has_value());
+                if (released && released->startup_owner)
+                    CHECK(child->observe_startup(*released->startup_owner, false));
+            }
+        } catch (...) { failure = std::current_exception(); }
+        // Successful original START/END already committed ownership. Both the
+        // ordinary ready path and an assertion/error path can safely drain it.
+        co_await dev->stop_async();
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+
+    CHECK(transport.cancellations == 1);
+    CHECK(transport.cancellation_target_matches);
+    CHECK(transport.timed_out_before_success);
+    CHECK(handed_off == !operator_release);
+    CHECK(protected_after_handoff == operator_release);
+    CHECK(decoded_ready == !operator_release);
+    CHECK(accepted_ready == !operator_release);
+    CHECK(released_on_request == operator_release);
+    CHECK_FALSE(child->startup_protected());
+    if (!operator_release) CHECK(child->status().state == "ready");
+    CHECK(transport.stops.load() == 1);
+    CHECK(transport.deletions.load() == 1);
+    CHECK(transport.native_frames_gone_at_stop.load());
+    CHECK(transport.cdev_closed_at_delete.load());
+    CHECK(state.destroyed.load());
+
+    // An accepted ready record permits the ordinary terminate/reap path. The
+    // independent /bin/true fixture guarantees cleanup even under the old bug.
+    child->terminate();
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!child->reaped() && std::chrono::steady_clock::now() < deadline) {
+        (void)child->try_reap();
+        if (!child->reaped()) std::this_thread::sleep_for(1ms);
+    }
+    CHECK(child->reaped());
+    if (failure) std::rethrow_exception(failure);
 }
 
 TEST_CASE("ublk: blocking stop waits for a slow source to finish", "[ublk][shutdown]") {

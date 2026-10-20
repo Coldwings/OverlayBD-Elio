@@ -216,7 +216,12 @@ void Queue::arm_done_poll() {
 
 void Queue::drain_done() {
     uint64_t cnt;
-    (void)::read(done_efd_, &cnt, sizeof(cnt));
+    ssize_t consumed;
+    do {
+        consumed = ::read(done_efd_, &cnt, sizeof(cnt));
+    } while (consumed < 0 && errno == EINTR);
+    if (consumed < 0 && errno != EAGAIN) fail(errno);
+    else if (consumed >= 0 && consumed != static_cast<ssize_t>(sizeof(cnt))) fail(EIO);
     std::deque<std::pair<uint16_t, int32_t>> batch;
     {
         std::lock_guard lock(mu_);

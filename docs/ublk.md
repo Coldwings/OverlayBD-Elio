@@ -184,6 +184,12 @@ and release admission; it owns none of those resources. Reporting failure or
 cancelling an observer cannot unwind the owning startup task. Successful ADD
 or original END supplies cleanup authority; failed unadopted recovery does not.
 
+Original START/END success can race an earlier timeout cancellation request.
+If the queues remain healthy and no operator release won admission, the
+successful ready handoff clears that historical error reason. The supervisor
+then accepts the coherent ready record and switches to ordinary lifecycle
+management; historical cancellation intent cannot strand startup protection.
+
 Explicit release settles startup control work, stops new source admission and
 awaits native bridge/handler frame destruction while retaining queue owners.
 Initial FETCH issuance must be fenced before the authorized STOP cancellation
