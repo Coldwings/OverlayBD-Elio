@@ -1,7 +1,7 @@
 # ADR-0021: Reuse tag handlers on their bridge worker
 
 - Status: accepted
-- Date: 2026-10-19
+- Date: 2026-10-20
 - Supersedes: none
 - Binds: src/ublk/elio_bridge.cpp, docs/ublk.md
 
@@ -14,6 +14,14 @@ on a different worker from its bridge, even for a single queue at depth one.
 The controlled placement experiment in issue
 [#120](https://github.com/Coldwings/OverlayBD-Elio/issues/120) identifies this
 handoff as a material part of the cached local-read latency.
+
+LSMT read latency, throughput and CPU cost are the primary performance
+objectives. Controlled local zero/LSMT reads improve with queue-local reusable
+handlers. Actual gzip-reader controls also expose a trade-off: CPU-intensive
+decompression for one queue concentrates on one worker and can lose substantial
+high-depth throughput. Favor the LSMT path while retaining asynchronous source
+semantics and documenting this cost; gzip throughput parity is not a condition
+for choosing this placement policy.
 
 A kernel tag permits one outstanding request at a time. This provides a natural
 reuse boundary without serializing requests across different tags. Native
@@ -33,11 +41,12 @@ before accessing tag state or publishing completion.
 - A tag's initial child admission may migrate once to its bridge worker. A
   reused tag avoids a fresh round-robin admission; unused tags do not allocate
   handler frames or incur startup scheduling.
-- Independent tags retain overlapping source operations. This is a per-queue
-  locality policy, not a global single-worker runtime. It can reduce CPU
-  parallelism for a single queue's CPU-intensive source work, so workload and
-  multi-queue trade-offs must be measured before claiming broad performance
-  improvement.
+- Independent tags retain overlapping asynchronous source operations. CPU work
+  for one queue runs on its bridge worker. The default favors LSMT performance;
+  CPU-intensive gzip work can use fewer cores and lose high-depth throughput.
+  This is a per-queue policy, with the runtime's worker count unchanged.
+  Multi-queue and remote/slow-source behavior require separate validation;
+  cached LSMT gains do not establish improvement for every source.
 - The bridge worker owns the tag's pending request, busy state and event.
   Foreign child destruction publishes atomic failure facts and wakes the
   bridge. The bridge consumes those facts before tag reuse. An active handler
@@ -60,6 +69,9 @@ before accessing tag state or publishing completion.
 
 - Fresh per-request TaskGroup admission repeats the measured placement hop.
   Binding the newly admitted body still pays that initial hop on every I/O.
+- Keeping fresh round-robin admission distributes CPU-heavy source work across
+  workers, but retains the higher cached LSMT floor. The selected default accepts
+  the measured gzip trade-off in favor of the primary LSMT objective.
 - Eagerly starting every tag handler multiplies startup work at large queue
   geometries even when only a small number of tags are used.
 - Directly awaiting each source read in the bridge serializes independent

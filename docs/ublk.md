@@ -361,6 +361,13 @@ source tasks and unset native event waits can still allocate. Performance issue
 [#120](https://github.com/Coldwings/OverlayBD-Elio/issues/120) also requires
 evaluation of those remaining handoffs and concurrent workload trade-offs.
 
+The default prioritizes LSMT latency, throughput and CPU cost. Tags can overlap
+asynchronous I/O, but CPU work for one queue runs on its bridge worker. A
+CPU-intensive gzip source may therefore use fewer cores and lose high-depth
+throughput. The runtime's worker count is unchanged; this policy does not
+guarantee the same performance trade-off for every source or queue geometry
+(ADR-0021).
+
 ### `src/ublk/device.hpp` — `obd::ublk::Device`
 
 Full lifecycle of one image as one ublk device. Non-copyable.
