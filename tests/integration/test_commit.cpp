@@ -29,9 +29,11 @@
 #include <nlohmann/json.hpp>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1249,6 +1251,205 @@ TEST_CASE("supervisor: rejected commits preserve crash recovery",
     REQUIRE(failures == 0);
 }
 
+
+namespace {
+
+void drain_create_fixture_generations(
+    const std::shared_ptr<supervisor::detail::DaemonTestGate>& gate,
+    const CheckFn& check) {
+    // A broken baseline can overwrite a live generation. Retain and collect
+    // each exact Child owner; never rediscover cleanup authority by PID/ID.
+    for (size_t generation = 0; generation < gate->spawn_count(); ++generation) {
+        const auto child = gate->spawned_child(generation).lock();
+        if (!child) continue;
+        child->kill();
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!child->reaped() && std::chrono::steady_clock::now() < deadline) {
+            child->try_reap();
+            std::this_thread::sleep_for(1ms);
+        }
+        check(child->reaped(), "create fixture generation did not reap");
+    }
+}
+
+void check_failed_create_admission(bool after_spawn) {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string image = write_config(dir, "image.json", nlohmann::json::object());
+    const std::string point = after_spawn ? "create_before_publish" : "create_admitted";
+    auto gate = std::make_shared<supervisor::detail::DaemonTestGate>();
+    gate->arm(point);
+    gate->fail_once(point);
+    auto mask = block_daemon_signals();
+    auto cfg = commit_test_cfg(sock);
+    cfg.blank_dir = dir / "blank";
+    const int failures = run_daemon_case(cfg,
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            auto rpc = [&](const nlohmann::json& command) {
+                return nlohmann::json::parse(uds_rpc(s, command.dump() + "\n"));
+            };
+            std::thread create;
+            nlohmann::json failed;
+            std::string error;
+            int pidfd = -1;
+            auto finish = [&] {
+                gate->release();
+                if (create.joinable()) create.join();
+                drain_create_fixture_generations(gate, check);
+                if (pidfd >= 0) { ::close(pidfd); pidfd = -1; }
+            };
+            try {
+                create = std::thread([&] {
+                    try { failed = rpc({{"cmd", "create"}, {"id", "x"}, {"config", image}}); }
+                    catch (const std::exception& e) { error = e.what(); }
+                });
+                if (!gate->wait()) throw std::runtime_error("create setup gate not reached");
+                check(!rpc({{"cmd", "status"}, {"id", "x"}}).value("ok", true),
+                      "unpublished create exposed a placeholder status");
+                check(rpc({{"cmd", "list"}}).at("devices").empty(),
+                      "unpublished create exposed a placeholder list entry");
+                if (after_spawn) {
+                    // The original Child is still held before publication and
+                    // cannot yet be reaped by the daemon. Pin identity now;
+                    // do not keep a strong owner across the injected unwind.
+                    {
+                        const auto child = gate->spawned_child().lock();
+                        if (!child) throw std::runtime_error("unpublished child missing");
+                        pidfd = static_cast<int>(::syscall(SYS_pidfd_open, child->pid(), 0));
+                    }
+                    if (pidfd < 0) throw std::system_error(errno, std::generic_category(), "pin unpublished child");
+                    pollfd alive{pidfd, POLLIN, 0};
+                    check(::poll(&alive, 1, 0) == 0, "unpublished fixture exited before failure");
+                }
+                gate->release();
+                create.join();
+                check(error.empty(), "injected create failure dropped its RPC");
+                check(!failed.value("ok", true), "injected create setup failure succeeded");
+                if (pidfd >= 0) {
+                    pollfd exited{pidfd, POLLIN, 0};
+                    check(::poll(&exited, 1, 0) == 1,
+                          "failed create replied before its unpublished child exited");
+                    // Readiness also accepts an exited zombie. Observe the
+                    // pinned process without consuming any owner's status:
+                    // only actual collection makes waitid report ECHILD.
+                    siginfo_t status{};
+                    int waited;
+                    do {
+                        waited = ::waitid(P_PIDFD, static_cast<id_t>(pidfd),
+                                          &status, WEXITED | WNOHANG | WNOWAIT);
+                    } while (waited < 0 && errno == EINTR);
+                    const int wait_error = errno;
+                    check(waited < 0 && wait_error == ECHILD,
+                          "failed create replied before collecting its unpublished child");
+                }
+                check(!rpc({{"cmd", "status"}, {"id", "x"}}).value("ok", true),
+                      "failed setup published an entry");
+                const auto retry = rpc({{"cmd", "create"}, {"id", "x"},
+                                         {"blank", {{"size", kFakeVsize}}}});
+                check(retry.value("ok", false), "failed setup left its admission reserved");
+                check(gate->spawn_count() == (after_spawn ? 2u : 1u),
+                      "failed setup or retry spawned an unexpected generation");
+                check(rpc({{"cmd", "destroy"}, {"id", "x"}}).value("ok", false),
+                      "retried create could not be destroyed");
+                finish();
+            } catch (...) { finish(); throw; }
+        }, gate);
+    CHECK_FALSE(gate->timeout());
+    REQUIRE(failures == 0);
+}
+
+}  // namespace
+
+TEST_CASE("supervisor: duplicate create admission cannot spawn or replace an active id",
+          "[supervisor][create-admission]") {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string rejected_upper = dir / "rejected-upper";
+    const std::string duplicate_config = write_config(dir, "duplicate.json",
+        {{"upper", {{"type", "lsmt"}, {"dir", rejected_upper}}}});
+    auto gate = std::make_shared<supervisor::detail::DaemonTestGate>();
+    gate->arm("create_admitted");
+    auto mask = block_daemon_signals();
+    auto cfg = commit_test_cfg(sock);
+    cfg.blank_dir = dir / "blank";
+    const int failures = run_daemon_case(cfg,
+        [&](const std::string& s, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(s); ++i) {
+                std::this_thread::sleep_for(20ms);
+            }
+            auto rpc = [&](const nlohmann::json& command) {
+                return nlohmann::json::parse(uds_rpc(s, command.dump() + "\n"));
+            };
+            std::thread first;
+            nlohmann::json admitted;
+            std::string error;
+            auto finish = [&] {
+                gate->release();
+                if (first.joinable()) first.join();
+                drain_create_fixture_generations(gate, check);
+            };
+            try {
+                first = std::thread([&] {
+                    try { admitted = rpc({{"cmd", "create"}, {"id", "x"},
+                                            {"blank", {{"size", kFakeVsize}}}}); }
+                    catch (const std::exception& e) { error = e.what(); }
+                });
+                if (!gate->wait()) throw std::runtime_error("create admission gate not reached");
+                check(gate->spawn_count() == 0, "admitted create spawned before held setup");
+                check(!rpc({{"cmd", "status"}, {"id", "x"}}).value("ok", true),
+                      "private admission was exposed through status");
+                check(rpc({{"cmd", "list"}}).at("devices").empty(),
+                      "private admission was exposed through list");
+                const auto duplicate = rpc({{"cmd", "create"}, {"id", "x"},
+                                             {"config", duplicate_config}});
+                check(!duplicate.value("ok", true), "concurrent duplicate create succeeded");
+                check(duplicate.value("error", "") == "id already exists: x",
+                      "duplicate create lost its rejection reason");
+                check(gate->spawn_count() == 0, "duplicate create spawned a second child");
+                check(!std::filesystem::exists(rejected_upper),
+                      "duplicate create initialized its writable workspace");
+                // A different ID must reach ready while A remains held; no
+                // global registry lock spans config, spawn or readiness work.
+                const auto other = rpc({{"cmd", "create"}, {"id", "other"},
+                                         {"blank", {{"size", kFakeVsize}}}});
+                check(other.value("ok", false), "unrelated create stalled or failed");
+                check(gate->spawn_count() == 1, "unrelated create did not own the only child");
+                check(!std::filesystem::exists(cfg.blank_dir + "/x"),
+                      "held create initialized its workspace early");
+                gate->release();
+                first.join();
+                check(error.empty(), "admitted create RPC threw");
+                check(admitted.value("ok", false), "admitted create failed");
+                const auto status = rpc({{"cmd", "status"}, {"id", "x"}});
+                check(status.value("pid", -1) == admitted.value("pid", -2),
+                      "registry no longer selects the admitted generation");
+                check(gate->spawn_count() == 2, "same-ID admission spawned more than one generation");
+                check(rpc({{"cmd", "resize"}, {"id", "other"},
+                           {"size", kFakeVsize + 4096}}).value("ok", false),
+                      "unrelated device could not serve commands");
+                check(rpc({{"cmd", "destroy"}, {"id", "x"}}).value("ok", false),
+                      "admitted device could not be destroyed");
+                check(rpc({{"cmd", "destroy"}, {"id", "other"}}).value("ok", false),
+                      "unrelated device could not be destroyed");
+                finish();
+            } catch (...) { finish(); throw; }
+        }, gate);
+    CHECK_FALSE(gate->timeout());
+    REQUIRE(failures == 0);
+}
+
+TEST_CASE("supervisor: failed create admission permits retry without publishing a placeholder",
+          "[supervisor][create-admission]") {
+    check_failed_create_admission(false);
+}
+
+TEST_CASE("supervisor: unpublished create failure reaps its child before admission reuse",
+          "[supervisor][create-admission]") {
+    check_failed_create_admission(true);
+}
 
 TEST_CASE("supervisor: stale destroy leaves a recreated device generation registered",
           "[supervisor]") {

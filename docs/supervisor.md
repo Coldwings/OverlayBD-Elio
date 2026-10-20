@@ -495,10 +495,14 @@ starting ──────(crash)─────→ exited   (reaper fills exit
 
 ### Spawning contract
 
-`Child::spawn` (`src/supervisor/child.cpp`) builds **argv entirely before
-fork**, then: socketpair → fork → in the child, only async-signal-safe
+`Child::spawn` (`src/supervisor/child.cpp`) builds **argv and the Child owner
+entirely before fork**, then: socketpair → fork → in the child, only async-signal-safe
 calls (`close`, `dup2`, `fcntl`, `execve`, `_exit`) because the parent
-hosts a live Elio runtime and anything else is UB. The child argv is:
+hosts a live Elio runtime and anything else is UB. The parent immediately
+attaches the PID and channel to the prepared owner through nonthrowing
+assignments. An allocation failure creates no process or channel; a later
+parent-side exception closes the channel and collects the owned child before
+escaping. The child argv is:
 
 ```
 <device_bin> --config <config.json> [--global <overlaybd.json>] \
@@ -605,6 +609,10 @@ completion barrier. Reaping proves process exit, not successful kernel
 - `static std::unique_ptr<Child> Child::spawn(const ChildSpec&)` — forks
   and execs per the spawning contract above; the parent end of the channel
   is set `O_NONBLOCK`. Throws `obd::error` on socketpair/fork failure.
+  Argument preparation and owner allocation may also throw. Returning the
+  owner does not confirm exec or readiness: an exec failure is observed
+  after collection through the child's status (`exit_code == 127`), rather
+  than thrown synchronously by `spawn`.
 - `~Child()` — closes the control fd if held; if the process is still
   unreaped: best-effort `SIGKILL` + blocking `waitpid` (retrying `EINTR`).
   Never signals or waits on an already reaped PID. Never throws.
@@ -679,6 +687,18 @@ devices and stops a live device before sealing (see "Offline commit").
 Blank-born devices commit exactly like image-born ones: their upper path
 and kind are recorded at create time (from the workspace layout, no config
 pre-parse needed).
+
+Create admission reserves an absent ID before asynchronous configuration or
+child setup. Another create for that ID receives the existing duplicate-ID
+error before spawning a child or initializing a workspace. Unrelated IDs
+continue independently; the registry mutex covers only admission and
+publication. Private reservations never appear in list/status as childless
+entries. Publication checks the reservation owner and inserts a complete
+entry atomically, then releases the reservation. Failed setup invalidates
+only its own token; an unpublished child's final owner kills/reaps it before
+that token expires. Inactive weak reservations are pruned by the next create.
+Once published, ordinary registry ownership and existing failure/teardown
+rules apply, including when the originating create remains inside mkfs.
 
 ## Invariants & Guarantees
 
@@ -835,6 +855,9 @@ commands and monitors to distinct workers. No kernel ublk is required.
 | `supervisor: trace stop history survives child EOF` | A completed trace_stop publishes stopped history that child EOF must preserve instead of overwriting as lost. |
 | `supervisor: shutdown drains a monitor after its entry was erased` | Hold EOF cleanup after a successful destroy; shutdown must retain the daemon until the erased entry's monitor departs. |
 | `supervisor: fixture cleanup keeps the original child generation` | Cleanup of a reaped and then expired weak owner leaves a separately owned live replacement untouched; all owned processes drain before assertions. |
+| `supervisor: duplicate create admission cannot spawn or replace an active id` | Hold admitted A before setup; B for the same ID is rejected without a child/workspace, while another ID reaches ready and serves commands. |
+| `supervisor: failed create admission permits retry without publishing a placeholder` | Inject a preparation allocation failure after admission; public lookup stays empty and a later same-ID create succeeds. |
+| `supervisor: unpublished create failure reaps its child before admission reuse` | An early pinned pidfd proves an unpublished child exits before failed-create reply and the next same-ID create. |
 | `supervisor: released device node checks preserve a replacement generation` | A pinned original inode disappears while a new file occupies its old pathname; read-only teardown checks preserve the replacement. |
 | `supervisor: destroy waits for reap after control EOF` | A live fake closes its channel while final cleanup is held; destroy cannot finish or kill it before release. |
 | `supervisor: control EOF stays distinct from a confirmed reap` | EOF fires only the liveness event while the process is alive; actual collection publishes a durable exit code that late monitor lines cannot overwrite. |
@@ -916,6 +939,15 @@ needing a real ublk device or root.
   binary does not exist and guards that the reaped `exit_code` is exactly
   127 and the status error contains "exec failed". This pins the exec-fail
   convention that operators and `cmd_create` rely on.
+- `supervisor: failed child ownership setup leaves no process or channel` —
+  injects an owner-allocation failure and a parent-side exception after fork;
+  no returned `Child` is needed to ensure collection and channel closure.
+- `supervisor: child ownership handoff retains the process and channel` —
+  verifies the successful factory result owns its original PID, nonblocking
+  status channel and copied ID, reports normal exit and closes the channel.
+- `supervisor: spawn failure fixture skips signaling a collected process` —
+  covers parent unwind without a retained process pin; fixture cleanup
+  first checks collection and sends no signal to the retired PID.
 - `supervisor: commit command parses and validates its fields` — pins the
   additive `commit` grammar (requires `id`, optional `user_tag`, unknown
   fields ignored) and that the `hello` handshake advertises the `commit`

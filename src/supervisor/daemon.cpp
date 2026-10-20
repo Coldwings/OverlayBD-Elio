@@ -35,6 +35,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <vector>
 #include <utility>
@@ -347,6 +348,10 @@ private:
 };
 
 class Daemon {
+    // Admission policy only: the coroutine owns the strong token, while
+    // public registry readers see only fully constructed DeviceEntry values.
+    struct CreateAdmission {};
+
     // Protected by mu_. The handler owns this state after routing releases
     // admission, so later commands cannot replace its result or event.
     struct DeviceCommand {
@@ -906,11 +911,23 @@ private:
         if (!file_exists(bin)) {
             co_return reply_error("obd-device binary not found: " + bin);
         }
+        // Keep this owner alive until AFTER private entry/Child teardown.
+        // A weak reservation needs no asynchronous lock from a destructor.
+        const auto admission = std::make_shared<CreateAdmission>();
         {
             co_await mu_.lock();
-            const bool dup = children_.contains(id);
-            mu_.unlock();
-            if (dup) co_return reply_error("id already exists: " + id);
+            elio::sync::lock_guard registry_guard{mu_};
+            std::erase_if(create_admissions_, [](const auto& item) {
+                return item.second.expired();
+            });
+            if (children_.contains(id) || create_admissions_.contains(id)) {
+                co_return reply_error("id already exists: " + id);
+            }
+            create_admissions_.emplace(id, admission);
+        }
+        if (test_gate_) {
+            co_await test_gate_->observe("create_admitted", {});
+            if (test_gate_->take_failure("create_admitted")) throw std::bad_alloc();
         }
 
         auto entry = std::make_shared<DeviceEntry>();
@@ -977,11 +994,23 @@ private:
             co_return reply_error(std::string("spawn failed: ") + e.what());
         }
         std::shared_ptr<Child> child = entry->child;
-        if (test_gate_) test_gate_->record_child(child);
+        if (test_gate_) {
+            test_gate_->record_child(child);
+            co_await test_gate_->observe("create_before_publish", child);
+            if (test_gate_->take_failure("create_before_publish")) throw std::bad_alloc();
+        }
         {
             co_await mu_.lock();
-            children_[id] = entry;
-            mu_.unlock();
+            elio::sync::lock_guard registry_guard{mu_};
+            const auto reserved = create_admissions_.find(id);
+            if (reserved == create_admissions_.end() ||
+                reserved->second.lock() != admission || children_.contains(id)) {
+                co_return reply_error("id already exists: " + id);
+            }
+            // Allocation failure leaves the reservation owned until this
+            // frame first destroys/reaps its unpublished child. No overwrite.
+            children_.emplace(id, entry);
+            create_admissions_.erase(reserved);
         }
         auto monitor = [this, entry, channel = take_channel(*entry->child)]() mutable
                        -> elio::coro::task<void> {
@@ -1792,6 +1821,8 @@ private:
     std::atomic<bool> reaper_stopping_{false};
     elio::sync::mutex mu_;
     std::map<std::string, std::shared_ptr<DeviceEntry>> children_;
+    // Protected by mu_; expired failure records are pruned on admission.
+    std::map<std::string, std::weak_ptr<CreateAdmission>> create_admissions_;
     std::atomic<bool> stopping_{false};
     /// Abandoned mkfs-helper pids the reaper still owes a reap (see
     /// reaper()): drained on every SIGCHLD wake, including the synthetic
