@@ -142,3 +142,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0018](./0018-download-trycnt-structural-boundary.md) | Treat invalid download tryCnt as a structural configuration error | proposed |
 | [0019](./0019-streaming-tar-converter.md) | Build tar streams into deterministic device-free LSMT layers | accepted |
 | [0020](./0020-native-turbooci.md) | Read TurboOCI natively and build its metadata locally | accepted |
+| [0021](./0021-reuse-tag-handlers-on-the-bridge-worker.md) | Reuse tag handlers on their bridge worker | accepted |

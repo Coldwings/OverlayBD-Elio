@@ -25,7 +25,9 @@
 #include <deque>
 #include <mutex>
 #ifdef OBD_TEST_HOOKS
+#include <elio/coro/task.hpp>
 #include <functional>
+namespace elio::sync { class event; }
 #endif
 
 namespace obd::ublk {
@@ -41,6 +43,14 @@ struct IoRequest {
     uint64_t byte_offset() const { return start_sector * 512ULL; }
     uint32_t byte_len() const { return nr_sectors * 512U; }
 };
+
+#ifdef OBD_TEST_HOOKS
+// Deterministic boundary injection, not a claim that a steal was observed.
+enum class BridgeResumePoint {
+    tag_wait, source_return, bridge_read, request_retry, cleanup, close_retry,
+    handlers_join, rejected_return,
+};
+#endif
 
 class Queue {
 public:
@@ -104,6 +114,22 @@ public:
     bool failed() const noexcept { return failed_.load(); }
     int failure() const noexcept { return failure_.load(); }
 
+#ifdef OBD_TEST_HOOKS
+    const auto& bridge_resume_hook_for_test() const noexcept {
+        return bridge_resume_hook_for_test_;
+    }
+    void observe_bridge_resume_for_test(BridgeResumePoint point) const {
+        if (bridge_resume_observer_for_test_) bridge_resume_observer_for_test_(point);
+    }
+    void notify_bridge_admission_for_test(elio::sync::event& ready) {
+        bridge_ready_for_test_ = &ready;
+        if (bridge_admission_hook_for_test_) bridge_admission_hook_for_test_();
+    }
+    void clear_bridge_admission_for_test() noexcept {
+        bridge_ready_for_test_ = nullptr;
+    }
+#endif
+
 private:
     friend struct DeviceTestAccess;
     /// Creates the queue io_uring. Must be called on the queue thread
@@ -138,6 +164,10 @@ private:
     // Inject failure before the potentially allocating completion insertion.
     // Private and per-queue; absent from builds with tests disabled.
     std::function<void()> completion_enqueue_hook_for_test_;
+    std::function<void()> bridge_admission_hook_for_test_;
+    std::function<elio::coro::task<void>(BridgeResumePoint)> bridge_resume_hook_for_test_;
+    std::function<void(BridgeResumePoint)> bridge_resume_observer_for_test_;
+    elio::sync::event* bridge_ready_for_test_ = nullptr;
 #endif
 
     std::atomic<bool> failed_{false};

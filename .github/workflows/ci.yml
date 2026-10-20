@@ -207,6 +207,39 @@ jobs:
           fi
           wait $TESTPID
 
+      - name: "E2E - two queues over remote LSMT"
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          log=build/ublk-e2e-remote-lsmt.log
+          printf 'ublk remote LSMT: head=%s kernel=%s\n' "$GITHUB_SHA" "$(uname -r)" | tee "$log"
+          set +e
+          timeout -s KILL 120 sudo -E ./build/tests/obd_integration_tests \
+            "integration: two ublk queues reuse tags over slow remote LSMT reads" \
+            -s --colour-mode none 2>&1 | tee -a "$log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'ublk remote LSMT: command exit=%s tee exit=%s\n' \
+            "${statuses[0]}" "${statuses[1]}" | tee -a "$log"
+          logging_status=$?
+          set -e
+          if (( statuses[1] != 0 || logging_status != 0 )); then
+            echo '::error::ublk remote LSMT: failed to preserve the test log'
+            if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+            if (( statuses[1] != 0 )); then exit "${statuses[1]}"; fi
+            exit "$logging_status"
+          fi
+          if (( statuses[0] == 4 )) &&
+             grep -Fq 'two kernel queues lack distinct allowed client CPUs' "$log"; then
+            echo '::warning::ublk remote LSMT: SKIP - no usable two-queue CPU map; multi-queue coverage was not exercised' \
+              | tee -a "$log"
+          elif (( statuses[0] != 0 )); then
+            echo "::error::ublk remote LSMT: failed or unexpected skip (exit=${statuses[0]})"
+            exit "${statuses[0]}"
+          else
+            echo 'ublk remote LSMT: PASS - both queue cohorts, HTTP reads, source EIO and tag reuse verified' \
+              | tee -a "$log"
+          fi
+
       - name: "E2E - writes and discard"
         timeout-minutes: 5
         run: |

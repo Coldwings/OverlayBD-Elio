@@ -16,8 +16,9 @@ each guards.
 | `tests/fixtures/` | (reserved for on-disk fixtures) | — |
 
 The ublk tests (`tests/unit/test_ublk.cpp`,
-`tests/integration/test_ublk_e2e.cpp`) compile only when
-`OBD_ENABLE_UBLK` is on; everything else builds everywhere.
+`tests/integration/test_ublk_e2e.cpp`) and the multi-queue remote-LSMT
+case in `tests/integration/test_integration.cpp` compile only when
+`OBD_ENABLE_UBLK` is on; other integration cases build without that backend.
 
 ### Fixtures (`tests/support.hpp`)
 
@@ -178,7 +179,8 @@ filters directly:
 `integration: ublk device serves sector reads from a blob`,
 `integration: ublk writable device serves writes and discard`,
 `integration: ublk device survives server death via USER_RECOVERY`,
-`integration: ublk device grows online and serves the new capacity`)
+`integration: ublk device grows online and serves the new capacity`,
+`integration: two ublk queues reuse tags over slow remote LSMT reads`)
 need `/dev/ublk-control` and root (or `CAP_SYS_ADMIN` in a suitable
 user namespace) with `ublk_drv` loaded. They **self-skip** via Catch2
 `SKIP()` when the kernel facility is absent, and
@@ -188,7 +190,9 @@ depend on privileged kernel state** — new privileged tests must
 self-skip the same way. The privileged CI job
 (`build-test-ublk-privileged` in `.github/workflows/ci.yml`) loads
 `ublk_drv` and runs these tests individually by exact name under `sudo`,
-with a separate bounded step and log for each. The online-grow step has a
+with a separate bounded step and log for each. The remote-LSMT step accepts
+only its explicit unsupported CPU-map skip, with a warning and retained log.
+The online-grow step has a
 120-second process timeout and records the commit, kernel, command exit status
 and the test-output `tee` exit status in `build/ublk-e2e-grow.log`, included
 in the `ublk-e2e-logs` artifact. On a supported driver it must verify capacity,
@@ -1436,6 +1440,43 @@ Every test, grouped by area, with the property it guards.
   privileged E2E: a real ublk device backed by an in-memory blob
   returns correct sectors through `/dev/ublkb<N>` (self-skips without
   `/dev/ublk-control`).
+- `integration: two ublk queues reuse tags over slow remote LSMT reads` — a
+  real two-queue/depth-four device serves direct reads through writer-produced
+  plain LSMT, `MergedLsmt`, `LsmtLayer`, and `RegistrySource` over the existing
+  range-capable `BlobServer`. Four dedicated client threads per queue bind to
+  distinct allowed CPUs selected from the kernel's `/sys/block/<device>/mq/*/cpu_list`.
+  The existing test friend snapshots immutable queue buffer addresses, so a
+  wrapper at the merged source boundary identifies each actual queue and tag;
+  the CPU map selects clients but does not supply the observed queue identity.
+  Thirty-two exact offset/count signatures use nonadjacent interior reads to
+  avoid client request merging. Missing, duplicate, wrong-wave, or misrouted
+  selected requests fail the case. A zero-inflight predicate and wave arming
+  share one mutex; no fixed startup settling delay is used. Startup and late
+  unmatched reads remain recorded and always delegate normally. All reads must
+  keep one stable entry worker per actual queue and stay within its tag depth;
+  each selected wave also requires overlapping reads, and actual tag IDs prove
+  reuse across waves. Selected reads delay through native asynchronous timers;
+  the third wave injects `-EIO` before delegation, and the fourth verifies correct
+  recovery bytes. Each selected request checks its delegate/result outcome.
+  The failure is a source-boundary injection, not an HTTP failure. Successful
+  waves must perform real HTTP data GETs; unrelated reads may also issue GETs
+  during the error wave, so a global zero-GET assertion would be invalid.
+  Matching background traffic cannot be distinguished by originating process;
+  a collision with the selected manifest fails rather than being ignored.
+  Initial bridge placement can give the
+  queues one or two distinct worker owners; both are valid. Device/source
+  ownership survives assertion failures through asynchronous drain; a native
+  TaskGroup owns and joins the mock listener before its active sessions drain.
+  Device, observation state, and mock owners stay in synchronous test scope
+  through public unbounded graceful runtime shutdown, and Device destruction
+  happens off-worker after shutdown returns. If cleanup task admission fails,
+  pending tasks may retain these owners until the external test timeout; the
+  fixture never forces teardown or destroys a live Device on coroutine unwind.
+  Self-skips without ublk, or after normal cleanup if the two queue maps lack
+  distinct CPUs allowed to the test. Logs preserve selected CPUs, observed
+  owners, overlap, actual qid/tag/offset/count and delegate results for selected
+  and unmatched reads after drain, and HTTP counts; an unsupported CPU-map skip
+  is not coverage.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with
@@ -1630,6 +1671,19 @@ Unmodified upstream-produced metadata and gzip fixture compatibility.
 - `image: upstream TurboOCI gzip fixture reads original payload`
 
 Elio task-ownership and notification migration regressions:
+
+- `ublk: foreign resumptions retain tag state until owner restoration` — warm
+  tag-wait, source-return, request-notification and stop-notification boundaries
+  deliberately migrate through the public native API. A joinable native task
+  holds the owner, while an owned OS thread applies/releases actual native
+  inbox-full and overflow-allocation rejection independently of scheduler
+  admission. The resumed frame must retain its request and avoid owner-only
+  state until actual owner return; source reads and shutdown still complete.
+  This is boundary injection, not a claim that the steal race was observed.
+  The guarded negative control records placement before a red-only owner rescue
+  so it never executes the subsequent plain-state race. Historical invalid
+  fixtures/signals are retained separately and establish no drain/pass result.
+
 
 - `supervisor: client task failure preserves daemon shutdown drain` —
   log-and-continue policy and worker placement alongside staged group joins.

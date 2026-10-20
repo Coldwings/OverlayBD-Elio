@@ -35,6 +35,13 @@ inline void fail_writer_event_dispatch() {
         throw std::bad_alloc();
     }
 }
+inline void fail_worker_event_dispatch() {
+    if (elio::runtime::worker_thread::current() != nullptr &&
+        take_failure(event_remaining)) {
+        event_failures.fetch_add(1);
+        throw std::bad_alloc();
+    }
+}
 }  // namespace runtime_fault_detail
 
 class DestroyedWaitFault {
@@ -69,6 +76,47 @@ public:
     unsigned failures() const { return runtime_fault_detail::event_failures.load(); }
 private:
     void (*old_)() = nullptr;
+};
+
+class WorkerEventFault {
+public:
+    explicit WorkerEventFault(unsigned failures = 1) {
+        runtime_fault_detail::event_remaining.store(failures);
+        runtime_fault_detail::event_failures.store(0);
+        old_ = elio::sync::detail::event_dispatch_storage_for_test.exchange(
+            runtime_fault_detail::fail_worker_event_dispatch);
+    }
+    ~WorkerEventFault() {
+        elio::sync::detail::event_dispatch_storage_for_test.store(old_);
+        runtime_fault_detail::event_remaining.store(0);
+    }
+    void arm(unsigned failures = 1) {
+        runtime_fault_detail::event_remaining.store(failures);
+    }
+    unsigned failures() const { return runtime_fault_detail::event_failures.load(); }
+private:
+    void (*old_)() = nullptr;
+};
+
+// Native enqueue pressure is global. Tests must release it from an owned OS
+// thread, so recovery cannot depend on an Elio admission that it rejects.
+class WorkerEnqueueFault {
+public:
+    WorkerEnqueueFault()
+        : old_inbox_(elio::runtime::detail::force_task_inbox_full_for_test.load()),
+          old_overflow_(elio::runtime::detail::fail_task_overflow_allocation_for_test.load()) {}
+    ~WorkerEnqueueFault() { release(); }
+    void arm() {
+        elio::runtime::detail::fail_task_overflow_allocation_for_test.store(true);
+        elio::runtime::detail::force_task_inbox_full_for_test.store(true);
+    }
+    void release() {
+        elio::runtime::detail::force_task_inbox_full_for_test.store(old_inbox_);
+        elio::runtime::detail::fail_task_overflow_allocation_for_test.store(old_overflow_);
+    }
+private:
+    bool old_inbox_;
+    bool old_overflow_;
 };
 
 class WakeStateFault {
