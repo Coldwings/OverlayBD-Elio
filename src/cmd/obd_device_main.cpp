@@ -8,6 +8,7 @@
 #include "supervisor/device_control.hpp"
 #include "supervisor/protocol.hpp"
 #include "cmd/startup_socket.hpp"
+#include "cmd/startup_fixture.hpp"
 
 #if defined(OBD_HAVE_UBLK) && OBD_HAVE_UBLK
 #include "ublk/device.hpp"
@@ -110,6 +111,11 @@ elio::coro::task<int> device_main(Args args) {
             : nullptr;
     obd::ublk::StartupControl startup(args.startup_generation == 0
                                         ? 1 : args.startup_generation);
+#ifdef OBD_TEST_HOOKS
+    // Explicit fixture-only opt-in; the borrowed hooks outlive all Device,
+    // queue, control and observer frames in the normal awaited cleanup below.
+    std::unique_ptr<obd::cmd::StartupFixture> startup_fixture;
+#endif
     auto report = [&](const obd::supervisor::ControlChannelWriterPtr& writer,
                       DeviceStatus status) noexcept {
         try {
@@ -160,8 +166,23 @@ elio::coro::task<int> device_main(Args args) {
         if (fills_parked) co_return;
         co_await obd::image::park_image_fills(opened);
         fills_parked = true;
+#ifdef OBD_TEST_HOOKS
+        if (startup_fixture) startup_fixture->observe({
+            .kind = obd::ublk::detail::StartupTestKind::caller_fills_parked});
+#endif
     };
     try {
+#ifdef OBD_TEST_HOOKS
+        if (const char* directory = std::getenv("OBD_TEST_STARTUP_FIXTURE_DIR");
+            directory && *directory) {
+            startup_fixture = co_await elio::spawn_blocking(
+                [path = std::string(directory), generation = startup.snapshot().generation,
+                 recovery = args.recover] {
+                    return std::make_unique<obd::cmd::StartupFixture>(path, generation, recovery);
+                });
+            startup.set_test_hooks(startup_fixture.get());
+        }
+#endif
         if (!channel) {
             standalone_socket.emplace(args.startup_socket, startup);
             standalone_control.emplace(elio::spawn([&]() -> elio::coro::task<void> {
@@ -343,6 +364,12 @@ elio::coro::task<int> device_main(Args args) {
         }
 
         obd::ublk::DeviceParams params;
+#ifdef OBD_TEST_HOOKS
+        if (startup_fixture) {
+            params.nr_queues = 2;
+            params.queue_depth = 4;
+        }
+#endif
         params.dev_sectors = dev_bytes / 512;
         params.read_only = !opened.writable;  // ADR-0008
         params.enable_recovery = global.ublk_recovery;  // ADR-0010
@@ -618,6 +645,15 @@ elio::coro::task<int> device_main(Args args) {
         facts.version += 2;
         if (!explicitly_released) facts.release = obd::ublk::StartupRelease::none;
     }
+#ifdef OBD_TEST_HOOKS
+    if (startup_fixture) startup_fixture->observe({
+        .kind = obd::ublk::detail::StartupTestKind::caller_terminal,
+        .opcode = static_cast<uint32_t>(facts.release),
+        .result = result, .flags = static_cast<uint32_t>(facts.phase),
+        .cookie = facts.raw_published, .value = facts.raw_retired,
+        .owner_flags = (facts.kernel_debt_known ? 1U : 0U) | (facts.control_pending ? 2U : 0U),
+        .release_sequence = facts.release_sequence});
+#endif
     try {
         const DeviceStatus terminal{result ? "failed" : "stopped", "", "",
                                     startup_status(facts)};

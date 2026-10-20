@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ublk/startup_test_hooks.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -54,6 +56,9 @@ public:
     }
     StartupControl(const StartupControl&) = delete;
     StartupControl& operator=(const StartupControl&) = delete;
+#ifdef OBD_TEST_HOOKS
+    void set_test_hooks(detail::StartupTestHooks* hooks) noexcept { test_hooks_ = hooks; }
+#endif
 
     StartupSnapshot snapshot() const noexcept {
         std::array<uint64_t, count> values{};
@@ -207,6 +212,7 @@ private:
     std::atomic<uint64_t> acknowledged_{0};
     std::atomic<bool> owner_entered_{false};
 #ifdef OBD_TEST_HOOKS
+    detail::StartupTestHooks* test_hooks_ = nullptr;
     // Deterministic interleavings at the two competing admission CAS sites.
     void (*before_request_cas_)(void*) noexcept = nullptr;
     void (*before_close_cas_)(void*) noexcept = nullptr;

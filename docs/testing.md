@@ -1486,6 +1486,50 @@ Every test, grouped by area, with the property it guards.
   owners, overlap, actual qid/tag/offset/count and delegate results for selected
   and unmatched reads after drain, and HTTP counts; an unsupported CPU-map skip
   is not coverage.
+- `integration: supervisor retains failed partial ublk recovery until explicit release` —
+  runs the production supervisor and device binaries with a real local LSMT image,
+  two queues and depth four. After a successful block read, an identity-pinned
+  original process is crashed to trigger normal recovery. A per-instance,
+  test-only gate holds replacement queue 1 before its initial submission while
+  queue 0 issues real FETCH commands. The case requires an actual failed,
+  settled END original and its separate cancellation CQE before testing retained
+  status/list, an explicit destroy while issuance remains incomplete, and final
+  release. A second section sends supervisor TERM and exercises its maintenance
+  listener. Raw and control cookies are correlated with their own terminal CQEs;
+  the final checks cover native bridge retirement, owner exit, cdev closure,
+  one DEL, the admitted release sequence, actual child reap, and removal of
+  pinned kernel node identities. Issuance alone is not acceptance evidence:
+  each parked data FETCH must return its original `-ENODEV` after authorized STOP.
+  This stage does not cover pending remote fills or post-END source-buffer loans.
+
+  The explicit `OBD_TEST_STARTUP_FIXTURE_DIR` environment in the spawned process
+  enables this fixture only in `OBD_TEST_HOOKS` builds. The directory must contain
+  `partial-recovery-v1`; normal invocations have null hooks. Each process exclusively
+  creates `<pid>-<generation>.events`, with an initialized header carrying PID,
+  process start ticks, generation and geometry. A fixed 16,384-record mmap log
+  stores separately committed observations; overflow invalidates the evidence
+  and never changes ownership or opens the gate. Event JSON exports include
+  source identity, allocated/committed counts and missing committed sequences,
+  so an abruptly killed original cannot look fully retired. `control_prepared`
+  identifies an original command; `control_submitted` is each actual submit call
+  and can include submission of its cancellation SQE. Only `control_original`
+  and `control_cancel` identify the corresponding real terminal CQEs.
+  `raw_prepared` describes preparation, `initial_issued` the existing submission
+  fence, and `raw_cqe` the actual original completion. `bridge_destroyed`,
+  `sources_drained`, `owner_exit` and `cdev_closed` follow the respective real
+  lifetime boundaries. `caller_fills_parked` follows the actual outer fill drain;
+  `caller_terminal` records the caller's final owner facts before reporting them.
+  Neither event changes report semantics or substitutes for actual reap.
+
+  Self-skips using the ordinary ublk prerequisite check. CTest retains its finite
+  timeout, but that external cutoff is not cleanup or retirement evidence.
+  Privileged acceptance uses an owned VM runner that preserves the VM/processes
+  on observation failure. The controller never force-kills a retained generation,
+  implicitly deletes a device, or opens queue 1 while original END is unresolved.
+  Failure artifacts remain in `/tmp/obd-startup-kernel-*` (or the configured
+  temporary directory): `result.json`, per-process `.events` and `.events.json`,
+  and `supervisor.log`. Export them before VM poweroff; a test timeout or missing
+  prerequisite is not a passed kernel case.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with

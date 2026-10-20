@@ -67,7 +67,13 @@ void Queue::close_retired() noexcept {
         cmd_buf_ = nullptr;
     }
     if (ublkc_fd_ >= 0) {
-        ::close(ublkc_fd_);
+        const int closed = ::close(ublkc_fd_);
+#ifdef OBD_TEST_HOOKS
+        if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::cdev_closed,
+            .queue = q_id_, .result = closed < 0 ? -errno : 0,
+            .value = static_cast<uint64_t>(ublkc_fd_)});
+#endif
+        (void)closed;
         ublkc_fd_ = -1;
     }
 }
@@ -201,6 +207,10 @@ void Queue::prep_io_cmd(uint32_t cmd_op, uint16_t tag, int32_t result) {
     slot.reply_ready = false;
     sqe->user_data = slot.cookie;
     ++raw_published_;
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::raw_prepared,
+        .queue = q_id_, .opcode = cmd_op, .result = result, .cookie = slot.cookie});
+#endif
 }
 
 void Queue::arm_done_poll() {
@@ -212,6 +222,10 @@ void Queue::arm_done_poll() {
     sqe->user_data = poll_cookie_;
     poll_armed_ = true;
     ++raw_published_;
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::raw_prepared,
+        .queue = q_id_, .opcode = IORING_OP_POLL_ADD, .cookie = poll_cookie_});
+#endif
 }
 
 void Queue::drain_done() {
@@ -377,6 +391,11 @@ void Queue::run(std::atomic<bool>& stop) {
     }
 #ifdef OBD_TEST_HOOKS
     try {
+        if (test_hooks_) {
+            // Expose actual prepared debt while the test holds submission.
+            publish_retirement();
+            test_hooks_->before_initial_submit(q_id_);
+        }
         if (initial_submit_hook_for_test_) initial_submit_hook_for_test_();
     } catch (...) {
         fail(EIO);
@@ -399,8 +418,15 @@ void Queue::run(std::atomic<bool>& stop) {
             // issuance of this batch. It does NOT prove acceptance/readiness:
             // a rejected FETCH still needs its original CQE. GETEVENTS alone
             // would not fence deferred/io-wq work if these constraints changed.
-            if (initial_batch && ret >= 0 && io_uring_sq_ready(&ring_) == 0)
+            if (initial_batch && ret >= 0 && io_uring_sq_ready(&ring_) == 0) {
+#ifdef OBD_TEST_HOOKS
+                if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::initial_issued,
+                    .queue = q_id_, .result = ret, .value = raw_published_});
+#endif
+                // Publish only after recording the issuance fence: release may
+                // submit STOP as soon as it observes this flag.
                 initial_fetches_issued_.store(true);
+            }
             if (maintenance) {
                 const int entered = io_uring_enter(ring_.ring_fd, 0, 0,
                                                    IORING_ENTER_GETEVENTS, nullptr);
@@ -413,6 +439,11 @@ void Queue::run(std::atomic<bool>& stop) {
                 if (n == 0) break;
                 for (unsigned i = 0; i < n; ++i) {
                     auto* cqe = cqes[i];
+#ifdef OBD_TEST_HOOKS
+                    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::raw_cqe,
+                        .queue = q_id_, .result = cqe->res, .flags = cqe->flags,
+                        .cookie = cqe->user_data});
+#endif
                     try {
                         if (cqe->user_data & kPollMarker) {
                             if (!poll_armed_ || cqe->user_data != poll_cookie_ ||

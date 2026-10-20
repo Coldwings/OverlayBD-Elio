@@ -11,6 +11,7 @@
 #pragma once
 
 #include "ublk/uapi_compat.hpp"
+#include "ublk/startup_test_hooks.hpp"
 
 #include <liburing.h>
 
@@ -132,6 +133,9 @@ public:
     /// Remembers an existing (recovered) device for ~Ctrl cleanup.
     void adopt_dev(uint32_t dev_id) noexcept { added_dev_ = static_cast<int>(dev_id); }
     void set_observer(CtrlObserver observer) noexcept { observer_ = observer; }
+#ifdef OBD_TEST_HOOKS
+    void set_test_hooks(detail::StartupTestHooks* hooks) noexcept { test_hooks_ = hooks; }
+#endif
     /// Device performs explicit, proven retirement before closing cdev/DEL.
     void disable_destructor_cleanup() noexcept { managed_lifetime_ = true; }
     int added_dev_id() const noexcept { return added_dev_; }
@@ -160,6 +164,9 @@ private:
     uint64_t next_cookie_ = 1;
     std::atomic<bool> pending_{false};
     CtrlObserver observer_;
+#ifdef OBD_TEST_HOOKS
+    detail::StartupTestHooks* test_hooks_ = nullptr;
+#endif
     detail::CtrlTransport* transport_ = nullptr;
     // ublk-control has never had an unlocked_ioctl handler: control
     // commands go through IORING_OP_URING_CMD, and the driver requires

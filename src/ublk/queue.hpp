@@ -16,6 +16,8 @@
 // thread.
 #pragma once
 
+#include "ublk/startup_test_hooks.hpp"
+
 #include "ublk/uapi_compat.hpp"
 
 #include <liburing.h>
@@ -104,6 +106,9 @@ public:
     /// return. The coordinator must keep this object and source graph alive.
     void run(std::atomic<bool>& stop);
     bool setup_ready() const noexcept { return setup_ready_.load(); }
+#ifdef OBD_TEST_HOOKS
+    void set_test_hooks(detail::StartupTestHooks* hooks) noexcept { test_hooks_ = hooks; }
+#endif
     bool bridge_ready() const noexcept { return bridge_ready_.load(); }
     void mark_bridge_ready() noexcept { bridge_ready_.store(true); }
     void publish_initial_fetches() noexcept {
@@ -249,6 +254,7 @@ private:
     // Private and per-queue; absent from builds with tests disabled.
     std::function<void()> completion_enqueue_hook_for_test_;
     std::function<void()> bridge_admission_hook_for_test_;
+    detail::StartupTestHooks* test_hooks_ = nullptr;
     std::function<void()> initial_submit_hook_for_test_;
     std::function<elio::coro::task<void>(BridgeResumePoint)> bridge_resume_hook_for_test_;
     std::function<void(BridgeResumePoint)> bridge_resume_observer_for_test_;

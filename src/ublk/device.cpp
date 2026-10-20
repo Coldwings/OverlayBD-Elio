@@ -23,6 +23,9 @@ void Device::open_queues() {
     for (uint16_t q = 0; q < params_.nr_queues; ++q) {
         auto queue = std::make_unique<Queue>(dev_id_, q, params_.queue_depth,
                                              params_.max_io_buf_bytes);
+#ifdef OBD_TEST_HOOKS
+        queue->set_test_hooks(test_hooks_);
+#endif
         // The driver's open exclusion is device-wide, not per queue.
         // Duplicate the first queue's descriptor so each queue retains
         // independent ownership without opening a second server session.
@@ -143,6 +146,10 @@ void Device::complete_control(void* opaque, uint32_t opcode, int result) noexcep
         dev.ctrl_->adopt_dev(dev.dev_id_);
         dev.owns_id_ = true;
         dev.started_ = true;
+#ifdef OBD_TEST_HOOKS
+        if (dev.test_hooks_) dev.test_hooks_->observe({.kind = detail::StartupTestKind::adopted,
+            .opcode = opcode, .result = result, .value = dev.dev_id_});
+#endif
     }
 }
 
@@ -180,6 +187,10 @@ elio::coro::task<void> Device::prepare_owners() {
         threads_.emplace_back([this, q]() noexcept {
             try { q->run(stop_); }
             catch (...) { q->fail(EIO); }
+#ifdef OBD_TEST_HOOKS
+            if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::owner_exit,
+                .queue = q->q_id(), .result = q->failure(), .value = q->owner_exited() ? 1U : 0U});
+#endif
         });
         bridge_tasks_.push_back(elio::spawn(run_bridge, q, src_.get(), &stop_));
     }
@@ -219,6 +230,9 @@ elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
     dev->src_ = std::move(src);
     dev->dev_id_ = dev_id;
     dev->startup_ = &startup;
+#ifdef OBD_TEST_HOOKS
+    dev->test_hooks_ = startup.test_hooks_;
+#endif
     dev->startup_deadline_ = std::chrono::steady_clock::now() +
                              std::chrono::seconds(5);
     dev->publish_startup();
@@ -228,6 +242,9 @@ elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
         co_await detail::run_control([&] {
             dev->ctrl_ = std::make_unique<Ctrl>();
             dev->ctrl_->disable_destructor_cleanup();
+#ifdef OBD_TEST_HOOKS
+            dev->ctrl_->set_test_hooks(dev->test_hooks_);
+#endif
             dev->ctrl_->set_observer({dev.get(), cancel_control,
                                       complete_control, observe_control});
         });
@@ -434,14 +451,25 @@ void Device::collect_bridge_results() noexcept {
 
 elio::coro::task<void> Device::drain_sources() {
     request_stop();
-    for (auto& bridge : bridge_tasks_) {
+    for (size_t index = 0; index < bridge_tasks_.size(); ++index) {
+        auto& bridge = bridge_tasks_[index];
         while (!bridge.is_destroyed()) {
             try { co_await bridge.wait_destroyed_async(); }
             catch (...) {}
         }
+#ifdef OBD_TEST_HOOKS
+        if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::bridge_destroyed,
+            .queue = static_cast<uint32_t>(index)});
+#endif
     }
     collect_bridge_results();
-    for (auto& q : queues_) q->sources_drained();
+    for (auto& q : queues_) {
+        q->sources_drained();
+#ifdef OBD_TEST_HOOKS
+        if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::sources_drained,
+            .queue = q->q_id()});
+#endif
+    }
 }
 
 bool Device::release_once() noexcept {
@@ -456,6 +484,9 @@ bool Device::release_once() noexcept {
         try {
             ctrl_ = std::make_unique<Ctrl>();
             ctrl_->disable_destructor_cleanup();
+#ifdef OBD_TEST_HOOKS
+            ctrl_->set_test_hooks(test_hooks_);
+#endif
             ctrl_->set_observer({this, cancel_control, complete_control,
                                  observe_control});
         } catch (...) {

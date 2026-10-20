@@ -651,6 +651,14 @@ original CQEs, cdev-close-before-DEL and actual process reap require separate
 owned-fixture evidence on Linux 6.6 and a current kernel before ADR-0022 is
 accepted. No full validation result is asserted here.
 
+The privileged case `integration: supervisor retains failed partial ublk recovery until explicit release`
+now exercises the real supervisor/exec'd caller with a two-queue pre-END gate,
+actual original/cancellation CQEs, explicit release, native retirement and reap.
+It uses opt-in per-instance hooks and preserves unresolved owners rather than
+force-killing them on failure. See `docs/testing.md` for event meanings, retained
+artifacts and the owned VM runner requirement. Its implementation is not a claim
+that the kernel matrix has passed, and it does not cover post-END source loans.
+
 
 Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 `OBD_ENABLE_UBLK` is on); the kernel-dependent end-to-end test lives in

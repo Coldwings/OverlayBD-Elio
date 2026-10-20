@@ -86,12 +86,20 @@ int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
     sqe->opcode = IORING_OP_URING_CMD;
     sqe->fd = fd_; sqe->cmd_op = cmd_op; sqe->user_data = original;
     std::memcpy(sqe->cmd, &cmd, sizeof(cmd));
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_prepared,
+        .opcode = cmd_op, .cookie = original, .value = dev_id});
+#endif
     report();
     // From preparation until every matching CQE, no exception, submit error,
     // cancellation result, or timeout can end the payload/ring lifetime.
     for (;;) {
         if (transport_ ? transport_->sq_ready() : io_uring_sq_ready(&ring_)) {
             const int rc = transport_ ? transport_->submit() : io_uring_submit(&ring_);
+#ifdef OBD_TEST_HOOKS
+            if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_submitted,
+                .opcode = cmd_op, .result = rc, .cookie = original, .value = dev_id});
+#endif
             if (rc < 0 && rc != -EINTR && !state.reason_errno)
                 state.reason_errno = -rc;
         }
@@ -113,6 +121,11 @@ int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
             } else if (cqe->user_data == original && !state.original_known) {
                 state.original_known = true;
                 state.original_result = cqe->res;
+#ifdef OBD_TEST_HOOKS
+                if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_original,
+                    .opcode = cmd_op, .result = cqe->res, .flags = cqe->flags,
+                    .cookie = cqe->user_data, .value = dev_id});
+#endif
                 if (cqe->res == 0 && cmd_op == UBLK_U_CMD_ADD_DEV)
                     added_dev_ = static_cast<int>(
                         static_cast<ublksrv_ctrl_dev_info*>(data)->dev_id);
@@ -124,6 +137,11 @@ int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
                        !state.cancel_known) {
                 state.cancel_known = true;
                 state.cancel_result = cqe->res;
+#ifdef OBD_TEST_HOOKS
+                if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_cancel,
+                    .opcode = cmd_op, .result = cqe->res, .flags = cqe->flags,
+                    .cookie = cqe->user_data, .value = original});
+#endif
             } else {
                 poisoned = true;
             }
@@ -141,6 +159,10 @@ int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
                     cancellation = next_cookie_++;
                     io_uring_prep_cancel64(cancel, original, 0);
                     cancel->user_data = cancellation;
+#ifdef OBD_TEST_HOOKS
+                    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_cancel_prepared,
+                        .opcode = cmd_op, .cookie = cancellation, .value = original});
+#endif
                 }
             }
         }
@@ -156,6 +178,11 @@ int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
     state.pending = false;
     pending_.store(false);
     report();
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_finished,
+        .opcode = cmd_op, .result = state.original_result, .cookie = original,
+        .value = static_cast<uint64_t>(state.reason_errno)});
+#endif
     if (state.original_result == 0) return 0;
     if (state.reason_errno &&
         (state.original_result == -EINTR || state.original_result == -ECANCELED))

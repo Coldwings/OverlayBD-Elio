@@ -150,11 +150,13 @@ target_compile_definitions(obd_integration_tests
             OBD_TEST_HAVE_UBLK=$<BOOL:${OBD_ENABLE_UBLK}>)
 add_dependencies(obd_integration_tests obd-test-fake-device)
 if(OBD_ENABLE_UBLK)
-    target_sources(obd_integration_tests PRIVATE integration/test_ublk_e2e.cpp)
+    target_sources(obd_integration_tests PRIVATE
+        integration/test_ublk_e2e.cpp integration/test_startup_kernel.cpp)
     target_link_libraries(obd_integration_tests PRIVATE obd_ublk)
     target_compile_definitions(obd_integration_tests
-        PRIVATE OBD_TEST_DEVICE_BIN="$<TARGET_FILE:obd-device>")
-    add_dependencies(obd_integration_tests obd-device)
+        PRIVATE OBD_TEST_DEVICE_BIN="$<TARGET_FILE:obd-device>"
+                OBD_TEST_SUPERVISOR_BIN="$<TARGET_FILE:obd-supervisor>")
+    add_dependencies(obd_integration_tests obd-device obd-supervisor)
 endif()
 catch_discover_tests(obd_integration_tests
     PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"

@@ -152,6 +152,9 @@ private:
     bool device_absent_ = false;
     int release_error_ = 0;
     std::mutex release_mu_;
+#ifdef OBD_TEST_HOOKS
+    detail::StartupTestHooks* test_hooks_ = nullptr;
+#endif
     StartupControl* startup_ = nullptr; // Cleared before returning a ready Device.
     StartupSnapshot startup_state_;
     std::chrono::steady_clock::time_point startup_deadline_;
