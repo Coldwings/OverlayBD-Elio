@@ -5,6 +5,7 @@
 #include "ublk/device.hpp"
 
 #include "../support.hpp"
+#include "../ublk_prerequisites.hpp"
 
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
@@ -60,10 +61,6 @@ elio::coro::task<int> with_device_cleanup(
 void stage(const char* msg) {
     std::fprintf(stderr, "[e2e-stage] %s\n", msg);
     std::fflush(stderr);
-}
-
-bool ublk_available() {
-    return ::access("/dev/ublk-control", F_OK) == 0;
 }
 
 // The recovery test reports live kernel state, not the requested ADD_DEV
@@ -215,8 +212,9 @@ private:
 
 TEST_CASE("integration: ublk device serves sector reads from a blob",
           "[ublk]") {
-    if (!ublk_available()) {
-        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
+    if (const auto reason = test::ublk_prerequisite_skip_reason();
+        !reason.empty()) {
+        SKIP(reason);
     }
     const uint16_t nr_queues = GENERATE(1, 2);
     INFO("nr_queues=" << nr_queues);
@@ -256,8 +254,9 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
 
 TEST_CASE("integration: ublk writable device serves writes and discard",
           "[ublk]") {
-    if (!ublk_available()) {
-        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
+    if (const auto reason = test::ublk_prerequisite_skip_reason();
+        !reason.empty()) {
+        SKIP(reason);
     }
     const int rc = test::run_coro([]() -> elio::coro::task<int> {
         auto data = test::pattern_bytes(512 * 64, 82);
@@ -333,12 +332,13 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
     // performs), then Device::resize_blocking issues
     // UBLK_U_CMD_UPDATE_SIZE and the kernel gendisk grows — after which a
     // WRITE into the grown region lands and reads back (not just
-    // BLKGETSIZE64). Self-skipping twice: no /dev/ublk-control at all, or
+    // BLKGETSIZE64). Self-skipping twice: missing access/capability, or
     // a kernel whose driver lacks the UPDATE_SIZE command (it landed in
     // the 6.16 development cycle) — both degrade to SKIP, never a
     // failure.
-    if (!ublk_available()) {
-        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
+    if (const auto reason = test::ublk_prerequisite_skip_reason();
+        !reason.empty()) {
+        SKIP(reason);
     }
     int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto data = test::pattern_bytes(512 * 64, 85);
@@ -602,8 +602,9 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
 
 TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
           "[ublk]") {
-    if (!ublk_available()) {
-        SKIP("/dev/ublk-control unavailable (kernel ublk not enabled)");
+    if (const auto reason = test::ublk_prerequisite_skip_reason();
+        !reason.empty()) {
+        SKIP(reason);
     }
     const uint16_t nr_queues = GENERATE(1, 2);
     INFO("nr_queues=" << nr_queues);
