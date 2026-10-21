@@ -2,6 +2,9 @@
 
 #ifdef OBD_TEST_HOOKS
 #include "ublk/startup_test_hooks.hpp"
+#include "source/blob_source.hpp"
+#include "common/errors.hpp"
+#include <elio/time/timer.hpp>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -32,7 +35,11 @@ public:
         if (dir < 0) throw std::system_error(errno, std::generic_category(), "startup fixture directory");
         int fd = -1;
         try {
-            const int marker = ::openat(dir, "partial-recovery-v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            bool adopted_source = false;
+            int marker = ::openat(dir, "adopted-source-v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (marker >= 0) adopted_source = true;
+            else if (errno == ENOENT)
+                marker = ::openat(dir, "partial-recovery-v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
             if (marker < 0) throw std::runtime_error("startup fixture marker is missing");
             ::close(marker);
             const auto filename = std::to_string(::getpid()) + "-" +
@@ -60,6 +67,7 @@ public:
             if (!(fields >> log_->process_start_ticks) || log_->process_start_ticks == 0)
                 throw std::runtime_error("startup fixture process identity invalid");
             log_->recovery = recovery ? 1 : 0;
+            log_->adopted_source = adopted_source ? 1 : 0;
             log_->initialized.store(1, std::memory_order_release);
             ::close(fd);
             ::close(dir);
@@ -91,7 +99,7 @@ public:
         record.committed.store(index + 1, std::memory_order_release);
     }
     void before_initial_submit(uint16_t queue) noexcept override {
-        if (!log_->recovery || queue != 1) return;
+        if (!log_->recovery || log_->adopted_source || queue != 1) return;
         observe({.kind = ublk::detail::StartupTestKind::initial_gate_enter, .queue = queue});
         // Deliberately blocks only this queue owner at its pre-existing test
         // seam. Controller loss or a test timeout cannot fabricate issuance.
@@ -99,8 +107,73 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         observe({.kind = ublk::detail::StartupTestKind::initial_gate_leave, .queue = queue});
     }
+    bool holds_source() const noexcept { return log_->recovery && log_->adopted_source; }
+    elio::coro::task<void> after_start_control() override {
+        if (!holds_source()) co_return;
+        observe({.kind = ublk::detail::StartupTestKind::post_control_enter});
+        while (!log_->post_control_open.load(std::memory_order_acquire)) {
+            try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+            catch (...) {} // A cancellation cannot silently release the checkpoint.
+        }
+        observe({.kind = ublk::detail::StartupTestKind::post_control_fail, .result = -EIO});
+        throw obd::error(EIO, "fixture local failure after successful END");
+    }
+    elio::coro::task<void> wait_source() {
+        while (!log_->source_open.load(std::memory_order_acquire)) {
+            try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+            catch (...) {} // Preserve the actual buffer loan until controller release.
+        }
+    }
 private:
     ublk::detail::StartupFixtureLog* log_ = nullptr;
+};
+
+// Installed only around the replacement's real, read-only assembled root.
+// The real source operation owns the actual queue buffer across this async gate.
+class StartupBorrowedSource final : public source::BlobSource {
+public:
+    StartupBorrowedSource(source::BlobSourcePtr inner, StartupFixture& fixture)
+        : inner_(std::move(inner)), fixture_(fixture) {}
+    ~StartupBorrowedSource() override {
+        fixture_.observe({.kind = ublk::detail::StartupTestKind::source_destroyed});
+    }
+    elio::coro::task<ssize_t> pread(void* buffer, size_t count, uint64_t offset) override {
+        const uint64_t loan = next_loan_.fetch_add(1);
+        ublk::detail::StartupTestEvent event{.kind = ublk::detail::StartupTestKind::source_enter,
+            .cookie = loan, .buffer = reinterpret_cast<uintptr_t>(buffer), .offset = offset, .length = count};
+        fixture_.observe(event);
+        // This destructor proves lexical loan-scope exit, not final coroutine
+        // frame destruction. The Device's native bridge destruction is separate.
+        struct Scope {
+            StartupFixture& fixture;
+            ublk::detail::StartupTestEvent event;
+            ~Scope() { event.kind = ublk::detail::StartupTestKind::source_scope_exit; fixture.observe(event); }
+        } scope{fixture_, event};
+        ssize_t result = -EIO;
+        try {
+            co_await fixture_.wait_source();
+            result = co_await inner_->pread(buffer, count, offset);
+        } catch (...) { result = -EIO; }
+        event.kind = ublk::detail::StartupTestKind::source_result;
+        event.result = static_cast<int32_t>(result);
+        if (result > 0) {
+            uint64_t checksum = 14695981039346656037ULL;
+            const auto* bytes = static_cast<const uint8_t*>(buffer);
+            for (ssize_t index = 0; index < result; ++index) {
+                checksum ^= bytes[index];
+                checksum *= 1099511628211ULL;
+            }
+            event.value = checksum;
+        }
+        fixture_.observe(event);
+        co_return result;
+    }
+    uint64_t size() const noexcept override { return inner_->size(); }
+    std::string_view label() const noexcept override { return inner_->label(); }
+private:
+    source::BlobSourcePtr inner_;
+    StartupFixture& fixture_;
+    std::atomic<uint64_t> next_loan_{1};
 };
 
 } // namespace obd::cmd

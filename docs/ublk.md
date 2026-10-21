@@ -657,7 +657,16 @@ actual original/cancellation CQEs, explicit release, native retirement and reap.
 It uses opt-in per-instance hooks and preserves unresolved owners rather than
 force-killing them on failure. See `docs/testing.md` for event meanings, retained
 artifacts and the owned VM runner requirement. Its implementation is not a claim
-that the kernel matrix has passed, and it does not cover post-END source loans.
+that the kernel matrix has passed; it covers pre-END partial publication.
+
+The separate `integration: adopted ublk recovery drains source frames before explicit release`
+case exercises a successful END followed by a real block request holding an
+actual queue buffer in the source coroutine, a local pre-ready failure and
+explicit release. Its async gates preserve the native borrower until controlled
+release, and its observations distinguish delegate bytes, source scope exit,
+bridge frame destruction and block-client completion. The kernel matrix must
+still validate this case; pending remote fills, reporting failure and refusal
+variants remain separate coverage obligations. See `docs/testing.md`.
 
 
 Unit tests live in `tests/unit/test_ublk.cpp` (built only when

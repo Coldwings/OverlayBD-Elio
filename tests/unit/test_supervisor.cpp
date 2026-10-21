@@ -12,6 +12,7 @@
 #include <elio/runtime/spawn_blocking.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -405,6 +406,8 @@ TEST_CASE("supervisor: exec failure surfaces as exit 127", "[supervisor]") {
 
 TEST_CASE("supervisor: reap evidence preserves actual child wait status",
           "[supervisor][reap-barrier]") {
+    const char* marker = GENERATE("partial-recovery-v1", "adopted-source-v1");
+    CAPTURE(marker);
     int expected_exit = 0;
     int expected_signal = 0;
     std::string ending = "exit 0\n";
@@ -422,7 +425,7 @@ TEST_CASE("supervisor: reap evidence preserves actual child wait status",
         ending = "kill -KILL $$\nexit 9\n";
     }
     test::TempDir directory;
-    test::write_file(directory / "partial-recovery-v1", {});
+    test::write_file(directory / marker, {});
     ReapFixtureEnvironment environment(directory.str());
     const auto script = directory / "exit-device.sh";
     const std::string content =
@@ -470,6 +473,8 @@ TEST_CASE("supervisor: reap evidence preserves actual child wait status",
 
 TEST_CASE("supervisor: unavailable reap evidence does not change child collection",
           "[supervisor][reap-barrier]") {
+    const char* marker = GENERATE("partial-recovery-v1", "adopted-source-v1");
+    CAPTURE(marker);
     bool occupied = false;
     SECTION("missing explicit fixture marker") {}
     SECTION("exclusive generation record already exists") { occupied = true; }
@@ -478,7 +483,7 @@ TEST_CASE("supervisor: unavailable reap evidence does not change child collectio
     const auto record = directory / "child-74.reap";
     const std::vector<uint8_t> sentinel{1, 3, 5, 7};
     if (occupied) {
-        test::write_file(directory / "partial-recovery-v1", {});
+        test::write_file(directory / marker, {});
         test::write_file(record, sentinel);
     }
     supervisor::ChildSpec spec;

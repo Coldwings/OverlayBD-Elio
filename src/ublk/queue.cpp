@@ -289,6 +289,12 @@ void Queue::dispatch_cqe(const io_uring_cqe* cqe) {
     req.tag = tag; req.op = ublksrv_get_op(&iod);
     req.flags = ublksrv_get_flags(&iod);
     req.start_sector = iod.start_sector; req.nr_sectors = iod.nr_sectors;
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::request_delivered,
+        .queue = q_id_, .opcode = req.op, .cookie = cqe->user_data,
+        .buffer = reinterpret_cast<uintptr_t>(io_buf(tag)), .offset = req.byte_offset(),
+        .length = req.byte_len(), .tag = tag});
+#endif
     try {
         std::lock_guard lock(mu_);
         pending_.push_back(req);

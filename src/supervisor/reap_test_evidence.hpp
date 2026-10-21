@@ -54,8 +54,11 @@ public:
         };
         const Fd dir{::open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
         if (dir.value < 0) return;
-        const Fd marker{::openat(dir.value, "partial-recovery-v1",
-                                O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+        Fd marker{::openat(dir.value, "partial-recovery-v1",
+                          O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+        if (marker.value < 0 && errno == ENOENT)
+            marker.value = ::openat(dir.value, "adopted-source-v1",
+                                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (marker.value < 0) return;
         char filename[64];
         const int length = std::snprintf(filename, sizeof(filename), "child-%llu.reap",

@@ -1058,12 +1058,13 @@ Every test, grouped by area, with the property it guards.
   binary yields EOF on the status channel plus exit code 127.
 - `supervisor: reap evidence preserves actual child wait status` — real
   fork/exec children exit zero, exit 134, abort, and receive SIGKILL. The
-  per-generation observation is absent before actual collection, preserves
+  both explicit fixture markers are exercised. The per-generation observation
+  is absent before actual collection, preserves
   raw wait-status distinctions despite a stopped self-report, and survives
   Child destruction. No ublk device or privileged operation is required.
 - `supervisor: unavailable reap evidence does not change child collection` —
-  a missing opt-in marker or an occupied exclusive evidence file leaves
-  normal child collection unchanged. No successful observation is invented,
+  a missing opt-in marker or an occupied exclusive evidence file in either
+  fixture mode leaves normal child collection unchanged. No successful observation is invented,
   and an existing file is not overwritten.
 - `supervisor: bdev path parses to device id` —
   `dev_id_from_bdev_path` extracts the id from `/dev/ublkbN` and
@@ -1569,6 +1570,66 @@ Every test, grouped by area, with the property it guards.
   per-generation `.reap` and `.reap.json`, and `supervisor.log`. Export them
   before VM poweroff; a test timeout or missing prerequisite is not a passed
   kernel case.
+- `integration: adopted ublk recovery drains source frames before explicit release` —
+  a separate production supervisor/device fixture permits both replacement queues
+  to submit and requires real successful START/END originals and committed
+  adoption. A test-only async checkpoint then holds the startup caller before
+  its ready handoff. A real direct block read enters the assembled LSMT root
+  through a replacement-only source wrapper; its timer-based gate suspends the
+  actual coroutine with its actual queue buffer. Observed queue delivery records
+  correlate qid, tag, original cookie, buffer address, offset and length with
+  every source loan. The selected read starts after the successful-END checkpoint.
+
+  Normal supervisor destroy must admit release sequence 1 while the checkpoint
+  and source loan remain held. Releasing only the checkpoint injects a local
+  `EIO` after successful END, preserving adoption. Repeated status/list observations
+  must retain that generation and protection while the source is still active;
+  no STOP/DEL, borrower bridge destruction, source destruction, queue owner exit
+  or false ready handoff is allowed. After the source gate opens, the real
+  delegate must return the full count with the expected byte checksum. Each
+  source scope must exit before its borrowing bridge's native frame destruction,
+  and all bridges must retire before STOP. Actual control/raw originals, cdev
+  closure, one DEL, caller terminal sequence and actual process reap remain
+  independently required. Supervisor-owned raw waitpid evidence must match
+  each pinned PID/generation and the supervisor PID: the original must have
+  SIGKILL and the replacement must exit normally with status zero. A completed
+  caller event or vanished proc entry cannot hide a subsequent allocator abort.
+  The block client must finish and be reaped: successful
+  reads must return exact bytes, while `EIO` during authorized release is recorded
+  separately. Delegate success alone does not establish block-client success.
+
+  The same explicit fixture directory environment selects the fixed
+  `adopted-source-v1` marker; it disables the partial-recovery queue-1 gate.
+  `post_control_enter` follows the successful control operation and
+  `post_control_fail` precedes the injected local error. `release_admitted`
+  follows the actual mailbox CAS, before failure drain publishes its final
+  release facts. `request_delivered` records the real kernel descriptor;
+  `source_enter`, `source_result` and `source_scope_exit` identify one wrapper
+  loan. The result includes an FNV-1a checksum over the actual delegate bytes.
+  Scope exit is a lexical lifetime observation, not native frame destruction;
+  the existing `bridge_destroyed` event supplies that separate proof.
+  `source_destroyed` marks wrapper destructor entry, not inner-source destructor
+  completion. Source hooks never manufacture IO requests or alter kernel CQEs.
+
+  Shared controller helpers live in `tests/integration/startup_kernel_support.hpp`;
+  case-specific sequencing remains separate from the partial-recovery test.
+  Artifacts remain in `/tmp/obd-startup-source-*`. Result schema version 1 names
+  `adopted-source-v1`, includes both PID/generation/start-tick identities, supervisor
+  PID, gate states and the matched original/replacement reap documents. Its
+  `expected_exports` lists exactly six files: result JSON, supervisor log, both
+  event JSON ledgers and both generation-specific reap JSON documents.
+  `expected_raw_evidence` separately lists the two raw event mappings and two
+  raw reap mappings. `export_complete` is false if a ledger, pinned identity,
+  committed matching reap record or required log is missing or an export fails;
+  `export_errors` records those failures. Acceptance additionally requires the
+  test's complete/success state and valid raw wait-status outcomes, not export
+  completeness alone. Use the distinct `[startup-kernel-source]` selector and
+  mode-specific external validation; partial-recovery's no-adoption and failed-END
+  expectations do not apply here. The existing prerequisite skip and finite CTest timeout are
+  unchanged; privileged acceptance requires the owned VM runner to preserve
+  unresolved owners and export these artifacts before shutdown. Controller loss
+  does not open either gate. This case does not validate remote background-fill
+  loans, report-serialization failures or teardown refusal/retry scenarios.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with

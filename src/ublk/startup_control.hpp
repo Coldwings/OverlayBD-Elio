@@ -107,6 +107,10 @@ public:
         if (!requested_.compare_exchange_strong(current, sequence))
             return current & closed_bit ? ReleaseRequestResult::not_startup
                                         : ReleaseRequestResult::busy;
+#ifdef OBD_TEST_HOOKS
+        if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::release_admitted,
+            .value = generation_, .release_sequence = sequence});
+#endif
         return ReleaseRequestResult::accepted;
     }
 

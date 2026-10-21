@@ -294,6 +294,9 @@ elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
             if (!busy) break;
             co_await elio::time::sleep_for(std::chrono::milliseconds(1));
         }
+#ifdef OBD_TEST_HOOKS
+        if (recovery && dev->test_hooks_) co_await dev->test_hooks_->after_start_control();
+#endif
         if (dev->try_publish_ready())
             co_return dev; // Ownership transfer after this point is nonthrowing.
     } catch (...) {

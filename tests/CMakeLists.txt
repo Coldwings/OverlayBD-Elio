@@ -151,7 +151,8 @@ target_compile_definitions(obd_integration_tests
 add_dependencies(obd_integration_tests obd-test-fake-device)
 if(OBD_ENABLE_UBLK)
     target_sources(obd_integration_tests PRIVATE
-        integration/test_ublk_e2e.cpp integration/test_startup_kernel.cpp)
+        integration/test_ublk_e2e.cpp integration/test_startup_kernel.cpp
+        integration/test_startup_active_source.cpp)
     target_link_libraries(obd_integration_tests PRIVATE obd_ublk)
     target_compile_definitions(obd_integration_tests
         PRIVATE OBD_TEST_DEVICE_BIN="$<TARGET_FILE:obd-device>"

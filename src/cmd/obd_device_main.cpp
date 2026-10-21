@@ -397,6 +397,13 @@ elio::coro::task<int> device_main(Args args) {
                 writable_top = &mw->writable_top();
             }
         }
+#ifdef OBD_TEST_HOOKS
+        if (startup_fixture && startup_fixture->holds_source()) {
+            if (opened.writable) throw obd::error(EINVAL, "source fixture requires read-only root");
+            opened.root = std::make_unique<obd::cmd::StartupBorrowedSource>(
+                std::move(opened.root), *startup_fixture);
+        }
+#endif
         // Refcounted: the control coroutine below captures a copy, so a
         // resize in flight can never outlive the Device (destroyed only
         // when the LAST reference drops, after the control loop exits).
