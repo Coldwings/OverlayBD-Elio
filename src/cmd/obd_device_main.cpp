@@ -175,11 +175,15 @@ elio::coro::task<int> device_main(Args args) {
 #ifdef OBD_TEST_HOOKS
         if (const char* directory = std::getenv("OBD_TEST_STARTUP_FIXTURE_DIR");
             directory && *directory) {
-            startup_fixture = co_await elio::spawn_blocking(
-                [path = std::string(directory), generation = startup.snapshot().generation,
-                 recovery = args.recover] {
-                    return std::make_unique<obd::cmd::StartupFixture>(path, generation, recovery);
-                });
+            // Keep the path in the coroutine frame throughout the awaited
+            // construction; the blocking callable only borrows its storage.
+            const std::string fixture_directory(directory);
+            auto construct_fixture = [&fixture_directory,
+                generation = startup.snapshot().generation, recovery = args.recover] {
+                return std::make_unique<obd::cmd::StartupFixture>(
+                    fixture_directory, generation, recovery);
+            };
+            startup_fixture = co_await elio::spawn_blocking(std::move(construct_fixture));
             startup.set_test_hooks(startup_fixture.get());
         }
 #endif

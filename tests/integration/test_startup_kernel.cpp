@@ -5,6 +5,7 @@
 #include "ublk/ctrl.hpp"
 #include "ublk/startup_control.hpp"
 #include "ublk/startup_test_hooks.hpp"
+#include "../child_reap_evidence.hpp"
 #include "../support.hpp"
 #include "../ublk_prerequisites.hpp"
 
@@ -402,6 +403,9 @@ public:
         require_fixture(replacement_log_->header().recovery == 1 &&
                         generation_ != original_generation, "replacement identity is not recovery");
         require_fixture(original_->reaped(), "old serving generation was replaced before actual reap");
+        const int original_wait = wait_reap_evidence(*original_log_, "original");
+        require_fixture(WIFSIGNALED(original_wait) && WTERMSIG(original_wait) == SIGKILL,
+                        "original process was not collected with the intentional SIGKILL");
         // Reaping the old process does not finish the driver's delayed
         // quiesce work. Linux 6.6 checks dying servers every five seconds;
         // observe the separate production START_RECOVERY retry (30 seconds)
@@ -471,6 +475,9 @@ public:
                  "released generation did not retire to caller terminal");
         validate_retirement();
         wait_for([&] { return replacement_->reaped(); }, 5s, "terminal replacement was not actually reaped");
+        const int replacement_wait = wait_reap_evidence(*replacement_log_, "replacement");
+        require_fixture(WIFEXITED(replacement_wait) && WEXITSTATUS(replacement_wait) == 0,
+                        "retired replacement did not exit normally with status zero");
         if (!maintenance_) {
             const auto destroyed = call({{"cmd", "destroy"}, {"id", "partial"}});
             remember("destroy-after-retirement", destroyed);
@@ -507,12 +514,22 @@ public:
                     exported = false;
                     report_["original_export_error"] = error.what();
                 }
+                try { export_reap_evidence(*original_log_, "original"); }
+                catch (const std::exception& error) {
+                    exported = false;
+                    report_["original_reap_export_error"] = error.what();
+                }
             }
             if (replacement_log_) {
                 try { replacement_log_->dump(); }
                 catch (const std::exception& error) {
                     exported = false;
                     report_["replacement_export_error"] = error.what();
+                }
+                try { export_reap_evidence(*replacement_log_, "replacement"); }
+                catch (const std::exception& error) {
+                    exported = false;
+                    report_["replacement_reap_export_error"] = error.what();
                 }
             }
             report_["export_complete"] = exported;
@@ -546,6 +563,47 @@ public:
         } catch (...) {} // Preserve the process, kernel resource and evidence.
     }
 private:
+    std::optional<obd::test::ChildReapSnapshot> read_reap_evidence(const EventLog& log) const {
+        const auto& identity = log.header();
+        auto evidence = obd::test::read_child_reap(directory_, identity.generation);
+        if (evidence) {
+            require_fixture(evidence->pid == identity.pid &&
+                            evidence->generation == identity.generation &&
+                            evidence->reaper_pid == static_cast<uint64_t>(supervisor_),
+                            "collected process does not match the pinned owner and supervisor");
+        }
+        return evidence;
+    }
+    Json reap_document(const EventLog& log, const obd::test::ChildReapSnapshot& evidence) const {
+        const int status = evidence.wait_status;
+        return {{"source_path", directory_ + "/child-" +
+                                 std::to_string(evidence.generation) + ".reap"},
+                {"magic", evidence.magic}, {"version", evidence.version}, {"committed", 1},
+                {"generation", evidence.generation}, {"reaper_pid", evidence.reaper_pid},
+                {"pid", evidence.pid}, {"wait_status", status},
+                // Start ticks come from the already pinned live process log;
+                // the reaper records only the exact PID it actually collected.
+                {"matched_process_start_ticks", log.header().process_start_ticks},
+                {"exited", WIFEXITED(status)}, {"exit_code", WIFEXITED(status) ? WEXITSTATUS(status) : -1},
+                {"signaled", WIFSIGNALED(status)}, {"term_signal", WIFSIGNALED(status) ? WTERMSIG(status) : 0}};
+    }
+    int wait_reap_evidence(const EventLog& log, const char* role) {
+        std::optional<obd::test::ChildReapSnapshot> evidence;
+        wait_for([&] {
+            evidence = read_reap_evidence(log);
+            return evidence.has_value();
+        }, 5s, "actual child wait status was not committed by its supervisor");
+        report_[std::string(role) + "_reap"] = reap_document(log, *evidence);
+        return evidence->wait_status;
+    }
+    void export_reap_evidence(const EventLog& log, const char* role) {
+        const auto evidence = read_reap_evidence(log);
+        require_fixture(evidence.has_value(), "actual child wait status is missing");
+        const auto document = reap_document(log, *evidence);
+        report_[std::string(role) + "_reap"] = document;
+        write_text(directory_ + "/child-" + std::to_string(evidence->generation) +
+                   ".reap.json", document.dump(2));
+    }
     Json call(const Json& command) const { return rpc(socket_, command); }
     void remember(const char* checkpoint, const Json& record) {
         report_["observations"].push_back({{"checkpoint", checkpoint}, {"record", record}});

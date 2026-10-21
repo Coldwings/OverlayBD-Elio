@@ -186,6 +186,11 @@ TEST_CASE("device: standalone startup socket rejects filesystem paths",
 #ifdef OBD_TEST_DEVICE_BIN
 TEST_CASE("device: standalone recovery assembly failure drains its control endpoint",
           "[startup-socket]") {
+    bool fixture_enabled = false;
+    SECTION("ordinary invocation") {}
+    SECTION("fixture construction retains its directory through the blocking call") {
+        fixture_enabled = true;
+    }
     obd::test::TempDir dir;
     const auto name = socket_name();
     const auto log = (dir.path() / "device.log").string();
@@ -195,6 +200,20 @@ TEST_CASE("device: standalone recovery assembly failure drains its control endpo
     std::vector<char*> argv;
     for (auto& argument : arguments) argv.push_back(argument.data());
     argv.push_back(nullptr);
+    std::vector<std::string> environment;
+    for (char** item = environ; *item; ++item)
+        if (std::string_view(*item).find("OBD_TEST_STARTUP_FIXTURE_DIR=") != 0)
+            environment.emplace_back(*item);
+    if (fixture_enabled) {
+        std::ofstream marker(dir.path() / "partial-recovery-v1");
+        marker << "test\n";
+        marker.close();
+        REQUIRE(marker.good());
+        environment.push_back("OBD_TEST_STARTUP_FIXTURE_DIR=" + dir.path().string());
+    }
+    std::vector<char*> envp;
+    for (auto& item : environment) envp.push_back(item.data());
+    envp.push_back(nullptr);
     posix_spawn_file_actions_t actions;
     REQUIRE(::posix_spawn_file_actions_init(&actions) == 0);
     const int open_error = ::posix_spawn_file_actions_addopen(
@@ -205,7 +224,7 @@ TEST_CASE("device: standalone recovery assembly failure drains its control endpo
     }
     pid_t pid = -1;
     const int error = ::posix_spawn(&pid, OBD_TEST_DEVICE_BIN, &actions,
-                                   nullptr, argv.data(), environ);
+                                   nullptr, argv.data(), envp.data());
     ::posix_spawn_file_actions_destroy(&actions);
     REQUIRE(error == 0);
     int status = 0;

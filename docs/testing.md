@@ -1056,6 +1056,15 @@ Every test, grouped by area, with the property it guards.
   ready event.
 - `supervisor: exec failure surfaces as exit 127` — a missing device
   binary yields EOF on the status channel plus exit code 127.
+- `supervisor: reap evidence preserves actual child wait status` — real
+  fork/exec children exit zero, exit 134, abort, and receive SIGKILL. The
+  per-generation observation is absent before actual collection, preserves
+  raw wait-status distinctions despite a stopped self-report, and survives
+  Child destruction. No ublk device or privileged operation is required.
+- `supervisor: unavailable reap evidence does not change child collection` —
+  a missing opt-in marker or an occupied exclusive evidence file leaves
+  normal child collection unchanged. No successful observation is invented,
+  and an existing file is not overwritten.
 - `supervisor: bdev path parses to device id` —
   `dev_id_from_bdev_path` extracts the id from `/dev/ublkbN` and
   rejects non-bdev paths (ADR-0010).
@@ -1498,7 +1507,11 @@ Every test, grouped by area, with the property it guards.
   listener. Raw and control cookies are correlated with their own terminal CQEs;
   the final checks cover native bridge retirement, owner exit, cdev closure,
   one DEL, the admitted release sequence, actual child reap, and removal of
-  pinned kernel node identities. Issuance alone is not acceptance evidence:
+  pinned kernel node identities. A separate supervisor-owned waitpid record
+  must show SIGKILL for the intentional original crash and normal exit zero
+  for the released replacement in both sections. Reap alone or a final
+  stopped self-report cannot hide a later allocator abort. Issuance alone is
+  not acceptance evidence:
   each parked data FETCH must return its original `-ENODEV` after authorized STOP.
   This stage does not cover pending remote fills or post-END source-buffer loans.
   Before observing queue publication, the fixture waits for the correlated
@@ -1526,6 +1539,26 @@ Every test, grouped by area, with the property it guards.
   `caller_terminal` records the caller's final owner facts before reporting them.
   Neither event changes report semantics or substitutes for actual reap.
 
+  The standalone assembly-failure unit test also enables this marked fixture
+  before rejecting an invalid image configuration, without constructing a ublk
+  device. It requires the expected normal exit. Fixture construction borrows
+  its path from the awaiting coroutine frame through a named blocking callable;
+  a focused ASAN run checks that this handoff does not double-free the path.
+
+  Before each fork the supervisor optionally prepares an exclusive
+  `child-<generation>.reap` mmap record in the same marked fixture directory.
+  `Child::try_reap` writes the actual collected PID and raw wait status, then
+  release-commits the record before publishing reap notifications. The sink
+  belongs to that Child and never borrows the synchronous spawn-test hooks.
+  Collection performs only fixed stores; evidence setup failure does not
+  change spawning, teardown or collection. The test rejects missing,
+  uncommitted or mismatched records and exports `child-<generation>.reap.json`
+  with reaper PID, child PID, generation, raw status and decoded exit/signal
+  fields. The JSON's `matched_process_start_ticks` comes from the already
+  pinned child event ledger, not from a process lookup after reap. Result
+  JSON includes the matched original/replacement reap documents. These
+  observations survive registry erasure during supervisor maintenance.
+
   Self-skips using the ordinary ublk prerequisite check. CTest retains its finite
   timeout, but that external cutoff is not cleanup or retirement evidence.
   Privileged acceptance uses an owned VM runner that preserves the VM/processes
@@ -1533,8 +1566,9 @@ Every test, grouped by area, with the property it guards.
   implicitly deletes a device, or opens queue 1 while original END is unresolved.
   Failure artifacts remain in `/tmp/obd-startup-kernel-*` (or the configured
   temporary directory): `result.json`, per-process `.events` and `.events.json`,
-  and `supervisor.log`. Export them before VM poweroff; a test timeout or missing
-  prerequisite is not a passed kernel case.
+  per-generation `.reap` and `.reap.json`, and `supervisor.log`. Export them
+  before VM poweroff; a test timeout or missing prerequisite is not a passed
+  kernel case.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with

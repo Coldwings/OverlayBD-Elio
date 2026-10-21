@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <chrono>
@@ -107,6 +108,10 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
 #endif
     auto child = std::unique_ptr<Child>(new Child(spec.id));
     child->startup_generation_ = spec.startup_generation;
+#ifdef OBD_TEST_HOOKS
+    child->reap_evidence_.prepare(std::getenv("OBD_TEST_STARTUP_FIXTURE_DIR"),
+                                  spec.startup_generation);
+#endif
 
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
@@ -302,6 +307,11 @@ bool Child::try_reap() {
             result = ::waitpid(pid_, &wait_status, WNOHANG);
         } while (result < 0 && errno == EINTR);
         if (result != pid_) return false;
+#ifdef OBD_TEST_HOOKS
+        // Capture the raw owned-process result before publishing reap or
+        // notifying waiters. Fixed mmap stores cannot throw after collection.
+        reap_evidence_.publish(result, wait_status);
+#endif
         // Keep collection and publication inside the signal lock: the PID
         // can be recycled as soon as waitpid returns, before any separate
         // note_reaped call could protect terminate()/kill().

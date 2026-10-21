@@ -500,6 +500,18 @@ starting → failed ─────────→ exited   (exec failure: exit 
 starting ──────(crash)─────→ exited   (reaper fills exit_code)
 ```
 
+The opt-in startup kernel fixture also requires the raw collected wait status:
+reap proves collection, not successful process shutdown. In test-enabled builds,
+`OBD_TEST_STARTUP_FIXTURE_DIR` plus its `partial-recovery-v1` marker enables a
+Child-owned, exclusive `child-<generation>.reap` mapping prepared before fork.
+The matching `Child::try_reap` publishes PID, generation, reaper PID and raw wait
+status before notifying waiters, using fixed stores without allocation or file
+I/O at collection. Missing evidence makes the fixture fail but never changes
+process ownership or teardown. The controller requires the intentionally killed
+original to show SIGKILL and the released replacement to show normal exit zero,
+even after a maintenance shutdown erases their registry entry. This internal
+test record is separate from the public supervisor protocol.
+
 ### Protected startup ownership (ADR-0022)
 
 Every supervised generation offers `startup_owner` version 1 before publishing
@@ -1072,6 +1084,13 @@ needing a real ublk device or root.
   binary does not exist and guards that the reaped `exit_code` is exactly
   127 and the status error contains "exec failed". This pins the exec-fail
   convention that operators and `cmd_create` rely on.
+- `supervisor: reap evidence preserves actual child wait status` — real
+  fork/exec exits distinguish exit zero, exit 134, SIGABRT and SIGKILL.
+  A reported stopped state cannot commit the observation; actual collection
+  does, and the durable record remains after Child destruction.
+- `supervisor: unavailable reap evidence does not change child collection` —
+  missing marker and exclusive-file collision leave collection unchanged,
+  never overwrite earlier evidence, and cannot produce a passing witness.
 - `supervisor: failed child ownership setup leaves no process or channel` —
   injects an owner-allocation failure and a parent-side exception after fork;
   no returned `Child` is needed to ensure collection and channel closure.

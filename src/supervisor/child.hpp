@@ -9,6 +9,7 @@
 #pragma once
 
 #include "supervisor/protocol.hpp"
+#include "supervisor/reap_test_evidence.hpp"
 
 #include <elio/sync/event.hpp>
 
@@ -144,6 +145,9 @@ private:
     std::string id_;
     pid_t pid_ = -1;
     int ctl_fd_ = -1;
+#ifdef OBD_TEST_HOOKS
+    detail::ChildReapEvidence reap_evidence_;
+#endif
 
     mutable std::mutex mu_;
     Status st_;
