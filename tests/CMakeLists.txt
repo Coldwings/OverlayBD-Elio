@@ -105,7 +105,8 @@ catch_discover_tests(obd_dart_dns_tests
 
 if(OBD_ENABLE_UBLK)
     target_sources(obd_unit_tests PRIVATE
-        unit/test_ublk.cpp unit/test_ublk_shutdown.cpp unit/test_ublk_startup.cpp
+        unit/test_ublk.cpp unit/test_ublk_tag_engine.cpp
+        unit/test_ublk_shutdown.cpp unit/test_ublk_startup.cpp
         unit/test_ublk_control_task.cpp unit/test_ublk_retirement.cpp
         unit/test_ublk_ctrl_loop.cpp)
     target_link_libraries(obd_unit_tests PRIVATE obd_ublk)

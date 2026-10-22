@@ -114,7 +114,7 @@ unknown rather than retiring a different command.
 
 ### Op dispatch table
 
-The bridge (`src/ublk/elio_bridge.cpp`, function `handle_io`) implements the
+The tag engine (`src/ublk/tag_engine.cpp`, function `handle_io`) implements the
 device's op policy:
 
 | ublk op | Behavior |
@@ -401,6 +401,80 @@ Queue thread side:
   and errno. `-ENODEV` / `-EINTR` / `-ECANCELED` cqes are treated as normal
   teardown, not failures.
 
+### `src/ublk/tag_engine.hpp` — reusable tag processing
+
+```cpp
+struct OwnerResult { uint16_t tag; uint64_t generation; int32_t result; };
+OwnerResultSink(void* context, Publish publish, Fail fail, Notify notify);
+void OwnerResultSink::publish(OwnerResult) const;
+void OwnerResultSink::fail(int) const noexcept;
+void OwnerResultSink::notify_owner() const noexcept;
+
+explicit ForeignResultMailbox(uint16_t depth);
+bool ForeignResultMailbox::arm(uint16_t tag, uint64_t generation) noexcept;
+bool ForeignResultMailbox::retire(uint16_t tag, uint64_t generation) noexcept;
+bool ForeignResultMailbox::publish(OwnerResult) noexcept;
+bool ForeignResultMailbox::take(uint16_t tag, uint64_t generation,
+                                OwnerResult& out) noexcept;
+
+TagEngine(Queue*, source::BlobSource*, OwnerResultSink, size_t owner);
+void TagEngine::collect_foreign_results() noexcept;
+bool TagEngine::admit(IoRequest);
+bool TagEngine::retry_signal(uint16_t tag);
+void TagEngine::begin_close() noexcept;
+bool TagEngine::retry_close_signal(uint16_t tag);
+elio::coro::task_group::join_awaitable TagEngine::join_handlers() noexcept;
+bool TagEngine::handlers_drained() const noexcept;
+```
+
+`OwnerResult` is the internal completion fact `{tag, generation, result}`.
+`OwnerResultSink(void*, Publish, Fail, Notify)` is a non-owning function-pointer
+callback boundary: only the tag owner calls `publish(OwnerResult)`; a foreign
+continuation may call the non-throwing `fail(int)` and `notify_owner()` callbacks
+to publish sticky failure/wake facts. Callback context and functions must
+outlive the engine.
+
+`ForeignResultMailbox(uint16_t depth)` preallocates one atomic slot per tag and
+rejects zero depth. `arm(tag, generation)` reserves an exact nonzero generation;
+`publish(OwnerResult)` fills that generation once without allocating or
+throwing; stale, duplicate, out-of-range and unarmed publications return false.
+Only the owner calls `take(tag, generation, out)` to consume and clear an exact
+ready result, or `retire(tag, generation)` after a normal owner-side result.
+Both reject a mismatched generation without changing the slot. Generations are
+bounded by the mailbox's packed atomic representation; the engine reports
+exhaustion before wraparound.
+
+`TagEngine(Queue*, BlobSource*, OwnerResultSink, size_t owner)` preallocates tag
+state and the mailbox, and keeps long-lived handlers in a native collect-all
+TaskGroup. The queue, source, callback context and selected scheduler worker
+must remain live until `join_handlers()` completes. All methods are owner-only
+except the foreign-safe sink callbacks. `admit(IoRequest)` rejects a closed
+engine before any mutation, rejects an invalid or busy tag, assigns a fresh
+generation, and reuses that tag's handler after its first admission. It returns
+false only when the event wake allocation must be retried with
+`retry_signal(tag)` from the caller's existing coroutine frame.
+`begin_close()` closes admission and marks every handler terminal;
+`retry_close_signal(tag)` wakes each live handler, and the caller then directly
+awaits the non-coroutine `join_handlers()` awaitable before consuming foreign
+results and destroying the engine. This split keeps the lifetime fence in the
+already-allocated bridge frame: an allocation failure cannot create a cleanup
+task that unwinds before the TaskGroup is joined. Child failures are reported
+only after the group drains; the bridge fail-stops if an internal join contract
+error is ever observed while a handler remains live.
+
+Normal handler returns restore and verify the owner, then publish directly
+through the sink. A rejected/skipped handler or a handler destroyed on another
+worker can only publish `-EIO` into its prearmed generation and wake the owner.
+The owner validates that generation before clearing busy state or invoking the
+sink, so a delayed result cannot complete a reused tag. TaskGroup frame lifetime
+and the per-request completion obligation remain separate facts.
+
+The current sink still calls `Queue::push_completion`, so this extraction does
+not change ADR-0006: queue threads continue to own raw rings, and both eventfd
+handoffs remain. The mailbox and sink are preparation for issue
+[#120](https://github.com/Coldwings/OverlayBD-Elio/issues/120); no same-owner raw
+ring pump is implemented here.
+
 ### `src/ublk/elio_bridge.hpp` — `obd::ublk::run_bridge`
 
 ```cpp
@@ -417,18 +491,18 @@ to the bridge's worker. Later requests for that tag use a native event rather
 than another scheduler admission. Tags remain independent: a source await on
 one tag does not serialize the other tags (ADR-0021).
 `-EINTR` / `-EAGAIN` on the eventfd read are retried.
-Each bridge owns its tag handlers in an Elio collect-all TaskGroup and
-joins them before returning. Ordinary stop wakes the bridge without
+Each bridge owns a `TagEngine`, whose Elio collect-all TaskGroup owns the tag
+handlers and joins them before returning. Ordinary stop wakes the bridge without
 cancelling admitted source IO; parked handlers are signaled to leave. Each
 handler checks the sticky close predicate before parking again, so a pending
 request and close notification may coalesce without requiring a second wake.
 Accepted source work still finishes before that handler leaves. Each request
 checks the group's cooperative cancellation token before invoking
 the source, including requests on a previously used tag. An admitted request's
-completion token posts `-EIO` if its initial child is rejected or skipped;
-a source exception also posts `-EIO`. A failed initial handler can be admitted
-again for a later request. Lifetime ownership stays with Elio, while the token
-records the kernel completion obligation (ADR-0006).
+mailbox records `-EIO` if its initial child is rejected or skipped; a source
+exception also produces `-EIO`. A failed initial handler can be admitted again
+for a later generation. Lifetime ownership stays with Elio, while the
+generation-checked result records the kernel completion obligation (ADR-0006).
 The bridge and handlers access tag state on the bridge worker. Elio user
 affinity is best effort: a stolen continuation can execute on another worker
 when owner re-enqueue fails. Every relevant suspension return therefore
@@ -439,13 +513,17 @@ request and pool, yielding and retrying until the owner is reached. The native
 already-local affinity awaitable allocates no helper frame or scheduler task.
 A source may deliberately migrate while running; the same restoration applies
 before clearing busy state or publishing completion. Failed/skipped child
-destructors on foreign workers publish only atomic failure facts and notify
-the bridge; they do not mutate owner-only tag state. Failure facts are consumed
+destructors on foreign workers publish only into the preallocated generation
+mailbox and notify the bridge; they do not invoke the owner result sink or
+mutate owner-only tag state. Failure facts are consumed
 before admitting a reused tag. Native event dispatch allocation failure retains
 the request and retries notification from the same bridge frame, including
-stop notifications. Sustained allocation failure can extend this drain.
-If the fallback completion itself cannot be enqueued, the token marks the
-queue failed and wakes its waiter. The same failure publication is used after
+stop notifications. Admission and close preparation are synchronous, and the
+bridge directly awaits TaskGroup's non-coroutine join awaitable; once a handler
+exists, no cleanup coroutine frame is required before that lifetime fence.
+Sustained event allocation failure can extend this drain.
+If the fallback completion itself cannot be enqueued, the sink marks the queue
+failed and wakes its waiter. The same failure publication is used after
 the bridge drains admitted handlers when a loop exception escapes, and on
 cold handler-pool setup failure.
 
@@ -552,7 +630,7 @@ startup mailbox; the returned Device's ordinary owner handles later shutdown.
 - **Full-request reads**: a READ completion always reports the requested
   length on success; EOF short reads from the source are zero-filled in the
   tag buffer. The kernel copies exactly `nr_sectors * 512` bytes out.
-  (Implementation: `handle_io` in src/ublk/elio_bridge.cpp.)
+  (Implementation: `handle_io` in src/ublk/tag_engine.cpp.)
 - **Sector math**: all offsets/lengths crossing the bridge are 512-byte
   sector based (`IoRequest::byte_offset` / `byte_len`); sources see
   byte-granular positional IO. Anchor: `src/ublk/queue.hpp::IoRequest`.
@@ -578,7 +656,7 @@ Three distinct execution contexts, with strict permissions:
 |---|---|---|
 | Control path | owned cold-controller thread, coordinated by the startup coroutine | Ctrl commands and their original/cancel ledger; blocking, cold path only |
 | ublk queue threads | one `std::thread` per `Queue` | **exclusively** their ring, the read-only mmap window, `pending_` push, `done_` drain |
-| Elio scheduler threads | bridge + per-tag `handle_io` coroutines | `try_pop_request`, tag IO buffers, `BlobSource` stack, `push_completion` |
+| Elio scheduler threads | bridge + owner-only `TagEngine` + per-tag `handle_io` coroutines | `try_pop_request`, tag IO buffers, `BlobSource` stack; only the selected owner consumes foreign results and calls the result sink |
 
 - `pending_` / `done_` are the only cross-thread shared state, guarded by
   `Queue::mu_`; wakeup is via `elio_efd_` / `done_efd_` (nonblocking,
@@ -597,7 +675,7 @@ Three distinct execution contexts, with strict permissions:
   to complete. Stop calls for a Device are sequential, not concurrent.
   Native destruction-observer allocation failure retries in the existing
   stop coroutine frame; owners remain retained until the bridge frame departs.
-- `run_bridge` and `handle_io` are Elio coroutines; all source IO goes
+- `run_bridge`, `TagEngine` handlers and `handle_io` are Elio coroutines; all source IO goes
   through the Elio IO backend (no blocking syscalls on the scheduler).
 - Inputs are not mutated: `DeviceParams` is read-only after `create`;
   `src` ownership moves into `Device` and outlives all bridges (destruction
@@ -689,12 +767,25 @@ kernel matrix is not a separate acceptance requirement absent a concrete wiring
 defect or an explicitly expanded scope.
 
 
-Unit tests live in `tests/unit/test_ublk.cpp` (built only when
+Unit tests live in `tests/unit/test_ublk*.cpp` (built only when
 `OBD_ENABLE_UBLK` is on); the kernel-dependent end-to-end test lives in
 `tests/integration/test_ublk_e2e.cpp`.
 
 - `ublk: repeated tag reads stay on the bridge worker` — four runtime workers
   retain source entry/resume on the explicitly selected bridge worker.
+- `ublk: foreign result mailbox enforces tag generations` — one preallocated
+  tag slot accepts its armed generation exactly once, rejects stale/duplicate
+  results and can be rearmed only after owner consumption.
+- `ublk: foreign handler destruction publishes only through owner sink` — a
+  real `TagEngine` handler migrates to another Elio worker and unwinds there;
+  its production guard records only an exact-generation mailbox fact and wake,
+  while the selected owner invokes the sink exactly once.
+- `ublk: tag engine rejects admission after terminal close` — cold and warm
+  reusable tags reject before creating a new obligation; compile-time checks
+  pin synchronous admission/close preparation and direct TaskGroup joining.
+- `ublk: admission failure still joins the accepted handler` — an exception
+  immediately after event publication cannot bypass request drain or the
+  handler lifetime fence.
 - `ublk: a reused tag does not readmit a scheduler child` — after a first
   successful read, another read succeeds without consuming an armed native
   scheduler-admission rejection.

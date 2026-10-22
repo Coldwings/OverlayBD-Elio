@@ -1911,6 +1911,22 @@ Unmodified upstream-produced metadata and gzip fixture compatibility.
 
 Elio task-ownership and notification migration regressions:
 
+- `ublk: foreign result mailbox enforces tag generations` — deterministic
+  preallocated-slot coverage for exact generation admission, stale and duplicate
+  rejection, one-time owner consumption and safe reuse by a newer generation.
+- `ublk: foreign handler destruction publishes only through owner sink` — a
+  real `TagEngine` handler migrates to another Elio worker and is forced to
+  unwind there. Its production `HandlerGuard` publishes only the exact
+  generation mailbox fact and owner wake; owner-side collection invokes the
+  sink exactly once on the selected worker.
+- `ublk: tag engine rejects admission after terminal close` — both a cold tag
+  and a completed reusable tag reject post-close admission before creating a
+  generation, child or completion obligation; API shape assertions keep
+  admission and close preparation synchronous and joining an awaitable.
+- `ublk: admission failure still joins the accepted handler` — the admission
+  observer throws immediately after the request wake. The bridge preserves the
+  failure, drains the accepted request and directly joins its handler before
+  reporting bridge termination.
 - `ublk: foreign resumptions retain tag state until owner restoration` — warm
   tag-wait, source-return, request-notification and stop-notification boundaries
   deliberately migrate through the public native API. A joinable native task

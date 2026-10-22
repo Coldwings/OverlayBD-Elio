@@ -5,6 +5,7 @@
 #include "cmd/startup_socket.hpp"
 #include "ublk/device.hpp"
 #include "ublk/elio_bridge.hpp"
+#include "ublk/tag_engine.hpp"
 
 #include "../support.hpp"
 #include "../runtime_faults.hpp"
@@ -31,6 +32,7 @@
 #include <functional>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 
 namespace obd::ublk {
 
@@ -191,8 +193,11 @@ struct DeviceTestAccess {
             queue(dev).notify_elio();
         };
     }
+    static void set_admission_hook(Device& dev, std::function<void()> hook) {
+        queue(dev).bridge_admission_hook_for_test_ = std::move(hook);
+    }
     static bool rescue_closing_tag(Device& dev) {
-        // Called with no suspension on the sole bridge worker. TagPool clears
+        // Called with no suspension on the sole bridge worker. TagEngine clears
         // this pointer before freeing its events, even before the outer
         // bridge join handle has reported final destruction.
         auto* ready = queue(dev).bridge_ready_for_test_;
@@ -214,6 +219,41 @@ struct ReadState {
     std::atomic<bool> destroyed{false};
     std::atomic<bool> destroyed_off_worker{false};
 };
+
+struct OwnerSinkObservation {
+    std::atomic<unsigned> published{0};
+    std::atomic<unsigned> notified{0};
+    std::atomic<unsigned> failed{0};
+    std::atomic<int> failure{0};
+    std::atomic<size_t> notify_worker{elio::coro::NO_AFFINITY};
+    std::atomic<size_t> publish_worker{elio::coro::NO_AFFINITY};
+    std::thread::id notify_thread;
+    std::thread::id publish_thread;
+    obd::ublk::OwnerResult result;
+};
+
+void record_owner_result(void* context, obd::ublk::OwnerResult result) {
+    auto& observed = *static_cast<OwnerSinkObservation*>(context);
+    observed.result = result;
+    observed.publish_thread = std::this_thread::get_id();
+    observed.publish_worker.store(elio::current_worker_id(),
+                                  std::memory_order_release);
+    observed.published.fetch_add(1, std::memory_order_release);
+}
+
+void record_sink_failure(void* context, int error) noexcept {
+    auto& observed = *static_cast<OwnerSinkObservation*>(context);
+    observed.failure.store(error, std::memory_order_release);
+    observed.failed.fetch_add(1, std::memory_order_release);
+}
+
+void record_owner_notification(void* context) noexcept {
+    auto& observed = *static_cast<OwnerSinkObservation*>(context);
+    observed.notify_thread = std::this_thread::get_id();
+    observed.notify_worker.store(elio::current_worker_id(),
+                                 std::memory_order_release);
+    observed.notified.fetch_add(1, std::memory_order_release);
+}
 
 // Scripted control CQEs exercise the real Ctrl/Device ownership callbacks.
 // The optional delayed START/END waits for actual cancellation submission before
@@ -757,6 +797,191 @@ TEST_CASE("ublk: a tag retries after its initial child admission is rejected", "
     CHECK(first_failed);
     CHECK(retried);
     CHECK(state.calls.load() == 1);
+}
+
+TEST_CASE("ublk: tag engine rejects admission after terminal close",
+          "[ublk][tag-engine][shutdown]") {
+    using obd::ublk::DeviceTestAccess;
+    using obd::ublk::IoRequest;
+    using obd::ublk::OwnerResultSink;
+    using obd::ublk::TagEngine;
+
+    static_assert(std::is_same_v<
+                  decltype(std::declval<TagEngine&>().admit(IoRequest{})),
+                  bool>);
+    static_assert(std::is_same_v<
+                  decltype(std::declval<TagEngine&>().begin_close()), void>);
+    static_assert(std::is_same_v<
+                  decltype(std::declval<TagEngine&>().join_handlers()),
+                  elio::coro::task_group::join_awaitable>);
+
+    bool warm = false;
+    SECTION("cold tag") {}
+    SECTION("warm reusable tag") { warm = true; }
+
+    OwnerSinkObservation observed;
+    obd::test::VectorSource source(std::vector<uint8_t>(512, 0x5a));
+    auto dev = DeviceTestAccess::make(nullptr, true, 1);
+    bool rejected = false;
+    unsigned published_before_rejection = 0;
+
+    elio::run([&]() -> elio::coro::task<void> {
+        OwnerResultSink sink(&observed, record_owner_result,
+                             record_sink_failure, record_owner_notification);
+        TagEngine engine(&DeviceTestAccess::queue(*dev), &source, sink,
+                         elio::current_worker_id());
+        if (warm) {
+            bool signaled = engine.admit(
+                IoRequest{0, UBLK_IO_OP_READ, 0, 0, 1});
+            while (!signaled) {
+                co_await elio::time::yield();
+                signaled = engine.retry_signal(0);
+            }
+            for (unsigned attempt = 0;
+                 attempt != 5000 &&
+                 observed.published.load(std::memory_order_acquire) == 0;
+                 ++attempt) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        engine.begin_close();
+        while (!engine.retry_close_signal(0))
+            co_await elio::time::yield();
+        try {
+            co_await engine.join_handlers();
+        } catch (...) {
+        }
+        engine.collect_foreign_results();
+        published_before_rejection =
+            observed.published.load(std::memory_order_acquire);
+        try {
+            (void)engine.admit(IoRequest{0, UBLK_IO_OP_READ, 0, 0, 1});
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+    }, one_worker());
+
+    dev.reset();
+    CHECK(rejected);
+    CHECK(observed.failed.load(std::memory_order_acquire) == 1);
+    CHECK(observed.failure.load(std::memory_order_acquire) == ESHUTDOWN);
+    CHECK(observed.published.load(std::memory_order_acquire) ==
+          published_before_rejection);
+    CHECK(observed.notified.load(std::memory_order_acquire) == 0);
+    CHECK(source.reads() == (warm ? 1 : 0));
+    CHECK(published_before_rejection == (warm ? 1 : 0));
+}
+
+TEST_CASE("ublk: foreign handler destruction publishes only through owner sink",
+          "[ublk][tag-engine][locality]") {
+    using obd::ublk::BridgeResumePoint;
+    using obd::ublk::DeviceTestAccess;
+    using obd::ublk::IoRequest;
+    using obd::ublk::OwnerResultSink;
+    using obd::ublk::TagEngine;
+
+    OwnerSinkObservation observed;
+    obd::test::VectorSource source(std::vector<uint8_t>(512, 0x5a));
+    auto dev = DeviceTestAccess::make(nullptr, true, 1);
+    std::thread::id owner_thread;
+    bool notification_preceded_publish = false;
+    bool joined_failure = false;
+
+    DeviceTestAccess::set_resume_hooks(
+        *dev,
+        [&](BridgeResumePoint point) -> elio::coro::task<void> {
+            if (point != BridgeResumePoint::tag_wait) co_return;
+            co_await elio::set_affinity(1);
+            throw std::runtime_error("forced foreign handler teardown");
+        },
+        {});
+
+    elio::runtime::run_config config;
+    config.num_threads = 2;
+    config.blocking_threads = 1;
+    config.shutdown_timeout = std::chrono::milliseconds::max();
+    elio::run([&]() -> elio::coro::task<void> {
+        co_await elio::set_affinity(0);
+        owner_thread = std::this_thread::get_id();
+        OwnerResultSink sink(&observed, record_owner_result,
+                             record_sink_failure, record_owner_notification);
+        TagEngine engine(&DeviceTestAccess::queue(*dev), &source, sink, 0);
+
+        bool signaled = engine.admit(
+            IoRequest{0, UBLK_IO_OP_READ, 0, 0, 1});
+        while (!signaled) {
+            co_await elio::time::yield();
+            signaled = engine.retry_signal(0);
+        }
+        for (unsigned attempt = 0;
+             attempt != 5000 &&
+             observed.notified.load(std::memory_order_acquire) == 0;
+             ++attempt) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        notification_preceded_publish =
+            observed.notified.load(std::memory_order_acquire) == 1 &&
+            observed.published.load(std::memory_order_acquire) == 0;
+        engine.collect_foreign_results();
+        engine.collect_foreign_results();
+        engine.begin_close();
+        while (!engine.retry_close_signal(0))
+            co_await elio::time::yield();
+        try {
+            co_await engine.join_handlers();
+        } catch (const elio::coro::task_group_error&) {
+            joined_failure = true;
+        }
+        engine.collect_foreign_results();
+    }, config);
+
+    dev.reset();
+    CHECK(notification_preceded_publish);
+    CHECK(joined_failure);
+    CHECK(observed.notified.load(std::memory_order_acquire) == 1);
+    CHECK(observed.notify_worker.load(std::memory_order_acquire) == 1);
+    CHECK(observed.notify_thread != owner_thread);
+    CHECK(observed.published.load(std::memory_order_acquire) == 1);
+    CHECK(observed.publish_worker.load(std::memory_order_acquire) == 0);
+    CHECK(observed.publish_thread == owner_thread);
+    CHECK(observed.failed.load(std::memory_order_acquire) == 0);
+    CHECK((observed.result == obd::ublk::OwnerResult{0, 1, -EIO}));
+    CHECK(source.reads() == 0);
+}
+
+TEST_CASE("ublk: admission failure still joins the accepted handler",
+          "[ublk][tag-engine][shutdown]") {
+    using obd::ublk::DeviceTestAccess;
+    LocalityState source;
+    bool injected = false;
+    bool completed = false;
+    bool joined_after_completion = false;
+    auto dev = DeviceTestAccess::make(std::make_unique<LocalitySource>(source));
+    DeviceTestAccess::set_admission_hook(*dev, [&] {
+        injected = true;
+        throw std::bad_alloc();
+    });
+
+    elio::run([&]() -> elio::coro::task<void> {
+        DeviceTestAccess::start_on(*dev, 0);
+        DeviceTestAccess::enqueue_read(*dev);
+        completed = co_await await_test_completion(*dev);
+        for (unsigned attempt = 0;
+             attempt != 5000 && DeviceTestAccess::running(*dev) != 0;
+             ++attempt) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        joined_after_completion =
+            DeviceTestAccess::running(*dev) == 0 &&
+            DeviceTestAccess::completed_read(*dev);
+        co_await dev->stop_async();
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+
+    CHECK(injected);
+    CHECK(completed);
+    CHECK(joined_after_completion);
+    CHECK(source.calls.load() == 1);
 }
 
 TEST_CASE("ublk: tag notification allocation failure retains reads and stop", "[ublk][locality]") {
