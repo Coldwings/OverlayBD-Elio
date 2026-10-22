@@ -117,6 +117,7 @@ private:
     friend struct DeviceTestAccess;
     Device() = default;
     void open_queues();
+    std::chrono::steady_clock::time_point startup_now() const noexcept;
     void request_stop() noexcept;
     static elio::coro::task<std::unique_ptr<Device>> start_impl(
         bool recovery, uint32_t dev_id, const DeviceParams& params,

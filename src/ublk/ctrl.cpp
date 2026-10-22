@@ -53,6 +53,9 @@ Ctrl::~Ctrl() {
     }
     if (!transport_) io_uring_queue_exit(&ring_);
     if (fd_ >= 0) ::close(fd_);
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_destroyed});
+#endif
 }
 
 int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,

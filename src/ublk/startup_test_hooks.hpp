@@ -6,8 +6,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+
+namespace obd::ublk { class Queue; }
 
 namespace obd::ublk::detail {
+class CtrlTransport;
 
 // Test-only observation boundary. The caller owns the instance through the
 // entire startup/retention/teardown lifetime. Observers must never throw or
@@ -22,6 +26,7 @@ enum class StartupTestKind : uint32_t {
     caller_terminal, post_control_enter, post_control_fail, source_enter,
     source_result, source_scope_exit, source_destroyed, request_delivered, release_admitted,
     failure_report_throw, failure_report_caught, failure_report_constructed, release_setup_throw,
+    control_destroyed, retained_entered,
 };
 struct StartupTestEvent {
     StartupTestKind kind{};
@@ -43,6 +48,18 @@ public:
     virtual void before_initial_submit(uint16_t queue) noexcept = 0;
     virtual elio::coro::task<void> after_start_control() { co_return; }
     virtual void before_release_attempt(uint64_t) {}
+    // Ordinary coordinator fixtures borrow dependencies through the same
+    // startup owner. Null/false preserves the kernel implementation. Queue
+    // adapters supply descriptors/buffers only, never lifecycle facts.
+    virtual CtrlTransport* control_transport() noexcept { return nullptr; }
+    virtual bool open_queue(Queue&, int) { return false; }
+    // Native queue/control threads only; throwing setup failures are caught
+    // by Queue::run before it can prepare any FETCH.
+    virtual void before_queue_setup(Queue&) {}
+    virtual void before_start_admission() {}
+    virtual std::chrono::steady_clock::time_point startup_now() noexcept {
+        return std::chrono::steady_clock::now();
+    }
 };
 
 // Finite shared-memory fixture wire layout, internal to test-enabled binaries.

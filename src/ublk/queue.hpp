@@ -185,6 +185,9 @@ public:
 private:
     friend struct DeviceTestAccess;
     friend struct QueueRetirementTestAccess;
+#ifdef OBD_TEST_HOOKS
+    friend struct StartupCoordinatorTestAccess;
+#endif
     /// Creates the queue io_uring. Must be called on the queue thread
     /// (SINGLE_ISSUER binds the creator; DEFER_TASKRUN binds the
     /// waiter). Throws obd::error on failure.

@@ -994,6 +994,49 @@ Every test, grouped by area, with the property it guards.
   grow-only reason (ADR-0014).
 ### ublk
 
+- `ublk: public create catches single queue setup failure` and
+  `ublk: public attach catches single queue setup failure` — enter the public
+  API with a per-instance control transport and queue-open adapter. A setup
+  exception inside the real queue owner is normalized to `EIO`, with zero
+  FETCH preparation and zero START/END admission. Create performs one STOP
+  and DEL after successful ADD; unadopted attach closes only its local owners.
+- `ublk: public create retains paused peer after queue setup failure` and
+  `ublk: public attach retains paused peer after queue setup failure` — queue 1
+  acknowledges a setup pause before queue 0 fails. While it remains paused,
+  the public operation and its source/cdev owners remain live, every queue
+  has zero published commands, and attach submits neither STOP nor DEL.
+  Opening the synthetic gate permits real owner exit and native bridge drain.
+- `ublk: public create observes failure across START admission gap` and
+  `ublk: public attach observes failure across END admission gap` — fail the
+  queue after the prerequisite check, before admitting the control command.
+  The real Ctrl observer detects `EIO`; its cancellation CQE arrives first,
+  while the original remains pending. Only original `-EINTR` permits cleanup;
+  published, unadopted attach additionally requires explicit release.
+- `ublk: public START cancellation leaves sole source blocking worker free` —
+  actual scripted START submission precedes queue failure and a read on the
+  Device-owned source. With one Elio worker and one blocking worker, that
+  source completes its blocking task and native frame before the original
+  START CQE is released. The failure callback also fences the borrowed source
+  task on a test failure. This is a source/pool dependency, not a kernel
+  delivered request or a queue-buffer loan.
+- `ublk: public START deadline retains original after cancellation CQE` —
+  advance only the per-instance startup clock after START admission. The
+  production cancellation observer saves `ETIMEDOUT`, without releasing the
+  pending original or any owner merely because cancellation has completed.
+
+These eight `[startup-coordinator]` cases share a cancel-CQE-first/original-held
+script and exercise the public `Device::create/attach` coordinator, actual
+queue owner threads, bridges, and Ctrl original/cancellation processing.
+Queue rings submit real commands to eventfd stand-ins; their rejected original
+CQEs are matched by cookie before cdev closure. Control CQEs and device identity
+are scripted: this is ordinary coordinator coverage, not ublk driver acceptance.
+Each borrowed dependency outlives the completed startup task. Native gates and
+the scripted original have bounded failure escapes; an escape fails the test
+and releases only synthetic checkpoints, never assigns retirement facts.
+The eight cases also require source destruction after native owner/bridge drain,
+closed cdevs and Ctrl destruction. Test seams are absent with
+`OBD_BUILD_TESTS=OFF`; normal invocations retain the kernel dependencies.
+
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
   Device destruction, with one worker and one blocking thread.

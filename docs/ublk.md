@@ -733,6 +733,16 @@ Unit tests live in `tests/unit/test_ublk.cpp` (built only when
 - `ublk: replacement queue open failure never repeats accepted recovery` —
   even `EBUSY` from opening replacement queues propagates immediately;
   START may not be repeated once it has reset the old queue state.
+- The eight public startup coordinator cases (`[startup-coordinator]`, listed
+  in [testing.md](testing.md#ublk)) cover create/attach setup failures, a paused
+  second owner with all-zero publication, the prerequisite-to-START/END
+  admission gap, post-START queue failure with sole blocking-pool source
+  progress, and the admitted START deadline. Their real coordinator and Ctrl
+  observer retain the original after a cancellation CQE, preserve `EIO` or
+  `ETIMEDOUT`, and distinguish new-device cleanup authority from explicit
+  release of a published, unadopted recovery. The queue rings retire real
+  eventfd-rejected commands; scripted control CQEs do not establish driver
+  acceptance. These ordinary tests complement the privileged #137 fixtures.
 - `ublk: failed startup drains sources before propagating its original error` —
   the production failure coordinator drains partial bridge registration and
   publishes released state before rethrowing the original failure. Source
