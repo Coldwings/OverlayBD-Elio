@@ -375,6 +375,9 @@ Queue::Retirement Queue::retirement() const noexcept {
 void Queue::run(std::atomic<bool>& stop) {
     std::vector<io_uring_cqe*> cqes;
     try {
+#ifdef OBD_TEST_HOOKS
+        if (test_hooks_) test_hooks_->before_queue_setup(*this);
+#endif
         init_ring();
         raw_.resize(depth_);
         cqes.resize(depth_ * 2);

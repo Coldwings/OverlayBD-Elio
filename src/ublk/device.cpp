@@ -29,10 +29,20 @@ void Device::open_queues() {
         // The driver's open exclusion is device-wide, not per queue.
         // Duplicate the first queue's descriptor so each queue retains
         // independent ownership without opening a second server session.
-        queue->open(shared_cdev_fd);
+#ifdef OBD_TEST_HOOKS
+        if (!test_hooks_ || !test_hooks_->open_queue(*queue, shared_cdev_fd))
+#endif
+            queue->open(shared_cdev_fd);
         if (shared_cdev_fd < 0) shared_cdev_fd = queue->cdev_fd();
         queues_.push_back(std::move(queue));
     }
+}
+
+std::chrono::steady_clock::time_point Device::startup_now() const noexcept {
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) return test_hooks_->startup_now();
+#endif
+    return std::chrono::steady_clock::now();
 }
 
 namespace {
@@ -127,7 +137,7 @@ int Device::cancel_control(void* opaque, uint32_t opcode) noexcept {
     if (dev.startup_ && dev.startup_->release_request()) return ECANCELED;
     for (const auto& q : dev.queues_)
         if (q->failed()) return q->failure() ? q->failure() : EIO;
-    if (std::chrono::steady_clock::now() >= dev.startup_deadline_)
+    if (dev.startup_now() >= dev.startup_deadline_)
         return ETIMEDOUT;
     return 0;
 }
@@ -206,7 +216,7 @@ elio::coro::task<void> Device::prepare_owners() {
             ready &= q->setup_ready() && q->bridge_ready();
         }
         if (ready) break;
-        if (std::chrono::steady_clock::now() >= startup_deadline_)
+        if (startup_now() >= startup_deadline_)
             throw error(ETIMEDOUT, "ublk owner setup deadline expired");
         co_await elio::time::sleep_for(std::chrono::milliseconds(1));
     }
@@ -233,14 +243,19 @@ elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
 #ifdef OBD_TEST_HOOKS
     dev->test_hooks_ = startup.test_hooks_;
 #endif
-    dev->startup_deadline_ = std::chrono::steady_clock::now() +
+    dev->startup_deadline_ = dev->startup_now() +
                              std::chrono::seconds(5);
     dev->publish_startup();
     std::exception_ptr failure;
     try {
         if (startup.release_request()) throw StartupReleased{};
         co_await detail::run_control([&] {
-            dev->ctrl_ = std::make_unique<Ctrl>();
+#ifdef OBD_TEST_HOOKS
+            auto* transport = dev->test_hooks_ ? dev->test_hooks_->control_transport() : nullptr;
+            if (transport) dev->ctrl_ = std::make_unique<Ctrl>(*transport);
+            else
+#endif
+                dev->ctrl_ = std::make_unique<Ctrl>();
             dev->ctrl_->disable_destructor_cleanup();
 #ifdef OBD_TEST_HOOKS
             dev->ctrl_->set_test_hooks(dev->test_hooks_);
@@ -274,7 +289,7 @@ elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
             dev->cur_bytes_.store(params.dev_sectors * 512,
                                   std::memory_order_release);
         }
-        dev->startup_deadline_ = std::chrono::steady_clock::now() +
+        dev->startup_deadline_ = dev->startup_now() +
                                  std::chrono::seconds(5);
         co_await dev->prepare_owners();
         for (;;) {
@@ -284,6 +299,9 @@ elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
             bool busy = false;
             try {
                 co_await detail::run_control([&] {
+#ifdef OBD_TEST_HOOKS
+                    if (dev->test_hooks_) dev->test_hooks_->before_start_admission();
+#endif
                     if (recovery) dev->ctrl_->end_user_recovery(dev_id);
                     else dev->ctrl_->start_dev(dev->dev_id_);
                 });
@@ -366,6 +384,9 @@ elio::coro::task<std::unique_ptr<Device>> Device::fail_startup(
 }
 
 elio::coro::task<void> Device::retained_startup() {
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::retained_entered});
+#endif
     for (;;) {
         const auto sequence = startup_->release_request();
         if (sequence) {
