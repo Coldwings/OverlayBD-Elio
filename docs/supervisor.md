@@ -502,8 +502,9 @@ starting ──────(crash)─────→ exited   (reaper fills exit
 
 The opt-in startup kernel fixture also requires the raw collected wait status:
 reap proves collection, not successful process shutdown. In test-enabled builds,
-`OBD_TEST_STARTUP_FIXTURE_DIR` plus either its `partial-recovery-v1` or
-`adopted-source-v1` marker enables a Child-owned, exclusive `child-<generation>.reap` mapping prepared before fork.
+`OBD_TEST_STARTUP_FIXTURE_DIR` plus a `partial-recovery-v1`,
+`adopted-source-v1` or `report-refusal-v1` marker enables a Child-owned, exclusive
+`child-<generation>.reap` mapping prepared before fork.
 The matching `Child::try_reap` publishes PID, generation, reaper PID and raw wait
 status before notifying waiters, using fixed stores without allocation or file
 I/O at collection. Missing evidence makes the fixture fail but never changes
@@ -1086,11 +1087,11 @@ needing a real ublk device or root.
   convention that operators and `cmd_create` rely on.
 - `supervisor: reap evidence preserves actual child wait status` — real
   fork/exec exits distinguish exit zero, exit 134, SIGABRT and SIGKILL under
-  both partial-recovery and adopted-source fixture markers.
+  partial-recovery, adopted-source and report-refusal fixture markers.
   A reported stopped state cannot commit the observation; actual collection
   does, and the durable record remains after Child destruction.
 - `supervisor: unavailable reap evidence does not change child collection` —
-  missing marker and exclusive-file collision for either fixture mode leave collection unchanged,
+  missing marker and exclusive-file collision for each fixture mode leave collection unchanged,
   never overwrite earlier evidence, and cannot produce a passing witness.
 - `supervisor: failed child ownership setup leaves no process or channel` —
   injects an owner-allocation failure and a parent-side exception after fork;

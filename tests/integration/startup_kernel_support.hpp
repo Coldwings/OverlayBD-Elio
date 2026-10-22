@@ -247,6 +247,7 @@ public:
         document["process_start_ticks"] = log_->process_start_ticks;
         document["recovery"] = log_->recovery;
         document["adopted_source"] = log_->adopted_source;
+        document["report_refusal"] = log_->report_refusal;
         document["overflow"] = log_->overflow.load();
         auto& records = document["events"] = Json::array();
         const auto count = std::min<uint64_t>(log_->allocated.load(), log_->records.size());

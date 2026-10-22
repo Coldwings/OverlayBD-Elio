@@ -664,9 +664,29 @@ case exercises a successful END followed by a real block request holding an
 actual queue buffer in the source coroutine, a local pre-ready failure and
 explicit release. Its async gates preserve the native borrower until controlled
 release, and its observations distinguish delegate bytes, source scope exit,
-bridge frame destruction and block-client completion. The kernel matrix must
-still validate this case; pending remote fills, reporting failure and refusal
-variants remain separate coverage obligations. See `docs/testing.md`.
+bridge frame destruction and block-client completion. Runtime results remain
+bound to their recorded source head and kernel; this case does not establish
+every reporting or release-error variant.
+
+The narrow `integration: retained ublk caller survives report failure and retries refused release`
+case combines an exception during the real caller's retained-failure report
+construction with a local release-controller setup exception. The first explicit
+release settles as refused sequence 1 with `ENOMEM` before any STOP preparation;
+a fresh sequence 2 uses the normal kernel teardown and actual reap path. The
+fault is a local setup exception, not a fabricated kernel failure. See
+`docs/testing.md` for the evidence and one-kernel composition-check boundary.
+
+Pending background fills have component and inspected composition coverage:
+`source: concurrent fill parking retains a slow remote past warning deadlines`
+and `source: native fill notifications survive allocation failure and stop races`
+exercise LayerStore retention; `ublk: retained recovery waits for source drain and explicit release`
+retries a throwing cleanup callback. The real caller keeps `OpenedImage` outside
+its protected body and passes `park_opened_fills` to Device; after source drain,
+`Device::fail_startup` retries this callback, and `park_image_fills` stops then
+awaits the retained LayerStores. This credits those tests and the source wiring,
+not an executed whole-caller pending-fill scenario. An additional remote-fill
+kernel matrix is not a separate acceptance requirement absent a concrete wiring
+defect or an explicitly expanded scope.
 
 
 Unit tests live in `tests/unit/test_ublk.cpp` (built only when

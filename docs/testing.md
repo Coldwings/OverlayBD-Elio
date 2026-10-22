@@ -1058,12 +1058,12 @@ Every test, grouped by area, with the property it guards.
   binary yields EOF on the status channel plus exit code 127.
 - `supervisor: reap evidence preserves actual child wait status` — real
   fork/exec children exit zero, exit 134, abort, and receive SIGKILL. The
-  both explicit fixture markers are exercised. The per-generation observation
+  all three explicit fixture markers are exercised. The per-generation observation
   is absent before actual collection, preserves
   raw wait-status distinctions despite a stopped self-report, and survives
   Child destruction. No ublk device or privileged operation is required.
 - `supervisor: unavailable reap evidence does not change child collection` —
-  a missing opt-in marker or an occupied exclusive evidence file in either
+  a missing opt-in marker or an occupied exclusive evidence file in each
   fixture mode leaves normal child collection unchanged. No successful observation is invented,
   and an existing file is not overwritten.
 - `supervisor: bdev path parses to device id` —
@@ -1630,6 +1630,49 @@ Every test, grouped by area, with the property it guards.
   unresolved owners and export these artifacts before shutdown. Controller loss
   does not open either gate. This case does not validate remote background-fill
   loans, report-serialization failures or teardown refusal/retry scenarios.
+- `integration: retained ublk caller survives report failure and retries refused release` —
+  reuses the real partial two-queue recovery fixture with the explicit
+  `report-refusal-v1` mode. After the original END fails and settles, the first
+  retained-failure report attempt throws `std::bad_alloc` inside the actual
+  caller observer's construction exception boundary. Separate throw/caught/later
+  construction events plus a supervisor status at least as new as the recovered
+  report revision show containment and successful reporting for the same protected
+  generation. Repeated status/list
+  must preserve that owner with no competing replacement or premature STOP/DEL.
+
+  The controller opens queue 1 only after settled END failure, then waits for
+  its real initial issuance before requesting destroy. A one-shot exception in
+  the retained release controller, immediately before `release_once`, exercises
+  the existing exception-to-`ENOMEM` refusal path. Sequence 1 must be terminally
+  `refused`, with its own release errno and the unchanged original END failure
+  reason. No STOP SQE has been prepared at this boundary; this is a local setup
+  failure, not evidence that a kernel STOP returned `ENOMEM`. Repeated truthful
+  status/list and a failed destroy response must leave the same live owner.
+  A fresh destroy admits sequence 2 and executes normal STOP/DEL. Existing raw
+  and control cookie checks, native bridge retirement, cdev-close ordering,
+  terminal release, matching supervisor-owned raw reap records (original
+  SIGKILL, replacement normal exit zero), and kernel node removal still apply.
+
+  `failure_report_throw`, `failure_report_caught` and
+  `failure_report_constructed` record the actual caller boundary; construction
+  alone does not prove a wire write, hence the separate supervisor observation.
+  `release_setup_throw` names the local fault and its sequence. The existing
+  `release_admitted` event follows its mailbox CAS, so another thread may enter
+  setup/STOP before that diagnostic event is appended; the validator uses
+  refused wire status and final sequence 2 instead of assuming a cross-thread
+  event-order guarantee. Neither hook changes a kernel CQE or adoption state.
+
+  Select `[startup-kernel-report-retry]`; artifacts use the distinct
+  `/tmp/obd-startup-report-retry-*` prefix. Result schema version 1 includes mode,
+  both complete process identities, supervisor PID, original failure reason,
+  expected release sequence 2, observations, matched reap documents and explicit
+  export completion/errors. Its six expected JSON/log exports and four raw
+  mappings follow the shared fixture layout. Missing/mismatched evidence fails
+  acceptance. The existing unprivileged skip and finite CTest timeout remain;
+  use the owned runner to preserve unresolved owners on observation failure.
+  One kernel run covers this caller/protocol composition gap; the two-kernel
+  partial-publication and active-borrower cases cover their distinct retirement
+  boundaries. Implementation alone is not a runtime pass or every failure variant.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with

@@ -273,6 +273,10 @@ elio::coro::task<int> device_main(Args args) {
                         auto owner = startup_status(startup.snapshot());
                         const bool failed = owner.phase == "retained" ||
                                             owner.phase == "releasing";
+#ifdef OBD_TEST_HOOKS
+                        if (failed && !owner.control_pending && startup_fixture)
+                            startup_fixture->before_failure_report(owner.revision);
+#endif
                         DeviceStatus status;
                         status.state = serving.load() ? "ready" :
                             failed ? "failed" : "starting";
@@ -281,11 +285,18 @@ elio::coro::task<int> device_main(Args args) {
                         if (failed) status.error =
                             "startup failed; owner retained pending explicit release";
                         status.startup_owner = std::move(owner);
+#ifdef OBD_TEST_HOOKS
+                        if (failed && startup_fixture)
+                            startup_fixture->failure_report_constructed(status.startup_owner->revision);
+#endif
                         report(channel, status);
                     }
                 } catch (...) {
                     // Observation failure cannot discard the owning startup
                     // coroutine or authorize its parent's force cleanup.
+#ifdef OBD_TEST_HOOKS
+                    if (startup_fixture) startup_fixture->failure_report_caught();
+#endif
                 }
                 try {
                     co_await elio::time::sleep_for(std::chrono::milliseconds(100));

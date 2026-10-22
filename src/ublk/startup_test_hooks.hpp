@@ -21,6 +21,7 @@ enum class StartupTestKind : uint32_t {
     cdev_closed, adopted, startup_snapshot, caller_fills_parked,
     caller_terminal, post_control_enter, post_control_fail, source_enter,
     source_result, source_scope_exit, source_destroyed, request_delivered, release_admitted,
+    failure_report_throw, failure_report_caught, failure_report_constructed, release_setup_throw,
 };
 struct StartupTestEvent {
     StartupTestKind kind{};
@@ -41,6 +42,7 @@ public:
     virtual void observe(StartupTestEvent event) noexcept = 0;
     virtual void before_initial_submit(uint16_t queue) noexcept = 0;
     virtual elio::coro::task<void> after_start_control() { co_return; }
+    virtual void before_release_attempt(uint64_t) {}
 };
 
 // Finite shared-memory fixture wire layout, internal to test-enabled binaries.
@@ -63,6 +65,7 @@ struct StartupFixtureLog {
     uint32_t queues = 2;
     uint32_t depth = 4;
     uint32_t adopted_source = 0;
+    uint32_t report_refusal = 0;
     std::atomic<uint32_t> queue_one_open{0};
     std::atomic<uint32_t> post_control_open{0};
     std::atomic<uint32_t> source_open{0};

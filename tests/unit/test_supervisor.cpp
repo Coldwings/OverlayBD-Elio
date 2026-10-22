@@ -406,7 +406,7 @@ TEST_CASE("supervisor: exec failure surfaces as exit 127", "[supervisor]") {
 
 TEST_CASE("supervisor: reap evidence preserves actual child wait status",
           "[supervisor][reap-barrier]") {
-    const char* marker = GENERATE("partial-recovery-v1", "adopted-source-v1");
+    const char* marker = GENERATE("partial-recovery-v1", "adopted-source-v1", "report-refusal-v1");
     CAPTURE(marker);
     int expected_exit = 0;
     int expected_signal = 0;
@@ -473,7 +473,7 @@ TEST_CASE("supervisor: reap evidence preserves actual child wait status",
 
 TEST_CASE("supervisor: unavailable reap evidence does not change child collection",
           "[supervisor][reap-barrier]") {
-    const char* marker = GENERATE("partial-recovery-v1", "adopted-source-v1");
+    const char* marker = GENERATE("partial-recovery-v1", "adopted-source-v1", "report-refusal-v1");
     CAPTURE(marker);
     bool occupied = false;
     SECTION("missing explicit fixture marker") {}

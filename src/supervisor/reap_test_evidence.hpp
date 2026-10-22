@@ -59,6 +59,9 @@ public:
         if (marker.value < 0 && errno == ENOENT)
             marker.value = ::openat(dir.value, "adopted-source-v1",
                                     O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (marker.value < 0 && errno == ENOENT)
+            marker.value = ::openat(dir.value, "report-refusal-v1",
+                                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (marker.value < 0) return;
         char filename[64];
         const int length = std::snprintf(filename, sizeof(filename), "child-%llu.reap",

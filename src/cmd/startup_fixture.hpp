@@ -36,10 +36,15 @@ public:
         int fd = -1;
         try {
             bool adopted_source = false;
+            bool report_refusal = false;
             int marker = ::openat(dir, "adopted-source-v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
             if (marker >= 0) adopted_source = true;
-            else if (errno == ENOENT)
-                marker = ::openat(dir, "partial-recovery-v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            else if (errno == ENOENT) {
+                marker = ::openat(dir, "report-refusal-v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+                if (marker >= 0) report_refusal = true;
+                else if (errno == ENOENT)
+                    marker = ::openat(dir, "partial-recovery-v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            }
             if (marker < 0) throw std::runtime_error("startup fixture marker is missing");
             ::close(marker);
             const auto filename = std::to_string(::getpid()) + "-" +
@@ -68,6 +73,7 @@ public:
                 throw std::runtime_error("startup fixture process identity invalid");
             log_->recovery = recovery ? 1 : 0;
             log_->adopted_source = adopted_source ? 1 : 0;
+            log_->report_refusal = report_refusal ? 1 : 0;
             log_->initialized.store(1, std::memory_order_release);
             ::close(fd);
             ::close(dir);
@@ -107,6 +113,28 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         observe({.kind = ublk::detail::StartupTestKind::initial_gate_leave, .queue = queue});
     }
+    void before_failure_report(uint64_t revision) {
+        if (!log_->recovery || !log_->report_refusal || report_thrown_.exchange(true)) return;
+        report_catch_pending_.store(true);
+        observe({.kind = ublk::detail::StartupTestKind::failure_report_throw, .result = -ENOMEM, .value = revision});
+        throw std::bad_alloc();
+    }
+    void failure_report_caught() noexcept {
+        if (report_catch_pending_.exchange(false))
+            observe({.kind = ublk::detail::StartupTestKind::failure_report_caught, .result = -ENOMEM});
+    }
+    void failure_report_constructed(uint64_t revision) noexcept {
+        if (report_thrown_.load() && !report_constructed_.exchange(true))
+            observe({.kind = ublk::detail::StartupTestKind::failure_report_constructed, .value = revision});
+    }
+    void before_release_attempt(uint64_t sequence) override {
+        if (!log_->recovery || !log_->report_refusal || sequence != 1 || release_thrown_.exchange(true)) return;
+        observe({.kind = ublk::detail::StartupTestKind::release_setup_throw, .result = -ENOMEM,
+                 .release_sequence = sequence});
+        // Local controller setup failure before release_once and any STOP SQE.
+        // Its caller's existing exception boundary settles this attempt.
+        throw std::bad_alloc();
+    }
     bool holds_source() const noexcept { return log_->recovery && log_->adopted_source; }
     elio::coro::task<void> after_start_control() override {
         if (!holds_source()) co_return;
@@ -126,6 +154,8 @@ public:
     }
 private:
     ublk::detail::StartupFixtureLog* log_ = nullptr;
+    std::atomic<bool> report_thrown_{false}, report_catch_pending_{false};
+    std::atomic<bool> report_constructed_{false}, release_thrown_{false};
 };
 
 // Installed only around the replacement's real, read-only assembled root.

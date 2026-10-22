@@ -376,7 +376,12 @@ elio::coro::task<void> Device::retained_startup() {
             startup_state_.release_errno = 0;
             publish_startup();
             try {
-                co_await detail::run_control([&] { (void)release_once(); });
+                co_await detail::run_control([&] {
+#ifdef OBD_TEST_HOOKS
+                    if (test_hooks_) test_hooks_->before_release_attempt(sequence);
+#endif
+                    (void)release_once();
+                });
             } catch (...) {
                 release_error_ = ENOMEM;
             }

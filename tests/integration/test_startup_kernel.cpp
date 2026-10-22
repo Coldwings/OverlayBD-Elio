@@ -5,15 +5,17 @@ using namespace obd::test::startup_kernel;
 
 class KernelStartupFixture {
 public:
-    KernelStartupFixture() {
-        auto pattern = (std::filesystem::temp_directory_path() / "obd-startup-kernel-XXXXXX").string();
+    explicit KernelStartupFixture(bool report_refusal = false) : report_refusal_(report_refusal) {
+        const auto prefix = report_refusal_ ? "obd-startup-report-retry-XXXXXX" : "obd-startup-kernel-XXXXXX";
+        auto pattern = (std::filesystem::temp_directory_path() / prefix).string();
         std::vector<char> writable(pattern.begin(), pattern.end());
         writable.push_back('\0');
         const char* made = ::mkdtemp(writable.data());
         if (!made) throw std::system_error(errno, std::generic_category(), "fixture directory");
         directory_ = made;
         socket_ = directory_ + "/s.sock";
-        write_text(directory_ + "/partial-recovery-v1", "two queues; depth four; recovery queue one gate\n");
+        write_text(directory_ + (report_refusal_ ? "/report-refusal-v1" : "/partial-recovery-v1"),
+                   "two queues; depth four; recovery queue one gate\n");
         write_text(directory_ + "/global.json", "{\"ublkConfig\":{\"enableRecovery\":true}}\n");
         // A real local LSMT image goes through the production assembler.
         payload_ = obd::test::pattern_bytes(256 * 1024, 93);
@@ -119,6 +121,36 @@ public:
             return status.value("state", "") == "failed" &&
                    status.at("startup_owner").at("phase") == "retained";
         }, 5s, "failed replacement was not reported retained");
+        if (report_refusal_) {
+            require_fixture(replacement_log_->header().report_refusal == 1, "report/refusal mode not enabled");
+            wait_for([&] {
+                return replacement_log_->has(Kind::failure_report_throw) &&
+                    replacement_log_->has(Kind::failure_report_caught) &&
+                    replacement_log_->has(Kind::failure_report_constructed);
+            }, 5s, "real caller failure report did not throw, catch and reconstruct");
+            uint64_t constructed_revision = 0;
+            for (const auto& event : replacement_log_->events()) {
+                if (event.kind == Kind::failure_report_constructed) constructed_revision = event.value;
+                if (event.kind == Kind::control_finished && event.opcode == UBLK_U_CMD_END_USER_RECOVERY &&
+                    event.result < 0 && (event.value == ETIMEDOUT || event.value == ECANCELED))
+                    failure_reason_ = static_cast<int>(event.value);
+            }
+            require_fixture(constructed_revision != 0 && failure_reason_ != 0, "missing report/END failure identity");
+            // Require the supervisor to receive this recovered revision (or a
+            // later one); a local construction event is not wire evidence.
+            wait_for([&] {
+                status = call({{"cmd", "status"}, {"id", "partial"}});
+                const auto& owner = status.at("startup_owner");
+                require_fixture(status.at("pid") == replacement_pid_ && owner.at("generation") == generation_,
+                                "report exception replaced its protected owner");
+                return owner.at("revision").get<uint64_t>() >= constructed_revision &&
+                       owner.at("control_pending") == false;
+            }, 5s, "supervisor did not observe the recovered failure report revision");
+            check_retained(status);
+            require_fixture(status.at("startup_owner").at("reason_errno") == failure_reason_,
+                            "report fault erased the original END failure reason");
+            remember("status-after-report-exception", status);
+        }
         for (unsigned observation = 0; observation != 3; ++observation) {
             check_retained(status);
             const auto listed = call({{"cmd", "list"}});
@@ -141,20 +173,24 @@ public:
             check_retained(status);
             require_fixture(call({{"cmd", "hello"}}).value("ok", false), "maintenance listener lost");
         }
-        const auto held_destroy = call({{"cmd", "destroy"}, {"id", "partial"}});
-        remember("destroy-while-held", held_destroy);
-        require_fixture(!held_destroy.value("ok", false), "destroy falsely succeeded before held submission");
-        status = call({{"cmd", "status"}, {"id", "partial"}});
-        remember("release-pending", status);
-        require_fixture(status.at("pid") == replacement_pid_ && status.at("startup_protected") == true,
-                        "pending release lost its owner");
-        require_fixture(status.at("startup_owner").at("release_sequence") == 1 &&
-                        status.at("startup_owner").at("release") == "pending",
-                        "operator release was not admitted as the same pending attempt");
-        require_no_stop_or_delete();
-        require_fixture(!replacement_->reaped(), "retained replacement reaped before issuance");
-        replacement_log_->open_queue_one();
-        gate_opened_ = true;
+        if (report_refusal_) {
+            exercise_report_refusal_retry();
+        } else {
+            const auto held_destroy = call({{"cmd", "destroy"}, {"id", "partial"}});
+            remember("destroy-while-held", held_destroy);
+            require_fixture(!held_destroy.value("ok", false), "destroy falsely succeeded before held submission");
+            status = call({{"cmd", "status"}, {"id", "partial"}});
+            remember("release-pending", status);
+            require_fixture(status.at("pid") == replacement_pid_ && status.at("startup_protected") == true,
+                            "pending release lost its owner");
+            require_fixture(status.at("startup_owner").at("release_sequence") == 1 &&
+                            status.at("startup_owner").at("release") == "pending",
+                            "operator release was not admitted as the same pending attempt");
+            require_no_stop_or_delete();
+            require_fixture(!replacement_->reaped(), "retained replacement reaped before issuance");
+            replacement_log_->open_queue_one();
+            gate_opened_ = true;
+        }
         wait_for([&] { return replacement_log_->has(Kind::caller_terminal); }, 15s,
                  "released generation did not retire to caller terminal");
         validate_retirement();
@@ -163,9 +199,11 @@ public:
         require_fixture(WIFEXITED(replacement_wait) && WEXITSTATUS(replacement_wait) == 0,
                         "retired replacement did not exit normally with status zero");
         if (!maintenance_) {
-            const auto destroyed = call({{"cmd", "destroy"}, {"id", "partial"}});
-            remember("destroy-after-retirement", destroyed);
-            require_fixture(destroyed.value("ok", false), "reaped released entry was not removed");
+            if (!retry_removed_) {
+                const auto destroyed = call({{"cmd", "destroy"}, {"id", "partial"}});
+                remember("destroy-after-retirement", destroyed);
+                require_fixture(destroyed.value("ok", false), "reaped released entry was not removed");
+            }
             require_fixture(call({{"cmd", "list"}}).at("devices").empty(), "registry retained completed entry");
             supervisor_pin_->signal(SIGTERM);
         }
@@ -180,6 +218,26 @@ public:
             report_["failure"] = failure;
             report_["complete"] = complete_;
             report_["maintenance"] = maintenance_;
+            report_["mode"] = report_refusal_ ? "report-refusal-v1" : "partial-recovery-v1";
+            report_["schema_version"] = 1;
+            report_["report_refusal"] = report_refusal_;
+            report_["expected_release_sequence"] = report_refusal_ ? 2 : 1;
+            report_["failure_reason"] = failure_reason_;
+            report_["export_errors"] = Json::array();
+            report_["expected_exports"] = Json::array({"result.json", "supervisor.log"});
+            report_["expected_raw_evidence"] = Json::array();
+            for (const auto* log : {original_log_.get(), replacement_log_.get()}) {
+                if (!log) continue;
+                const auto& identity = log->header();
+                const auto events = std::to_string(identity.pid) + "-" + std::to_string(identity.generation) + ".events";
+                const auto reap = "child-" + std::to_string(identity.generation) + ".reap";
+                report_["expected_exports"].push_back(events + ".json");
+                report_["expected_exports"].push_back(reap + ".json");
+                report_["expected_raw_evidence"].push_back(events);
+                report_["expected_raw_evidence"].push_back(reap);
+            }
+            if (!original_log_ || !replacement_log_)
+                report_["export_errors"].push_back("missing original/replacement event ledger");
             report_["original_pid"] = original_ ? original_->pid() : -1;
             report_["original_generation"] = original_log_ ? original_log_->header().generation : 0;
             report_["original_start_ticks"] = original_log_ ? original_log_->header().process_start_ticks : 0;
@@ -197,11 +255,13 @@ public:
                 catch (const std::exception& error) {
                     exported = false;
                     report_["original_export_error"] = error.what();
+                    report_["export_errors"].push_back(Json{{"field", "original_export_error"}, {"error", error.what()}});
                 }
                 try { export_reap_evidence(*original_log_, "original"); }
                 catch (const std::exception& error) {
                     exported = false;
                     report_["original_reap_export_error"] = error.what();
+                    report_["export_errors"].push_back(Json{{"field", "original_reap_export_error"}, {"error", error.what()}});
                 }
             }
             if (replacement_log_) {
@@ -209,12 +269,19 @@ public:
                 catch (const std::exception& error) {
                     exported = false;
                     report_["replacement_export_error"] = error.what();
+                    report_["export_errors"].push_back(Json{{"field", "replacement_export_error"}, {"error", error.what()}});
                 }
                 try { export_reap_evidence(*replacement_log_, "replacement"); }
                 catch (const std::exception& error) {
                     exported = false;
                     report_["replacement_reap_export_error"] = error.what();
+                    report_["export_errors"].push_back(Json{{"field", "replacement_reap_export_error"}, {"error", error.what()}});
                 }
+            }
+            if (!original_ || !replacement_ || !supervisor_pin_ ||
+                !std::filesystem::is_regular_file(directory_ + "/supervisor.log")) {
+                exported = false;
+                report_["export_errors"].push_back("missing pinned identity or supervisor log");
             }
             report_["export_complete"] = exported;
             write_text(directory_ + "/result.json", report_.dump(2));
@@ -237,8 +304,16 @@ public:
                 if (end_failed_ && replacement_log_) {
                     replacement_log_->open_queue_one();
                     gate_opened_ = true;
-                    wait_for([&] { return replacement_log_->has(Kind::caller_terminal); }, 15s,
-                             "cleanup still owns kernel commands");
+                    wait_for([&] {
+                        if (replacement_log_->has(Kind::caller_terminal)) return true;
+                        if (report_refusal_) {
+                            const auto status = call({{"cmd", "status"}, {"id", "partial"}});
+                            if (status.value("ok", false) && status.contains("startup_owner") &&
+                                status.at("startup_owner").at("release") == "refused")
+                                (void)call({{"cmd", "destroy"}, {"id", "partial"}});
+                        }
+                        return false;
+                    }, 15s, "cleanup still owns kernel commands");
                     (void)call({{"cmd", "destroy"}, {"id", "partial"}});
                 }
             }
@@ -247,6 +322,52 @@ public:
         } catch (...) {} // Preserve the process, kernel resource and evidence.
     }
 private:
+    void exercise_report_refusal_retry() {
+        // END has failed and settled; publishing the held real batch cannot
+        // turn this into a late-success/adopted scenario.
+        replacement_log_->open_queue_one();
+        gate_opened_ = true;
+        wait_for([&] { return replacement_log_->has(Kind::initial_issued, 1); }, 5s,
+                 "second queue did not issue before local release setup failure");
+        require_no_stop_or_delete();
+        const auto refused = call({{"cmd", "destroy"}, {"id", "partial"}});
+        remember("destroy-local-refusal", refused);
+        require_fixture(!refused.value("ok", false), "first local refusal falsely reported destroy success");
+        Json status;
+        wait_for([&] {
+            status = call({{"cmd", "status"}, {"id", "partial"}});
+            const auto& owner = status.at("startup_owner");
+            return owner.at("release_sequence") == 1 && owner.at("release") == "refused";
+        }, 5s, "first release did not settle as refused sequence one");
+        for (unsigned observation = 0; observation != 3; ++observation) {
+            check_retained(status);
+            const auto& owner = status.at("startup_owner");
+            require_fixture(owner.at("release_sequence") == 1 && owner.at("release") == "refused" &&
+                owner.at("release_errno") == ENOMEM && owner.at("reason_errno") == failure_reason_,
+                "settled local refusal changed sequence, errno or original END failure");
+            require_no_stop_or_delete();
+            require_fixture(!replacement_log_->has(Kind::caller_terminal) &&
+                            !replacement_log_->has(Kind::cdev_closed), "refused attempt falsely retired resources");
+            const auto listed = call({{"cmd", "list"}});
+            remember("refused-list", listed);
+            require_fixture(listed.at("devices").size() == 1 &&
+                            listed.at("devices").at(0).at("pid") == replacement_pid_ &&
+                            listed.at("devices").at(0).at("recoveries") == 1,
+                            "refusal replaced or removed the protected generation");
+            remember("refused-status", status);
+            std::this_thread::sleep_for(30ms);
+            status = call({{"cmd", "status"}, {"id", "partial"}});
+        }
+        const auto retry = call({{"cmd", "destroy"}, {"id", "partial"}});
+        remember("destroy-fresh-retry", retry);
+        retry_removed_ = retry.value("ok", false);
+        wait_for([&] {
+            for (const auto& event : replacement_log_->events())
+                if (event.kind == Kind::release_admitted && event.value == generation_ &&
+                    event.release_sequence == 2) return true;
+            return false;
+        }, 5s, "fresh retry did not admit sequence two for the same generation");
+    }
     int wait_reap_evidence(const EventLog& log, const char* role) {
         return ReapEvidence(directory_, supervisor_, report_).wait_reap_evidence(log, role);
     }
@@ -405,7 +526,7 @@ private:
                 require_fixture(event.flags == static_cast<uint32_t>(obd::ublk::StartupPhase::released) &&
                                 event.cookie == event.value && event.owner_flags == 1 &&
                                 event.opcode == static_cast<uint32_t>(obd::ublk::StartupRelease::released) &&
-                                event.release_sequence == 1,
+                                event.release_sequence == (report_refusal_ ? 2U : 1U),
                                 "terminal caller has unresolved debt or mismatched release identity");
             }
             if (event.queue < 2) {
@@ -493,9 +614,42 @@ private:
                             "issuance/native retirement/owner exit/cdev close ordering invalid");
         }
         require_fixture(!replacement_log_->has(Kind::adopted), "unadopted case crossed adoption");
+        if (report_refusal_) {
+            size_t thrown = events.size(), caught = events.size(), constructed = events.size();
+            size_t setup = events.size(), admitted_one = events.size(), admitted_two = events.size();
+            unsigned throws = 0, catches = 0, constructions = 0, setups = 0, admissions = 0;
+            for (size_t index = 0; index < events.size(); ++index) {
+                const auto& event = events[index];
+                if (event.kind == Kind::failure_report_throw) { thrown = index; ++throws; }
+                if (event.kind == Kind::failure_report_caught) { caught = index; ++catches; }
+                if (event.kind == Kind::failure_report_constructed) { constructed = index; ++constructions; }
+                if (event.kind == Kind::release_setup_throw) {
+                    require_fixture(event.result == -ENOMEM && event.release_sequence == 1,
+                                    "local setup fault has wrong errno or sequence");
+                    setup = index; ++setups;
+                }
+                if (event.kind == Kind::release_admitted) {
+                    require_fixture(event.value == generation_, "release admitted for wrong generation");
+                    ++admissions;
+                    if (event.release_sequence == 1) admitted_one = index;
+                    else if (event.release_sequence == 2) admitted_two = index;
+                    else throw std::runtime_error("unexpected additional release sequence");
+                }
+            }
+            // release_admitted is observed after the mailbox CAS: another
+            // thread may enter setup/STOP before that diagnostic record lands.
+            // Refused wire status and final sequence 2 prove the protocol order.
+            require_fixture(throws == 1 && catches == 1 && constructions == 1 && setups == 1 && admissions == 2 &&
+                thrown < caught && caught < constructed && constructed < admitted_one && constructed < setup &&
+                admitted_one < admitted_two && issued[1] < setup && setup < admitted_two && setup < stop,
+                "report containment/local refusal/fresh admission ordering or count invalid");
+            report_["fault_validation"] = "one real caller report exception contained; sequence 1 refused ENOMEM before STOP setup; fresh sequence 2 retired actual resources";
+        }
         report_["cookie_validation"] = "all real prepared cookies have one terminal original CQE; data FETCH aborted with ENODEV after authorized STOP";
     }
 
+    bool report_refusal_ = false, retry_removed_ = false;
+    int failure_reason_ = 0;
     std::string directory_, socket_;
     pid_t supervisor_ = -1, reader_ = -1, replacement_pid_ = -1;
     uint32_t id_ = UINT32_MAX;
@@ -524,6 +678,22 @@ TEST_CASE("integration: supervisor retains failed partial ublk recovery until ex
     if (!failure.empty()) fixture.attempt_supported_cleanup();
     const bool exported = fixture.finish_report(failure);
     INFO("preserved fixture evidence: " << fixture.directory());
+    INFO("fixture failure: " << failure);
+    CHECK(exported);
+    CHECK(failure.empty());
+}
+
+TEST_CASE("integration: retained ublk caller survives report failure and retries refused release",
+          "[ublk][startup-kernel-report-retry]") {
+    if (const auto reason = obd::test::ublk_prerequisite_skip_reason(); !reason.empty()) SKIP(reason);
+    KernelStartupFixture fixture(true);
+    std::string failure;
+    try { fixture.run(false); }
+    catch (const std::exception& error) { failure = error.what(); }
+    catch (...) { failure = "unknown reporting/refusal fixture failure"; }
+    if (!failure.empty()) fixture.attempt_supported_cleanup();
+    const bool exported = fixture.finish_report(failure);
+    INFO("preserved report/refusal evidence: " << fixture.directory());
     INFO("fixture failure: " << failure);
     CHECK(exported);
     CHECK(failure.empty());
