@@ -54,8 +54,9 @@ A read travels through four ownership boundaries:
    count).
 2. **Queue thread → Elio scheduler.** The request is pushed onto the
    queue's pending deque and the bridge is woken through the `elio_efd`
-   eventfd. The bridge coroutine (`src/ublk/elio_bridge.cpp`, see
-   `run_bridge`) pops pending requests and spawns one coroutine per tag,
+   eventfd. The bridge coroutine (`src/ublk/elio_bridge.cpp`; see
+   `run_bridge`) pops pending requests and feeds a reusable tag engine
+   (`src/ublk/tag_engine.cpp`) with one coroutine per tag,
    so per-tag IO overlaps; completion ordering across tags is irrelevant
    to ublk.
 3. **Elio → image stack.** Each IO coroutine calls

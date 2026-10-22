@@ -3,8 +3,9 @@
 // The bridge coroutine waits on the queue's elio_efd (registered with the
 // Elio IO backend), pops pending requests, and fans each one out as its own
 // coroutine so per-tag IO overlaps. Read handlers fill the tag's kernel-
-// shared IO buffer from the merged block source and hand the result back to
-// the queue thread via push_completion().
+// shared IO buffer from the merged block source. A reusable owner-only tag
+// engine hands results through a sink which, in this topology, still calls
+// Queue::push_completion() and wakes the queue thread.
 //
 // Op policy (read-only device, ADR-0007):
 //   READ    → served from the block source; short reads zero-filled

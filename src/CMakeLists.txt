@@ -69,7 +69,8 @@ if(OBD_ENABLE_UBLK)
         ublk/ctrl.cpp
         ublk/queue.cpp
         ublk/device.cpp
-        ublk/elio_bridge.cpp)
+        ublk/elio_bridge.cpp
+        ublk/tag_engine.cpp)
     obd_target_warnings(obd_ublk)
     target_include_directories(obd_ublk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(obd_ublk PUBLIC OBD_HAVE_UBLK=1)
