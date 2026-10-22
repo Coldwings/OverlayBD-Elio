@@ -8,6 +8,9 @@
 // child-side work unsafe.
 #pragma once
 
+#include "supervisor/protocol.hpp"
+#include "supervisor/reap_test_evidence.hpp"
+
 #include <elio/sync/event.hpp>
 
 #include <sys/types.h>
@@ -35,6 +38,9 @@ struct ChildSpec {
                               // this empty and set `blank` instead)
     std::string global_path;  // overlaybd.json (may be empty = device default)
     int dev_id_request = -1;
+    /// Nonzero for the versioned startup-owner handshake. Chosen before fork;
+    /// a child cannot publish device commands before its matching grant.
+    uint64_t startup_generation = 0;
     /// ADR-0010: spawn in recovery mode (obd-device --recover): attach to
     /// the existing dev_id device instead of creating a new one.
     bool recover = false;
@@ -65,7 +71,7 @@ public:
     /// Owner storage is constructed before creating the channel or process.
     static std::unique_ptr<Child> spawn(const ChildSpec& spec);
 
-    ~Child();  // best-effort SIGKILL + reap if still unreaped
+    ~Child();  // Cannot force-kill an unresolved protected startup owner.
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
 
@@ -88,6 +94,13 @@ public:
     };
 
     Status status() const;
+    struct Snapshot {
+        Status status;
+        std::optional<StartupOwnerStatus> startup_owner;
+        bool startup_protected = false;
+    };
+    /// One coherent generation observation for public list/status replies.
+    Snapshot snapshot() const;
     /// Called by the monitor/reaper coroutines; publishes the status and
     /// wakes waiters once the state is terminal for creation purposes
     /// (ready/failed/exited). Ignores late updates after an actual reap.
@@ -101,6 +114,20 @@ public:
     /// EOF may arrive while device/kernel cleanup is still running.
     elio::sync::event& reaped_event() noexcept { return reaped_event_; }
     bool reaped() const;
+
+    uint64_t startup_generation() const noexcept { return startup_generation_; }
+    /// Install BEFORE attempting a grant write. Failed delivery does not undo
+    /// protection. Serialized with terminate/kill, not a daemon-side TOCTOU test.
+    bool protect_startup(uint64_t generation);
+    bool startup_protected() const;
+    bool startup_granted() const;
+    /// Persist operator authority before serializing/writing the request.
+    /// Retries reuse a pending attempt; only an observed refusal advances it.
+    std::optional<uint64_t> admit_startup_release();
+    /// Accept only current, monotonic ownership facts. A ready handoff also
+    /// requires the ordinary lifecycle ready report, not just phase=ready.
+    bool observe_startup(const StartupOwnerStatus& owner, bool ready_report);
+    std::optional<StartupOwnerStatus> startup_status() const;
 
     void terminate() noexcept;  // SIGTERM
     void kill() noexcept;       // SIGKILL
@@ -118,12 +145,22 @@ private:
     std::string id_;
     pid_t pid_ = -1;
     int ctl_fd_ = -1;
+#ifdef OBD_TEST_HOOKS
+    detail::ChildReapEvidence reap_evidence_;
+#endif
 
     mutable std::mutex mu_;
     Status st_;
     bool ready_reached_ = false;
     bool exit_reached_ = false;
     bool reaped_ = false;
+    uint64_t startup_generation_ = 0;
+    bool startup_granted_ = false;
+    bool startup_protected_ = false;
+    bool startup_ready_ = false;
+    bool startup_released_ = false;
+    uint64_t startup_release_sequence_ = 0;
+    std::optional<StartupOwnerStatus> startup_status_;
     elio::sync::event ready_event_;
     elio::sync::event exit_event_;
     elio::sync::event reaped_event_;

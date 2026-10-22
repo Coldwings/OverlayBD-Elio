@@ -1,8 +1,9 @@
 # ADR-0010: ublk USER_RECOVERY crash recovery with bounded respawn
 
-- Status: accepted
-- Date: 2026-09-08
+- Status: superseded by ADR-0022
+- Date: 2026-10-20
 - Supersedes: none
+- Superseded scope: [ADR-0022](./0022-retain-failed-startup-owners.md) changes unresolved startup replacement and shutdown only; other decisions remain in force.
 - Binds: src/ublk/ctrl.cpp, src/ublk/device.cpp,
   src/cmd/obd_device_main.cpp, src/supervisor/child.cpp,
   src/supervisor/daemon.cpp, src/supervisor/protocol.cpp,

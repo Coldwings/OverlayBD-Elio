@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <time.h>
 
 namespace obd::ublk {
 
@@ -39,48 +40,154 @@ Ctrl::Ctrl() {
     }
 }
 
+Ctrl::Ctrl(detail::CtrlTransport& transport) noexcept : transport_(&transport) {}
+
 Ctrl::~Ctrl() {
-    if (added_dev_ >= 0) {
+    while (pending_.load()) {
+        timespec pause{0, 10000000};
+        ::nanosleep(&pause, nullptr);
+    }
+    if (!managed_lifetime_ && added_dev_ >= 0) {
         stop_dev(static_cast<uint32_t>(added_dev_));
         del_dev(static_cast<uint32_t>(added_dev_));
     }
-    io_uring_queue_exit(&ring_);
+    if (!transport_) io_uring_queue_exit(&ring_);
     if (fd_ >= 0) ::close(fd_);
 }
 
 int Ctrl::ctrl_cmd_raw(uint32_t cmd_op, uint32_t dev_id,
                        uint16_t queue_id, void* data, uint16_t len,
                        uint64_t data0) noexcept {
-    ublksrv_ctrl_cmd cmd {};
-    cmd.dev_id = dev_id;
-    cmd.queue_id = queue_id;
-    cmd.len = len;
-    cmd.addr = reinterpret_cast<uint64_t>(data);
+    bool idle = false;
+    if (!pending_.compare_exchange_strong(idle, true)) return -EBUSY;
+    CtrlProgress state;
+    state.opcode = cmd_op;
+    state.pending = true;
+    const auto report = [&]() noexcept {
+        if (observer_.progress) observer_.progress(observer_.context, state);
+    };
+    auto* sqe = transport_ ? transport_->get_sqe() : io_uring_get_sqe(&ring_);
+    if (!sqe) {
+        pending_.store(false);
+        state.pending = false;
+        state.original_known = true;
+        state.original_result = -EBUSY;
+        report();
+        return -EBUSY;
+    }
+    const uint64_t original = next_cookie_++;
+    uint64_t cancellation = 0;
+    bool poisoned = false;
+    std::memset(sqe, 0, 2 * sizeof(*sqe));
+    ublksrv_ctrl_cmd cmd{};
+    cmd.dev_id = dev_id; cmd.queue_id = queue_id;
+    cmd.len = len; cmd.addr = reinterpret_cast<uint64_t>(data);
     cmd.data[0] = data0;
-
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-    if (sqe == nullptr) return -EBUSY;
     sqe->opcode = IORING_OP_URING_CMD;
-    sqe->fd = fd_;
-    sqe->cmd_op = cmd_op;
+    sqe->fd = fd_; sqe->cmd_op = cmd_op; sqe->user_data = original;
     std::memcpy(sqe->cmd, &cmd, sizeof(cmd));
-    sqe->user_data = 0;
-
-    ELIO_LOG_INFO("ublk ctrl cmd {:#x} dev {} submitting", cmd_op, dev_id);
-    const int submitted = io_uring_submit_and_wait(&ring_, 1);
-    if (submitted < 0) {
-        ELIO_LOG_INFO("ublk ctrl cmd {:#x} dev {} submit failed {}", cmd_op,
-                      dev_id, submitted);
-        return -errno;
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_prepared,
+        .opcode = cmd_op, .cookie = original, .value = dev_id});
+#endif
+    report();
+    // From preparation until every matching CQE, no exception, submit error,
+    // cancellation result, or timeout can end the payload/ring lifetime.
+    for (;;) {
+        if (transport_ ? transport_->sq_ready() : io_uring_sq_ready(&ring_)) {
+            const int rc = transport_ ? transport_->submit() : io_uring_submit(&ring_);
+#ifdef OBD_TEST_HOOKS
+            if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_submitted,
+                .opcode = cmd_op, .result = rc, .cookie = original, .value = dev_id});
+#endif
+            if (rc < 0 && rc != -EINTR && !state.reason_errno)
+                state.reason_errno = -rc;
+        }
+        const int entered = transport_ ? transport_->enter() :
+            io_uring_enter(ring_.ring_fd, 0, 0, IORING_ENTER_GETEVENTS, nullptr);
+        if (entered < 0 && entered != -EINTR && !state.reason_errno)
+            state.reason_errno = -entered;
+        for (;;) {
+            io_uring_cqe* cqe = nullptr;
+            const int rc = transport_ ? transport_->peek_cqe(&cqe) :
+                io_uring_peek_cqe(&ring_, &cqe);
+            if (rc != 0 || !cqe) {
+                if (rc != 0 && rc != -EAGAIN && rc != -EINTR && !state.reason_errno)
+                    state.reason_errno = -rc;
+                break;
+            }
+            if (cqe->flags & IORING_CQE_F_MORE) {
+                poisoned = true;
+            } else if (cqe->user_data == original && !state.original_known) {
+                state.original_known = true;
+                state.original_result = cqe->res;
+#ifdef OBD_TEST_HOOKS
+                if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_original,
+                    .opcode = cmd_op, .result = cqe->res, .flags = cqe->flags,
+                    .cookie = cqe->user_data, .value = dev_id});
+#endif
+                if (cqe->res == 0 && cmd_op == UBLK_U_CMD_ADD_DEV)
+                    added_dev_ = static_cast<int>(
+                        static_cast<ublksrv_ctrl_dev_info*>(data)->dev_id);
+                // Ownership commit is at the actual original CQE, before any
+                // error/result reporting or return through an await boundary.
+                if (observer_.completed)
+                    observer_.completed(observer_.context, cmd_op, cqe->res);
+            } else if (cancellation && cqe->user_data == cancellation &&
+                       !state.cancel_known) {
+                state.cancel_known = true;
+                state.cancel_result = cqe->res;
+#ifdef OBD_TEST_HOOKS
+                if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_cancel,
+                    .opcode = cmd_op, .result = cqe->res, .flags = cqe->flags,
+                    .cookie = cqe->user_data, .value = original});
+#endif
+            } else {
+                poisoned = true;
+            }
+            if (transport_) transport_->cqe_seen(cqe);
+            else io_uring_cqe_seen(&ring_, cqe);
+        }
+        if (poisoned && !state.reason_errno) state.reason_errno = EPROTO;
+        if (!state.original_known && observer_.cancel_reason) {
+            const int reason = observer_.cancel_reason(observer_.context, cmd_op);
+            if (reason && !state.reason_errno) state.reason_errno = reason;
+            if (reason && !cancellation) {
+                if (auto* cancel = transport_ ? transport_->get_sqe() :
+                                               io_uring_get_sqe(&ring_)) {
+                    std::memset(cancel, 0, 2 * sizeof(*cancel));
+                    cancellation = next_cookie_++;
+                    io_uring_prep_cancel64(cancel, original, 0);
+                    cancel->user_data = cancellation;
+#ifdef OBD_TEST_HOOKS
+                    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_cancel_prepared,
+                        .opcode = cmd_op, .cookie = cancellation, .value = original});
+#endif
+                }
+            }
+        }
+        if (!poisoned && state.original_known &&
+            (!cancellation || state.cancel_known)) break;
+        report();
+        if (transport_) transport_->idle();
+        else {
+            timespec pause{0, 1000000};
+            ::nanosleep(&pause, nullptr);
+        }
     }
-    io_uring_cqe* cqe = nullptr;
-    int res = -EIO;
-    if (io_uring_peek_cqe(&ring_, &cqe) == 0 && cqe != nullptr) {
-        res = cqe->res;
-        io_uring_cqe_seen(&ring_, cqe);
-    }
-    ELIO_LOG_INFO("ublk ctrl cmd {:#x} dev {} -> {}", cmd_op, dev_id, res);
-    return res;
+    state.pending = false;
+    pending_.store(false);
+    report();
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::control_finished,
+        .opcode = cmd_op, .result = state.original_result, .cookie = original,
+        .value = static_cast<uint64_t>(state.reason_errno)});
+#endif
+    if (state.original_result == 0) return 0;
+    if (state.reason_errno &&
+        (state.original_result == -EINTR || state.original_result == -ECANCELED))
+        return -state.reason_errno;
+    return state.original_result;
 }
 
 void Ctrl::ctrl_cmd(uint32_t cmd_op, uint32_t dev_id, uint16_t queue_id,
@@ -224,3 +331,19 @@ void Ctrl::del_dev(uint32_t dev_id) noexcept {
 }
 
 }  // namespace obd::ublk
+
+namespace obd::ublk {
+int Ctrl::stop_dev_result(uint32_t dev_id) noexcept {
+    return ctrl_cmd_raw(UBLK_U_CMD_STOP_DEV, dev_id, UINT16_MAX, nullptr, 0, 0);
+}
+int Ctrl::delete_dev_once(uint32_t dev_id) noexcept {
+    if (delete_attempted_) return delete_result_;
+    delete_attempted_ = true;
+    // Deletion may already have taken effect on an interrupted/error return.
+    // Disarm any numeric-ID destructor retry before sending the command.
+    added_dev_ = -1;
+    delete_result_ = ctrl_cmd_raw(UBLK_U_CMD_DEL_DEV, dev_id,
+                                  UINT16_MAX, nullptr, 0, 0);
+    return delete_result_;
+}
+} // namespace obd::ublk

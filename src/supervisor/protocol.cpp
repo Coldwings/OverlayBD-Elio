@@ -263,8 +263,115 @@ std::string reply_hello() {
     // grow-only online resize command is served; "blank" = create
     // accepts the ADR-0014 blank (raw) device modes 2/3.
     fields["features"] =
-        nlohmann::json::array({"commit", "trace", "resize", "blank"});
+        nlohmann::json::array({"commit", "trace", "resize", "blank", "startup_owner"});
     return reply_ok(fields);
+}
+
+namespace {
+
+bool owner_phase(std::string_view phase) {
+    return phase == "preparing" || phase == "control_pending" ||
+           phase == "retained" || phase == "releasing" ||
+           phase == "ready" || phase == "released";
+}
+
+bool owner_release(std::string_view release) {
+    return release == "none" || release == "pending" ||
+           release == "refused" || release == "released";
+}
+
+bool nonnegative_integer_field(const nlohmann::json& j, const char* key) {
+    if (!j.contains(key)) return false;
+    const auto& value = j[key];
+    return value.is_number_unsigned() ||
+           (value.is_number_integer() && value.get<int64_t>() >= 0);
+}
+
+bool int32_field(const nlohmann::json& j, const char* key) {
+    if (!j.contains(key)) return false;
+    const auto& value = j[key];
+    // Compare in the stored integer domain before narrowing. JSON's mixed
+    // signed/unsigned comparisons can convert UINT64_MAX to a negative value.
+    if (value.is_number_unsigned())
+        return value.get<uint64_t>() <= uint64_t{INT32_MAX};
+    if (!value.is_number_integer()) return false;
+    const auto number = value.get<int64_t>();
+    return number >= INT32_MIN && number <= INT32_MAX;
+}
+
+} // namespace
+
+nlohmann::json startup_owner_json(const StartupOwnerStatus& owner) {
+    return {{"version", kStartupOwnerVersion},
+            {"generation", owner.generation}, {"revision", owner.revision},
+            {"phase", owner.phase}, {"device_id", owner.device_id},
+            {"reason_errno", owner.reason_errno},
+            {"control_pending", owner.control_pending},
+            {"kernel_debt_known", owner.kernel_debt_known},
+            {"raw_published", owner.raw_published},
+            {"raw_retired", owner.raw_retired},
+            {"release_sequence", owner.release_sequence},
+            {"release", owner.release}, {"release_errno", owner.release_errno}};
+}
+
+bool valid_startup_owner(const StartupOwnerStatus& owner) noexcept {
+    if (owner.generation == 0 || !owner_phase(owner.phase) ||
+        !owner_release(owner.release) || owner.device_id < -1 ||
+        owner.reason_errno < 0 || owner.release_errno < 0 ||
+        owner.release_sequence >= (uint64_t{1} << 63) ||
+        owner.raw_retired > owner.raw_published) return false;
+    if (owner.release == "none") {
+        if (owner.release_sequence != 0 || owner.release_errno != 0) return false;
+    } else {
+        if (owner.release_sequence == 0) return false;
+        if (owner.release == "refused") {
+            if (owner.release_errno == 0 || owner.phase != "retained") return false;
+        } else if (owner.release_errno != 0) return false;
+    }
+    if (owner.phase == "released" &&
+        (owner.control_pending || !owner.kernel_debt_known ||
+         owner.raw_retired != owner.raw_published ||
+         (owner.release != "none" && owner.release != "released"))) return false;
+    if (owner.release == "released" && owner.phase != "released") return false;
+    if (owner.phase == "ready" &&
+        (owner.control_pending || !owner.kernel_debt_known ||
+         owner.reason_errno != 0 || owner.release != "none")) return false;
+    return true;
+}
+
+std::optional<StartupOwnerStatus> parse_startup_owner(const nlohmann::json& j) {
+    try {
+        if (!j.is_object() || !j.contains("version") ||
+            !j["version"].is_number_integer() ||
+            j["version"] != kStartupOwnerVersion ||
+            !nonnegative_integer_field(j, "generation") ||
+            j["generation"].get<uint64_t>() == 0 ||
+            !nonnegative_integer_field(j, "revision") ||
+            !nonnegative_integer_field(j, "raw_published") ||
+            !nonnegative_integer_field(j, "raw_retired") ||
+            !nonnegative_integer_field(j, "release_sequence"))
+            return std::nullopt;
+        for (const char* key : {"device_id", "reason_errno", "release_errno"}) {
+            if (!int32_field(j, key)) return std::nullopt;
+        }
+        StartupOwnerStatus owner;
+        owner.generation = j["generation"].get<uint64_t>();
+        owner.revision = j["revision"].get<uint64_t>();
+        owner.phase = j.at("phase").get<std::string>();
+        owner.device_id = j["device_id"].get<int>();
+        owner.reason_errno = j["reason_errno"].get<int>();
+        owner.control_pending = j.at("control_pending").get<bool>();
+        owner.kernel_debt_known = j.at("kernel_debt_known").get<bool>();
+        owner.raw_published = j["raw_published"].get<uint64_t>();
+        owner.raw_retired = j["raw_retired"].get<uint64_t>();
+        owner.release_sequence = j["release_sequence"].get<uint64_t>();
+        owner.release = j.at("release").get<std::string>();
+        owner.release_errno = j["release_errno"].get<int>();
+        if (!valid_startup_owner(owner)) return std::nullopt;
+        return owner;
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
 }
 
 std::optional<DeviceStatus> parse_device_status(std::string_view line) {
@@ -277,11 +384,19 @@ std::optional<DeviceStatus> parse_device_status(std::string_view line) {
     if (!j.is_object() || !j.contains("state") || !j["state"].is_string()) {
         return std::nullopt;
     }
-    DeviceStatus st;
-    st.state = j["state"].get<std::string>();
-    st.device = j.value("device", "");
-    st.error = j.value("error", "");
-    return st;
+    try {
+        DeviceStatus st;
+        st.state = j["state"].get<std::string>();
+        st.device = j.value("device", "");
+        st.error = j.value("error", "");
+        if (j.contains("startup_owner")) {
+            st.startup_owner = parse_startup_owner(j["startup_owner"]);
+            if (!st.startup_owner) return std::nullopt;
+        }
+        return st;
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
 }
 
 std::string make_device_status(const DeviceStatus& st) {
@@ -289,6 +404,7 @@ std::string make_device_status(const DeviceStatus& st) {
     j["state"] = st.state;
     if (!st.device.empty()) j["device"] = st.device;
     if (!st.error.empty()) j["error"] = st.error;
+    if (st.startup_owner) j["startup_owner"] = startup_owner_json(*st.startup_owner);
     return j.dump() + "\n";
 }
 

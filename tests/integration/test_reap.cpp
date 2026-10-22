@@ -184,7 +184,8 @@ public:
     }
 };
 
-void check_reap_barrier(const std::string& operation) {
+void check_reap_barrier(const std::string& operation,
+                        const std::string& fault_point = {}) {
     test::TempDir directory;
     const std::string socket = directory / "s.sock";
     const std::string upper = directory / "upper";
@@ -246,6 +247,18 @@ void check_reap_barrier(const std::string& operation) {
             }
             pidfd = static_cast<int>(::syscall(SYS_pidfd_open, child_pid, 0));
             if (pidfd < 0) throw std::system_error(errno, std::generic_category(), "pin child PID");
+            if (!fault_point.empty()) gate->fail_once(fault_point);
+            if (fault_point == "accept_admission") {
+                // The failed admission owns only this connection. The next
+                // request must still reach the same daemon accept service.
+                bool rejected = false;
+                try { (void)reap_rpc(socket, {{"cmd", "hello"}}); }
+                catch (const std::exception&) { rejected = true; }
+                check(rejected, "injected handler admission did not fail");
+                check(reap_rpc(socket, {{"cmd", "status"}, {"id", "d"}})
+                          .value("ok", false),
+                      "accept service did not survive failed admission");
+            }
             if (operation == "shutdown") {
                 if (::kill(::getpid(), SIGTERM) != 0) throw std::runtime_error("signal daemon");
             } else if (operation == "create_failure") {
@@ -320,12 +333,14 @@ void check_reap_barrier(const std::string& operation) {
         check(waited < 0 && errno == ECHILD, "daemon returned without reaping child");
     }
     INFO("operation: " << operation);
+    INFO("fault point: " << fault_point);
     INFO(daemon_error);
     for (const auto& failure : failures) WARN(failure);
     CHECK(failures.empty());
     CHECK(daemon_error.empty());
     CHECK(result == 0);
     CHECK(daemon_result.load() == 0);
+    if (!fault_point.empty()) CHECK_FALSE(gate->take_failure(fault_point));
 }
 
 }  // namespace
@@ -361,6 +376,25 @@ TEST_CASE("supervisor: failed blank create waits for reap before removal", "[sup
 
 TEST_CASE("supervisor: shutdown waits for reap after control EOF", "[supervisor][reap-barrier]") {
     check_reap_barrier("shutdown");
+}
+
+TEST_CASE("supervisor: lifecycle services retry transient ownership failures",
+          "[supervisor][reap-barrier][startup-supervisor]") {
+    SECTION("accept admission preserves management service") {
+        check_reap_barrier("destroy", "accept_admission");
+    }
+    SECTION("consumed SIGCHLD sweep retries without another exit") {
+        check_reap_barrier("destroy", "reaper_snapshot");
+    }
+    SECTION("EOF publication retains its owner through allocation failure") {
+        check_reap_barrier("destroy", "monitor_eof_publish");
+    }
+    SECTION("destroy finalization releases its busy flag") {
+        check_reap_barrier("destroy", "destroy_finalize");
+    }
+    SECTION("shutdown retains daemon until its task groups join") {
+        check_reap_barrier("shutdown", "shutdown_children");
+    }
 }
 
 #ifdef OBD_TEST_DEVICE_BIN

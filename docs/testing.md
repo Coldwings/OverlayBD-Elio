@@ -997,9 +997,18 @@ Every test, grouped by area, with the property it guards.
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
   Device destruction, with one worker and one blocking thread.
-- `ublk: failed setup drains partial state before rethrowing its error` —
-  the create/attach cleanup routine preserves the original exception and
-  destroys partial state off-worker, before and after bridge registration.
+- `ublk: failed startup drains sources before propagating its original error` —
+  the production startup failure coordinator drains partial bridge state,
+  publishes release, and preserves the original exception. The test owner
+  then destroys the retained source graph off-worker.
+- `ublk: retained recovery waits for source drain and explicit release` —
+  source loans and ancillary cleanup must finish before explicit STOP;
+  refused STOP preserves ownership, retry closes the stand-in cdev before
+  a single DEL. Uses actual Device/bridge/Ctrl code with scripted control
+  CQEs, without a real ublk device or raw FETCH retirement proof.
+- `ublk: original END completion decides recovery adoption` — actual Ctrl
+  completion dispatch adopts only original-success; cleanup runs through
+  the production Device failure coordinator.
 - `ublk: blocking stop waits for a slow source to finish` — a normal read
   completes after eight seconds while a dedicated off-worker caller drains;
   stop must not return before completion, and owners remain valid throughout.
@@ -1047,6 +1056,16 @@ Every test, grouped by area, with the property it guards.
   ready event.
 - `supervisor: exec failure surfaces as exit 127` — a missing device
   binary yields EOF on the status channel plus exit code 127.
+- `supervisor: reap evidence preserves actual child wait status` — real
+  fork/exec children exit zero, exit 134, abort, and receive SIGKILL. The
+  all three explicit fixture markers are exercised. The per-generation observation
+  is absent before actual collection, preserves
+  raw wait-status distinctions despite a stopped self-report, and survives
+  Child destruction. No ublk device or privileged operation is required.
+- `supervisor: unavailable reap evidence does not change child collection` —
+  a missing opt-in marker or an occupied exclusive evidence file in each
+  fixture mode leaves normal child collection unchanged. No successful observation is invented,
+  and an existing file is not overwritten.
 - `supervisor: bdev path parses to device id` —
   `dev_id_from_bdev_path` extracts the id from `/dev/ublkbN` and
   rejects non-bdev paths (ADR-0010).
@@ -1477,6 +1496,183 @@ Every test, grouped by area, with the property it guards.
   owners, overlap, actual qid/tag/offset/count and delegate results for selected
   and unmatched reads after drain, and HTTP counts; an unsupported CPU-map skip
   is not coverage.
+- `integration: supervisor retains failed partial ublk recovery until explicit release` —
+  runs the production supervisor and device binaries with a real local LSMT image,
+  two queues and depth four. After a successful block read, an identity-pinned
+  original process is crashed to trigger normal recovery. A per-instance,
+  test-only gate holds replacement queue 1 before its initial submission while
+  queue 0 issues real FETCH commands. The case requires an actual failed,
+  settled END original and its separate cancellation CQE before testing retained
+  status/list, an explicit destroy while issuance remains incomplete, and final
+  release. A second section sends supervisor TERM and exercises its maintenance
+  listener. Raw and control cookies are correlated with their own terminal CQEs;
+  the final checks cover native bridge retirement, owner exit, cdev closure,
+  one DEL, the admitted release sequence, actual child reap, and removal of
+  pinned kernel node identities. A separate supervisor-owned waitpid record
+  must show SIGKILL for the intentional original crash and normal exit zero
+  for the released replacement in both sections. Reap alone or a final
+  stopped self-report cannot hide a later allocator abort. Issuance alone is
+  not acceptance evidence:
+  each parked data FETCH must return its original `-ENODEV` after authorized STOP.
+  This stage does not cover pending remote fills or post-END source-buffer loans.
+  Before observing queue publication, the fixture waits for the correlated
+  successful START_RECOVERY original and settlement. Its 35-second observation
+  allowance covers the production 30-second retry budget: reaping alone does
+  not finish Linux 6.6's delayed quiesce work. Queue publication and END failure
+  then have separate observation deadlines; none authorizes forced cleanup.
+
+  The explicit `OBD_TEST_STARTUP_FIXTURE_DIR` environment in the spawned process
+  enables this fixture only in `OBD_TEST_HOOKS` builds. The directory must contain
+  `partial-recovery-v1`; normal invocations have null hooks. Each process exclusively
+  creates `<pid>-<generation>.events`, with an initialized header carrying PID,
+  process start ticks, generation and geometry. A fixed 16,384-record mmap log
+  stores separately committed observations; overflow invalidates the evidence
+  and never changes ownership or opens the gate. Event JSON exports include
+  source identity, allocated/committed counts and missing committed sequences,
+  so an abruptly killed original cannot look fully retired. `control_prepared`
+  identifies an original command; `control_submitted` is each actual submit call
+  and can include submission of its cancellation SQE. Only `control_original`
+  and `control_cancel` identify the corresponding real terminal CQEs.
+  `raw_prepared` describes preparation, `initial_issued` the existing submission
+  fence, and `raw_cqe` the actual original completion. `bridge_destroyed`,
+  `sources_drained`, `owner_exit` and `cdev_closed` follow the respective real
+  lifetime boundaries. `caller_fills_parked` follows the actual outer fill drain;
+  `caller_terminal` records the caller's final owner facts before reporting them.
+  Neither event changes report semantics or substitutes for actual reap.
+
+  The standalone assembly-failure unit test also enables this marked fixture
+  before rejecting an invalid image configuration, without constructing a ublk
+  device. It requires the expected normal exit. Fixture construction borrows
+  its path from the awaiting coroutine frame through a named blocking callable;
+  a focused ASAN run checks that this handoff does not double-free the path.
+
+  Before each fork the supervisor optionally prepares an exclusive
+  `child-<generation>.reap` mmap record in the same marked fixture directory.
+  `Child::try_reap` writes the actual collected PID and raw wait status, then
+  release-commits the record before publishing reap notifications. The sink
+  belongs to that Child and never borrows the synchronous spawn-test hooks.
+  Collection performs only fixed stores; evidence setup failure does not
+  change spawning, teardown or collection. The test rejects missing,
+  uncommitted or mismatched records and exports `child-<generation>.reap.json`
+  with reaper PID, child PID, generation, raw status and decoded exit/signal
+  fields. The JSON's `matched_process_start_ticks` comes from the already
+  pinned child event ledger, not from a process lookup after reap. Result
+  JSON includes the matched original/replacement reap documents. These
+  observations survive registry erasure during supervisor maintenance.
+
+  Self-skips using the ordinary ublk prerequisite check. CTest retains its finite
+  timeout, but that external cutoff is not cleanup or retirement evidence.
+  Privileged acceptance uses an owned VM runner that preserves the VM/processes
+  on observation failure. The controller never force-kills a retained generation,
+  implicitly deletes a device, or opens queue 1 while original END is unresolved.
+  Failure artifacts remain in `/tmp/obd-startup-kernel-*` (or the configured
+  temporary directory): `result.json`, per-process `.events` and `.events.json`,
+  per-generation `.reap` and `.reap.json`, and `supervisor.log`. Export them
+  before VM poweroff; a test timeout or missing prerequisite is not a passed
+  kernel case.
+- `integration: adopted ublk recovery drains source frames before explicit release` —
+  a separate production supervisor/device fixture permits both replacement queues
+  to submit and requires real successful START/END originals and committed
+  adoption. A test-only async checkpoint then holds the startup caller before
+  its ready handoff. A real direct block read enters the assembled LSMT root
+  through a replacement-only source wrapper; its timer-based gate suspends the
+  actual coroutine with its actual queue buffer. Observed queue delivery records
+  correlate qid, tag, original cookie, buffer address, offset and length with
+  every source loan. The selected read starts after the successful-END checkpoint.
+
+  Normal supervisor destroy must admit release sequence 1 while the checkpoint
+  and source loan remain held. Releasing only the checkpoint injects a local
+  `EIO` after successful END, preserving adoption. Repeated status/list observations
+  must retain that generation and protection while the source is still active;
+  no STOP/DEL, borrower bridge destruction, source destruction, queue owner exit
+  or false ready handoff is allowed. After the source gate opens, the real
+  delegate must return the full count with the expected byte checksum. Each
+  source scope must exit before its borrowing bridge's native frame destruction,
+  and all bridges must retire before STOP. Actual control/raw originals, cdev
+  closure, one DEL, caller terminal sequence and actual process reap remain
+  independently required. Supervisor-owned raw waitpid evidence must match
+  each pinned PID/generation and the supervisor PID: the original must have
+  SIGKILL and the replacement must exit normally with status zero. A completed
+  caller event or vanished proc entry cannot hide a subsequent allocator abort.
+  The block client must finish and be reaped: successful
+  reads must return exact bytes, while `EIO` during authorized release is recorded
+  separately. Delegate success alone does not establish block-client success.
+
+  The same explicit fixture directory environment selects the fixed
+  `adopted-source-v1` marker; it disables the partial-recovery queue-1 gate.
+  `post_control_enter` follows the successful control operation and
+  `post_control_fail` precedes the injected local error. `release_admitted`
+  follows the actual mailbox CAS, before failure drain publishes its final
+  release facts. `request_delivered` records the real kernel descriptor;
+  `source_enter`, `source_result` and `source_scope_exit` identify one wrapper
+  loan. The result includes an FNV-1a checksum over the actual delegate bytes.
+  Scope exit is a lexical lifetime observation, not native frame destruction;
+  the existing `bridge_destroyed` event supplies that separate proof.
+  `source_destroyed` marks wrapper destructor entry, not inner-source destructor
+  completion. Source hooks never manufacture IO requests or alter kernel CQEs.
+
+  Shared controller helpers live in `tests/integration/startup_kernel_support.hpp`;
+  case-specific sequencing remains separate from the partial-recovery test.
+  Artifacts remain in `/tmp/obd-startup-source-*`. Result schema version 1 names
+  `adopted-source-v1`, includes both PID/generation/start-tick identities, supervisor
+  PID, gate states and the matched original/replacement reap documents. Its
+  `expected_exports` lists exactly six files: result JSON, supervisor log, both
+  event JSON ledgers and both generation-specific reap JSON documents.
+  `expected_raw_evidence` separately lists the two raw event mappings and two
+  raw reap mappings. `export_complete` is false if a ledger, pinned identity,
+  committed matching reap record or required log is missing or an export fails;
+  `export_errors` records those failures. Acceptance additionally requires the
+  test's complete/success state and valid raw wait-status outcomes, not export
+  completeness alone. Use the distinct `[startup-kernel-source]` selector and
+  mode-specific external validation; partial-recovery's no-adoption and failed-END
+  expectations do not apply here. The existing prerequisite skip and finite CTest timeout are
+  unchanged; privileged acceptance requires the owned VM runner to preserve
+  unresolved owners and export these artifacts before shutdown. Controller loss
+  does not open either gate. This case does not validate remote background-fill
+  loans, report-serialization failures or teardown refusal/retry scenarios.
+- `integration: retained ublk caller survives report failure and retries refused release` —
+  reuses the real partial two-queue recovery fixture with the explicit
+  `report-refusal-v1` mode. After the original END fails and settles, the first
+  retained-failure report attempt throws `std::bad_alloc` inside the actual
+  caller observer's construction exception boundary. Separate throw/caught/later
+  construction events plus a supervisor status at least as new as the recovered
+  report revision show containment and successful reporting for the same protected
+  generation. Repeated status/list
+  must preserve that owner with no competing replacement or premature STOP/DEL.
+
+  The controller opens queue 1 only after settled END failure, then waits for
+  its real initial issuance before requesting destroy. A one-shot exception in
+  the retained release controller, immediately before `release_once`, exercises
+  the existing exception-to-`ENOMEM` refusal path. Sequence 1 must be terminally
+  `refused`, with its own release errno and the unchanged original END failure
+  reason. No STOP SQE has been prepared at this boundary; this is a local setup
+  failure, not evidence that a kernel STOP returned `ENOMEM`. Repeated truthful
+  status/list and a failed destroy response must leave the same live owner.
+  A fresh destroy admits sequence 2 and executes normal STOP/DEL. Existing raw
+  and control cookie checks, native bridge retirement, cdev-close ordering,
+  terminal release, matching supervisor-owned raw reap records (original
+  SIGKILL, replacement normal exit zero), and kernel node removal still apply.
+
+  `failure_report_throw`, `failure_report_caught` and
+  `failure_report_constructed` record the actual caller boundary; construction
+  alone does not prove a wire write, hence the separate supervisor observation.
+  `release_setup_throw` names the local fault and its sequence. The existing
+  `release_admitted` event follows its mailbox CAS, so another thread may enter
+  setup/STOP before that diagnostic event is appended; the validator uses
+  refused wire status and final sequence 2 instead of assuming a cross-thread
+  event-order guarantee. Neither hook changes a kernel CQE or adoption state.
+
+  Select `[startup-kernel-report-retry]`; artifacts use the distinct
+  `/tmp/obd-startup-report-retry-*` prefix. Result schema version 1 includes mode,
+  both complete process identities, supervisor PID, original failure reason,
+  expected release sequence 2, observations, matched reap documents and explicit
+  export completion/errors. Its six expected JSON/log exports and four raw
+  mappings follow the shared fixture layout. Missing/mismatched evidence fails
+  acceptance. The existing unprivileged skip and finite CTest timeout remain;
+  use the owned runner to preserve unresolved owners on observation failure.
+  One kernel run covers this caller/protocol composition gap; the two-kernel
+  partial-publication and active-borrower cases cover their distinct retirement
+  boundaries. Implementation alone is not a runtime pass or every failure variant.
 - `integration: ublk writable device serves writes and discard` — a
   writable device (in-memory writable root) answers block-device
   writes, and a `BLKDISCARD` ioctl reaches `discard()` with

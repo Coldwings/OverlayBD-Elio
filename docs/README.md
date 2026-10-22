@@ -19,9 +19,9 @@ contract), testing status, and stability guarantees.
 | [trace-format.md](./trace-format.md) | upstream OverlayBD prefetch trace blob — byte-exact wire specification (ADR-0013 step 0) | Specification of upstream format; codec, replay, and supervisor-driven recording implemented |
 | [source.md](./source.md) | `src/source` — blob sources: local, registry, layer store with background fill, DART proxy | Implemented, tests passing |
 | [image.md](./image.md) | `src/image` — config.json parsing and image assembly (read-only or with a writable upper) | Implemented, tests passing |
-| [ublk.md](./ublk.md) | `src/ublk` — ublk control plane, per-queue data plane, Elio bridge | Implemented, tests passing |
-| [supervisor.md](./supervisor.md) | `src/supervisor` — daemon, per-device child lifecycle, control protocol | Implemented, tests passing |
-| [binaries.md](./binaries.md) | `obd-supervisor`, `obd-device`, `obdctl`, `obd-mkimage`, `obd-convert` — usage and behavior | Implemented, tests passing |
+| [ublk.md](./ublk.md) | `src/ublk` — ublk control plane, per-queue data plane, Elio bridge | Implemented; startup retirement evidence limits documented |
+| [supervisor.md](./supervisor.md) | `src/supervisor` — daemon, per-device child lifecycle, control protocol | Implemented; startup retirement evidence limits documented |
+| [binaries.md](./binaries.md) | `obd-supervisor`, `obd-device`, `obdctl`, `obd-mkimage`, `obd-convert` — usage and behavior | Implemented; startup retirement evidence limits documented |
 | [config.md](./config.md) | configuration reference — global config, per-image config.json, compatibility notes | Living contract |
 | [testing.md](./testing.md) | test strategy — unit, integration, privileged ublk E2E, fixtures | Living policy |
 | [operations.md](./operations.md) | deployment and operations guide | Living policy |

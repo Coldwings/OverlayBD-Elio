@@ -4,17 +4,19 @@
 //
 // Threading model (ADR-0004/0006): the device lives inside one obd-device
 // process; queue threads own their rings; the Elio scheduler serves the
-// image stack. Destruction stops queue threads, then STOP_DEV/DEL_DEV via
-// ~Ctrl.
+// image stack. Teardown stops kernel IO, proves raw/native retirement,
+// closes queue cdevs, and then deletes the device.
 #pragma once
 
 #include "source/blob_source.hpp"
 #include "ublk/ctrl.hpp"
 #include "ublk/queue.hpp"
+#include "ublk/startup_control.hpp"
 
 #include <elio/coro/task.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -38,6 +40,9 @@ public:
     static elio::coro::task<std::unique_ptr<Device>> create(
         const DeviceParams& params, source::BlobSourcePtr src,
         FailureCleanup failure_cleanup = {});
+    static elio::coro::task<std::unique_ptr<Device>> create(
+        const DeviceParams& params, source::BlobSourcePtr src,
+        StartupControl& startup, FailureCleanup failure_cleanup = {});
 
     /// ADR-0010: attaches to an EXISTING device created with
     /// UBLK_F_USER_RECOVERY after the previous server process died.
@@ -46,7 +51,12 @@ public:
     /// END_USER_RECOVERY (retrying EBUSY). The replacement must not open a
     /// queue cdev before START succeeds. The params' queue geometry must
     /// match the original device's. Must be
-    /// awaited on the Elio scheduler. Throws obd::error on failure.
+    /// awaited on the Elio scheduler. The caller must supply a StartupControl
+    /// accessible to a concurrent observer/release service and keep both it and
+    /// the runtime alive until this operation finishes. Published, unadopted
+    /// failure retains this operation and all resource owners until explicit
+    /// release succeeds; it throws StartupReleased after that release. Other
+    /// failures throw obd::error only after eligible cleanup has completed.
     /// D3: the grow-only resize baseline (`size_bytes`) is seeded from
     /// the kernel's REAL current capacity (Ctrl::get_params), NOT from
     /// `params` — a grown device keeps its capacity across USER_RECOVERY,
@@ -54,7 +64,8 @@ public:
     /// silently shrink the gendisk.
     static elio::coro::task<std::unique_ptr<Device>> attach(
         uint32_t dev_id, const DeviceParams& params,
-        source::BlobSourcePtr src, FailureCleanup failure_cleanup = {});
+        source::BlobSourcePtr src, StartupControl& startup,
+        FailureCleanup failure_cleanup = {});
 
     ~Device();
     Device(const Device&) = delete;
@@ -98,21 +109,55 @@ public:
     /// while source IO completes, then joins queue threads off-worker.
     /// The caller must retain this Device until the await completes.
     elio::coro::task<void> stop_async();
+    /// Read only after awaited stop_async (or blocking stop) has completed.
+    /// Unlike the startup observer, this includes the final queue ledger.
+    StartupSnapshot released_snapshot() const noexcept;
 
 private:
     friend struct DeviceTestAccess;
     Device() = default;
     void open_queues();
     void request_stop() noexcept;
-    static elio::coro::task<void> cleanup_failed(
-        std::unique_ptr<Device> dev, std::exception_ptr failure,
-        FailureCleanup failure_cleanup = {});
+    static elio::coro::task<std::unique_ptr<Device>> start_impl(
+        bool recovery, uint32_t dev_id, const DeviceParams& params,
+        source::BlobSourcePtr src, StartupControl& startup,
+        FailureCleanup failure_cleanup);
+    elio::coro::task<void> prepare_owners();
+    elio::coro::task<void> drain_sources();
+    elio::coro::task<void> retained_startup();
+    void collect_bridge_results() noexcept;
+    bool release_once() noexcept;
+    void refresh_startup() noexcept;
+    void publish_startup() noexcept;
+    bool try_publish_ready();
+    static int cancel_control(void*, uint32_t) noexcept;
+    static void complete_control(void*, uint32_t, int) noexcept;
+    static void observe_control(void*, const CtrlProgress&) noexcept;
+    // Shared production failure path; the start_impl frame retains this
+    // Device until cleanup or explicitly authorized release has completed.
+    elio::coro::task<std::unique_ptr<Device>> fail_startup(
+        bool recovery, std::exception_ptr failure, FailureCleanup& failure_cleanup);
 
     DeviceParams params_;
     source::BlobSourcePtr src_;
     std::unique_ptr<Ctrl> ctrl_;
     uint32_t dev_id_ = 0;
     bool started_ = false;
+    bool owns_id_ = false;
+    bool publication_released_ = false;
+    bool recovery_started_ = false;
+    bool release_authorized_ = false;
+    bool released_ = false;
+    bool stop_completed_ = false;
+    bool device_absent_ = false;
+    int release_error_ = 0;
+    std::mutex release_mu_;
+#ifdef OBD_TEST_HOOKS
+    detail::StartupTestHooks* test_hooks_ = nullptr;
+#endif
+    StartupControl* startup_ = nullptr; // Cleared before returning a ready Device.
+    StartupSnapshot startup_state_;
+    std::chrono::steady_clock::time_point startup_deadline_;
     /// Live device capacity in bytes; the resize grow-only baseline.
     /// Atomic: resize_blocking runs on a spawn_blocking pool thread
     /// while the device command loop reads size_bytes() on a worker.

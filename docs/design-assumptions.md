@@ -43,18 +43,24 @@ writers alone. Any format-semantics change is breaking (ADR trigger T1).
 
 Setup and assembly failures throw `obd::error` / `obd::format_error`. Hot
 IO paths (`pread`/`pwrite` of sources and layers) return negative `-errno`
-values and never throw. A device that cannot assemble must not come up
-half-broken: assembly failure fails the create request.
+values and never throw. A device that cannot assemble must not report ready: assembly failure fails
+the create request. Failure reporting does not release published kernel loans;
+a retained startup operation keeps its complete ownership graph (ADR-0022).
 
 ## A6. One process per device
 
 Each block device is served by exactly one child process spawned by the
 supervisor (ADR-0004). Devices never share a process; a device crash
 cannot take down siblings. The supervisor owns lifecycle over the
-documented wire protocols and never serves device IO itself. A crashed
-device process is replaced via ublk USER_RECOVERY with a bounded respawn
-(ADR-0010): the kernel keeps the device QUIESCED and reissues outstanding
-IO to the replacement, so a crash is a latency spike, not a mount failure.
+documented wire protocols and never serves device IO itself. An unexpected
+ready-device crash can be replaced via ublk USER_RECOVERY
+with bounded respawn (ADR-0010): the kernel keeps the device QUIESCED and
+reissues outstanding IO when recovery succeeds. An unresolved startup owner
+is never replaced automatically (ADR-0022). Before granting startup the
+supervisor protects its generation against automatic TERM/KILL. Failed
+pre-END recovery retains the old device and its required process/resources;
+explicit destroy must prove retirement before removal. Shutdown preserves
+operational list/status/destroy service while such owners remain.
 
 ## A7. Ring ownership and the bridge
 

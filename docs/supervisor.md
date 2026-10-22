@@ -93,14 +93,15 @@ command (`src/supervisor/daemon.cpp`):
 
 - **hello**: `{"ok":true,"protocol":<int>,"version":"<project version>",
   "features":[...]}` — the handshake. `protocol` is the control-protocol
-  revision (`kProtocolVersion`, currently 4; 1 = initial command set,
+  revision (`kProtocolVersion`, currently 5; 1 = initial command set,
   2 = added `commit`, 3 = added `trace_start`/`trace_stop` and the
   additive `trace` status field, 4 = added `resize` and the
   `virtual_size` create/commit fields (D3) and the `blank` create mode
-  (ADR-0014)); `version` is the project version string wired from CMake
+  (ADR-0014), 5 = retained startup ownership (ADR-0022)); `version` is the
+  project version string wired from CMake
   (`kProjectVersion`); `features` is a JSON array of strings — the
   capability gate for optional commands, currently
-  `["commit","trace","resize","blank"]`.
+  `["commit","trace","resize","blank","startup_owner"]`.
 - **create**: `{"ok":true,"id","pid","device"}` — `device` is the child's
   reported `/dev/ublkb<N>`. With an optional `virtual_size` (bytes > 0)
   the device is created with that capacity instead of the image's
@@ -108,11 +109,14 @@ command (`src/supervisor/daemon.cpp`):
   reply adds `"mode":"blank"`, `"size":<bytes>`, and — only when the
   request carried an `mkfs` — `"mkfs":"<type>"` (the mode-3 format ran
   on the new device before the reply).
-- **destroy**: `{"ok":true,"id"}`.
+- **destroy**: `{"ok":true,"id"}` only after eligible teardown and actual reap.
+  Protected startup uses explicit release; timeout/refusal keeps its entry.
 - **list**: `{"ok":true,"devices":[{"id","pid","state","device","error"}, ...]}`.
 - **status**: `{"ok":true,"id","pid","state","device","error","exit_code"}`
   (`exit_code` is -1 until the child is reaped). Both `status` and
-  `list` replies carry the additive **`trace`** object once a recording
+  `list` replies also expose `shutdown_pending`, `startup_protected`, and
+  the current `startup_owner` snapshot when available (see below). They carry
+  the additive **`trace`** object once a recording
   was started on the device (see "Trace recording" below).
 - **commit** (ADR-0014): `{"ok":true,"id","path","sha256","size"}`
   — the sealed upper's file path, the hex sha256 of the sealed file, and
@@ -141,8 +145,9 @@ ADR-0014). Concretely:
   a client that needs a capability checks `protocol`/`features` once at
   handshake time instead of discovering breakage at runtime.
 
-This rule is what allows obdctl, obd-supervisor, and any external
-(non-C++) CLI to be upgraded independently.
+This rule permits independent client upgrades. The private supervisor/device
+pair additionally requires the versioned startup grant in ADR-0022; supported
+old/new pairs reject startup before publication instead of silently degrading.
 
 ### Offline commit (ADR-0014)
 
@@ -150,8 +155,9 @@ This rule is what allows obdctl, obd-supervisor, and any external
 LSMT layer **offline** — the device process is never alive while its upper
 is being sealed. Contract:
 
-- **Stopped-device contract.** If the device is live (any state other than
-  `exited`), commit stops it first: SIGTERM plus a bounded reap
+- **Stopped-device contract.** Protected/retained startup generations are
+  refused, including an externally reaped owner without retirement evidence.
+  For an eligible live device, commit stops it first: SIGTERM plus a bounded reap
   (`stop_timeout_sec`, escalating to SIGKILL with a 2 s grace) — the
   destroy-path mechanics *without* removing the entry from the registry,
   so `status` keeps working afterwards. Only when the child is reaped does
@@ -444,15 +450,14 @@ JSON-lines framing, same 64 KiB cap. Device → supervisor traffic is
 lifecycle **status lines** plus, since protocol 3, `reply`-discriminated
 command replies/events (see "Trace recording" above; the supervisor
 routes on the `reply` field and treats everything else as a status
-line). Supervisor → device traffic is **signals** (SIGTERM = shutdown
-request, SIGKILL = force) plus, since protocol 3, JSON-lines trace
-commands on the same socketpair. Devices that predate trace control
-never read the channel, so a new-supervisor/old-device pairing degrades
-to "device control channel timeout" on trace commands; the reverse
-pairing simply never receives them. Device shutdown must not leave the
-device's command reader parked (obd-device `shutdown(2)`s the channel on
-its way out — a parked coroutine would stall the scheduler's teardown
-drain). All device-side WRITERS (status reports, trace replies, the
+line). Supervisor → device traffic includes the version-1 startup grant,
+status/release commands and ordinary trace/resize commands. TERM/KILL policy
+applies only to eligible unprotected children; protected startup requires
+explicit release. Supported old/new supervisor/device pairs reject the missing
+or unknown `--startup-generation` argument before publishing device work.
+Device shutdown completes its private reader before destroying borrowed hooks;
+the same reader spans startup and ready operation.
+All device-side WRITERS (status reports, trace replies, the
 expiry event — different coroutines on different workers) go through
 one shared serialized writer (`ControlChannelWriter`,
 src/supervisor/device_control.hpp): AF_UNIX SOCK_STREAM has no PIPE_BUF
@@ -468,7 +473,8 @@ framing is clean again — the channel tolerates the loss of at most one
 line per stall episode (command replies carry a 30 s timeout; status is
 re-queryable).
 
-Status lines (`DeviceStatus` / `make_device_status`):
+Lifecycle vocabulary (`DeviceStatus` / `make_device_status`; supervised
+reports additionally carry `startup_owner` below):
 
 ```json
 {"state":"starting"}
@@ -480,8 +486,9 @@ Status lines (`DeviceStatus` / `make_device_status`):
 `state` is required (string); `device` and `error` are optional and
 omitted when empty. The supervisor additionally maintains one internal
 state, `exited`, which the child never sends: it is assigned when the
-status channel hits EOF or the reaper collects the process
-(`Child::try_reap`). EOF only reports loss of the control channel: the
+status channel hits EOF for an unprotected generation, or the reaper collects
+the process (`Child::try_reap`). Protected channel loss remains a failed owner.
+EOF only reports loss of the control channel: the
 process can still be checkpointing or destroying its ublk control owner.
 The separate `reaped()` / `reaped_event()` barrier records actual process
 exit and must precede entry removal or offline sealing. The externally
@@ -493,6 +500,72 @@ starting → failed ─────────→ exited   (exec failure: exit 
 starting ──────(crash)─────→ exited   (reaper fills exit_code)
 ```
 
+The opt-in startup kernel fixture also requires the raw collected wait status:
+reap proves collection, not successful process shutdown. In test-enabled builds,
+`OBD_TEST_STARTUP_FIXTURE_DIR` plus a `partial-recovery-v1`,
+`adopted-source-v1` or `report-refusal-v1` marker enables a Child-owned, exclusive
+`child-<generation>.reap` mapping prepared before fork.
+The matching `Child::try_reap` publishes PID, generation, reaper PID and raw wait
+status before notifying waiters, using fixed stores without allocation or file
+I/O at collection. Missing evidence makes the fixture fail but never changes
+process ownership or teardown. The controller requires the intentionally killed
+original to show SIGKILL and the released replacement to show normal exit zero,
+even after a maintenance shutdown erases their registry entry. This internal
+test record is separate from the public supervisor protocol.
+
+### Protected startup ownership (ADR-0022)
+
+Every supervised generation offers `startup_owner` version 1 before publishing
+ublk work. The parent registers its Child, monitor and channel, installs
+protection from automatic termination, then sends:
+
+```json
+{"cmd":"startup_begin","version":1,"generation":7}
+{"cmd":"startup_status","generation":7}
+{"cmd":"startup_release","generation":7,"seq":1}
+```
+
+Lifecycle replies use the command name in `reply`, echo the generation and any
+sequence, and include the observed `startup_owner`. The single monitor routes
+both status and replies; all parent writes share a serialized channel writer.
+Grant delivery failure does not revoke protection. Missing capability/status
+never selects a legacy cleanup mode.
+
+The additive snapshot has these fields:
+
+| Field | Meaning |
+|---|---|
+| `version`, `generation`, `revision` | Version 1; immutable nonzero child identity; monotonic observation revision. |
+| `phase` | `preparing`, `control_pending`, `retained`, `releasing`, `ready`, or `released`. |
+| `device_id` | Kernel device ID, or -1 before known. |
+| `reason_errno` | Nonnegative startup failure reason; 0 when none. |
+| `control_pending`, `kernel_debt_known` | Whether control work remains and whether raw ownership accounting is known. |
+| `raw_published`, `raw_retired` | Original queue-command accounting; a cancellation CQE is not original retirement. |
+| `release_sequence`, `release`, `release_errno` | Operator attempt identity, `none`/`pending`/`refused`/`released`, and nonnegative release errno. |
+
+Only coherent current-generation observations may change protection; stale or
+contradictory records cannot restore weaker state. A ready handoff needs both
+`state=ready` and matching `phase=ready`. Failure stays `state=failed` with
+retained/releasing ownership; a lost channel or actual external reap cannot
+manufacture successful retirement or permit another replacement.
+
+`destroy` admits an increasing sequence in `[1, 2^63)` on the current owner.
+Acceptance reports pending. The private release ledger survives the client's
+wait, failed delivery and timeout. Retrying observes the pending attempt;
+a terminal refusal permits a newer attempt. Ready versus release admission is
+serialized in the device, so release acceptance cannot be lost at handoff.
+The child settles original control/raw commands and native frames, closes
+queue/cdev resources, and performs one authorized DEL before reporting release.
+The supervisor additionally requires actual reap before removing that entry.
+Unknown outcomes remain retained; timeout never escalates to TERM/KILL.
+Safe automatic cleanup without an operator sequence is a separate terminal
+case, not acknowledgement of an accepted explicit request.
+
+Create timeout/failure and daemon shutdown do not authorize destructive
+cleanup of an unadopted recovery. During shutdown maintenance, status/list
+include `shutdown_pending=true`; hello/list/status/destroy remain available,
+while other new work is refused. See "Daemon shutdown" for execution ownership.
+
 ### Spawning contract
 
 `Child::spawn` (`src/supervisor/child.cpp`) builds **argv and the Child owner
@@ -500,19 +573,23 @@ entirely before fork**, then: socketpair → fork → in the child, only async-s
 calls (`close`, `dup2`, `fcntl`, `execve`, `_exit`) because the parent
 hosts a live Elio runtime and anything else is UB. The parent immediately
 attaches the PID and channel to the prepared owner through nonthrowing
-assignments. An allocation failure creates no process or channel; a later
-parent-side exception closes the channel and collects the owned child before
-escaping. The child argv is:
+assignments. An allocation failure during this preparation creates no process
+or channel; a later exception inside this pre-grant spawn operation closes the
+channel and collects the owned child before escaping. After a grant attempt,
+protected ownership instead follows the retained-maintenance rules. The child
+argv is:
 
 ```
 <device_bin> --config <config.json> [--global <overlaybd.json>] \
-             --control-fd 3 [--dev-id <N>]
+             --control-fd 3 --startup-generation <G> [--dev-id <N>]
 <device_bin> --blank-size <bytes> --blank-dir <workspace> \
-             [--global <overlaybd.json>] --control-fd 3 [--dev-id <N>]
+             [--global <overlaybd.json>] --control-fd 3 --startup-generation <G> [--dev-id <N>]
 ```
 
 The blank form (ADR-0014) replaces `--config`; `--global` is omitted when
-empty; `--dev-id` is omitted when negative.
+empty; `--dev-id` is omitted when negative. The supervisor allocates a fresh
+nonzero generation before each initial or recovery spawn; IDs reused after
+destroy do not reuse generations within the daemon lifetime.
 There is no PATH lookup — the supervisor resolves the binary itself. On
 `execve` failure the child `_exit(127)`s; the parent observes EOF on the
 channel plus exit code 127 and reports "exec failed (obd-device not found
@@ -529,26 +606,22 @@ exit status; the same sweep collects the helper pids that runner
 ABANDONED via `take_orphan_pids()`, see the mkfs bound above), and one
 **monitor coroutine per child** (a `LineReader` over
 the child's status fd feeding `Child::update_status`). The children
-registry (`std::map<id, std::shared_ptr<Child>>`) is guarded by an
+registry of shared `DeviceEntry` owners is guarded by an
 `elio::sync::mutex` — coroutine-aware, never held across heavy work.
 Signals must be blocked process-wide by the caller (signalfd model).
 
 Bounded waits: `create` waits up to `ready_timeout_sec` (default 60 s) for
-the child's first terminal-for-creation state (`ready`/`failed`/`exited`)
-via `Child::ready_event`; on timeout or failure the child is SIGTERMed and
-an error reply returned. `destroy` SIGTERMs, waits up to
-`stop_timeout_sec` (default 10 s) for `reaped_event`, escalates to SIGKILL
-with a further 2 s reap grace, then erases the child from the registry.
-If the reap still cannot be confirmed, `destroy` returns an error and
-retains the entry for a later retry; failed mode-3 create cleanup also
-retains an unreaped entry and reports the cleanup failure. `commit` never
-seals while a child remains unreaped, even if status already says `exited`.
-Shutdown (SIGTERM/SIGINT to the daemon) stops accepting, SIGTERMs every
-child, and applies the same reap and post-SIGKILL bounds before stopping
-the reaper. A failed reap makes shutdown fail; the last-owner destructor
-remains a best-effort SIGKILL/blocking-wait fallback, not the normal
-completion barrier. Reaping proves process exit, not successful kernel
-`STOP_DEV`/`DEL_DEV`; real-device tests check the kernel nodes separately.
+ready/failed/exited and returns an error on failure or timeout. A protected
+startup owner remains registered. For an eligible unprotected child,
+`destroy` uses TERM, `stop_timeout_sec` (default 10 s), then KILL and a 2 s
+reap grace; failure to confirm reap retains the entry. For protected startup,
+destroy requests explicit release and retains the entry on refusal/timeout.
+Commit refuses protected ownership and otherwise requires actual reap before
+sealing. Reaping proves process exit, not retirement of kernel loans.
+
+Shutdown keeps maintenance service operational while protected owners or
+unpublished create admissions remain. Its eventual task drainage and
+exception behavior are specified under "Daemon shutdown" below.
 
 ## Public API
 
@@ -556,7 +629,7 @@ completion barrier. Reaping proves process exit, not successful kernel
 
 - `inline constexpr size_t kMaxMessageBytes = 64 * 1024` — maximum JSON-line
   length on both channels.
-- `inline constexpr int kProtocolVersion = 4` — control-protocol revision;
+- `inline constexpr int kProtocolVersion = 5` — control-protocol revision;
   increments only for additive batches (see the additive-only rule above).
 - `inline constexpr std::string_view kProjectVersion` — the project version
   string, wired from CMake `project(... VERSION ...)` via the
@@ -590,12 +663,23 @@ completion barrier. Reaping proves process exit, not successful kernel
 - `std::string reply_hello()` — the `hello` handshake reply via the
   `reply_ok` envelope: `protocol` (`kProtocolVersion`), `version`
   (`kProjectVersion`), and `features` (a JSON array of capability strings,
-  currently `["commit","trace","resize","blank"]`).
+  currently `["commit","trace","resize","blank","startup_owner"]`).
+- `inline constexpr int kStartupOwnerVersion = 1` — private startup capability.
+- `struct StartupOwnerStatus` — the generation, revision, phase, device ID,
+  reason, control/raw-debt and release fields specified above.
+- `nlohmann::json startup_owner_json(const StartupOwnerStatus&)` and
+  `std::optional<StartupOwnerStatus> parse_startup_owner(const nlohmann::json&)`
+  — versioned ownership encoding and validation.
+- `bool valid_startup_owner(const StartupOwnerStatus&) noexcept` — coherent
+  facts; Child additionally validates request admission and monotonicity.
 - `struct DeviceStatus` — `state` (`starting` | `ready` | `failed` |
-  `stopped`), `device` (`/dev/ublkb<N>` when ready), `error` (when failed).
+  `stopped`), `device` (`/dev/ublkb<N>` when ready), `error` (when failed),
+  optional `startup_owner`.
 - `std::optional<DeviceStatus> parse_device_status(std::string_view)` —
   `nullopt` unless the line is a JSON object with a string `state`;
-  `device`/`error` default to `""`.
+  `device`/`error` default to `""`. A present malformed ownership record is
+  rejected. Codec acceptance of absent ownership does not enable a legacy
+  bypass in the daemon's mandatory startup handshake.
 - `std::string make_device_status(const DeviceStatus&)` — the obd-device
   side encoder; omits empty `device`/`error`. Round-trips with
   `parse_device_status`.
@@ -604,6 +688,7 @@ completion barrier. Reaping proves process exit, not successful kernel
 
 - `struct ChildSpec` — `id`, `device_bin` (absolute path), `config_path`,
   `global_path` (may be empty), `dev_id_request` (`-1` = auto), `recover`,
+  `startup_generation` (nonzero for supervised startup),
   and — for blank devices — `blank` + `blank_size` + `blank_dir`
   (ADR-0014; a blank spec carries no `config_path`).
 - `static std::unique_ptr<Child> Child::spawn(const ChildSpec&)` — forks
@@ -613,9 +698,11 @@ completion barrier. Reaping proves process exit, not successful kernel
   owner does not confirm exec or readiness: an exec failure is observed
   after collection through the child's status (`exit_code == 127`), rather
   than thrown synchronously by `spawn`.
-- `~Child()` — closes the control fd if held; if the process is still
-  unreaped: best-effort `SIGKILL` + blocking `waitpid` (retrying `EINTR`).
-  Never signals or waits on an already reaped PID. Never throws.
+- `~Child()` — cannot force-kill protected startup ownership. Normal daemon
+  ownership retains the complete operational graph until release; the
+  destructor's blocking fallback is not a replacement for that ownership.
+  For an eligible unprotected child it closes the held control fd and uses
+  best-effort KILL/reap. Never signals an already reaped PID.
 - `const std::string& id() const`, `pid_t pid() const`.
 - `int control_fd() const` — parent end of the status channel.
 - `int release_control_fd() noexcept` — detaches the fd (the monitor
@@ -624,6 +711,10 @@ completion barrier. Reaping proves process exit, not successful kernel
   vocabulary adds `"exited"`), `device`, `error`, `exit_code` (`-1` until
   reaped).
 - `Status status() const` — mutex-guarded snapshot.
+- `Child::Snapshot snapshot() const` — one coherent observation containing
+  `status`, optional `startup_owner`, and `startup_protected`, used by public
+  list/status so lifecycle and protection facts cannot come from different
+  revisions.
 - `void update_status(const Status&)` — publishes a status; fires
   `ready_event` the first time the state becomes `ready` / `failed` /
   `exited`, and `exit_event` on `exited`. Each event fires at most once.
@@ -633,7 +724,8 @@ completion barrier. Reaping proves process exit, not successful kernel
 - `bool reaped() const`, `elio::sync::event& reaped_event()` — actual
   process-reap state and its one-shot event. EOF never fires this event.
 - `void terminate() noexcept` — SIGTERM. `void kill() noexcept` — SIGKILL.
-  Both are no-ops on an untracked or already reaped PID.
+  Both are no-ops for protected startup, an untracked PID or an already
+  reaped PID. Protection and signal admission share the Child mutex.
 - `bool try_reap()` — performs owned-PID `waitpid(..., WNOHANG)` and
   records a newly confirmed reap, returning true only for that transition:
   `exit_code` = `WEXITSTATUS`, or `128 + WTERMSIG` when signaled; state
@@ -650,6 +742,36 @@ completion barrier. Reaping proves process exit, not successful kernel
   Coroutine owners retain the child, yield and retry before abandoning
   their observation; the monitor, reaper and stop helper apply this rule.
   Reap facts and exit codes remain committed if notification needs retry.
+
+- `uint64_t startup_generation() const noexcept` — immutable process identity.
+- `bool protect_startup(uint64_t generation)` — install protection before grant
+  delivery; reject a foreign or completed owner.
+- `bool startup_protected() const`, `bool startup_granted() const` — synchronized
+  facts; granted includes a conservatively protected delivery attempt.
+- `std::optional<uint64_t> admit_startup_release()` — persist operator authority;
+  return the current pending sequence or a fresh sequence after refusal.
+- `bool observe_startup(const StartupOwnerStatus&, bool ready_report)` — validate
+  identity, monotonic facts and release correlation before changing protection.
+- `std::optional<StartupOwnerStatus> startup_status() const` — diagnostic snapshot;
+  copying diagnostic strings can allocate and is not an ownership transfer.
+
+### `src/supervisor/device_control.hpp`
+
+`DeviceControlSession` keeps one private-channel reader across startup and
+ready operation. Its `Lifecycle` callback has signature
+`std::function<std::optional<nlohmann::json>(const nlohmann::json&)>`; a present
+reply handles a lifecycle command, while absence permits ordinary dispatch.
+`publish_ready(std::shared_ptr<image::TraceRecorder>, DeviceControlHooks)`
+publishes serving hooks under a mutex. `load` copies that pair only after
+publication; `lifecycle` invokes the immutable callback. Borrowed captures must
+outlive the reader and its final frame destruction.
+
+`run_device_control_with_session(ControlChannelWriterPtr,
+std::shared_ptr<image::TraceRecorder>, DeviceControlHooks,
+std::shared_ptr<DeviceControlSession>)` returns `elio::coro::task<void>` and
+serves both phases without competing readers. Command/reporting exceptions do
+not transfer startup ownership or authorize teardown. The original
+`run_device_control` entry point remains available for ready-only callers.
 
 ### `src/supervisor/daemon.hpp`
 
@@ -670,7 +792,8 @@ completion barrier. Reaping proves process exit, not successful kernel
   suite never executes host mkfs.
 - `elio::coro::task<int> run_daemon(const DaemonConfig&)` — binds the
   socket, runs accept loop + reaper + monitors until SIGTERM/SIGINT, then
-  shuts down gracefully (children terminated first). Returns the process
+  enters shutdown maintenance if protected owners remain, then drains all
+  owned tasks and eligible children. Returns the process
   exit code (1 if the socket cannot be bound, 0 otherwise). Caller must
   have blocked the handled signals process-wide (signalfd model).
 
@@ -707,14 +830,17 @@ rules apply, including when the originating create remains inside mkfs.
   reported — siblings and the daemon are unaffected (ADR-0004).
 - **Reaping completeness**: every spawned child is reaped exactly once —
   by the SIGCHLD reaper or a stop path through `Child::try_reap`, with
-  `~Child` (SIGKILL + blocking `waitpid`) as a last-owner fallback.
-  Removal and sealing wait for actual reap. No zombies survive the daemon.
+  the ordinary Child fallback is unavailable to protected startup owners.
+  Removal requires eligible retirement and actual reap; sealing refuses
+  unresolved startup ownership. Protected generations retain the daemon.
 - **One-shot control channel**: an admitted command produces at most one
   reply before the connection closes. Malformed commands map to a
   `{"ok":false,...}` reply; shutdown or I/O failure can prevent delivery
   (see "Daemon shutdown").
 - **Bounded process waits**: readiness waits use `ready_timeout_sec`;
-  graceful and post-SIGKILL reap waits use `stop_timeout_sec` + 2 s.
+  eligible graceful and post-KILL reap waits use `stop_timeout_sec` + 2 s.
+  Protected release waits may return unresolved; resource retention itself
+  is not bounded by a client deadline.
   Required notification retries retain their owners through allocation
   failure, as do task drains; these are process-wait bounds, not a global
   wall-clock deadline under sustained memory exhaustion.
@@ -783,10 +909,10 @@ rules apply, including when the originating create remains inside mkfs.
   plus optional `device`/`error`; the state vocabulary
   `starting`/`ready`/`failed`/`stopped`) may only change with an ADR —
   and then only **additively** (see the additive-only evolution rule
-  above; ADR-0014). obdctl, obd-supervisor, and obd-device may be
-  upgraded independently.
+  above; ADR-0014). ADR-0022 additionally requires a compatible
+  supervisor/device startup-owner handshake; client upgrades remain additive.
 - **The fd-3 + argv contract** between supervisor and obd-device
-  (`--control-fd 3`, `--config` for image mode, `--blank-size
+  (`--control-fd 3`, mandatory `--startup-generation`, `--config` for image mode, `--blank-size
   <bytes> --blank-dir <workspace>` for blank mode (ADR-0014), optional
   `--global`, optional `--dev-id`, CLOEXEC-cleared fd 3) is part of the
   same wire contract.
@@ -801,6 +927,21 @@ rules apply, including when the originating create remains inside mkfs.
   choice, monitor/reaper coroutine structure.
 
 ## Testing
+
+Retained startup coverage is separate from kernel retirement evidence:
+
+- `supervisor: retained startup survives release refusal then releases on retry`
+  exercises the real daemon with a protocol peer and a correlated retry.
+- `supervisor: SIGTERM preserves retained owners and serves maintenance commands`
+  exercises maintenance observation, admission refusal and explicit destroy.
+- `supervisor: malformed startup ownership never becomes legacy status`
+  checks that invalid ownership input cannot select unprotected fallback.
+
+These ordinary process/codec tests do not prove raw kernel-command retirement.
+Acceptance additionally requires owned Linux 6.6 and current-kernel fixtures
+covering original CQEs, native-frame retirement, close-before-DEL and reap.
+The proposed ADR-0022 does not assert that the complete kernel matrix has run.
+
 
 `supervisor: create validates device ids before integer narrowing` exercises
 image and blank create requests at both valid endpoints and signed/unsigned
@@ -944,6 +1085,14 @@ needing a real ublk device or root.
   binary does not exist and guards that the reaped `exit_code` is exactly
   127 and the status error contains "exec failed". This pins the exec-fail
   convention that operators and `cmd_create` rely on.
+- `supervisor: reap evidence preserves actual child wait status` — real
+  fork/exec exits distinguish exit zero, exit 134, SIGABRT and SIGKILL under
+  partial-recovery, adopted-source and report-refusal fixture markers.
+  A reported stopped state cannot commit the observation; actual collection
+  does, and the durable record remains after Child destruction.
+- `supervisor: unavailable reap evidence does not change child collection` —
+  missing marker and exclusive-file collision for each fixture mode leave collection unchanged,
+  never overwrite earlier evidence, and cannot produce a passing witness.
 - `supervisor: failed child ownership setup leaves no process or channel` —
   injects an owner-allocation failure and a parent-side exception after fork;
   no returned `Child` is needed to ensure collection and channel closure.
@@ -1033,8 +1182,8 @@ the spawn tests create their fake binaries under a temporary directory).
 
 Each device is supervised for its whole lifetime by one coroutine
 (`supervise_entry`) that reads the child's status channel and, on an
-**unexpected** exit (not a requested `destroy`, not daemon shutdown),
-respawns the child with `--recover --dev-id N`: the ublk device was
+**unexpected ready-device** exit after actual reap (not a requested destroy,
+shutdown, or an unresolved startup owner), respawns the child with `--recover --dev-id N`: the ublk device was
 created with `UBLK_F_USER_RECOVERY` and survives serverless in the kernel,
 so the replacement *attaches* instead of re-creating.
 **Blank-device caveat:** the respawn re-runs the blank assembly, which
@@ -1050,7 +1199,15 @@ flag first and never respawn.
 
 ### Daemon shutdown
 
-Shutdown closes admission and cancels the listener's pending accept,
+Shutdown first closes new-work and startup-grant admission. While a protected
+startup owner remains, it retains the listener, clients, registry, monitors,
+reaper and runtime for hello/list/status/explicit destroy. It reports
+`shutdown_pending`, refuses other new work, and does not signal protected
+children. Create reservations and recovery publication are accounted for
+before final drainage. External reap without retirement evidence does not
+clear this condition (ADR-0022).
+
+After protected owners release, final shutdown cancels the listener's pending accept,
 accepted clients' socket reads/writes, and forwarded device-channel writes.
 An idle peer, a partial JSON line, or a device that stops reading therefore
 needs no additional peer traffic to let those I/O operations finish. The
@@ -1058,8 +1215,8 @@ listener and each stream retain their descriptors through I/O completion.
 
 Command admission occurs at the shutdown check after reading a complete
 line. A connection accepted earlier, or even a line fully read before that
-check, can receive EOF/reset without dispatch or a JSON reply when shutdown
-has begun. Already admitted handlers remain owned until completion, which
+check, can receive EOF/reset without dispatch or a JSON reply when final
+drainage has begun. Maintenance permits the observation/release commands above. Already admitted handlers remain owned until completion, which
 may include cancellation or failure; draining them does not guarantee
 successful command execution or response delivery.
 
@@ -1067,7 +1224,7 @@ The daemon drains accepted handlers first, with device monitors and the
 SIGCHLD reaper still running: an already admitted command may finish a
 create, spawn its monitor, or wait for a device reply or exit. It then stops
 the stable set of registered children, waits for actual reaps (including
-the 2 s post-SIGKILL grace), cancels remaining monitor reads, and
+the ordinary 2 s post-KILL grace for eligible children), cancels remaining monitor reads, and
 drains **all** admitted monitors, including those whose entry was removed
 by `destroy`. Only after this work departs does it wake and drain the reaper.
 Recovery publication still takes `op_mu` followed by the registry mutex;
@@ -1076,8 +1233,9 @@ shutdown takes `op_mu` before choosing the generation to terminate.
 Accepts, clients, monitors and the reaper have separate Elio TaskGroups
 under the ADR-0002 runtime rule. Each stage's join closes its admission and
 waits for frame and callable destruction, not merely a task result or a
-child's exit event. Startup/signal-wait exceptions follow the same drain
-before propagating. Task body failures are logged promptly and do not
+child's exit event. Startup/signal-wait exceptions follow the same ownership/maintenance path
+before propagating; diagnostics and transient observation failures cannot
+unwind the retained graph. Task body failures are logged promptly and do not
 cancel siblings; admission failures are reported after the affected group
 drains. The reaper remains placed on worker 0 using Elio affinity. Test
 client/monitor bodies use workers 2/1 to exercise cross-worker ownership.

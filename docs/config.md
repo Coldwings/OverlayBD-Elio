@@ -121,6 +121,14 @@ failures are logged and skipped, never a bring-up error; see
 |---|---|---|---|
 | `enableRecovery` | bool | `true` | ADR-0010: create devices with `UBLK_F_USER_RECOVERY` so a crashed device process can be replaced without failing the block device. Disable only for debugging; kernels without the feature fall back automatically. |
 
+Recovery flags do not authorize cleanup of an unadopted old device. Under
+ADR-0022, failed startup with outstanding ownership retains its process and
+resources until supported release. Disabling `enableRecovery` does not disable
+startup ownership accounting or make timeout/EOF a retirement barrier. No
+configuration option selects an automatic destructive fallback. The
+`--startup-generation` grant is supervisor-generated protocol metadata, not an
+image or global configuration field.
+
 ### Recognized but not honored
 
 `cacheConfig` and `ioEngine` are parsed-tolerated (ignored as unknown

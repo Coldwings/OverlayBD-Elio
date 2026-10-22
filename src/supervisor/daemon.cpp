@@ -160,6 +160,9 @@ public:
                 co_return line;
             }
             if (buf_.size() > kMaxMessageBytes) co_return std::nullopt;
+            // Allocate before consuming socket bytes; retrying next() after
+            // allocation failure must not lose part of a lifecycle record.
+            buf_.reserve(buf_.size() + 4096);
             char tmp[4096];
             const auto r =
                 co_await stream_.read(tmp, sizeof(tmp), token_);
@@ -185,7 +188,8 @@ struct SyncMutexGuard {
 constexpr elio::coro::task_group_options kDaemonTaskOptions{
     .failure_policy = elio::coro::task_group_failure_policy::collect_all};
 
-void report_daemon_task_failure(std::exception_ptr failure) {
+void report_daemon_task_failure(std::exception_ptr failure) noexcept {
+    try {
     try {
         std::rethrow_exception(std::move(failure));
     } catch (const std::exception& error) {
@@ -193,6 +197,7 @@ void report_daemon_task_failure(std::exception_ptr failure) {
     } catch (...) {
         ELIO_LOG_ERROR("daemon task failed with an unknown exception");
     }
+    } catch (...) {}
 }
 
 // Logging and placement are daemon policy; TaskGroup owns admission and
@@ -421,6 +426,9 @@ class Daemon {
         // matching reply; the handler keeps its operation through consumption.
         // `trace` is null until the first trace_start.
         std::shared_ptr<elio::net::uds_stream> control;
+        elio::sync::mutex write_mu;
+        bool grant_sent = false;
+        bool shutdown_stop_requested = false;
         std::shared_ptr<DeviceCommand> active_command;
         uint64_t cmd_seq = 0;  // fresh correlation token for each admission
         nlohmann::json trace;
@@ -457,32 +465,33 @@ public:
         elio::signal::signal_set term_set;
         term_set.add(SIGTERM).add(SIGINT);
         elio::signal::signal_fd term_fd(term_set);
+        elio::signal::signal_set chld_set;
+        chld_set.add(SIGCHLD);
+        elio::signal::signal_fd chld_fd(chld_set);
 
         // Allocate the drain coroutine frames before any child is admitted.
         auto accept_join = join_daemon_tasks(accept_tasks_);
         auto client_join = join_daemon_tasks(client_tasks_);
         auto monitor_join = join_daemon_tasks(monitor_tasks_);
         auto reaper_join = join_daemon_tasks(reaper_tasks_);
+        auto accept_body = accept_loop(*listener);
+        auto reaper_body = reaper(chld_fd);
         std::exception_ptr failure;
         try {
-            spawn_daemon_task(accept_tasks_, [this, &listener]() -> elio::coro::task<void> {
-                co_await accept_loop(*listener);
-            });
+            // Signal ownership and the reaper frame exist before accepting
+            // any request that can publish/grant a device.
+            spawn_daemon_task(reaper_tasks_,
+                [body = std::move(reaper_body)]() mutable {
+                    return std::move(body);
+                }, 0);
+            spawn_daemon_task(accept_tasks_,
+                [body = std::move(accept_body)]() mutable {
+                    return std::move(body);
+                });
             if (test_gate_ && test_gate_->is_armed("startup_failure")) {
                 co_await test_gate_->observe("startup_failure", {});
                 throw std::runtime_error("injected daemon startup failure");
             }
-            // Keep the SIGCHLD activity on worker 0. Elio v0.6 resolves the
-            // current worker's I/O context at every signal_fd wait.
-            spawn_daemon_task(reaper_tasks_, [this]() -> elio::coro::task<void> {
-                if (test_gate_) test_gate_->mark(
-                    "reaper_worker_" + std::to_string(elio::runtime::current_worker_id()));
-                elio::signal::signal_set chld_set;
-                chld_set.add(SIGCHLD);
-                elio::signal::signal_fd chld_fd(chld_set);
-                co_await reaper(chld_fd);
-            }, 0);
-
             // Wait for the shutdown signal.
             for (;;) {
                 auto info = co_await term_fd.wait();
@@ -493,9 +502,43 @@ public:
         } catch (...) {
             failure = std::current_exception();
         }
-        ELIO_LOG_INFO("supervisor shutting down");
+        // Close grant/create admission under the same lock used to install
+        // startup protection. Keep accept/client/monitor/reaper service alive
+        // while any protected owner or unpublished create remains.
+        bool maintenance_complete = false;
+        while (!maintenance_complete) {
+            try {
+                co_await mu_.lock();
+                SyncMutexGuard registry_guard{mu_};
+                if (test_gate_ && !shutdown_requested_.load())
+                    test_gate_->mark("shutdown_pending");
+                shutdown_requested_.store(true);
+                bool retained = false;
+                for (const auto& [id, admission] : create_admissions_) {
+                    (void)id;
+                    retained |= !admission.expired();
+                }
+                for (const auto& [id, entry] : children_) {
+                    (void)id;
+                    if (entry->child->startup_protected()) {
+                        retained = true;
+                    } else if (!entry->shutdown_stop_requested) {
+                        entry->child->terminate();
+                        entry->shutdown_stop_requested = true;
+                    }
+                }
+                maintenance_complete = !retained;
+            } catch (...) {
+                report_daemon_task_failure(std::current_exception());
+            }
+            if (!maintenance_complete) {
+                try { co_await elio::time::sleep_for(std::chrono::milliseconds(20)); }
+                catch (...) {}
+            }
+        }
+        try { ELIO_LOG_INFO("supervisor shutting down"); } catch (...) {}
         stopping_.store(true);
-        if (test_gate_) test_gate_->mark("shutdown");
+        try { if (test_gate_) test_gate_->mark("shutdown"); } catch (...) {}
         auto cancel = [&](elio::coro::cancel_source& source) {
             try {
                 source.cancel();
@@ -505,60 +548,152 @@ public:
         };
         cancel(accept_cancel_);
         cancel(client_cancel_);
-        co_await accept_join;
-        listener->close();
-        // No accept can now add another handler. Admitted commands may still
-        // create monitors or await child replies/reaping, so drain them first.
-        co_await client_join;
-
-        // Handlers can no longer change registry membership. Mark every
-        // entry, then take op_mu so a recovery already past its stop check
-        // finishes publishing before we choose the child to terminate.
-        {
-            co_await mu_.lock();
-            SyncMutexGuard registry_guard{mu_};
-            for (auto& [id, entry] : children_) entry->destroying = true;
-        }
-        for (auto& [id, entry] : children_) {
-            co_await entry->op_mu.lock();
-            SyncMutexGuard op_guard{entry->op_mu};
-            entry->child->terminate();
-        }
-        for (auto& [id, entry] : children_) {
-            co_await entry->op_mu.lock();
-            SyncMutexGuard op_guard{entry->op_mu};
-            auto child = entry->child;
-            bool reaped = false;
+        enum class Drain { accepts, clients, children, monitors, reaper, done };
+        auto drain = Drain::accepts;
+        while (drain != Drain::done) {
             try {
-                reaped = co_await stop_child_and_reap(child);
+                switch (drain) {
+                case Drain::accepts:
+                    co_await accept_join;
+                    listener->close();
+                    drain = Drain::clients;
+                    break;
+                case Drain::clients:
+                    co_await client_join;
+                    drain = Drain::children;
+                    break;
+                case Drain::children: {
+                    // All handlers are gone and shutdown forbids recovery.
+                    // Registry membership is now stable. A failed lock/reap
+                    // setup retries this stage without destroying owners.
+                    {
+                        if (test_gate_ && test_gate_->take_failure("shutdown_children"))
+                            throw std::bad_alloc();
+                        co_await mu_.lock();
+                        SyncMutexGuard registry_guard{mu_};
+                        for (auto& [id, entry] : children_) entry->destroying = true;
+                    }
+                    bool all_reaped = true;
+                    for (auto& [id, entry] : children_) {
+                        (void)id;
+                        co_await entry->op_mu.lock();
+                        SyncMutexGuard op_guard{entry->op_mu};
+                        const bool reaped = co_await stop_child_and_reap(entry->child);
+                        all_reaped &= reaped;
+                    }
+                    if (all_reaped) {
+                        cancel(monitor_cancel_);
+                        drain = Drain::monitors;
+                    }
+                    break;
+                }
+                case Drain::monitors:
+                    co_await monitor_join;
+                    reaper_stopping_.store(true);
+                    ::kill(::getpid(), SIGCHLD);
+                    drain = Drain::reaper;
+                    break;
+                case Drain::reaper:
+                    co_await reaper_join;
+                    drain = Drain::done;
+                    break;
+                case Drain::done:
+                    break;
+                }
             } catch (...) {
-                if (!failure) failure = std::current_exception();
+                report_daemon_task_failure(std::current_exception());
             }
-            if (!reaped && !failure) {
-                failure = std::make_exception_ptr(std::runtime_error(
-                    "device did not exit after SIGKILL: " + id));
+            if (drain != Drain::done) {
+                try { co_await elio::time::sleep_for(std::chrono::milliseconds(10)); }
+                catch (...) {}
             }
         }
-        // A child (or an inherited socket in its descendants) need not close
-        // the channel to let the monitor depart. Cancellation completes the
-        // read before its shared stream owner can close the descriptor.
-        cancel(monitor_cancel_);
-        co_await monitor_join;
-        reaper_stopping_.store(true);
-        ::kill(::getpid(), SIGCHLD);
-        co_await reaper_join;
         if (failure) std::rethrow_exception(failure);
         co_return 0;
     }
 
 private:
+    uint64_t allocate_startup_generation() {
+        auto value = next_startup_generation_.load();
+        for (;;) {
+            if (value == UINT64_MAX)
+                throw error(EOVERFLOW, "startup generation exhausted");
+            if (next_startup_generation_.compare_exchange_weak(value, value + 1))
+                return value;
+        }
+    }
+
+    elio::coro::task<bool> write_device_line(
+        const std::shared_ptr<DeviceEntry>& entry,
+        std::shared_ptr<elio::net::uds_stream> channel, std::string line,
+        elio::coro::cancel_token token = {}) {
+        const auto acquired = co_await entry->write_mu.lock(token);
+        if (acquired == elio::coro::cancel_result::cancelled) co_return false;
+        SyncMutexGuard writer_guard{entry->write_mu};
+        try {
+            size_t sent = 0;
+            while (sent < line.size()) {
+                const auto result = co_await channel->write(
+                    line.data() + sent, line.size() - sent, token);
+                if (result.result <= 0) {
+                    // A partially written record must not be followed by a
+                    // new JSON record that would turn it into different input.
+                    channel->shutdown(SHUT_WR);
+                    co_return false;
+                }
+                sent += static_cast<size_t>(result.result);
+            }
+        } catch (...) {
+            channel->shutdown(SHUT_WR);
+            throw;
+        }
+        co_return true;
+    }
+
+    elio::coro::task<void> maybe_grant_startup(
+        const std::shared_ptr<DeviceEntry>& entry,
+        const std::shared_ptr<elio::net::uds_stream>& channel) {
+        auto child = entry->child;
+        const auto owner = child->startup_status();
+        if (!owner || owner->phase != "preparing" || owner->control_pending ||
+            owner->raw_published != 0 || owner->release_sequence != 0) co_return;
+        {
+            co_await mu_.lock();
+            SyncMutexGuard registry_guard{mu_};
+            if (shutdown_requested_.load() || stopping_.load() ||
+                entry->destroying || entry->grant_sent ||
+                entry->child != child) co_return;
+            // The published registry and this live monitor already own Child.
+            // Protection is installed before serialization or the first byte.
+            if (!child->protect_startup(owner->generation)) co_return;
+        }
+        nlohmann::json grant{{"cmd", "startup_begin"},
+                             {"version", kStartupOwnerVersion},
+                             {"generation", owner->generation}};
+        const auto line = grant.dump() + "\n";
+        bool sent = false;
+        auto outcome = co_await elio::with_timeout(
+            std::chrono::seconds(cfg_.ready_timeout_sec),
+            [&](elio::coro::cancel_token token) -> elio::coro::task<void> {
+                sent = co_await write_device_line(entry, channel, line, std::move(token));
+            });
+        if (outcome && sent) {
+            co_await mu_.lock();
+            SyncMutexGuard registry_guard{mu_};
+            entry->grant_sent = true;
+        }
+    }
+
     static std::shared_ptr<elio::net::uds_stream> take_channel(Child& child) {
-        elio::net::uds_stream stream(child.release_control_fd());
-        return std::make_shared<elio::net::uds_stream>(std::move(stream));
+        // Allocate shared ownership before consuming Child's descriptor.
+        auto stream = std::make_shared<elio::net::uds_stream>(-1);
+        *stream = elio::net::uds_stream(child.release_control_fd());
+        return stream;
     }
 
     elio::coro::task<void> accept_loop(elio::net::uds_listener& listener) {
         while (!stopping_.load()) {
+          try {
             auto stream = co_await listener.accept(accept_cancel_.get_token());
             if (!stream) {
                 if (stopping_.load()) break;
@@ -567,6 +702,8 @@ private:
             }
             if (stopping_.load()) break;
             if (test_gate_) co_await test_gate_->observe("accepted", {});
+            if (test_gate_ && test_gate_->take_failure("accept_admission"))
+                throw std::bad_alloc();
             auto handle = [this, s = std::move(*stream)]() mutable
                           -> elio::coro::task<void> {
                 co_await handle_client(std::move(s));
@@ -575,6 +712,15 @@ private:
             // workers without changing the normal daemon's scheduling.
             spawn_daemon_task(client_tasks_, std::move(handle),
                 test_gate_ ? std::optional<size_t>{2} : std::nullopt);
+          } catch (...) {
+            report_daemon_task_failure(std::current_exception());
+            // Losing one connection must not abandon the management service
+            // for retained owners. No child can be granted by an unadmitted
+            // handler.
+          }
+          if (!stopping_.load()) {
+            try { co_await elio::time::yield(); } catch (...) {}
+          }
         }
     }
 
@@ -603,7 +749,10 @@ private:
             // handler must never kill the client coroutine without the
             // promised clean error reply.
             try {
-                if (c == "create") reply = co_await cmd_create(*cmd);
+                if (shutdown_requested_.load() && c != "hello" && c != "list" &&
+                    c != "status" && c != "destroy")
+                    reply = reply_error("supervisor shutdown pending; retained owners remain");
+                else if (c == "create") reply = co_await cmd_create(*cmd);
                 else if (c == "destroy") reply = co_await cmd_destroy(*cmd);
                 else if (c == "commit") reply = co_await cmd_commit(*cmd);
                 else if (c == "trace_start")
@@ -633,14 +782,26 @@ private:
                                            std::shared_ptr<elio::net::uds_stream> channel) {
         for (;;) {
             {
-                {
-                    co_await mu_.lock();
-                    entry->control = channel;
-                    mu_.unlock();
+                bool channel_published = false;
+                while (!channel_published) {
+                    try {
+                        co_await mu_.lock();
+                        SyncMutexGuard registry_guard{mu_};
+                        entry->control = channel;
+                        channel_published = true;
+                    } catch (...) {
+                        report_daemon_task_failure(std::current_exception());
+                    }
+                    if (!channel_published) {
+                        try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+                        catch (...) {}
+                    }
                 }
                 LineReader reader(*channel, monitor_cancel_.get_token());
+                std::optional<std::string> line;
                 for (;;) {
-                    auto line = co_await reader.next();
+                  try {
+                    if (!line) line = co_await reader.next();
                     if (!line) break;
                     // ADR-0013: command replies and trace events carry
                     // the "reply" discriminator; everything else is a
@@ -649,11 +810,22 @@ private:
                         nlohmann::json j = nlohmann::json::parse(
                             *line, nullptr, false);
                         if (!j.is_discarded() && is_device_reply_line(j)) {
+                            if (j.contains("startup_owner")) {
+                                const auto owner = parse_startup_owner(j["startup_owner"]);
+                                if (owner) entry->child->observe_startup(*owner, false);
+                            }
+                            const auto kind = str_or(j, "reply");
+                            if (kind == "startup_begin" || kind == "startup_status" ||
+                                kind == "startup_release") {
+                                line.reset();
+                                continue;
+                            }
                             co_await route_device_reply(entry, std::move(j));
                             if (test_gate_) {
                                 test_gate_->mark("device_reply_routed");
                                 co_await test_gate_->observe("device_reply", {});
                             }
+                            line.reset();
                             continue;
                         }
                     }
@@ -661,8 +833,25 @@ private:
                     if (!st) {
                         ELIO_LOG_WARNING("device {}: malformed status line",
                                          entry->spec.id);
+                        line.reset();
                         continue;
                     }
+                    if (!st->startup_owner ||
+                        !entry->child->observe_startup(*st->startup_owner,
+                                                       st->state == "ready")) {
+                        line.reset();
+                        continue;
+                    }
+                    // phase=ready observed during caller setup is not the
+                    // ready lifecycle handoff. Keep protection until both
+                    // agree and the current generation validates them.
+                    if (st->state == "ready" &&
+                        (st->startup_owner->phase != "ready" ||
+                         entry->child->startup_protected())) {
+                        line.reset();
+                        continue;
+                    }
+                    co_await maybe_grant_startup(entry, channel);
                     Child::Status cur = entry->child->status();
                     cur.state = st->state;
                     if (!st->device.empty()) cur.device = st->device;
@@ -683,19 +872,33 @@ private:
                     }
                     ELIO_LOG_INFO("device {} state: {} {}", entry->spec.id,
                                   st->state, st->device);
+                    line.reset();
+                  } catch (...) {
+                    // Preserve the reader buffer and current record, as well
+                    // as the protected Child and channel, for observation retry.
+                    report_daemon_task_failure(std::current_exception());
+                  }
+                  if (line) {
+                    try { co_await elio::time::sleep_for(std::chrono::milliseconds(10)); }
+                    catch (...) {}
+                  }
                 }
+                bool eof_done = false;
+                std::shared_ptr<DeviceCommand> closing_operation;
+                while (!eof_done) {
+                  try {
                 if (test_gate_) co_await test_gate_->observe("monitor_eof", entry->child);
                 {
                     co_await mu_.lock();
+                    SyncMutexGuard registry_guard{mu_};
                     entry->control.reset();
                     if (entry->active_command) {
-                        auto operation = entry->active_command;
-                        operation->reply =
+                        closing_operation = entry->active_command;
+                        closing_operation->reply =
                             {{"ok", false},
                              {"error", "device control channel closed"}};
-                        operation->terminal = true;
+                        closing_operation->terminal = true;
                         entry->active_command.reset();
-                        operation->waiter.set();
                     }
                     // Crash/exit mid-record: queued records were
                     // memory-only and died with the device — never
@@ -704,25 +907,47 @@ private:
                     // nothing).
                     if (entry->trace.is_object() &&
                         entry->trace.value("state", "") == "recording") {
-                        entry->trace["state"] = "lost";
-                        entry->trace["reason"] = "device_exit";
+                        auto trace = entry->trace;
+                        trace["state"] = "lost";
+                        trace["reason"] = "device_exit";
+                        entry->trace = std::move(trace);
                     }
-                    mu_.unlock();
+                }
+                if (test_gate_ && test_gate_->take_failure("monitor_eof_publish"))
+                    throw std::bad_alloc();
+                if (closing_operation) {
+                    closing_operation->waiter.set();
+                    closing_operation.reset();
                 }
                 if (test_gate_) test_gate_->mark("device_eof_completed");
                 // EOF reports a lost channel, not completed process cleanup.
                 // Removal/sealing use the separate actual-reap barrier.
                 Child::Status cur = entry->child->status();
                 if (cur.state != "exited") {
-                    cur.state = "exited";
+                    cur.state = entry->child->startup_protected() ? "failed" : "exited";
+                    if (entry->child->startup_protected())
+                        cur.error = "startup owner retained; control channel closed";
                     entry->child->update_status(cur);
                 }
                 while (!entry->child->try_notify_waiters()) {
                     co_await elio::time::yield();
                 }
+                eof_done = true;
+                  } catch (...) {
+                    report_daemon_task_failure(std::current_exception());
+                  }
+                  if (!eof_done) {
+                    try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+                    catch (...) {}
+                  }
+                }
                 channel.reset();
             }
-            if (stopping_.load()) co_return;
+            bool generation_installed = false;
+            while (!generation_installed) {
+              try {
+            if (stopping_.load() || shutdown_requested_.load() ||
+                entry->child->startup_protected()) co_return;
             {
                 co_await mu_.lock();
                 const bool destroy = entry->destroying;
@@ -737,6 +962,10 @@ private:
                     entry->spec.id, entry->dev_id, entry->recoveries);
                 co_return;
             }
+            entry->child->try_reap();
+            if (!entry->child->reaped())
+                co_await entry->child->reaped_event().wait(monitor_cancel_.get_token());
+            if (monitor_cancel_.is_cancelled()) co_return;
             // Respawn in recovery mode: the kernel kept the ublk device
             // (created with UBLK_F_USER_RECOVERY), so the replacement
             // attaches instead of creating. op_mu serializes the respawn
@@ -751,10 +980,16 @@ private:
                 co_await mu_.lock();
                 const bool destroy = entry->destroying;
                 mu_.unlock();
-                if (destroy || stopping_.load()) co_return;  // op_guard releases
+                if (destroy || stopping_.load() || shutdown_requested_.load() ||
+                    entry->child->startup_protected()) co_return;
+                // EOF is not process exit. Do not let replacement ownership
+                // destroy a still-live old server as an incidental side effect.
+                entry->child->try_reap();
+                if (!entry->child->reaped()) co_return;
                 ChildSpec spec = entry->spec;
                 spec.recover = true;
                 spec.dev_id_request = entry->dev_id;
+                spec.startup_generation = allocate_startup_generation();
                 std::shared_ptr<Child> next;
                 try {
                     next = std::shared_ptr<Child>(
@@ -768,20 +1003,33 @@ private:
                 // Child destruction can kill/waitpid and must not block
                 // the registry (nor may spawn or the fd handoff run there).
                 if (test_gate_) test_gate_->record_child(next);
+                auto next_channel = take_channel(*next);
                 std::shared_ptr<Child> previous;
                 co_await mu_.lock();
                 {
                     SyncMutexGuard registry_guard{mu_};
                     previous = std::exchange(entry->child, next);
                     entry->recoveries += 1;
+                    entry->grant_sent = false;
+                    entry->shutdown_stop_requested = false;
+                    channel = std::move(next_channel);
+                    generation_installed = true;
                 }
                 previous.reset();
-                ELIO_LOG_WARNING(
+                try { ELIO_LOG_WARNING(
                     "device {} recovering via ublk USER_RECOVERY "
                     "(attempt {}, dev_id {})",
-                    entry->spec.id, entry->recoveries, entry->dev_id);
+                    entry->spec.id, entry->recoveries, entry->dev_id); }
+                catch (...) {}
                 if (test_gate_) co_await test_gate_->observe("recovery", next);
-                channel = take_channel(*next);
+            }
+              } catch (...) {
+                report_daemon_task_failure(std::current_exception());
+              }
+              if (!generation_installed) {
+                try { co_await elio::time::sleep_for(std::chrono::milliseconds(10)); }
+                catch (...) {}
+              }
             }
         }
     }
@@ -796,70 +1044,84 @@ private:
     /// pids are device children (the registry) and never touches anything
     /// else.
     elio::coro::task<void> reaper(elio::signal::signal_fd& sigfd) {
-        while (!reaper_stopping_.load()) {
-            auto info = co_await sigfd.wait();
-            if (!info) break;
-            // A coalesced SIGCHLD can cover several exits: sweep until a
-            // full pass reaps nothing.
-            for (;;) {
-                std::vector<std::pair<std::string, std::shared_ptr<Child>>>
-                    snapshot;
-                {
-                    co_await mu_.lock();
-                    snapshot.reserve(children_.size());
-                    for (auto& [id, entry] : children_) {
-                        snapshot.emplace_back(id, entry->child);
-                    }
-                    mu_.unlock();
-                }
-                bool reaped_any = false;
-                for (auto& [id, child] : snapshot) {
-                    const bool collected = child->try_reap();
-                    // Keep this snapshot owner through notification retry,
-                    // even if a stop handler has already erased the entry.
-                    while (!child->try_notify_waiters()) {
-                        co_await elio::time::yield();
-                    }
-                    if (!collected) continue;
-                    ELIO_LOG_INFO("device {} exited (code {})", id,
-                                  child->status().exit_code);
-                    reaped_any = true;
-                }
-                // Abandoned out-of-band helpers (a mode-3 mkfs that
-                // outlived its bounded post-SIGKILL reap) are collected
-                // here too: their owner has given up on them, and no other
-                // wait may touch them (a wildcard wait would steal a LIVE
-                // helper's status — see above), so the reaper is the only
-                // place that can keep them from zombifying.
-                for (const pid_t orphan :
-                     cfg_.mkfs_runner->take_orphan_pids()) {
-                    abandoned_helpers_.push_back(orphan);
-                }
-                for (auto it = abandoned_helpers_.begin();
-                     it != abandoned_helpers_.end();) {
-                    int wstatus = 0;
-                    const pid_t r = ::waitpid(*it, &wstatus, WNOHANG);
-                    // Erase on the pid (we reaped it) or on a TERMINAL error
-                    // (ECHILD: it was reaped elsewhere; anything but EINTR
-                    // means this wait will never succeed). Keeping such a pid
-                    // would grow the list forever and re-issue a syscall for
-                    // it on every SIGCHLD wake.
-                    if (r == *it) {
-                        ELIO_LOG_INFO(
-                            "reaped abandoned mkfs helper (pid {})", *it);
-                        it = abandoned_helpers_.erase(it);
-                    } else if (r < 0 && errno != EINTR) {
-                        ELIO_LOG_WARNING(
-                            "abandoned mkfs helper pid {} is unreapable "
-                            "(waitpid: {}); dropping it",
-                            *it, std::strerror(errno));
-                        it = abandoned_helpers_.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-                if (!reaped_any) break;
+        bool sweep_due = false;
+        bool snapshot_ready = false;
+        bool reaped_any = false;
+        bool placement_reported = false;
+        size_t next_child = 0;
+        std::vector<std::shared_ptr<Child>> snapshot;
+        // A transferred batch must remain owned if extending the long-lived
+        // helper list fails. Removing a numeric PID after waitpid precedes all
+        // diagnostics, so retry cannot wait on a recycled PID.
+        std::vector<pid_t> incoming_helpers;
+        for (;;) {
+          try {
+            if (!placement_reported) {
+                if (test_gate_) test_gate_->mark(
+                    "reaper_worker_" + std::to_string(elio::runtime::current_worker_id()));
+                placement_reported = true;
             }
+            if (!sweep_due) {
+                if (reaper_stopping_.load()) co_return;
+                const auto info = co_await sigfd.wait();
+                if (!info) continue;
+                sweep_due = true;
+            }
+            if (!snapshot_ready) {
+                co_await mu_.lock();
+                SyncMutexGuard registry_guard{mu_};
+                snapshot.clear();
+                if (test_gate_ && test_gate_->take_failure("reaper_snapshot"))
+                    throw std::bad_alloc();
+                snapshot.reserve(children_.size());
+                for (auto& [id, entry] : children_) {
+                    (void)id;
+                    snapshot.push_back(entry->child);
+                }
+                next_child = 0;
+                reaped_any = false;
+                snapshot_ready = true;
+            }
+            while (next_child != snapshot.size()) {
+                const auto& child = snapshot[next_child];
+                const bool collected = child->try_reap();
+                reaped_any |= collected;
+                // Preserve the snapshot and cursor through failure, including
+                // a notification failure after another owner erased the entry.
+                while (!child->try_notify_waiters()) co_await elio::time::yield();
+                ++next_child;
+                if (collected) {
+                    try { ELIO_LOG_INFO("device {} exited (code {})", child->id(),
+                                        child->status().exit_code); }
+                    catch (...) {}
+                }
+            }
+            if (incoming_helpers.empty())
+                incoming_helpers = cfg_.mkfs_runner->take_orphan_pids();
+            abandoned_helpers_.reserve(abandoned_helpers_.size() + incoming_helpers.size());
+            abandoned_helpers_.insert(abandoned_helpers_.end(),
+                                      incoming_helpers.begin(), incoming_helpers.end());
+            incoming_helpers.clear();
+            for (auto it = abandoned_helpers_.begin(); it != abandoned_helpers_.end();) {
+                int wstatus = 0;
+                const pid_t pid = *it;
+                const pid_t r = ::waitpid(pid, &wstatus, WNOHANG);
+                if (r == pid || (r < 0 && errno != EINTR)) {
+                    it = abandoned_helpers_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            snapshot.clear();
+            snapshot_ready = false;
+            sweep_due = reaped_any;
+          } catch (...) {
+            report_daemon_task_failure(std::current_exception());
+            // Retry the consumed SIGCHLD's unfinished sweep, not the next
+            // signal wait. The kernel need not send a second notification.
+          }
+          try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+          catch (...) {}
         }
     }
 
@@ -917,6 +1179,8 @@ private:
         {
             co_await mu_.lock();
             elio::sync::lock_guard registry_guard{mu_};
+            if (shutdown_requested_.load())
+                co_return reply_error("supervisor shutdown pending");
             std::erase_if(create_admissions_, [](const auto& item) {
                 return item.second.expired();
             });
@@ -987,6 +1251,7 @@ private:
                     e.what());
             }
         }
+        entry->spec.startup_generation = allocate_startup_generation();
         try {
             entry->child =
                 std::shared_ptr<Child>(Child::spawn(entry->spec).release());
@@ -1095,6 +1360,9 @@ private:
     /// Shared stop barrier: channel EOF can precede Device/ublk teardown.
     /// Keep the reaper live through both the graceful and post-kill waits.
     elio::coro::task<bool> stop_child_and_reap(std::shared_ptr<Child> child) {
+        // Even actual external reap cannot substitute for the protected
+        // generation's retirement report. No signal escalation is allowed.
+        if (child->startup_protected()) co_return false;
         // A SIGCHLD can predate registry insertion; collect an already
         // exited child here rather than depending on another signal wake.
         child->try_reap();
@@ -1127,6 +1395,50 @@ private:
             }
         }
         co_return static_cast<bool>(gone) || child->reaped();
+    }
+
+    /// Operator authority only. The release sequence is stored on the Child,
+    /// independent of this request's timeout and the generic command waiter.
+    elio::coro::task<bool> release_child_and_reap(
+        const std::shared_ptr<DeviceEntry>& entry) {
+        auto child = entry->child; // entry op_mu pins this generation
+        if (!child->startup_protected())
+            co_return co_await stop_child_and_reap(child);
+        std::shared_ptr<elio::net::uds_stream> channel;
+        uint64_t sequence = 0;
+        {
+            co_await mu_.lock();
+            SyncMutexGuard registry_guard{mu_};
+            channel = entry->control;
+            if (!channel || child->reaped()) co_return false;
+            const auto admitted = child->admit_startup_release();
+            if (!admitted) co_return false;
+            sequence = *admitted;
+        }
+        nlohmann::json command{{"cmd", "startup_release"},
+                               {"generation", child->startup_generation()},
+                               {"seq", sequence}};
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(cfg_.stop_timeout_sec);
+        const auto line = command.dump() + "\n";
+        auto written = co_await elio::with_timeout(
+            std::chrono::seconds(cfg_.stop_timeout_sec),
+            [&](elio::coro::cancel_token token) -> elio::coro::task<void> {
+                if (!co_await write_device_line(entry, channel, line, std::move(token)))
+                    throw error(EPIPE, "startup release channel unavailable");
+            });
+        if (!written) co_return false;
+        while (child->startup_protected()) {
+            const auto owner = child->startup_status();
+            if (owner && owner->release_sequence == sequence &&
+                owner->release == "refused") co_return false;
+            if (child->reaped() || std::chrono::steady_clock::now() >= deadline)
+                co_return false;
+            co_await elio::time::sleep_for(std::chrono::milliseconds(10));
+        }
+        // A validated ready handoff may win before release acceptance.
+        // Otherwise only validated terminal retirement clears protection.
+        co_return co_await stop_child_and_reap(child);
     }
 
     /// Stops and removes EXACTLY the given device entry (used on
@@ -1321,17 +1633,19 @@ private:
         const auto cmd_kind = cmd["cmd"].get<std::string>();
         {
             co_await mu_.lock();
+            SyncMutexGuard registry_guard{mu_};
             auto it = children_.find(id);
             if (it != children_.end()) entry = it->second;
             command_busy = entry && entry->active_command;
-            if (entry && !command_busy && entry->control) {
+            if (entry && !command_busy && entry->control &&
+                !entry->child->startup_protected() &&
+                entry->child->status().state == "ready") {
                 operation->seq = ++entry->cmd_seq;
                 operation->kind = cmd_kind;
                 seq = operation->seq;
                 entry->active_command = operation;
                 channel = entry->control;
             }
-            mu_.unlock();
         }
         if (!entry) co_return reply_error("no such device: " + id);
         if (!channel) {
@@ -1356,21 +1670,10 @@ private:
             // Loop the write: a short write on SOCK_STREAM is legal and
             // retryable (buffer pressure), not a hard failure — same rule
             // as the device side's ControlChannelWriter.
-            size_t sent = 0;
-            while (sent < line.size()) {
-                const auto w = co_await channel->write(
-                    line.data() + sent, line.size() - sent, client_cancel_.get_token());
-                if (w.result < 0) {
-                    co_await fail_pending();
-                    co_return reply_error("cannot reach the device control "
-                                          "channel: " + id);
-                }
-                if (w.result == 0) {
-                    co_await fail_pending();
-                    co_return reply_error("cannot reach the device control "
-                                          "channel (short write): " + id);
-                }
-                sent += static_cast<size_t>(w.result);
+            if (!co_await write_device_line(entry, channel, line,
+                                            client_cancel_.get_token())) {
+                co_await fail_pending();
+                co_return reply_error("cannot reach the device control channel: " + id);
             }
             // Resolve optional test configuration before constructing the
             // awaitable; the normal path never dereferences a test gate.
@@ -1537,40 +1840,47 @@ private:
             mu_.unlock();
         }
         if (!entry) co_return reply_error("no such device: " + id);
-        if (test_gate_) {
-            co_await test_gate_->observe("destroy_admitted", entry->child);
-        }
-
-        // op_mu serializes the stop against a recovery respawn in flight.
-        co_await entry->op_mu.lock();
         bool reaped = false;
         std::exception_ptr stop_failure;
-        {
+        try {
+            if (test_gate_)
+                co_await test_gate_->observe("destroy_admitted", entry->child);
+            // Lock/admission failures must also clear the handler's busy bit.
+            co_await entry->op_mu.lock();
             SyncMutexGuard op_guard{entry->op_mu};
+            reaped = co_await release_child_and_reap(entry);
+        } catch (...) {
+            stop_failure = std::current_exception();
+        }
+        // This frame owns the busy flag until it either erases the exact
+        // entry or makes another explicit destroy possible. Finalization
+        // cannot be abandoned on a contended-lock allocation failure.
+        bool finalized = false;
+        while (!finalized) {
             try {
-                reaped = co_await stop_child_and_reap(entry->child);
+                if (test_gate_ && test_gate_->take_failure("destroy_finalize"))
+                    throw std::bad_alloc();
+                co_await mu_.lock();
+                SyncMutexGuard registry_guard{mu_};
+                if (reaped) {
+                    const auto it = children_.find(id);
+                    if (it != children_.end() && it->second == entry)
+                        children_.erase(it);
+                }
+                entry->destroy_op_in_progress = false;
+                finalized = true;
             } catch (...) {
-                stop_failure = std::current_exception();
+                report_daemon_task_failure(std::current_exception());
+            }
+            if (!finalized) {
+                try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+                catch (...) {}
             }
         }
         if (!reaped) {
-            co_await mu_.lock();
-            entry->destroy_op_in_progress = false;
-            mu_.unlock();
             if (stop_failure) std::rethrow_exception(stop_failure);
             co_return reply_error(
-                "device did not exit after SIGKILL; entry retained: " + id);
-        }
-        {
-            co_await mu_.lock();
-            // Failed-create cleanup may independently remove this entry
-            // while destroy is admitted. A new create can then reuse its id;
-            // remove only the generation whose child we actually stopped.
-            auto it = children_.find(id);
-            if (it != children_.end() && it->second == entry) {
-                children_.erase(it);
-            }
-            mu_.unlock();
+                "device release unresolved or refused; entry retained: " + id);
         }
         co_return reply_ok({{"id", id}});
     }
@@ -1618,6 +1928,10 @@ private:
                 if (entry->destroy_op_in_progress) {
                     mu_.unlock();
                     co_return reply_error("device is being destroyed: " + id);
+                }
+                if (entry->child->startup_protected()) {
+                    mu_.unlock();
+                    co_return reply_error("startup owner retained; upper not sealed: " + id);
                 }
                 entry->committing = true;
             }
@@ -1677,17 +1991,18 @@ private:
         }
         const std::string& upper = entry->upper_path;
 
+        co_await entry->op_mu.lock();
+        SyncMutexGuard op_guard{entry->op_mu};
         {
             co_await mu_.lock();
+            SyncMutexGuard registry_guard{mu_};
+            if (entry->child->startup_protected())
+                co_return reply_error("startup owner retained; upper not sealed: " + id);
             // From this point commit is intentionally stopping the live
             // device. Pre-stop refusals above must leave crash recovery
             // enabled for the still-running child.
             entry->destroying = true;
-            mu_.unlock();
         }
-
-        co_await entry->op_mu.lock();
-        SyncMutexGuard op_guard{entry->op_mu};
 
         // Stopped-device contract (ADR-0014): commit stops a live device
         // first (SIGTERM + bounded reap — the destroy mechanics without
@@ -1700,6 +2015,8 @@ private:
         // is held no further respawn can install another.
         for (int attempt = 0;; ++attempt) {
             std::shared_ptr<Child> child = entry->child;
+            if (child->startup_protected())
+                co_return reply_error("startup owner retained; upper not sealed: " + id);
             if (child->reaped()) break;
             if (attempt >= 3) {
                 co_return reply_error(
@@ -1756,7 +2073,8 @@ private:
 
     elio::coro::task<nlohmann::json> status_fields(const EntrySnapshot& snapshot,
                                  bool include_exit_code) {
-        const Child::Status st = snapshot.child->status();
+        const auto child = snapshot.child->snapshot();
+        const auto& st = child.status;
         if (test_gate_) {
             co_await test_gate_->observe(
                 include_exit_code ? "status" : "list", snapshot.child);
@@ -1768,6 +2086,10 @@ private:
                                  {"error", st.error},
                                  {"recoveries", snapshot.recoveries}};
         if (include_exit_code) fields["exit_code"] = st.exit_code;
+        fields["shutdown_pending"] = shutdown_requested_.load();
+        fields["startup_protected"] = child.startup_protected;
+        if (child.startup_owner)
+            fields["startup_owner"] = startup_owner_json(*child.startup_owner);
         if (!snapshot.trace.is_null()) fields["trace"] = snapshot.trace;
         co_return fields;
     }
@@ -1824,6 +2146,8 @@ private:
     // Protected by mu_; expired failure records are pruned on admission.
     std::map<std::string, std::weak_ptr<CreateAdmission>> create_admissions_;
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> shutdown_requested_{false};
+    std::atomic<uint64_t> next_startup_generation_{1};
     /// Abandoned mkfs-helper pids the reaper still owes a reap (see
     /// reaper()): drained on every SIGCHLD wake, including the synthetic
     /// one that unparks the reaper at shutdown.

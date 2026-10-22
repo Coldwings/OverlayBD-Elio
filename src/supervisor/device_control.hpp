@@ -121,6 +121,42 @@ struct DeviceControlHooks {
     ResizeExecutor resize;
 };
 
+/// Cold control-plane handoff from startup to serving. The same channel
+/// reader handles lifecycle commands throughout; publishing ordinary hooks
+/// cannot create a second reader or race a command copying those hooks.
+class DeviceControlSession {
+public:
+    using Lifecycle = std::function<std::optional<nlohmann::json>(
+        const nlohmann::json&)>;
+    explicit DeviceControlSession(Lifecycle lifecycle)
+        : lifecycle_(std::move(lifecycle)) {}
+
+    void publish_ready(std::shared_ptr<image::TraceRecorder> recorder,
+                       DeviceControlHooks hooks) {
+        std::lock_guard lock(mu_);
+        recorder_ = std::move(recorder);
+        hooks_ = std::move(hooks);
+        ready_ = true;
+    }
+    bool load(std::shared_ptr<image::TraceRecorder>& recorder,
+              DeviceControlHooks& hooks) const {
+        std::lock_guard lock(mu_);
+        if (!ready_) return false;
+        recorder = recorder_;
+        hooks = hooks_;
+        return true;
+    }
+    std::optional<nlohmann::json> lifecycle(const nlohmann::json& cmd) const {
+        return lifecycle_(cmd);
+    }
+private:
+    const Lifecycle lifecycle_;
+    mutable std::mutex mu_;
+    bool ready_ = false;
+    std::shared_ptr<image::TraceRecorder> recorder_;
+    DeviceControlHooks hooks_;
+};
+
 /// Builds the D3 `apply_resize` implementation shared by the real device
 /// (and anything else wiring a resize seam), so its ordering and its
 /// shutdown contract are testable without a device or kernel:
@@ -171,5 +207,11 @@ elio::coro::task<void> run_device_control(
     ControlChannelWriterPtr channel,
     std::shared_ptr<image::TraceRecorder> recorder,
     DeviceControlHooks hooks = {});
+
+elio::coro::task<void> run_device_control_with_session(
+    ControlChannelWriterPtr channel,
+    std::shared_ptr<image::TraceRecorder> recorder,
+    DeviceControlHooks hooks,
+    std::shared_ptr<DeviceControlSession> session);
 
 }  // namespace obd::supervisor

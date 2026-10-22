@@ -307,6 +307,7 @@ elio::coro::task<void> run_bridge_local(Queue* q, source::BlobSource* src,
     TagPool pool(q);
     elio::coro::task_group handlers({
         .failure_policy = elio::coro::task_group_failure_policy::collect_all});
+    q->mark_bridge_ready();
     const int efd = q->elio_efd();
     uint64_t cnt = 0;
     std::exception_ptr failure;

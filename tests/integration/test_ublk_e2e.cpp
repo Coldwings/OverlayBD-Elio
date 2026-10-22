@@ -21,6 +21,7 @@
 #include <cerrno>
 #include <csignal>
 #include <system_error>
+#include <thread>
 
 #include <fcntl.h>
 
@@ -567,33 +568,67 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
     // quiesce work (Linux 6.6 can take about five seconds). Device::attach
     // must wait out EBUSY before opening replacement queue cdevs itself.
     stage("recovery: attach");
-    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto data = test::pattern_bytes(512 * 64, 84);
-        source::BlobSourcePtr src =
-            std::make_unique<test::VectorSource>(data);
-        ublk::DeviceParams params;
-        params.dev_sectors = data.size() / 512;
-        params.nr_queues = nr_queues;
-        auto dev = co_await ublk::Device::attach(
-            dev_id, params, std::move(src));
-        server.dev_id = UINT32_MAX;  // The replacement now owns cleanup.
-        int fd2 = -1;
-        co_return co_await with_device_cleanup(dev, fd2, [&]()
-            -> elio::coro::task<int> {
-            fd2 = co_await bdev_io([&] {
-                return ::open(dev->bdev_path().c_str(), O_RDONLY);
-            });
-            REQUIRE(fd2 >= 0);
-            std::vector<uint8_t> buf2(4096);
-            const ssize_t nread2 = co_await bdev_io([&] {
-                return ::pread(fd2, buf2.data(), buf2.size(), 2048);
-            });
-            REQUIRE(nread2 == 4096);
-            REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
-                                                 expected.begin() + 2048 + 4096));
-            co_return 0;
-        });
+    ublk::StartupControl startup(1);
+    // This fixture owns the old device and explicitly authorizes one release
+    // attempt if replacement startup fails. Keep the mailbox reachable while
+    // attach is suspended; a private controller inside attach cannot do this.
+    std::jthread release_observer([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            const auto state = startup.snapshot();
+            if (state.phase == ublk::StartupPhase::retained) {
+                (void)startup.request_release(state.generation, 1);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     });
+    int rc = -1;
+    try {
+        rc = test::run_coro([&]() -> elio::coro::task<int> {
+            auto data = test::pattern_bytes(512 * 64, 84);
+            source::BlobSourcePtr src =
+                std::make_unique<test::VectorSource>(data);
+            ublk::DeviceParams params;
+            params.dev_sectors = data.size() / 512;
+            params.nr_queues = nr_queues;
+            auto dev = co_await ublk::Device::attach(
+                dev_id, params, std::move(src), startup);
+            server.dev_id = UINT32_MAX;  // The replacement now owns cleanup.
+            int fd2 = -1;
+            co_return co_await with_device_cleanup(dev, fd2, [&]()
+                -> elio::coro::task<int> {
+                fd2 = co_await bdev_io([&] {
+                    return ::open(dev->bdev_path().c_str(), O_RDONLY);
+                });
+                REQUIRE(fd2 >= 0);
+                std::vector<uint8_t> buf2(4096);
+                const ssize_t nread2 = co_await bdev_io([&] {
+                    return ::pread(fd2, buf2.data(), buf2.size(), 2048);
+                });
+                REQUIRE(nread2 == 4096);
+                REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
+                                                     expected.begin() + 2048 + 4096));
+                co_return 0;
+            });
+        });
+    } catch (...) {
+        // END may have succeeded before a later startup check failed. The
+        // replacement then owns automatic cleanup even without an explicit
+        // release request. Require positive deletion/absence evidence: a
+        // locally released pre-publication frame alone says nothing about
+        // whether the old device still exists.
+        const auto final = startup.snapshot();
+        const bool absent = final.original_known &&
+            ((final.operation == ublk::StartupOperation::remove &&
+              (final.original_result == 0 || final.original_result == -ENODEV)) ||
+             (final.operation == ublk::StartupOperation::stop &&
+              final.original_result == -ENODEV));
+        if (final.phase == ublk::StartupPhase::released && absent)
+            server.dev_id = UINT32_MAX;
+        throw;
+    }
+    release_observer.request_stop();
+    release_observer.join();
     REQUIRE(rc == 0);
     REQUIRE(kernel_device_absent(dev_id));
 }

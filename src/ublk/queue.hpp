@@ -16,6 +16,8 @@
 // thread.
 #pragma once
 
+#include "ublk/startup_test_hooks.hpp"
+
 #include "ublk/uapi_compat.hpp"
 
 #include <liburing.h>
@@ -24,6 +26,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <vector>
 #ifdef OBD_TEST_HOOKS
 #include <elio/coro/task.hpp>
 #include <functional>
@@ -54,6 +57,13 @@ enum class BridgeResumePoint {
 
 class Queue {
 public:
+    struct Retirement {
+        uint64_t published = 0;
+        uint64_t retired = 0;
+        uint32_t delivered = 0;
+        bool known = true;
+        bool complete = true;
+    };
     Queue(uint32_t dev_id, uint16_t q_id, uint16_t depth,
           uint32_t max_io_buf_bytes);
     ~Queue();
@@ -90,11 +100,53 @@ public:
 
     // --- queue thread -------------------------------------------------------
 
-    /// Blocking queue loop: parks FETCH commands, dispatches new requests
-    /// to the pending queue, commits finished ones. Returns when `stop`
-    /// becomes true (call wakeup() to interrupt the wait) or when the ring
-    /// fails (check failed()).
+    /// Initializes on the real owner, then waits for the publication gate.
+    /// After publication, faults enter maintenance rather than exit with raw
+    /// kernel loans. Only request_owner_exit() plus proven retirement permits
+    /// return. The coordinator must keep this object and source graph alive.
     void run(std::atomic<bool>& stop);
+    bool setup_ready() const noexcept { return setup_ready_.load(); }
+#ifdef OBD_TEST_HOOKS
+    void set_test_hooks(detail::StartupTestHooks* hooks) noexcept { test_hooks_ = hooks; }
+#endif
+    bool bridge_ready() const noexcept { return bridge_ready_.load(); }
+    void mark_bridge_ready() noexcept { bridge_ready_.store(true); }
+    void publish_initial_fetches() noexcept {
+        publication_gate_.store(1);
+        publication_gate_.notify_all();
+    }
+    void abort_setup() noexcept {
+        publication_gate_.store(2);
+        publication_gate_.notify_all();
+    }
+    void request_release() noexcept {
+        releasing_.store(true);
+        wakeup();
+    }
+    void kernel_stopped() noexcept {
+        kernel_stopped_.store(true);
+        wakeup();
+    }
+    void request_owner_exit() noexcept {
+        exit_requested_.store(true);
+        abort_setup();
+        wakeup();
+    }
+    bool owner_exited() const noexcept { return owner_exited_.load(); }
+    /// Owner has finished initial FETCH preparation and synchronously issued
+    /// that batch. This is a STOP ordering fence, NOT driver acceptance,
+    /// queue readiness, or original-CQE retirement.
+    bool initial_fetches_issued() const noexcept {
+        return initial_fetches_issued_.load();
+    }
+    Retirement retirement() const noexcept;
+    void sources_drained() noexcept {
+        sources_drained_.store(true);
+        wakeup();
+    }
+    /// Only after owner-thread join and positive command retirement. Close
+    /// the ring/mapping/cdev before DEL, retaining diagnostic queues/buffers.
+    void close_retired() noexcept;
 
     /// Interrupts the run() wait (e.g. after setting stop).
     void wakeup() noexcept;
@@ -132,6 +184,7 @@ public:
 
 private:
     friend struct DeviceTestAccess;
+    friend struct QueueRetirementTestAccess;
     /// Creates the queue io_uring. Must be called on the queue thread
     /// (SINGLE_ISSUER binds the creator; DEFER_TASKRUN binds the
     /// waiter). Throws obd::error on failure.
@@ -140,6 +193,26 @@ private:
     void arm_done_poll();
     void drain_done();
     void dispatch_cqe(const io_uring_cqe* cqe);
+    void publish_retirement() noexcept;
+    bool kernel_retired() const noexcept;
+    void prepare_replies();
+    void reject_pending();
+    void recover_lost_replies() noexcept;
+
+    struct RawSlot {
+        uint64_t cookie = 0;
+        bool pending = false;
+        bool delivered = false;
+        bool completing = false;
+        bool reply_ready = false;
+        int32_t reply = 0;
+    };
+    std::vector<RawSlot> raw_;
+    uint64_t next_cookie_ = 1;
+    uint64_t raw_published_ = 0;
+    uint64_t raw_retired_ = 0;
+    uint64_t poll_cookie_ = 0;
+    bool debt_known_ = true;
 
     uint32_t dev_id_;
     uint16_t q_id_;
@@ -156,6 +229,22 @@ private:
     int elio_efd_ = -1;  // queue thread → Elio: new pending requests
     int done_efd_ = -1;  // Elio → queue thread: completions ready
     bool poll_armed_ = false;
+    std::atomic<uint8_t> publication_gate_{0};
+    std::atomic<bool> setup_ready_{false};
+    std::atomic<bool> bridge_ready_{false};
+    std::atomic<bool> releasing_{false};
+    std::atomic<bool> kernel_stopped_{false};
+    std::atomic<bool> exit_requested_{false};
+    std::atomic<bool> owner_exited_{false};
+    std::atomic<bool> initial_fetches_issued_{false};
+    std::atomic<bool> sources_drained_{false};
+    // Updated only at setup/maintenance/exit, never per successful hot IO.
+    std::atomic<uint64_t> retirement_version_{0};
+    std::atomic<uint64_t> published_snapshot_{0};
+    std::atomic<uint64_t> retired_snapshot_{0};
+    std::atomic<uint32_t> delivered_snapshot_{0};
+    std::atomic<bool> known_snapshot_{true};
+    std::atomic<bool> complete_snapshot_{true};
 
     std::mutex mu_;
     std::deque<IoRequest> pending_;
@@ -165,6 +254,8 @@ private:
     // Private and per-queue; absent from builds with tests disabled.
     std::function<void()> completion_enqueue_hook_for_test_;
     std::function<void()> bridge_admission_hook_for_test_;
+    detail::StartupTestHooks* test_hooks_ = nullptr;
+    std::function<void()> initial_submit_hook_for_test_;
     std::function<elio::coro::task<void>(BridgeResumePoint)> bridge_resume_hook_for_test_;
     std::function<void(BridgeResumePoint)> bridge_resume_observer_for_test_;
     elio::sync::event* bridge_ready_for_test_ = nullptr;

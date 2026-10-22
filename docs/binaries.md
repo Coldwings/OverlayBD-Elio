@@ -44,7 +44,8 @@ obd-supervisor [--socket PATH] [--global PATH] [--device-bin PATH]
                [--blank-dir PATH] [--mkfs-timeout SEC]
 ```
 
-Runs in the foreground until SIGTERM/SIGINT. Options (defaults from
+Runs in the foreground. SIGTERM/SIGINT requests shutdown; protected startup
+owners keep it in maintenance until released (ADR-0022). Options (defaults from
 `src/supervisor/daemon.hpp::DaemonConfig`):
 
 | Option | Default | Meaning |
@@ -53,7 +54,7 @@ Runs in the foreground until SIGTERM/SIGINT. Options (defaults from
 | `--global PATH` | `/etc/overlaybd-elio/overlaybd.json` | Global config handed to children when a `create` command does not carry its own `--global`. |
 | `--device-bin PATH` | empty = sibling of the supervisor executable | obd-device binary to exec for each device. |
 | `--ready-timeout SEC` | `60` | How long `create` waits for the child's `ready` status before failing the request. |
-| `--stop-timeout SEC` | `10` | `destroy` grace period: SIGTERM first, SIGKILL after this many seconds. |
+| `--stop-timeout SEC` | `10` | Ready-device TERM/reap grace; protected startup release wait. Timeout does not authorize killing a protected owner. |
 | `--blank-dir PATH` | `/var/lib/overlaybd-elio/devices` | ADR-0014: root of the per-device workspaces for blank (raw) devices — each owns `<blank-dir>/<id>/` with `overlaybd.zero` (sealed empty LSMT zero base) and `overlaybd.rw` (writable upper). |
 | `--mkfs-timeout SEC` | `300` | ADR-0014 mode 3: bound for the host `mkfs.<type>` run on a new blank device. |
 | `--help`, `-h` | — | Print usage and exit 0. |
@@ -62,7 +63,8 @@ Runs in the foreground until SIGTERM/SIGINT. Options (defaults from
 
 ```
 obd-device (--config PATH | --blank-size BYTES --blank-dir PATH)
-          [--global PATH] [--control-fd N] [--dev-id N] [--recover]
+          [--global PATH] [--control-fd N --startup-generation N]
+          [--dev-id N] [--recover] [--startup-socket @NAME]
 ```
 
 | Option | Default | Meaning |
@@ -71,7 +73,9 @@ obd-device (--config PATH | --blank-size BYTES --blank-dir PATH)
 | `--blank-size BYTES` | — | ADR-0014 modes 2/3: create a blank (raw) device of this many bytes (no config) — the empty LSMT zero base + a writable LSMT-RW upper are assembled in `--blank-dir`. Strictly validated here too (positive, 512-aligned, ≤ 16 TiB; a negative or overflowing value is a usage error, exit 2), not only by the supervisor's `parse_blank_spec`. |
 | `--blank-dir PATH` | — | ADR-0014: per-device workspace for a blank device (files `overlaybd.zero` / `overlaybd.rw`). |
 | `--global PATH` | empty = built-in defaults | Global `overlaybd.json`; when omitted, a default-constructed `GlobalConfig` is used. |
-| `--control-fd N` | `-1` (no reporting) | Inherited fd for JSON-lines lifecycle status reports (the socketpair end installed by the supervisor). |
+| `--control-fd N` | `-1` (standalone socket) | Inherited fd for JSON-lines lifecycle status reports (the socketpair end installed by the supervisor). |
+| `--startup-generation N` | fresh random nonzero value in standalone mode | Required with `--control-fd`; the supervisor supplies it and grants startup on that channel before device publication (ADR-0022). Standalone commands must use the generation returned by status. |
+| `--startup-socket @NAME` | `@obd-device-<effective-uid>-<pid>` | Standalone startup status/release endpoint, established before image assembly for both create and recovery. Linux abstract Unix socket; exclusive bind, no filesystem entry or unlink. Mutually exclusive with `--control-fd`. |
 | `--dev-id N` | `-1` (auto-assign) | Requested ublk device id; the kernel picks a free id when negative. |
 | `--recover` | off | ADR-0010: attach to the existing `--dev-id` device via `START_USER_RECOVERY` instead of creating a new one (requires `--dev-id`). Used by the supervisor when respawning a crashed device. |
 | `--help`, `-h` | — | Print usage and exit 0. |
@@ -118,8 +122,9 @@ present, must precede the command word. Commands:
   image-build input (see [operations.md](./operations.md)); mode-2
   devices (no `--mkfs`) are formatted by the caller. The reply carries
   `mode`, `size`, and `mkfs` when requested.
-- `destroy <id>` — stop the child (SIGTERM, then SIGKILL after the
-  supervisor's stop timeout) and remove the device.
+- `destroy <id>` — stop a ready child under the normal TERM/reap policy, or
+  explicitly release a protected startup generation. Refusal or timeout keeps
+  its entry; success requires retirement and actual reap (ADR-0022).
 - `list` — list known devices and their states.
 - `status <id>` — query one device.
 - `commit <id> [--tag TAG]` — offline commit (ADR-0014): stop
@@ -240,9 +245,10 @@ with many files, rather than a known output-correctness incompatibility.
   option). obdctl exits `0` exactly when the supervisor's reply carries
   `"ok": true`, `1` otherwise (including connection failures and malformed
   replies).
-- obd-device exit `0` means a *clean stop*: the device served, received
-  SIGTERM/SIGINT, tore the ublk device down, and reported `stopped`. Exit
-  `1` covers every setup or runtime failure, including an image whose
+- obd-device exit `0` covers clean ready-device stop and completed explicit
+  startup release. A retained failure stays alive instead of exiting; a
+  `failed` status alone is not an exit notification. Exit `1` covers completed
+  failure cleanup, including an image whose
   virtual size is zero or not a multiple of 512 bytes (rejected up front as
   "virtual size not sector aligned").
 
@@ -263,19 +269,50 @@ running on arbitrary threads.
   supervisor's offline `commit` seal consumes; a checkpoint failure is
   logged and shutdown continues (commit will then report the missing
   checkpoint).
-- obd-supervisor: SIGTERM/SIGINT triggers a graceful shutdown — children
-  are terminated first (SIGTERM with the stop-timeout grace, then SIGKILL)
-  before the daemon exits.
+- obd-device during protected startup: TERM/INT does not authorize release.
+  The startup observer and private command reader remain available; explicit
+  destroy uses the generation-bound release protocol.
+- obd-supervisor: SIGTERM/SIGINT closes new-work admission. Protected startup
+  owners keep the listener, registry and execution services alive for
+  hello/list/status/destroy, with `shutdown_pending` reported. Normal child
+  shutdown and daemon drainage finish after those owners release.
 
 ### Lifecycle status reporting
 
 obd-device reports `starting` → `ready` (with the `/dev/ublkb<N>` path) →
 `stopped`, or `failed` with an error string, as JSON-lines on the inherited
 `--control-fd` (`src/supervisor/protocol.hpp::DeviceStatus`, built via
-`src/supervisor/protocol.hpp::make_device_status`). Reports are best-effort
-single short writes; the supervisor tolerates a lost report as EOF on the
-channel and falls back to waitpid-derived state. Without `--control-fd`
-(standalone runs) reporting is silently disabled.
+`src/supervisor/protocol.hpp::make_device_status`). Reports use a serialized best-effort writer. Protocol v5 adds `startup_owner`
+version 1 with generation/revision, phase, debt and release facts. Missing or
+malformed reports and channel EOF never weaken installed startup protection;
+waitpid proves process exit, not kernel retirement. Without `--control-fd`
+(standalone runs), an abstract Unix socket provides the same startup-owner
+facts and explicit release admission. Its address and generation are printed
+to stderr before image assembly; the final ownership report is also written
+to stderr. A conflicting endpoint fails before device publication. Connections
+require the server's effective UID or UID 0 via `SO_PEERCRED`.
+
+Each connection accepts one JSON-line command (maximum 4096 bytes, one-second
+request deadline). Slow clients are handled independently; at most 32 handlers
+are admitted. `{"cmd":"startup_status"}` returns `ok`, startup-owner protocol
+`version`, and `startup_owner`. `startup_release` additionally requires the
+current unsigned `generation` and a fresh unsigned `seq` in `[1, 2^63)`.
+Acceptance returns `release:"pending"`; that connection then receives one
+outcome record with `seq`, `release`, and `startup_owner`. `released` is sent
+only after caller/device cleanup has completed. A status snapshot's
+`startup_owner.phase:"released"` can precede outer image/fill cleanup; use the
+correlated final outcome or terminal process report for that stronger barrier.
+A refusal retains the service and resources. If another request supersedes the observed sequence, the outcome
+is `superseded`, requiring a fresh status query. Disconnecting does not revoke
+an accepted release, and EOF alone never proves retirement.
+
+The socket stays available while startup is retained and during normal serving.
+After ready handoff, `startup_release` returns `not_startup`; use the ordinary
+TERM/INT shutdown path. Once cleanup completes, admission closes, existing
+handlers drain, and closing the listener releases its abstract name. Filesystem
+socket paths are rejected: this endpoint never unlinks a potentially replaced
+pathname. See [standalone recovery operation](operations.md#standalone-recovery-control)
+for a command example.
 
 ### Supervisor control socket
 
@@ -284,8 +321,8 @@ The supervisor listens on a stream UDS (default
 connection, one JSON-lines reply, max 64 KiB per message
 (`src/supervisor/protocol.hpp::kMaxMessageBytes`). `create` spawns one
 obd-device child per request — process isolation per device is the ADR-0004
-guarantee. `destroy` sends SIGTERM and escalates to SIGKILL after
-`--stop-timeout` seconds. A blank (`create-blank`) request spawns the same
+guarantee. `destroy` uses TERM/KILL only for eligible unprotected children;
+protected startup owners use explicit release without signal escalation. A blank (`create-blank`) request spawns the same
 kind of child with `--blank-size`/`--blank-dir` (ADR-0014); when the blank
 carries an `mkfs` type, the supervisor additionally runs host
 `mkfs.<type>` against the reported `/dev/ublkb<N>` before answering — and
@@ -297,8 +334,9 @@ output).
 - obdctl, obd-mkimage and obd-convert are single-threaded, synchronous
   tools; they hold no state between invocations.
 - The supervisor↔obdctl command protocol and the supervisor↔obd-device
-  status protocol are wire contracts between binaries that may be upgraded
-  independently; changes require an ADR (trigger T1, see
+  status protocol are wire contracts. Client fields evolve additively;
+  supervisor/device pairing requires the startup-owner grant introduced by
+  ADR-0022. Supported old/new pairings fail before publication; changes require an ADR (trigger T1, see
   [adr/README.md](./adr/README.md)).
 - Command-line parsing is exact-token matching: `--socket=PATH` style
   combined forms are *not* accepted by any of the five binaries.
@@ -309,6 +347,16 @@ output).
   obdctl↔supervisor command grammar: valid `create`/`destroy`/`list`/
   `status` lines parse; malformed JSON, unknown commands and bad fields are
   rejected with an error.
+- `device: standalone startup socket remains reachable with a stalled client` —
+  drives the real abstract-socket service, exclusive bind, concurrent status,
+  generation/sequence admission, pending versus terminal release, and native
+  handler drainage after a join-observer setup failure.
+- `device: standalone startup socket rejects filesystem paths` — validates the
+  abstract-name boundary without unlinking an existing filesystem entry.
+- `device: standalone recovery assembly failure drains its control endpoint` —
+  executes the real standalone recovery binary with a missing config; verifies
+  pre-publication failure, terminal ownership reporting, actual process exit,
+  and endpoint reuse without privileged kernel work.
 - `supervisor: daemon answers hello and never drops bad input` — the
   `obdctl hello` path end to end: a real daemon answers the handshake with
   `protocol`/`version`/`features` and never drops malformed input.

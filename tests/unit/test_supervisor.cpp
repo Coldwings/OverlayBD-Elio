@@ -6,11 +6,13 @@
 
 #include "../support.hpp"
 #include "../runtime_faults.hpp"
+#include "../child_reap_evidence.hpp"
 
 #include <elio/coro/task_group.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -25,6 +27,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,6 +47,22 @@ bool reap_child(supervisor::Child& child) {
     } while (std::chrono::steady_clock::now() < deadline);
     return child.reaped();
 }
+
+class ReapFixtureEnvironment {
+public:
+    explicit ReapFixtureEnvironment(const std::string& directory) {
+        if (const char* previous = std::getenv("OBD_TEST_STARTUP_FIXTURE_DIR"))
+            previous_ = previous;
+        if (::setenv("OBD_TEST_STARTUP_FIXTURE_DIR", directory.c_str(), 1) != 0)
+            throw std::system_error(errno, std::generic_category(), "set reap fixture environment");
+    }
+    ~ReapFixtureEnvironment() {
+        if (previous_) ::setenv("OBD_TEST_STARTUP_FIXTURE_DIR", previous_->c_str(), 1);
+        else ::unsetenv("OBD_TEST_STARTUP_FIXTURE_DIR");
+    }
+private:
+    std::optional<std::string> previous_;
+};
 
 }  // namespace
 
@@ -381,6 +402,108 @@ TEST_CASE("supervisor: exec failure surfaces as exit 127", "[supervisor]") {
     REQUIRE(child->status().error.find("exec failed") !=
             std::string::npos);
     ::close(child->release_control_fd());
+}
+
+TEST_CASE("supervisor: reap evidence preserves actual child wait status",
+          "[supervisor][reap-barrier]") {
+    const char* marker = GENERATE("partial-recovery-v1", "adopted-source-v1", "report-refusal-v1");
+    CAPTURE(marker);
+    int expected_exit = 0;
+    int expected_signal = 0;
+    std::string ending = "exit 0\n";
+    SECTION("normal zero exit") {}
+    SECTION("normal nonzero exit is not a signal") {
+        expected_exit = 134;
+        ending = "exit 134\n";
+    }
+    SECTION("abort after a stopped self-report is not success") {
+        expected_signal = SIGABRT;
+        ending = "kill -ABRT $$\nexit 9\n";
+    }
+    SECTION("intentional crash retains its raw signal") {
+        expected_signal = SIGKILL;
+        ending = "kill -KILL $$\nexit 9\n";
+    }
+    test::TempDir directory;
+    test::write_file(directory / marker, {});
+    ReapFixtureEnvironment environment(directory.str());
+    const auto script = directory / "exit-device.sh";
+    const std::string content =
+        "#!/bin/sh\nulimit -c 0\necho '{\"state\":\"stopped\"}' >&3\n" + ending;
+    test::write_file(script, std::vector<uint8_t>(content.begin(), content.end()));
+    REQUIRE(::chmod(script.c_str(), 0755) == 0);
+    supervisor::ChildSpec spec;
+    spec.id = "actual-reap-evidence";
+    spec.device_bin = script;
+    spec.startup_generation = 73;
+    auto child = supervisor::Child::spawn(spec);
+    const auto pid = child->pid();
+    // Neither a child-reported stopped state nor process exit itself can
+    // publish the waitpid witness before this Child actually collects it.
+    auto stopped = child->status();
+    stopped.state = "stopped";
+    child->update_status(stopped);
+    CHECK_FALSE(test::read_child_reap(directory.str(), spec.startup_generation).has_value());
+    CHECK_FALSE(child->reaped_event().is_set());
+    REQUIRE(reap_child(*child));
+    REQUIRE(child->reaped_event().is_set());
+    const auto evidence = test::read_child_reap(directory.str(), spec.startup_generation);
+    REQUIRE(evidence.has_value());
+    CHECK(evidence->pid == static_cast<uint64_t>(pid));
+    CHECK(evidence->reaper_pid == static_cast<uint64_t>(::getpid()));
+    CHECK(evidence->generation == spec.startup_generation);
+    if (expected_signal != 0) {
+        CHECK_FALSE(WIFEXITED(evidence->wait_status));
+        REQUIRE(WIFSIGNALED(evidence->wait_status));
+        CHECK(WTERMSIG(evidence->wait_status) == expected_signal);
+        CHECK(child->status().exit_code == 128 + expected_signal);
+    } else {
+        REQUIRE(WIFEXITED(evidence->wait_status));
+        CHECK(WEXITSTATUS(evidence->wait_status) == expected_exit);
+        CHECK_FALSE(WIFSIGNALED(evidence->wait_status));
+        CHECK(child->status().exit_code == expected_exit);
+    }
+    CHECK_FALSE(child->try_reap());
+    child.reset();
+    const auto retained = test::read_child_reap(directory.str(), spec.startup_generation);
+    REQUIRE(retained.has_value());
+    CHECK(retained->pid == evidence->pid);
+    CHECK(retained->wait_status == evidence->wait_status);
+}
+
+TEST_CASE("supervisor: unavailable reap evidence does not change child collection",
+          "[supervisor][reap-barrier]") {
+    const char* marker = GENERATE("partial-recovery-v1", "adopted-source-v1", "report-refusal-v1");
+    CAPTURE(marker);
+    bool occupied = false;
+    SECTION("missing explicit fixture marker") {}
+    SECTION("exclusive generation record already exists") { occupied = true; }
+    test::TempDir directory;
+    ReapFixtureEnvironment environment(directory.str());
+    const auto record = directory / "child-74.reap";
+    const std::vector<uint8_t> sentinel{1, 3, 5, 7};
+    if (occupied) {
+        test::write_file(directory / marker, {});
+        test::write_file(record, sentinel);
+    }
+    supervisor::ChildSpec spec;
+    spec.id = "unavailable-reap-evidence";
+    spec.device_bin = "/bin/true";
+    spec.startup_generation = 74;
+    auto child = supervisor::Child::spawn(spec);
+    REQUIRE(reap_child(*child));
+    CHECK(child->status().exit_code == 0);
+    CHECK(child->reaped_event().is_set());
+    if (occupied) {
+        std::ifstream input(record, std::ios::binary);
+        const std::vector<uint8_t> contents{std::istreambuf_iterator<char>(input),
+                                            std::istreambuf_iterator<char>()};
+        CHECK(contents == sentinel);
+        CHECK_THROWS(test::read_child_reap(directory.str(), spec.startup_generation));
+    } else {
+        CHECK_FALSE(std::filesystem::exists(record));
+        CHECK_FALSE(test::read_child_reap(directory.str(), spec.startup_generation).has_value());
+    }
 }
 
 TEST_CASE("supervisor: control EOF stays distinct from a confirmed reap", "[supervisor][reap-barrier]") {

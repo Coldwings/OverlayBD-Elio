@@ -304,6 +304,59 @@ jobs:
             "integration: supervisor reaps children before releasing ublk devices" -s \
             2>&1 | tee build/ublk-e2e-supervisor.log
 
+      - name: "E2E - retained recovery lifecycle"
+        timeout-minutes: 11
+        run: |
+          evidence_root=$(mktemp -d /tmp/obd-ci-XXXXXX)
+          printf '%s\n' "$evidence_root" > build/ublk-startup-root
+          for scenario in partial source report-retry; do
+            log="build/ublk-e2e-startup-$scenario.log"
+            if [ "$scenario" = partial ]; then
+              selector='integration: supervisor retains failed partial ublk recovery until explicit release'
+            elif [ "$scenario" = source ]; then
+              selector='integration: adopted ublk recovery drains source frames before explicit release'
+            else
+              selector='integration: retained ublk caller survives report failure and retries refused release'
+            fi
+            printf 'ublk retained recovery: scenario=%s head=%s kernel=%s\n' \
+              "$scenario" "$GITHUB_SHA" "$(uname -r)" > "$log"
+            sudo -E env TMPDIR="$evidence_root" \
+              ./build/tests/obd_integration_tests "$selector" \
+              -s --colour-mode none >> "$log" 2>&1 &
+            TESTPID=$!
+            for i in $(seq 1 180); do
+              kill -0 "$TESTPID" 2>/dev/null || break
+              sleep 1
+            done
+            if kill -0 "$TESTPID" 2>/dev/null; then
+              echo 'ublk retained recovery: observation deadline; owners remain retained' | tee -a "$log"
+              cat "$log"
+              exit 1
+            fi
+            set +e
+            wait "$TESTPID"
+            rc=$?
+            set -e
+            printf 'ublk retained recovery: exit=%s\n' "$rc" | tee -a "$log"
+            cat "$log"
+            if (( rc == 4 )); then
+              echo '::error::retained recovery unexpectedly skipped'
+              exit 1
+            fi
+            if (( rc != 0 )); then exit "$rc"; fi
+          done
+
+      - name: Preserve retained-recovery evidence
+        if: always()
+        run: |
+          # A failed observation is diagnostic evidence, never retirement.
+          # Capture before the hosted VM is discarded; do not kill its owners.
+          if [ -f build/ublk-startup-root ]; then
+            read -r evidence_root < build/ublk-startup-root
+            sudo tar -czf build/ublk-startup-evidence.tar.gz \
+              -C "$evidence_root" .
+          fi
+
       - name: Capture available shutdown diagnostics
         if: failure()
         run: |
@@ -319,7 +372,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ublk-e2e-logs
-          path: build/ublk-e2e-*.log
+          path: |
+            build/ublk-e2e-*.log
+            build/ublk-startup-evidence.tar.gz
           if-no-files-found: ignore
 
   docs-governance:

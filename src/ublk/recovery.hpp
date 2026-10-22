@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <chrono>
 #include <system_error>
-#include <type_traits>
 
 namespace obd::ublk::detail {
 
@@ -45,19 +44,6 @@ elio::coro::task<void> start_recovery_and_open_queues(
     // Keep this outside the catch: an open failure must not retry START,
     // which has already reset the old queue state successfully.
     open_queues();
-}
-
-// Keep successful adoption as the final nonthrowing step. The actual
-// preparation/END/adoption callbacks are supplied by Device::attach.
-template <typename Prepare, typename End, typename Adopt>
-elio::coro::task<void> finish_recovery(Prepare prepare, End end, Adopt adopt) {
-    static_assert(std::is_nothrow_invocable_v<Adopt&>,
-                  "recovery adoption must not throw");
-    // No fallible metadata or logging may follow adoption: failure cleanup
-    // would otherwise delete the id before the caller can disarm its guard.
-    co_await prepare();
-    co_await end();
-    adopt();
 }
 
 }  // namespace obd::ublk::detail
