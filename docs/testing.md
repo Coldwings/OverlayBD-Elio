@@ -756,6 +756,8 @@ Every test, grouped by area, with the property it guards.
   immediately when the gate is open, admitted mid-wait when the gate
   opens before the timeout, and refused outright (`std::nullopt`, no
   slot taken) when mis-called with OnDemand.
+  Both Prefetch and Fill timeout queues are exercised; under ASAN this
+  also detects the waiter ownership use-after-free from issue #148.
 - `source: admission funnel grows additively on flat latency and halves on rise` —
   flat samples at the EMA baseline raise the window by one each; a
   sample above 150% of the baseline halves it; the drifted baseline
