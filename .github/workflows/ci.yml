@@ -135,6 +135,18 @@ jobs:
             liburing-dev zlib1g-dev libssl-dev linux-libc-dev \
             cmake ninja-build g++
 
+      - name: Select ublk driver source release
+        id: ublk-kernel
+        run: |
+          release="$(uname -r | cut -d. -f1-2)"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ublk driver release source
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ublk-source/linux-${{ steps.ublk-kernel.outputs.release }}
+          key: ublk-mainline-release-source-v1-${{ steps.ublk-kernel.outputs.release }}
+
       - name: Build and load ublk_drv
         # Ubuntu kernels do not ship ublk_drv (CONFIG_BLK_DEV_UBLK=n in
         # every noble package), so modprobe alone cannot work. Build the
@@ -157,16 +169,11 @@ jobs:
             /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            "linux-headers-$(uname -r)" build-essential libelf-dev dwarves
+            "linux-headers-$(uname -r)" build-essential libelf-dev dwarves xz-utils
           kbase="$(uname -r | cut -d. -f1-2)"
+          timeout --kill-after=5s 300s bash scripts/fetch-ublk-driver.sh "$kbase" /tmp/ublk-source
           mkdir -p /tmp/ublk && cd /tmp/ublk
-          # Retry transient source-host failures with curl's exponential
-          # backoff/Retry-After handling, and bound the complete download.
-          timeout --kill-after=5s 180s curl -fsSL \
-            --retry 4 --retry-max-time 150 \
-            --connect-timeout 15 --max-time 30 \
-            "https://raw.githubusercontent.com/torvalds/linux/v${kbase}/drivers/block/ublk_drv.c" \
-            -o ublk_drv.c
+          cp "/tmp/ublk-source/linux-$kbase/ublk_drv.c" ublk_drv.c
           echo 'obj-m += ublk_drv.o' > Makefile
           make -C "/lib/modules/$(uname -r)/build" M=/tmp/ublk modules
           sudo insmod /tmp/ublk/ublk_drv.ko
