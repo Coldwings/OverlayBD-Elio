@@ -363,7 +363,8 @@ Every test, grouped by area, with the property it guards.
   surrounding nonzero lower bytes still fall through instead of being hidden
   by the backing filesystem's wider allocation extent.
 - `format: sparse completed operations survive process exit without flush` —
-  an exec-isolated writer completes either a 512-byte DATA write or ZERO
+  an exec-isolated writer completes a 512-byte DATA write, an actual zero DATA
+  write (the source path used by NOUNMAP), or logical ZERO
   publication and calls `_exit` without destructors or guest FLUSH; reopening
   in the parent recovers the completed state and its adjacent lower bytes.
 - `format: sparse coverage rejects corruption and stale identity` — malformed
@@ -392,6 +393,18 @@ Every test, grouped by area, with the property it guards.
 - `format: sparse coverage install state recovers or fails closed` — failures
   around marker sync and rename preserve a validated temporary artifact for
   recovery; missing or corrupt installation evidence is rejected.
+- `format: sparse interrupted import retains legacy DATA pages` — an initial
+  temporary with no complete-snapshot proof restarts import instead of turning
+  unwritten snapshot pages into INHERIT.
+- `format: sparse legacy import survives process interruption` — an exec helper
+  exits before the header, after the header and after the first imported page;
+  recovery retains both early and late legacy DATA regions.
+- `format: sparse recovered FLUSH synchronizes prior process coverage` — a
+  completed helper write exits without flush; the replacement's FLUSH still
+  reaches the coverage descriptor and can retry a failed synchronization.
+- `format: sparse unmarked temporary rejects replacement inode` — a temporary
+  cannot install its identity on a different unmarked data inode. The existing
+  marker-preserving replacement case remains valid.
 - `format: sparse coverage rejects data truncation without cleanup` — an
   existing zero-length inode is not mistaken for a new file, and any recovered
   DATA sector past the retained backing EOF fails closed.

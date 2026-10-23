@@ -63,6 +63,7 @@ constexpr char kCoverageSlotMagic[8] = {'O', 'B', 'D', 'C', 'V', 'P', '2', '\0'}
 constexpr uint32_t kCoverageVersion = 2;
 constexpr uint32_t kCoverageFlagXattrIdentity = 1u << 0;
 constexpr uint32_t kCoverageFlagLegacyImport = 1u << 1;
+constexpr uint32_t kCoverageFlagSnapshotComplete = 1u << 2;
 constexpr uint64_t kCoverageCommit = 0xc04d495454454432ULL;
 constexpr std::string_view kCoverageIdentityXattr =
     "user.overlaybd.sparse-coverage-id";
@@ -342,6 +343,11 @@ CoverageHeaderBinding read_coverage_binding(const std::string& path) {
     }
     CoverageHeaderBinding binding;
     binding.flags = bytes::load_u32_le(header.data() + 20);
+    if ((binding.flags & ~(kCoverageFlagXattrIdentity |
+                           kCoverageFlagLegacyImport |
+                           kCoverageFlagSnapshotComplete)) != 0) {
+        throw format_error("sparse coverage has unsupported flags: " + path);
+    }
     std::memcpy(binding.identity.data(), header.data() + 48,
                 binding.identity.size());
     return binding;
@@ -707,7 +713,7 @@ void SparseRwLayer::create_coverage_snapshot(bool legacy_import) {
     identity.value = random_coverage_identity();
     identity.xattr = identity_status == XattrIdentityStatus::kMissing;
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
-    const auto header =
+    auto header =
         make_coverage_header(cur_vsize, data_st, identity, legacy_import);
 
     const std::string tmp = coverage_path_ + ".tmp";
@@ -718,11 +724,19 @@ void SparseRwLayer::create_coverage_snapshot(bool legacy_import) {
     }
     FdGuard guard(fd, &tmp);
 
+#ifdef OBD_TEST_HOOKS
+    if (coverage_install_fail_stage_for_test_.load(std::memory_order_acquire) == -5)
+        ::_exit(87);  // Exec-only process-interruption fixture, before header.
+#endif
     int rc = pwrite_all_sync(fd, header.data(), header.size(), 0);
     const uint64_t target_size = coverage_file_size(cur_vsize);
     if (rc == 0 && ::ftruncate(fd, static_cast<off_t>(target_size)) != 0) {
         rc = errno;
     }
+#ifdef OBD_TEST_HOOKS
+    if (rc == 0 && coverage_install_fail_stage_for_test_.load(std::memory_order_acquire) == -3)
+        ::_exit(87);  // Valid initial header, no complete-snapshot proof.
+#endif
 
     std::set<uint64_t> pages;
     for (const auto& segment : segments_) {
@@ -745,6 +759,21 @@ void SparseRwLayer::create_coverage_snapshot(bool legacy_import) {
                                  sizeof(uint64_t),
                                  offset + kCoverageSlotCommitOffset);
         }
+#ifdef OBD_TEST_HOOKS
+        if (rc == 0 && coverage_install_fail_stage_for_test_.load(std::memory_order_acquire) == -4)
+            ::_exit(87);  // Stop after the first imported page.
+#endif
+    }
+    if (rc == 0) {
+        // An ordinary valid header and sparse length cannot prove that all
+        // imported DATA pages were written. Publish this proof only after
+        // the complete initial snapshot, before any identity installation.
+        bytes::store_u32_le(header.data() + 20,
+            bytes::load_u32_le(header.data() + 20) |
+                kCoverageFlagSnapshotComplete);
+        bytes::store_u32_le(header.data() + 64,
+                            crc32::crc32c(header.data(), 64));
+        rc = pwrite_all_sync(fd, header.data(), header.size(), 0);
     }
     if (rc == 0 && ::fsync(fd) != 0) rc = errno;
     if (rc == 0) rc = guard.close();
@@ -829,8 +858,13 @@ void SparseRwLayer::load_coverage(const std::string& artifact_path,
     }
     const uint32_t flags = bytes::load_u32_le(header.data() + 20);
     if ((flags & ~(kCoverageFlagXattrIdentity |
-                   kCoverageFlagLegacyImport)) != 0) {
+                   kCoverageFlagLegacyImport |
+                   kCoverageFlagSnapshotComplete)) != 0) {
         throw format_error("sparse coverage has unsupported flags: " +
+                           artifact_path);
+    }
+    if ((flags & kCoverageFlagSnapshotComplete) == 0) {
+        throw format_error("sparse coverage initial snapshot is incomplete: " +
                            artifact_path);
     }
     const uint64_t initial_vsize = bytes::load_u64_le(header.data() + 24);
@@ -840,16 +874,26 @@ void SparseRwLayer::load_coverage(const std::string& artifact_path,
         throw format_error("sparse coverage vsize mismatch: " + artifact_path);
     }
     if ((flags & kCoverageFlagXattrIdentity) != 0) {
-        if (verify_xattr) {
-            std::array<uint8_t, 16> identity {};
-            const XattrIdentityStatus status =
-                read_xattr_identity(fd_, &identity);
-            if (status != XattrIdentityStatus::kPresent ||
-                std::memcmp(identity.data(), header.data() + 48,
-                            identity.size()) != 0) {
+        std::array<uint8_t, 16> identity {};
+        const XattrIdentityStatus status = read_xattr_identity(fd_, &identity);
+        if (status == XattrIdentityStatus::kPresent) {
+            if (std::memcmp(identity.data(), header.data() + 48,
+                            identity.size()) == 0) {
+                // A matching durable marker supports marker-preserving copy
+                // or replacement even when device/inode changed.
+            } else {
                 throw format_error("sparse coverage data identity mismatch: " +
                                    artifact_path);
             }
+        } else if (verify_xattr || status != XattrIdentityStatus::kMissing ||
+                   bytes::load_u64_le(header.data() + 32) !=
+                       static_cast<uint64_t>(data_st.st_dev) ||
+                   bytes::load_u64_le(header.data() + 40) !=
+                       static_cast<uint64_t>(data_st.st_ino)) {
+            // Until the marker is installed, the snapshot must still belong
+            // to the original inode. A temporary name grants no identity.
+            throw format_error("sparse coverage data identity mismatch: " +
+                               artifact_path);
         }
     } else if (bytes::load_u64_le(header.data() + 32) !=
                    static_cast<uint64_t>(data_st.st_dev) ||
@@ -982,7 +1026,9 @@ void SparseRwLayer::load_coverage(const std::string& artifact_path,
                                 artifact_path);
     }
     coverage_fd_ = guard.release();
-    coverage_dirty_ = false;
+    // A completed prior-process operation may exist only in the surviving
+    // page cache. Reopen cannot infer that a successful FLUSH persisted it.
+    coverage_dirty_ = true;
 }
 
 elio::coro::task<int> SparseRwLayer::publish_coverage_locked(
@@ -1189,7 +1235,7 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
     };
     const std::string coverage_tmp = layer->coverage_path_ + ".tmp";
     const bool has_coverage = exists(layer->coverage_path_);
-    const bool has_coverage_tmp = exists(coverage_tmp);
+    bool has_coverage_tmp = exists(coverage_tmp);
     if (has_coverage) {
         layer->load_coverage(layer->coverage_path_, original_data_size);
         // Keep accepting the v1 zero-mask artifact. It remains a protective
@@ -1218,12 +1264,39 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
         std::array<uint8_t, 16> installed_identity {};
         const XattrIdentityStatus installed_status =
             read_xattr_identity(layer->fd_, &installed_identity);
+        if (has_coverage_tmp &&
+            installed_status != XattrIdentityStatus::kPresent) {
+            struct stat temporary_st {};
+            if (::stat(coverage_tmp.c_str(), &temporary_st) != 0) {
+                throw_errno(errno, "cannot stat sparse coverage temporary");
+            }
+            const bool incomplete = temporary_st.st_size <
+                    static_cast<off_t>(kCoverageHeaderSize) ||
+                (read_coverage_binding(coverage_tmp).flags &
+                    kCoverageFlagSnapshotComplete) == 0;
+            if (incomplete) {
+                // No marker was installed and the initial snapshot never
+                // completed. Its absent pages are not evidence of INHERIT;
+                // rebuild from the still-authoritative legacy data/zeroes.
+                if (::unlink(coverage_tmp.c_str()) != 0) {
+                    throw_errno(errno, "cannot restart sparse coverage import");
+                }
+                const int drc = fsync_parent_dir(coverage_tmp);
+                if (drc != 0) throw_errno(drc, "cannot sync sparse coverage directory");
+                has_coverage_tmp = false;
+            }
+        }
         if (has_coverage_tmp) {
             // A temporary artifact is recoverable only after complete format,
             // slot and EOF validation. Its name remains non-authoritative.
             layer->load_coverage(coverage_tmp, original_data_size, false);
             const CoverageHeaderBinding binding =
                 read_coverage_binding(coverage_tmp);
+            // A complete temporary might have survived process exit before
+            // its creator's fsync. Persist it before making its marker durable.
+            if (::fsync(layer->coverage_fd_) != 0) {
+                throw_errno(errno, "cannot sync sparse coverage temporary");
+            }
             if ((binding.flags & kCoverageFlagXattrIdentity) != 0) {
                 if (installed_status == XattrIdentityStatus::kPresent) {
                     if (installed_identity != binding.identity) {

@@ -558,7 +558,9 @@ The header fields are: magic at 0 (8 bytes), `u32` version at 8, `u32` header
 size at 12, `u32` sector size at 16, `u32` flags at 20, `u64` initial virtual
 size at 24, `u64 st_dev` at 32, `u64 st_ino` at 40, identity at 48 (16 bytes),
 and `u32` CRC at 64. Flag bit 0 requires the identity xattr; bit 1 marks a
-legacy import; other bits are rejected. Bytes 68 through 4095 are reserved and
+legacy import; bit 2 proves the complete initial snapshot. Bit 2 is required
+for an authoritative file or resumable complete temporary; other bits are
+rejected. Bytes 68 through 4095 are reserved and
 ignored by this version.
 
 Each slot contains magic `OBDCVP2\0` at 0 (8 bytes), `u64` page number at 8,
@@ -571,6 +573,20 @@ commit word, writes bytes `0..4151`, then writes the commit word. The file's
 logical size is `4096 + ceil(vsize/(512*16384))*8320`; untouched page regions
 remain sparse holes. The virtual size cannot exceed the 50-bit segment offset
 window.
+
+A page without a recognized commit marker has an implicit initial INHERIT
+state. A corrupt recognized committed candidate requires a valid rollback slot
+or open fails. A damaged sole first-generation commit marker cannot be
+distinguished from interrupted first publication; arbitrary marker corruption
+is outside this detection guarantee.
+
+The snapshot-complete flag is set, with a refreshed header CRC, only after every
+initial imported page has been written. An incomplete unmarked temporary
+restarts legacy import. Before an xattr marker exists, temporary recovery checks
+device/inode; afterwards a matching marker permits marker-preserving inode
+replacement. Recovery synchronizes a complete temporary before installing its
+marker and treats reopened coverage as potentially dirty, so FLUSH after a
+process restart synchronizes it even without a new write.
 
 For a pre-existing v1 file with no coverage sidecar, `open` performs a
 one-time `SEEK_DATA`/`SEEK_HOLE` import, overlays `.zeroes`, then atomically

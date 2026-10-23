@@ -37,9 +37,13 @@ The artifact is a sparse two-bit-per-sector map. One logical metadata page
 describes 8 MiB of virtual device space and has two generation-numbered slots.
 A writer clears the inactive slot's commit word, writes its complete body and
 CRC, then writes the commit word last. Recovery selects the newest valid slot.
-An uncommitted or checksum-invalid slot falls back to the other valid slot;
-recovery fails closed when no valid committed slot survives. Sparse holes in
-the artifact mean INHERIT.
+An uncommitted or checksum-invalid slot falls back to the other valid slot.
+If recognized committed candidates are corrupt and no valid slot survives,
+recovery fails closed. A page with no recognized commit marker uses its
+implicit initial INHERIT state. Corruption of the sole first-generation commit
+marker is indistinguishable from interrupted first publication; this format
+does not promise detection of arbitrary marker corruption. Sparse holes mean
+INHERIT.
 
 Each modifying request writes the backing data or zero operation first where
 required. Before publishing a page it allocates that page's complete runtime
@@ -73,6 +77,15 @@ final artifact is missing, open resumes only a fully valid temporary artifact;
 without one it fails closed. A pre-existing zero-length data inode is never
 classified as newly created, so its metadata is not silently removed.
 
+The initial header has its snapshot-complete flag clear. Only after every
+initial page is written does the creator set flag bit 2, refresh the header
+CRC and sync the temporary. An incomplete unmarked temporary is discarded and
+the legacy import restarts; absent snapshot pages cannot be mistaken for
+INHERIT. Before a matching xattr marker exists, a complete temporary must match
+the recorded device/inode. A recovered complete temporary is synchronized before
+marker installation. Every reopened coverage file is potentially dirty until
+the replacement process successfully flushes it, including without new writes.
+
 ## Consequences
 
 - A 512-byte DATA write and adjacent INHERIT sectors remain distinct across a
@@ -94,13 +107,19 @@ classified as newly created, so its metadata is not silently removed.
   leaving the data inode intact is indistinguishable from a genuine v1 upper.
   The documented device+inode fallback detects mismatched surviving sidecars,
   but cannot detect loss of all sidecars and will attempt legacy import.
-- Corrupt headers, identity mismatches, invalid sector states, and pages with
-  no valid committed slot stop open rather than exposing lower data.
+- Corrupt authoritative headers, identity mismatches, invalid sector states,
+  and corrupt recognized committed pages without a valid rollback stop open.
 
 ## Alternatives considered
 
 - FIEMAP plus ZERO_RANGE cannot recover guest intent: written extents are
   filesystem-block granular and UNWRITTEN extents carry no origin tag.
+- The selected metadata design does not invoke FIEMAP or ZERO_RANGE. Their
+  absence therefore needs no physical-zero fallback to reconstruct ownership:
+  the persisted ZERO state is authoritative even when physical hole punching
+  is unavailable. The actual-zero fallback proposed for the extent-discovery
+  alternative is replaced by that ownership record. NOUNMAP keeps its actual
+  zero-write path; logical DISCARD does not promise zeroed backing bytes.
 - Copying a complete filesystem block from the merged view before every
   partial write would make extent-wide DATA truthful, but adds lower reads and
   write amplification to the latency-sensitive path and makes filesystem
