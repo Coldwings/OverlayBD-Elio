@@ -195,6 +195,11 @@ self-skip the same way. The privileged CI job
 `ublk_drv` and runs these tests individually by exact name under `sudo`,
 with a separate bounded step and log for each. The remote-LSMT step accepts
 only its explicit unsupported CPU-map skip, with a warning and retained log.
+Driver-source download permits four transient retries with exponential backoff
+and server `Retry-After` handling, a 15-second connection limit and 30-second
+per-transfer limit. Its retry budget is 150 seconds; an outer 180-second
+deadline (plus a five-second termination grace) bounds the whole download.
+A permanent or exhausted download failure stops preparation before compilation.
 The online-grow step has a
 120-second process timeout and records the commit, kernel, command exit status
 and the test-output `tee` exit status in `build/ublk-e2e-grow.log`, included

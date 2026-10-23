@@ -160,7 +160,11 @@ jobs:
             "linux-headers-$(uname -r)" build-essential libelf-dev dwarves
           kbase="$(uname -r | cut -d. -f1-2)"
           mkdir -p /tmp/ublk && cd /tmp/ublk
-          curl -fsSL \
+          # Retry transient source-host failures with curl's exponential
+          # backoff/Retry-After handling, and bound the complete download.
+          timeout --kill-after=5s 180s curl -fsSL \
+            --retry 4 --retry-max-time 150 \
+            --connect-timeout 15 --max-time 30 \
             "https://raw.githubusercontent.com/torvalds/linux/v${kbase}/drivers/block/ublk_drv.c" \
             -o ublk_drv.c
           echo 'obj-m += ublk_drv.o' > Makefile
