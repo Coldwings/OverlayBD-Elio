@@ -50,8 +50,8 @@ selective rejections, so single-flight and cache-lifetime behavior is
 observable. Unit tests retain its listener task through `with_mock_registry`:
 normal return and exceptions both stop the server, join and destroy the
 listener task, and then await zero active connections before destroying the
-fixture (issue #149). The integration tests reuse the
-same style of in-process server, so no test touches the network; the
+fixture (issue #149). The registry integration tests reuse the same style
+of in-process server and communicate with local loopback peers. The
 multi-blob variant (`BlobMapServer` in
 `tests/integration/test_integration.cpp`) adds per-blob GET/extent
 counters, per-request latency injection, and an optional serialized
