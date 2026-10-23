@@ -756,9 +756,12 @@ admission funnel (ADR-0012; see Concepts §"Read admission funnel").
   windows are skipped, never awaited" contract). Cancel-safe where
   `acquire()` is not: a waiter whose slot was already reserved when the
   timeout fires adopts the slot rather than leaking it; a still-queued
-  waiter is removed under the funnel mutex. OnDemand is refused
-  outright (`std::nullopt`, logged — a real runtime check, not an
-  assert): unconditional admission is the OnDemand contract, and a
+  waiter is removed under the funnel mutex.
+  Exceptional exits, including inherited task cancellation, also reconcile
+  the waiter: remove it if still queued, or release its already reserved
+  slot before propagating the failure. Scavenger cleanup adds no AIMD sample.
+  OnDemand is refused outright (`std::nullopt`, logged — a real runtime
+  check, not an assert): unconditional admission is the OnDemand contract, and a
   bounded on-demand call is always a caller bug.
 - `cap_request(cls, bytes)` — clamps scavenger requests to
   `scavenger_size_cap` (~1 MiB; the caller splits); OnDemand is uncapped.
@@ -1308,6 +1311,14 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   closed returns `std::nullopt` at its timeout, dequeues without leaking a slot, is
   still admitted when the gate opens before the deadline, and refuses
   OnDemand outright. ASAN checks waiter ownership during timeout teardown.
+- `source: bounded admission cancellation removes queued waiters` —
+  issue #150: inherited cancellation of an executing parent removes its
+  queued Prefetch/Fill waiter; after the on-demand gate opens, the full
+  admission window remains available.
+- `source: bounded admission cancellation releases a reserved slot before a delayed wake` —
+  issue #150: a releaser reserves the cancelled waiter's slot before
+  exceptional cleanup and retains its notification through caller-frame
+  destruction; cleanup releases the slot and the late wake stays safe.
 - `source: admission funnel grows additively on flat latency and halves on rise` —
   flat samples at the EMA baseline raise the window by one each; a sample
   above 150% of the baseline halves it (AIMD, ADR-0012).

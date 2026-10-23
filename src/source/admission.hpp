@@ -186,6 +186,8 @@ public:
     /// ADOPTS the slot (returns a Permit) instead of leaking it; a
     /// waiter still queued is removed under mu_ before returning. The
     /// AIMD/latency accounting is untouched (no Permit, no sample).
+    /// Exceptional exits, including inherited cancellation, remove a queued
+    /// waiter or release its reservation before propagating the failure.
     /// OnDemand is refused outright (`std::nullopt`, logged) —
     /// unconditional admission is its contract, so a bounded on-demand
     /// call is always a caller bug.
@@ -237,6 +239,20 @@ public:
         gap_hook_ = std::move(hook);
     }
 
+#ifdef OBD_TEST_HOOKS
+    /// Install before starting a bounded acquire; clear after its frame joins.
+    /// The observer runs before exceptional waiter reconciliation.
+    void set_bounded_exception_hook_for_test(std::function<void()> hook) {
+        bounded_exception_hook_ = std::move(hook);
+    }
+    /// Retain the supplied wake closure to model a releaser delayed after
+    /// reserving a slot. The closure owns the same waiter as the releaser.
+    void set_deferred_wake_hook_for_test(
+        std::function<void(std::function<void()>)> hook) {
+        deferred_wake_hook_ = std::move(hook);
+    }
+#endif
+
 private:
     struct Waiter {
         elio::sync::event admitted;
@@ -272,6 +288,10 @@ private:
     std::atomic<uint64_t> scavenger_admissions_{0};
     std::atomic<uint64_t> scavenger_waits_{0};
     std::function<void()> gap_hook_;  // test-only, see set_gap_hook_for_test
+#ifdef OBD_TEST_HOOKS
+    std::function<void()> bounded_exception_hook_;
+    std::function<void(std::function<void()>)> deferred_wake_hook_;
+#endif
 };
 
 using AdmissionFunnelPtr = std::shared_ptr<AdmissionFunnel>;
