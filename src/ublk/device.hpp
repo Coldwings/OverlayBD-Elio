@@ -126,6 +126,11 @@ private:
     elio::coro::task<void> prepare_owners();
     elio::coro::task<void> drain_sources();
     elio::coro::task<void> retained_startup();
+    /// Reflect a mailbox admission in the observable startup snapshot before
+    /// potentially long source/raw retirement. The owning Device coroutine is
+    /// the sole snapshot writer; the control-channel caller only owns the
+    /// mailbox CAS.
+    uint64_t publish_pending_release() noexcept;
     void collect_bridge_results() noexcept;
     bool release_once() noexcept;
     void refresh_startup() noexcept;

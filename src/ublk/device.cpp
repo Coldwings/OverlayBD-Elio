@@ -442,14 +442,8 @@ elio::coro::task<void> Device::retained_startup() {
     if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::retained_entered});
 #endif
     for (;;) {
-        const auto sequence = startup_->release_request();
+        const auto sequence = publish_pending_release();
         if (sequence) {
-            release_authorized_ = true;
-            startup_state_.phase = StartupPhase::releasing;
-            startup_state_.release_sequence = sequence;
-            startup_state_.release = StartupRelease::pending;
-            startup_state_.release_errno = 0;
-            publish_startup();
             try {
                 co_await detail::run_control([&] {
 #ifdef OBD_TEST_HOOKS
@@ -482,6 +476,23 @@ elio::coro::task<void> Device::retained_startup() {
         try { co_await elio::time::sleep_for(std::chrono::milliseconds(10)); }
         catch (...) {}
     }
+}
+
+uint64_t Device::publish_pending_release() noexcept {
+    if (!startup_) return 0;
+    const auto sequence = startup_->release_request();
+    if (sequence == 0) return 0;
+    release_authorized_ = true;
+    if (startup_state_.release_sequence != sequence ||
+        startup_state_.release != StartupRelease::pending ||
+        startup_state_.phase != StartupPhase::releasing) {
+        startup_state_.phase = StartupPhase::releasing;
+        startup_state_.release_sequence = sequence;
+        startup_state_.release = StartupRelease::pending;
+        startup_state_.release_errno = 0;
+        publish_startup();
+    }
+    return sequence;
 }
 
 uint64_t Device::resize_blocking(uint64_t bytes) {
@@ -548,6 +559,11 @@ elio::coro::task<void> Device::drain_sources() {
     request_stop();
     if (!owner_tasks_.empty()) {
         for (;;) {
+            // Admission and source retirement are independent facts. A source
+            // handler (or a prepared-but-held initial FETCH) may outlive the
+            // supervisor's command timeout, so expose the accepted request
+            // while preserving the drain fence before release_once().
+            (void)publish_pending_release();
             bool drained = true;
             for (const auto& queue : queues_)
                 drained &= queue->source_handlers_drained();

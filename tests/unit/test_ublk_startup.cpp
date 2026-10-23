@@ -231,7 +231,7 @@ private:
 
 enum class Scenario {
     setup_single, setup_pair, admission_gap, source_progress, deadline,
-    owner_reject,
+    owner_reject, owner_pending_release,
 };
 class Hooks final : public detail::StartupTestHooks {
 public:
@@ -246,7 +246,8 @@ public:
 
     detail::CtrlTransport* control_transport() noexcept override { return &script; }
     bool legacy_thread_topology() const noexcept override {
-        return scenario != Scenario::owner_reject;
+        return scenario != Scenario::owner_reject &&
+               scenario != Scenario::owner_pending_release;
     }
     bool open_queue(Queue& queue, int shared) override {
         StartupCoordinatorTestAccess::open(queue, shared);
@@ -272,7 +273,25 @@ public:
         if (elio::runtime::worker_thread::current()) native_admission.store(false);
         if (scenario == Scenario::admission_gap) admission.wait();
     }
-    void before_initial_submit(uint16_t) noexcept override { initial.wait(); }
+    void before_initial_submit(uint16_t) noexcept override {
+        if (scenario != Scenario::owner_pending_release) initial.wait();
+    }
+    elio::coro::task<void> before_initial_submit_async(uint16_t) override {
+        if (scenario != Scenario::owner_pending_release) co_return;
+        initial.entered.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        for (;;) {
+            {
+                std::lock_guard lock(initial.mutex);
+                if (initial.open) co_return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                initial.escaped.store(true);
+                co_return;
+            }
+            co_await elio::time::sleep_for(1ms);
+        }
+    }
     std::chrono::steady_clock::time_point startup_now() noexcept override {
         return std::chrono::steady_clock::time_point{} + std::chrono::seconds(clock_seconds.load());
     }
@@ -670,6 +689,110 @@ void run_owner_rejection_scenario() {
     CHECK(admitted == 1);
     CHECK(absent == 1);
 }
+
+void run_pending_release_before_initial_submit() {
+    Hooks hooks(Scenario::owner_pending_release);
+    StartupControl startup(137);
+    startup.set_test_hooks(&hooks);
+    SourceState source_state;
+    hooks.source_state = &source_state;
+    hooks.script.source = &source_state;
+    Outcome outcome;
+    bool pending_before_submit = false;
+
+    elio::runtime::run_config config;
+    config.num_threads = 2;
+    config.blocking_threads = 1;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto source = std::make_unique<PoolSource>(source_state);
+        DeviceParams params;
+        params.nr_queues = 1;
+        params.queue_depth = 2;
+        params.max_io_buf_bytes = 4096;
+        params.dev_sectors = 128;
+        auto launch = [&]() -> elio::coro::task<void> {
+            try {
+                (void)co_await Device::attach(
+                    42, params, std::move(source), startup);
+                outcome.ready = true;
+            } catch (const StartupReleased&) {
+                outcome.released = true;
+            } catch (const std::system_error& error) {
+                outcome.error = error.code().value();
+            } catch (...) {
+                outcome.error = -1;
+            }
+            outcome.returned = true;
+        };
+        auto operation = elio::spawn(launch);
+        std::exception_ptr failure;
+        try {
+            const bool initial_held = co_await until([&] {
+                return hooks.initial.entered.load();
+            });
+            CHECK(initial_held);
+            const bool end_admitted = co_await until([&] {
+                return hooks.script.admitted.load();
+            });
+            CHECK(end_admitted);
+            hooks.clock_seconds.store(6);
+            const bool cancellation_observed = co_await until([&] {
+                const auto snapshot = startup.snapshot();
+                return snapshot.cancel_known && snapshot.control_pending;
+            });
+            CHECK(cancellation_observed);
+            hooks.script.release_original.store(true);
+            const bool failure_settled = co_await until([&] {
+                const auto snapshot = startup.snapshot();
+                return snapshot.original_known && !snapshot.control_pending &&
+                       snapshot.phase == StartupPhase::retained;
+            });
+            CHECK(failure_settled);
+            CHECK(startup.request_release(137, 1) ==
+                  ReleaseRequestResult::accepted);
+            pending_before_submit = co_await until([&] {
+                const auto snapshot = startup.snapshot();
+                return snapshot.phase == StartupPhase::releasing &&
+                       snapshot.release == StartupRelease::pending &&
+                       snapshot.release_sequence == 1;
+            });
+            CHECK(pending_before_submit);
+            CHECK_FALSE(hooks.queues[0]->initial_fetches_issued());
+            CHECK(hooks.script.stops.load() == 0);
+            CHECK(hooks.script.deletes.load() == 0);
+            CHECK_FALSE(operation.is_ready());
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        hooks.rescue();
+        (void)startup.request_release(137, 1);
+        co_await operation;
+        co_await operation.wait_destroyed_async();
+        if (failure) std::rethrow_exception(failure);
+    }, config);
+
+    CHECK(pending_before_submit);
+    CHECK(outcome.returned);
+    CHECK(outcome.released);
+    CHECK_FALSE(outcome.ready);
+    CHECK(outcome.error == 0);
+    CHECK_FALSE(hooks.initial.escaped.load());
+    CHECK_FALSE(hooks.script.escaped.load());
+    CHECK(source_state.destroyed.load());
+    CHECK(hooks.count(Kind::retained_entered) == 1);
+    CHECK(hooks.count(Kind::initial_issued) == 1);
+    CHECK(hooks.count(Kind::owner_exit) == 1);
+    CHECK(hooks.count(Kind::bridge_destroyed) == 1);
+    CHECK(hooks.count(Kind::cdev_closed) == 1);
+    CHECK(hooks.script.stops.load() == 1);
+    CHECK(hooks.script.deletes.load() == 1);
+    const auto final = startup.snapshot();
+    CHECK(final.phase == StartupPhase::released);
+    CHECK(final.release == StartupRelease::released);
+    CHECK(final.release_sequence == 1);
+    CHECK(final.kernel_debt_known);
+    CHECK(final.raw_published == final.raw_retired);
+}
 }
 
 TEST_CASE("ublk: public create catches single queue setup failure", "[ublk][startup-coordinator]") {
@@ -699,4 +822,8 @@ TEST_CASE("ublk: public START deadline retains original after cancellation CQE",
 TEST_CASE("ublk: failed second fixed owner allocation seals its ownerless queue",
           "[ublk][startup-coordinator][owner-pump]") {
     run_owner_rejection_scenario();
+}
+TEST_CASE("ublk: release admission is published while initial FETCH remains held",
+          "[ublk][startup-coordinator][owner-pump]") {
+    run_pending_release_before_initial_submit();
 }
