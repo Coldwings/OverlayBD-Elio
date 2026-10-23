@@ -231,7 +231,7 @@ private:
 
 enum class Scenario {
     setup_single, setup_pair, admission_gap, source_progress, deadline,
-    owner_reject, owner_pending_release,
+    owner_reject, owner_pending_release, owner_cleanup_release,
 };
 class Hooks final : public detail::StartupTestHooks {
 public:
@@ -247,7 +247,8 @@ public:
     detail::CtrlTransport* control_transport() noexcept override { return &script; }
     bool legacy_thread_topology() const noexcept override {
         return scenario != Scenario::owner_reject &&
-               scenario != Scenario::owner_pending_release;
+               scenario != Scenario::owner_pending_release &&
+               scenario != Scenario::owner_cleanup_release;
     }
     bool open_queue(Queue& queue, int shared) override {
         StartupCoordinatorTestAccess::open(queue, shared);
@@ -793,6 +794,122 @@ void run_pending_release_before_initial_submit() {
     CHECK(final.kernel_debt_known);
     CHECK(final.raw_published == final.raw_retired);
 }
+
+void run_pending_release_during_failure_cleanup() {
+    Hooks hooks(Scenario::owner_cleanup_release);
+    StartupControl startup(138);
+    startup.set_test_hooks(&hooks);
+    SourceState source_state;
+    hooks.source_state = &source_state;
+    hooks.script.source = &source_state;
+    Outcome outcome;
+    Gate cleanup;
+    bool pending_during_cleanup = false;
+
+    elio::runtime::run_config config;
+    config.num_threads = 2;
+    config.blocking_threads = 1;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto source = std::make_unique<PoolSource>(source_state);
+        DeviceParams params;
+        params.nr_queues = 1;
+        params.queue_depth = 2;
+        params.max_io_buf_bytes = 4096;
+        params.dev_sectors = 128;
+        Device::FailureCleanup failure_cleanup = [&]() -> elio::coro::task<void> {
+            cleanup.entered.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + 5s;
+            for (;;) {
+                {
+                    std::lock_guard lock(cleanup.mutex);
+                    if (cleanup.open) co_return;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    cleanup.escaped.store(true);
+                    co_return;
+                }
+                co_await elio::time::sleep_for(1ms);
+            }
+        };
+        auto launch = [&]() -> elio::coro::task<void> {
+            try {
+                (void)co_await Device::attach(
+                    42, params, std::move(source), startup, failure_cleanup);
+                outcome.ready = true;
+            } catch (const StartupReleased&) {
+                outcome.released = true;
+            } catch (const std::system_error& error) {
+                outcome.error = error.code().value();
+            } catch (...) {
+                outcome.error = -1;
+            }
+            outcome.returned = true;
+        };
+        auto operation = elio::spawn(launch);
+        std::exception_ptr failure;
+        try {
+            const bool end_admitted = co_await until([&] {
+                return hooks.script.admitted.load();
+            });
+            CHECK(end_admitted);
+            hooks.clock_seconds.store(6);
+            const bool cancellation_observed = co_await until([&] {
+                const auto snapshot = startup.snapshot();
+                return snapshot.cancel_known && snapshot.control_pending;
+            });
+            CHECK(cancellation_observed);
+            hooks.script.release_original.store(true);
+            const bool cleanup_held = co_await until([&] {
+                return cleanup.entered.load();
+            });
+            CHECK(cleanup_held);
+            CHECK(hooks.count(Kind::sources_drained) == 1);
+            CHECK(hooks.count(Kind::retained_entered) == 0);
+            CHECK(startup.snapshot().release == StartupRelease::none);
+            CHECK(startup.request_release(138, 1) ==
+                  ReleaseRequestResult::accepted);
+            const auto pending = startup.snapshot();
+            pending_during_cleanup =
+                pending.phase == StartupPhase::releasing &&
+                pending.release == StartupRelease::pending &&
+                pending.release_sequence == 1;
+            CHECK(pending_during_cleanup);
+            CHECK_FALSE(operation.is_ready());
+            CHECK(hooks.script.stops.load() == 0);
+            CHECK(hooks.script.deletes.load() == 0);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        cleanup.release();
+        hooks.rescue();
+        (void)startup.request_release(138, 1);
+        co_await operation;
+        co_await operation.wait_destroyed_async();
+        if (failure) std::rethrow_exception(failure);
+    }, config);
+
+    CHECK(pending_during_cleanup);
+    CHECK(outcome.returned);
+    CHECK(outcome.released);
+    CHECK_FALSE(outcome.ready);
+    CHECK(outcome.error == 0);
+    CHECK_FALSE(cleanup.escaped.load());
+    CHECK_FALSE(hooks.script.escaped.load());
+    CHECK(source_state.destroyed.load());
+    CHECK(hooks.count(Kind::retained_entered) == 1);
+    CHECK(hooks.count(Kind::initial_issued) == 1);
+    CHECK(hooks.count(Kind::owner_exit) == 1);
+    CHECK(hooks.count(Kind::bridge_destroyed) == 1);
+    CHECK(hooks.count(Kind::cdev_closed) == 1);
+    CHECK(hooks.script.stops.load() == 1);
+    CHECK(hooks.script.deletes.load() == 1);
+    const auto final = startup.snapshot();
+    CHECK(final.phase == StartupPhase::released);
+    CHECK(final.release == StartupRelease::released);
+    CHECK(final.release_sequence == 1);
+    CHECK(final.kernel_debt_known);
+    CHECK(final.raw_published == final.raw_retired);
+}
 }
 
 TEST_CASE("ublk: public create catches single queue setup failure", "[ublk][startup-coordinator]") {
@@ -826,4 +943,8 @@ TEST_CASE("ublk: failed second fixed owner allocation seals its ownerless queue"
 TEST_CASE("ublk: release admission is published while initial FETCH remains held",
           "[ublk][startup-coordinator][owner-pump]") {
     run_pending_release_before_initial_submit();
+}
+TEST_CASE("ublk: release admission is visible while failure cleanup remains held",
+          "[ublk][startup-coordinator][owner-pump]") {
+    run_pending_release_during_failure_cleanup();
 }

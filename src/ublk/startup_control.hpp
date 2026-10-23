@@ -62,11 +62,13 @@ public:
 
     StartupSnapshot snapshot() const noexcept {
         std::array<uint64_t, count> values{};
-        uint64_t version;
+        uint64_t version, request, acknowledged;
         do {
             version = version_.load();
             if (version & 1) continue;
             for (size_t i = 0; i < count; ++i) values[i] = fields_[i].load();
+            request = requested_.load();
+            acknowledged = acknowledged_.load();
             if (version == version_.load()) break;
         } while (true);
         StartupSnapshot s;
@@ -88,6 +90,17 @@ public:
         s.release_sequence = values[release_sequence];
         s.release = static_cast<StartupRelease>(values[release]);
         s.release_errno = static_cast<int>(static_cast<int64_t>(values[release_error]));
+        // request_release() is the acceptance linearization point and may run
+        // while the Device owner is suspended in caller cleanup. Project the
+        // outstanding mailbox request at read time so status/list cannot deny
+        // that accepted attempt merely because the owner has not resumed to
+        // persist the same facts yet. Only the Device owner writes fields_.
+        if ((request & closed_bit) == 0 && request != acknowledged) {
+            s.phase = StartupPhase::releasing;
+            s.release_sequence = request;
+            s.release = StartupRelease::pending;
+            s.release_errno = 0;
+        }
         return s;
     }
 

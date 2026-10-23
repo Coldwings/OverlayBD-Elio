@@ -808,7 +808,15 @@ Unit tests live in `tests/unit/test_ublk*.cpp` (built only when
   the second join-state allocation to fail. It requires the admitted first
   owner to drain, seals the ownerless queue with zero raw publication, and
   closes both cdevs before one STOP/DEL. These ordinary tests complement the
-  privileged #137 fixtures.
+  privileged #137 fixtures. A tenth production-topology case,
+  `ublk: release admission is published while initial FETCH remains held`,
+  proves that an accepted sequence becomes observable while initial submission
+  still fences STOP. An eleventh,
+  `ublk: release admission is visible while failure cleanup remains held`,
+  admits after source drain while caller cleanup is suspended and requires the
+  mailbox-backed snapshot to expose that same sequence immediately. Both use
+  scripted control CQEs and rejecting eventfd queue stand-ins rather than real
+  ublk-driver acceptance.
 - `ublk: failed startup drains sources before propagating its original error` —
   the production failure coordinator drains partial bridge registration and
   publishes released state before rethrowing the original failure. Source

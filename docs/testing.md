@@ -1044,6 +1044,17 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   publish zero raw commands yet report source drain and owner exit; queue 0
   must drain its admitted owner frame. Both cdev stand-ins close before the
   single STOP/DEL, and no START command is admitted.
+- `ublk: release admission is published while initial FETCH remains held` —
+  admit an explicit release while a fixed owner has prepared, but not submitted,
+  its initial FETCH batch. The observable snapshot must publish the same pending
+  sequence before the gate opens, without issuing STOP or DEL; opening the gate
+  then proves raw retirement, owner-frame destruction and terminal release.
+- `ublk: release admission is visible while failure cleanup remains held` —
+  finish fixed-owner source drain, suspend the caller cleanup callback, and
+  admit release after the final drain poll. `StartupControl::snapshot()` must
+  immediately project the outstanding mailbox sequence as pending before the
+  cleanup or retained loop resumes. Both tests use scripted control CQEs and
+  rejecting eventfd queue stand-ins, so they do not prove ublk-driver acceptance.
 
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
