@@ -1052,8 +1052,9 @@ closed cdevs and Ctrl destruction. Test seams are absent with
 - `ublk: release admission is visible while failure cleanup remains held` —
   finish fixed-owner source drain, suspend the caller cleanup callback, and
   admit release after the final drain poll. `StartupControl::snapshot()` must
-  immediately project the outstanding mailbox sequence as pending before the
-  cleanup or retained loop resumes. Both tests use scripted control CQEs and
+  immediately project the outstanding mailbox sequence as pending at a newer
+  revision before the cleanup or retained loop resumes. Both tests use scripted
+  control CQEs and
   rejecting eventfd queue stand-ins, so they do not prove ublk-driver acceptance.
 
 - `ublk: control task releases its device owner before final destruction` —
@@ -1101,6 +1102,11 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   `/dev/ublk-control` or on kernels whose driver lacks the command (it
   landed in the 6.16 cycle).
 ### supervisor
+
+- `supervisor: projected startup release advances observation revision` —
+  pass a pre-admission snapshot through the real `Child` observer, accept the
+  matching mailbox request, then require its projected pending snapshot to
+  carry a newer revision and survive the same observer's stale-record guard.
 
 - `supervisor: protocol commands parse and reject garbage` — the
   control-protocol parser accepts the four commands and rejects
@@ -1646,7 +1652,8 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   Normal supervisor destroy must admit release sequence 1 while the checkpoint
   and source loan remain held. Releasing only the checkpoint injects a local
   `EIO` after successful END, preserving adoption. Repeated status/list observations
-  must retain that generation and protection while the source is still active;
+  must expose that generation as `releasing` with pending sequence 1 and the
+  original `EIO`, while retaining protection as long as the source is still active;
   no STOP/DEL, borrower owner-frame destruction, source destruction, queue
   owner exit or false ready handoff is allowed. After the source gate opens, the real
   delegate must return the full count with the expected byte checksum. Each

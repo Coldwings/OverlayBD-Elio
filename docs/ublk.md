@@ -576,7 +576,9 @@ Full lifecycle of one image as one ublk device. Non-copyable.
 - `explicit StartupControl(uint64_t generation)` — rejects zero; non-copyable.
 - `StartupSnapshot snapshot() const noexcept` — allocation-free coherent facts:
   phase/operation, identity/revision, original/cancel results and known flags,
-  control/raw debt, and release sequence/result. It transfers no ownership.
+  control/raw debt, and release sequence/result. An accepted mailbox request
+  projects an odd revision between the owner's even publications so protocol
+  consumers can accept the changed pending facts. It transfers no ownership.
 - `ReleaseRequestResult request_release(uint64_t generation, uint64_t sequence)
   noexcept` — one outstanding increasing sequence in `[1, 2^63)`; returns
   accepted, stale, busy or not_startup. Ready closure and acceptance use one

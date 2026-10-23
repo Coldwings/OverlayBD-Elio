@@ -46,6 +46,7 @@ TEST_CASE("ublk: startup release rejects foreign and invalid identities",
           "[ublk-unit][startup-control]") {
     REQUIRE_THROWS_AS(StartupControl(0), std::invalid_argument);
     StartupControl control(19);
+    const auto initial = control.snapshot();
     for (const auto sequence : {uint64_t{0}, uint64_t{1} << 63,
                                 std::numeric_limits<uint64_t>::max()}) {
         REQUIRE(control.request_release(19, sequence) ==
@@ -56,6 +57,12 @@ TEST_CASE("ublk: startup release rejects foreign and invalid identities",
     REQUIRE(Owner::pending(control) == 0);
     REQUIRE(control.request_release(19, 1) == ReleaseRequestResult::accepted);
     REQUIRE(Owner::pending(control) == 1);
+    const auto pending = control.snapshot();
+    REQUIRE(pending.version > initial.version);
+    REQUIRE(pending.version % 2 == 1);
+    REQUIRE(pending.phase == StartupPhase::releasing);
+    REQUIRE(pending.release_sequence == 1);
+    REQUIRE(pending.release == StartupRelease::pending);
 }
 
 TEST_CASE("ublk: ready handoff excludes a later startup release",

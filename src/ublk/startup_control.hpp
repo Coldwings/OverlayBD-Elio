@@ -94,8 +94,12 @@ public:
         // while the Device owner is suspended in caller cleanup. Project the
         // outstanding mailbox request at read time so status/list cannot deny
         // that accepted attempt merely because the owner has not resumed to
-        // persist the same facts yet. Only the Device owner writes fields_.
+        // persist the same facts yet. The odd revision is the admission event
+        // between two owner-published even revisions; without it the parent
+        // must reject changed facts at the same revision. Only the Device
+        // owner writes fields_.
         if ((request & closed_bit) == 0 && request != acknowledged) {
+            s.version = version + 1;
             s.phase = StartupPhase::releasing;
             s.release_sequence = request;
             s.release = StartupRelease::pending;
