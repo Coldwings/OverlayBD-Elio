@@ -1086,7 +1086,7 @@ elio::coro::task<void> LayerStore::run_fill() {
 
 // ---------------------------------------------------------------------------
 // Write-behind writer thread (blocking disk work lives here, never on an
-// Elio worker — same precedent as the ublk queue threads)
+// Elio worker)
 // ---------------------------------------------------------------------------
 
 void LayerStore::signal_fill_events_from_writer(bool completion) {

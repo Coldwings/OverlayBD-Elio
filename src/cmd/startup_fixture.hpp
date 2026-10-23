@@ -21,7 +21,6 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
-#include <thread>
 
 namespace obd::cmd {
 
@@ -105,13 +104,19 @@ public:
         record.committed.store(index + 1, std::memory_order_release);
     }
     void before_initial_submit(uint16_t queue) noexcept override {
-        if (!log_->recovery || log_->adopted_source || queue != 1) return;
+        (void)queue;
+    }
+    elio::coro::task<void> before_initial_submit_async(uint16_t queue) override {
+        if (!log_->recovery || log_->adopted_source || queue != 1) co_return;
         observe({.kind = ublk::detail::StartupTestKind::initial_gate_enter, .queue = queue});
-        // Deliberately blocks only this queue owner at its pre-existing test
-        // seam. Controller loss or a test timeout cannot fabricate issuance.
-        while (!log_->queue_one_open.load(std::memory_order_acquire))
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // Hold prepared FETCH debt without blocking its fixed Elio worker.
+        // Controller loss or a test timeout cannot fabricate issuance.
+        while (!log_->queue_one_open.load(std::memory_order_acquire)) {
+            try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+            catch (...) {} // Cancellation cannot bypass the issuance fence.
+        }
         observe({.kind = ublk::detail::StartupTestKind::initial_gate_leave, .queue = queue});
+        co_return;
     }
     void before_failure_report(uint64_t revision) {
         if (!log_->recovery || !log_->report_refusal || report_thrown_.exchange(true)) return;
@@ -173,7 +178,7 @@ public:
             .cookie = loan, .buffer = reinterpret_cast<uintptr_t>(buffer), .offset = offset, .length = count};
         fixture_.observe(event);
         // This destructor proves lexical loan-scope exit, not final coroutine
-        // frame destruction. The Device's native bridge destruction is separate.
+        // frame destruction. The Device's queue-owner destruction is separate.
         struct Scope {
             StartupFixture& fixture;
             ublk::detail::StartupTestEvent event;

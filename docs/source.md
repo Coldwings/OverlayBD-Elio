@@ -991,7 +991,7 @@ Callers may rely on:
   `CredentialStore` and the base64 helpers are synchronous and
   scheduler-free. LayerStore's blocking disk writes (and its completion
   read-back) run on its own dedicated plain `std::thread`, never on an Elio
-  worker — the same precedent as the ublk queue threads.
+  worker. This is an explicit blocking-work boundary.
 - **Concurrent reads** — concurrent `pread`s on one source are safe for
   every type in this module. `LocalFileSource` and `RegistrySource` are
   stateless per read; `RegistryClient`'s caches are mutex-guarded and its

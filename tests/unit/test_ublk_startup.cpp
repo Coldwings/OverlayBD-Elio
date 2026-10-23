@@ -6,6 +6,7 @@
 
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/runtime/scheduler.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <sys/eventfd.h>
@@ -76,6 +77,7 @@ struct SourceState {
     std::atomic<bool> entered{false}, pool_ran{false}, returned{false}, destroyed{false};
     std::atomic<unsigned> owners{0}, bridges{0}, closed{0}, controls{0};
     unsigned expected_queues = 1;
+    unsigned expected_bridges = 1;
     std::atomic<bool> destroyed_after_retirement{false};
 };
 class PoolSource final : public obd::source::BlobSource {
@@ -84,7 +86,7 @@ public:
     ~PoolSource() override {
         state_.destroyed_after_retirement.store(
             state_.owners.load() == state_.expected_queues &&
-            state_.bridges.load() == state_.expected_queues &&
+            state_.bridges.load() == state_.expected_bridges &&
             state_.closed.load() == state_.expected_queues && state_.controls.load() == 1);
         state_.destroyed.store(true);
     }
@@ -227,7 +229,10 @@ private:
     std::chrono::steady_clock::time_point admitted_at_;
 };
 
-enum class Scenario { setup_single, setup_pair, admission_gap, source_progress, deadline };
+enum class Scenario {
+    setup_single, setup_pair, admission_gap, source_progress, deadline,
+    owner_reject,
+};
 class Hooks final : public detail::StartupTestHooks {
 public:
     explicit Hooks(Scenario which) : scenario(which) {}
@@ -240,6 +245,9 @@ public:
     std::atomic<bool> native_setup{true}, native_admission{true}, overflow{false};
 
     detail::CtrlTransport* control_transport() noexcept override { return &script; }
+    bool legacy_thread_topology() const noexcept override {
+        return scenario != Scenario::owner_reject;
+    }
     bool open_queue(Queue& queue, int shared) override {
         StartupCoordinatorTestAccess::open(queue, shared);
         queues.at(queue.q_id()) = &queue;
@@ -254,6 +262,11 @@ public:
             }
             paused_setup.wait();
         }
+    }
+    void before_owner_spawn(uint16_t queue) override {
+        if (scenario == Scenario::owner_reject && queue == 1)
+            elio::runtime::detail::fail_next_join_state_allocation_for_test.store(
+                true, std::memory_order_release);
     }
     void before_start_admission() override {
         if (elio::runtime::worker_thread::current()) native_admission.store(false);
@@ -302,6 +315,7 @@ void run_scenario(bool recovery, Scenario scenario) {
     SourceState source_state;
     hooks.source_state = &source_state;
     source_state.expected_queues = scenario == Scenario::setup_pair ? 2 : 1;
+    source_state.expected_bridges = source_state.expected_queues;
     hooks.script.source = &source_state;
     hooks.script.source_required.store(scenario == Scenario::source_progress);
     Outcome outcome;
@@ -583,6 +597,79 @@ void run_scenario(bool recovery, Scenario scenario) {
         CHECK(startup.snapshot().release == StartupRelease::released);
     }
 }
+
+void run_owner_rejection_scenario() {
+    Hooks hooks(Scenario::owner_reject);
+    StartupControl startup(136);
+    startup.set_test_hooks(&hooks);
+    SourceState source_state;
+    source_state.expected_queues = 2;
+    // Queue 1 fails before a coroutine frame is admitted, so only queue 0 has
+    // a join handle whose destruction can be observed.
+    source_state.expected_bridges = 1;
+    hooks.source_state = &source_state;
+    hooks.script.source = &source_state;
+    Outcome outcome;
+
+    elio::runtime::detail::fail_next_join_state_allocation_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::run_config config;
+    config.num_threads = 2;
+    config.blocking_threads = 1;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto source = std::make_unique<PoolSource>(source_state);
+        DeviceParams params;
+        params.nr_queues = 2;
+        params.queue_depth = 2;
+        params.max_io_buf_bytes = 4096;
+        params.dev_sectors = 128;
+        try {
+            auto device = co_await Device::create(
+                params, std::move(source), startup);
+            outcome.ready = true;
+            co_await device->stop_async();
+        } catch (const std::system_error& error) {
+            outcome.error = error.code().value();
+        } catch (const std::bad_alloc&) {
+            outcome.error = ENOMEM;
+        } catch (...) {
+            outcome.error = -1;
+        }
+        outcome.returned = true;
+    }, config);
+    elio::runtime::detail::fail_next_join_state_allocation_for_test.store(
+        false, std::memory_order_release);
+
+    CHECK(outcome.returned);
+    CHECK_FALSE(outcome.ready);
+    CHECK(outcome.error == ENOMEM);
+    CHECK_FALSE(hooks.overflow.load());
+    CHECK_FALSE(elio::runtime::detail::fail_next_join_state_allocation_for_test.load());
+    CHECK(source_state.destroyed.load());
+    CHECK(source_state.destroyed_after_retirement.load());
+    CHECK(hooks.count(Kind::sources_drained) == 2);
+    CHECK(hooks.count(Kind::owner_exit) == 2);
+    CHECK(hooks.count(Kind::bridge_destroyed) == 1);
+    CHECK(hooks.count(Kind::cdev_closed) == 2);
+    CHECK(hooks.count(Kind::control_destroyed) == 1);
+    CHECK(hooks.count(Kind::initial_issued) == 0);
+    CHECK(hooks.count(Kind::adopted) == 0);
+    CHECK(hooks.script.starts.load() == 0);
+    CHECK(hooks.script.stops.load() == 1);
+    CHECK(hooks.script.deletes.load() == 1);
+    CHECK(startup.snapshot().kernel_debt_known);
+    CHECK(startup.snapshot().raw_published == 0);
+    CHECK(startup.snapshot().raw_retired == 0);
+
+    unsigned admitted = 0, absent = 0;
+    for (const auto& event : hooks.events()) {
+        if (event.kind != Kind::owner_exit) continue;
+        if (event.value == 1) ++admitted;
+        if (event.value == 0) ++absent;
+    }
+    CHECK(admitted == 1);
+    CHECK(absent == 1);
+}
 }
 
 TEST_CASE("ublk: public create catches single queue setup failure", "[ublk][startup-coordinator]") {
@@ -608,4 +695,8 @@ TEST_CASE("ublk: public START cancellation leaves sole source blocking worker fr
 }
 TEST_CASE("ublk: public START deadline retains original after cancellation CQE", "[ublk][startup-coordinator]") {
     run_scenario(false, Scenario::deadline);
+}
+TEST_CASE("ublk: failed second fixed owner allocation seals its ownerless queue",
+          "[ublk][startup-coordinator][owner-pump]") {
+    run_owner_rejection_scenario();
 }

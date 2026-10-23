@@ -46,6 +46,10 @@ public:
     virtual ~StartupTestHooks() = default;
     virtual void observe(StartupTestEvent event) noexcept = 0;
     virtual void before_initial_submit(uint16_t queue) noexcept = 0;
+    virtual elio::coro::task<void> before_initial_submit_async(uint16_t queue) {
+        before_initial_submit(queue);
+        co_return;
+    }
     virtual elio::coro::task<void> after_start_control() { co_return; }
     virtual void before_release_attempt(uint64_t) {}
     // Ordinary coordinator fixtures borrow dependencies through the same
@@ -53,9 +57,16 @@ public:
     // adapters supply descriptors/buffers only, never lifecycle facts.
     virtual CtrlTransport* control_transport() noexcept { return nullptr; }
     virtual bool open_queue(Queue&, int) { return false; }
+    // Retains the pre-ADR-0023 native-thread topology only for deterministic
+    // coordinator fixtures whose synchronous gates deliberately block an
+    // owner. Production and real-kernel fixtures always return false.
+    virtual bool legacy_thread_topology() const noexcept { return false; }
     // Native queue/control threads only; throwing setup failures are caught
     // by Queue::run before it can prepare any FETCH.
     virtual void before_queue_setup(Queue&) {}
+    // Runs immediately before constructing each fixed-owner join handle.
+    // Tests may ask Elio to reject that one scheduler admission.
+    virtual void before_owner_spawn(uint16_t) {}
     virtual void before_start_admission() {}
     virtual std::chrono::steady_clock::time_point startup_now() noexcept {
         return std::chrono::steady_clock::now();

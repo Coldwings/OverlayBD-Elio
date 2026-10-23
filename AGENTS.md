@@ -22,8 +22,9 @@ A read-first block-device stack for OverlayBD-format container images:
 - **image** — assembly: an OverlayBD-compatible `config.json` becomes a
   merged read-only block source.
 - **ublk** — the data plane: per-queue io_uring rings speaking
-  `UBLK_IO_FETCH_REQ` / `UBLK_IO_COMMIT_AND_FETCH_REQ` uring-cmds, bridged to
-  the Elio scheduler that runs the image stack.
+  `UBLK_IO_FETCH_REQ` / `UBLK_IO_COMMIT_AND_FETCH_REQ` uring-cmds. One fixed
+  Elio worker owns each ring, its bounded command pump, and its reusable tag
+  handlers while the image stack runs in the same scheduler domain.
 - **supervisor** — the process model: one daemon supervises one isolated
   child process per block device; a device crash never takes down its
   siblings.
@@ -39,7 +40,7 @@ src/common/       shared utilities: errors, logging glue, digest, byte ranges
 src/format/       OverlayBD on-disk formats: zfile, lsmt, layer merge (+ fixture writers)
 src/source/       blob sources: local, registry, layer store with background fill, dart proxy
 src/image/        image assembly from overlaybd-compatible config.json
-src/ublk/         ublk control + per-queue data plane + Elio bridge
+src/ublk/         ublk control + fixed-worker per-queue data plane
 src/supervisor/   daemon, child-process lifecycle, control-socket protocol
 src/cmd/          binary entry points (obd-supervisor, obd-device)
 tools/            obdctl, obd-mkimage, obd-convert
@@ -139,9 +140,10 @@ Every module above is implemented with tests and a `docs/<module>.md`.
 - C++20, exceptions for error paths on setup/cold routes, `task<T>` +
   result values on hot IO routes; never block a coroutine on a synchronous
   syscall — use the Elio IO backend.
-- The ublk per-queue rings are owned exclusively by their queue thread; the
-  Elio scheduler never submits to them (see ADR-0006). Cross-boundary
-  handoffs go through the documented bridge interfaces only.
+- Each ublk per-queue ring is owned exclusively by one fixed Elio worker (see
+  ADR-0023). Only coroutines restored to that worker may touch raw ring state
+  or submit commands; source awaits may migrate, but completion must restore
+  the owner first.
 - No hidden global mutable state; singletons are explicit and constructed in
   `main` only.
 - Comments and identifiers in code: English.

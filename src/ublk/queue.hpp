@@ -1,19 +1,16 @@
-// ublk per-queue data plane (ADR-0006).
+// ublk per-queue data plane (ADR-0023).
 //
 // Each Queue owns one /dev/ublkc<N> queue: the kernel-shared command buffer
 // (mmap, read-only to us), one raw liburing io_uring ring, and the per-tag
-// IO buffers. The ring is owned EXCLUSIVELY by the queue thread: only it
-// submits FETCH/COMMIT uring-cmds (the kernel pins io->task at FETCH and
-// requires COMMIT from the same task).
+// IO buffers. The ring is owned EXCLUSIVELY by one fixed Elio worker: only
+// coroutines running on that worker submit FETCH/COMMIT uring-cmds (the
+// kernel pins io->task at FETCH and requires COMMIT from the same task).
 //
-// Cross-thread protocol:
-//
-//   queue thread --(pending_ + elio_efd)--> Elio bridge coroutines
-//   Elio workers --(done_ + done_efd)-----> queue thread
-//
-// The queue thread additionally parks a POLL_ADD on done_efd in its ring,
-// so Elio-side completions wake its io_uring wait without a separate poll
-// thread.
+// The raw ring registers elio_efd with io_uring. The owner's Elio-native ring
+// waits on that eventfd while the raw ring is idle. Normal tag completion stays
+// on the owner worker and submits COMMIT_AND_FETCH directly, so it does not
+// cross a thread or write an eventfd. Stop/failure and exceptional foreign
+// handler retirement write elio_efd to wake the pump.
 #pragma once
 
 #include "ublk/startup_test_hooks.hpp"
@@ -23,9 +20,12 @@
 #include <liburing.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <sys/types.h>
+#include <thread>
 #include <vector>
 #ifdef OBD_TEST_HOOKS
 #include <elio/coro/task.hpp>
@@ -34,6 +34,112 @@ namespace elio::sync { class event; }
 #endif
 
 namespace obd::ublk {
+
+namespace detail {
+
+struct SubmissionDrain {
+    unsigned remaining = 0;
+    int last = 0;
+    int error = 0;
+};
+
+/// Drain `expected` SQEs after liburing has flushed them to the shared SQ.
+/// `submit` is called exactly once for a fresh batch; all remaining progress,
+/// including an initial EINTR or partial return, uses direct ring entry so it
+/// cannot be lost when liburing's private sqe_head has already advanced.
+template<class Submit, class Enter>
+SubmissionDrain drain_submissions(unsigned expected, bool fresh,
+                                  Submit&& submit, Enter&& enter) {
+    SubmissionDrain result{.remaining = expected};
+    bool first = fresh;
+    while (result.remaining != 0) {
+        const int rc = first ? submit() : enter(result.remaining);
+        first = false;
+        if (rc == -EINTR) continue;
+        if (rc < 0) {
+            result.error = -rc;
+            return result;
+        }
+        if (rc == 0) {
+            result.error = EIO;
+            return result;
+        }
+        if (static_cast<unsigned>(rc) > result.remaining) {
+            result.error = EPROTO;
+            return result;
+        }
+        result.last = rc;
+        result.remaining -= static_cast<unsigned>(rc);
+    }
+    return result;
+}
+
+struct CqDrain {
+    unsigned consumed = 0;
+    bool more = false;
+};
+
+struct OwnerCqTurn {
+    unsigned consumed = 0;
+    unsigned enters = 0;
+    unsigned hints = 0;
+    bool immediate = false;
+    int error = 0;
+};
+
+/// Execute one bounded raw-CQ turn. A registered eventfd notification can be
+/// either the pre-CQE DEFER_TASKRUN hint or the later CQ-tail notification.
+/// Every consumed hint is therefore followed by another GETEVENTS entry and
+/// CQ drain before this function may return. The hint budget prevents a noisy
+/// eventfd from monopolising the fixed worker.
+template<class Enter, class Drain, class ReadHint>
+OwnerCqTurn drain_owner_cq_turn(unsigned budget, Enter&& enter,
+                                Drain&& drain, ReadHint&& read_hint) {
+    OwnerCqTurn result;
+    if (budget == 0) {
+        result.immediate = true;
+        return result;
+    }
+
+    for (;;) {
+        int entered;
+        do { entered = enter(); } while (entered == -EINTR);
+        ++result.enters;
+        if (entered < 0) {
+            result.error = -entered;
+            return result;
+        }
+
+        const auto batch = drain(budget - result.consumed);
+        if (batch.consumed > budget - result.consumed) {
+            result.error = EPROTO;
+            return result;
+        }
+        result.consumed += batch.consumed;
+        if (batch.more || result.consumed == budget) {
+            result.immediate = true;
+            return result;
+        }
+
+        // This point is reached only after satisfying the entry owed by the
+        // previously consumed hint. Do not consume another hint once its
+        // matching entry would exceed this turn's bound.
+        if (result.hints == budget) {
+            result.immediate = true;
+            return result;
+        }
+        int hinted;
+        do { hinted = read_hint(); } while (hinted == -EINTR);
+        if (hinted < 0) {
+            result.error = -hinted;
+            return result;
+        }
+        if (hinted == 0) return result;
+        ++result.hints;
+    }
+}
+
+}  // namespace detail
 
 /// One IO command extracted from the kernel-shared ublksrv_io_desc.
 struct IoRequest {
@@ -75,7 +181,8 @@ public:
     /// a Device share one open file description (the driver permits only
     /// one open). Mmaps this queue's command buffer and allocates its
     /// buffers. Throws obd::error on failure. The ring is NOT created here:
-    /// see run().
+    /// production creates it in init_owner_pump(); deterministic legacy tests
+    /// create it in run().
     void open(int shared_cdev_fd = -1);
 
     uint16_t q_id() const noexcept { return q_id_; }
@@ -86,7 +193,62 @@ public:
     /// in/out of it). Written by Elio workers for reads.
     void* io_buf(uint16_t tag) noexcept;
 
-    // --- Elio side (any worker thread) -------------------------------------
+    // --- Same-worker owner pump (ADR-0023) ---------------------------------
+
+    /// Creates and eventfd-registers the raw ring on the current Elio worker.
+    /// No ublk command has been prepared when this returns.
+    void init_owner_pump(size_t owner_worker);
+    /// Claims the scheduler-admitted owner before its first suspension.
+    /// False means launch failure already sealed this queue as ownerless.
+    bool begin_owner() noexcept;
+    /// Seals a queue whose joinable task was never admitted. No ring command
+    /// exists, so source drain and raw retirement are immediately complete.
+    bool abort_unstarted_owner(int error) noexcept;
+    bool owner_started() const noexcept {
+        return owner_admission_.load(std::memory_order_acquire) == 1;
+    }
+    int owner_eventfd() const noexcept { return elio_efd_; }
+    bool publication_ready() const noexcept {
+        return publication_gate_.load(std::memory_order_acquire) == 1;
+    }
+    bool publication_aborted() const noexcept {
+        return publication_gate_.load(std::memory_order_acquire) == 2;
+    }
+    /// Separates preparation from synchronous submission so an opt-in
+    /// integration fixture can hold the exact issuance boundary without
+    /// blocking the fixed worker. Once prepared, the owner must eventually
+    /// call submit_owner_fetches even if that fixture wait fails.
+    void prepare_owner_fetches();
+    void submit_owner_fetches();
+#ifdef OBD_TEST_HOOKS
+    elio::coro::task<void> await_initial_submit_for_test();
+#endif
+
+    /// Consume at most `budget` raw CQEs and queue delivered requests in the
+    /// preallocated owner-local request ring. True means CQ work remains.
+    bool drive_owner_cq(unsigned budget);
+
+    /// Called by TagEngine only after it restored the owner worker. Validates
+    /// the tag obligation, prepares COMMIT_AND_FETCH, and submits it from the
+    /// same task identity that issued FETCH.
+    void complete_on_owner(uint16_t tag, int32_t result);
+
+    /// Reject delivered-but-unadmitted work and drive reply/raw retirement.
+    void maintain_owner();
+    bool owner_may_exit() const noexcept {
+        return exit_requested_.load(std::memory_order_acquire) &&
+               kernel_retired();
+    }
+    void finish_owner() noexcept;
+    bool source_handlers_drained() const noexcept {
+        return sources_drained_.load(std::memory_order_acquire);
+    }
+    void mark_source_handlers_drained() noexcept {
+        sources_drained_.store(true, std::memory_order_release);
+        wakeup();
+    }
+
+    // --- Legacy test bridge boundary --------------------------------------
 
     int elio_efd() const noexcept { return elio_efd_; }
 
@@ -114,10 +276,12 @@ public:
     void publish_initial_fetches() noexcept {
         publication_gate_.store(1);
         publication_gate_.notify_all();
+        wakeup();
     }
     void abort_setup() noexcept {
         publication_gate_.store(2);
         publication_gate_.notify_all();
+        wakeup();
     }
     void request_release() noexcept {
         releasing_.store(true);
@@ -141,8 +305,7 @@ public:
     }
     Retirement retirement() const noexcept;
     void sources_drained() noexcept {
-        sources_drained_.store(true);
-        wakeup();
+        mark_source_handlers_drained();
     }
     /// Only after owner-thread join and positive command retirement. Close
     /// the ring/mapping/cdev before DEL, retaining diagnostic queues/buffers.
@@ -188,10 +351,14 @@ private:
 #ifdef OBD_TEST_HOOKS
     friend struct StartupCoordinatorTestAccess;
 #endif
-    /// Creates the queue io_uring. Must be called on the queue thread
-    /// (SINGLE_ISSUER binds the creator; DEFER_TASKRUN binds the
-    /// waiter). Throws obd::error on failure.
+    /// Creates the queue io_uring. Must be called on its final owner task;
+    /// SINGLE_ISSUER binds the creator and DEFER_TASKRUN binds local-work
+    /// execution to explicit GETEVENTS by that task.
     void init_ring();
+    void register_owner_eventfd();
+    void assert_owner() const;
+    pid_t capture_owner_tid() noexcept;
+    void submit_owner();
     void prep_io_cmd(uint32_t cmd_op, uint16_t tag, int32_t result);
     void arm_done_poll();
     void drain_done();
@@ -211,9 +378,20 @@ private:
         int32_t reply = 0;
     };
     std::vector<RawSlot> raw_;
+    std::vector<io_uring_cqe*> owner_cqes_;
+    std::vector<IoRequest> owner_pending_;
+    uint16_t owner_pending_head_ = 0;
+    uint16_t owner_pending_tail_ = 0;
+    uint16_t owner_pending_count_ = 0;
+    size_t owner_worker_ = static_cast<size_t>(-1);
+    pid_t owner_tid_ = -1;
+    std::thread::id owner_thread_id_{};
+    bool same_owner_pump_ = false;
     uint64_t next_cookie_ = 1;
     uint64_t raw_published_ = 0;
     uint64_t raw_retired_ = 0;
+    unsigned owner_submit_remaining_ = 0;
+    bool owner_initial_preparing_ = false;
     uint64_t poll_cookie_ = 0;
     bool debt_known_ = true;
 
@@ -229,7 +407,7 @@ private:
     uint64_t cmd_buf_len_ = 0;
     uint8_t* io_bufs_ = nullptr;
 
-    int elio_efd_ = -1;  // queue thread → Elio: new pending requests
+    int elio_efd_ = -1;  // raw CQ plus stop/failure wake for owner pump
     int done_efd_ = -1;  // Elio → queue thread: completions ready
     bool poll_armed_ = false;
     std::atomic<uint8_t> publication_gate_{0};
@@ -239,6 +417,12 @@ private:
     std::atomic<bool> kernel_stopped_{false};
     std::atomic<bool> exit_requested_{false};
     std::atomic<bool> owner_exited_{false};
+    // Published by the fixed owner while coordinator/control paths may
+    // concurrently choose which eventfd wakes this queue. Keep the owner-local
+    // topology flag above off the hot-path atomic surface.
+    std::atomic<bool> owner_wakeup_on_elio_{false};
+    // 0 = unclaimed, 1 = owner body began, 2 = launch rejected/absent.
+    std::atomic<uint8_t> owner_admission_{0};
     std::atomic<bool> initial_fetches_issued_{false};
     std::atomic<bool> sources_drained_{false};
     // Updated only at setup/maintenance/exit, never per successful hot IO.
@@ -262,6 +446,7 @@ private:
     std::function<elio::coro::task<void>(BridgeResumePoint)> bridge_resume_hook_for_test_;
     std::function<void(BridgeResumePoint)> bridge_resume_observer_for_test_;
     elio::sync::event* bridge_ready_for_test_ = nullptr;
+    unsigned owner_tid_syscalls_for_test_ = 0;
 #endif
 
     std::atomic<bool> failed_{false};

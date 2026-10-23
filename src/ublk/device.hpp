@@ -1,10 +1,10 @@
 // UblkDevice: full device lifecycle for one OverlayBD image — control
-// plane (ADD_DEV/SET_PARAMS/START_DEV), per-queue data-plane threads, and
-// the Elio bridge coroutines serving IO from the merged block source.
+// plane (ADD_DEV/SET_PARAMS/START_DEV), and fixed-worker per-queue owner
+// coroutines serving raw ublk commands and merged-source IO.
 //
-// Threading model (ADR-0004/0006): the device lives inside one obd-device
-// process; queue threads own their rings; the Elio scheduler serves the
-// image stack. Teardown stops kernel IO, proves raw/native retirement,
+// Threading model (ADR-0004/0023): the device lives inside one obd-device
+// process; one fixed Elio worker owns each queue ring and its reusable tag
+// handlers. Teardown stops source admission, proves raw/native retirement,
 // closes queue cdevs, and then deletes the device.
 #pragma once
 
@@ -32,10 +32,10 @@ public:
     using FailureCleanup = std::function<elio::coro::task<void>()>;
 
     /// Creates and starts the device over `src` (the merged block view):
-    /// opens queues, launches queue threads (which park their FETCH
-    /// commands), issues SET_PARAMS, spawns the bridge coroutines, then
-    /// START_DEV (retrying EBUSY until every queue is parked). Must be
-    /// awaited on the Elio scheduler (bridges are independent joinable tasks).
+    /// opens queues, launches fixed-worker owners (which park their FETCH
+    /// commands), issues SET_PARAMS, then START_DEV (retrying EBUSY until
+    /// every queue is parked). Must be awaited on the Elio scheduler; owners
+    /// are independent joinable tasks retained through raw retirement.
     /// Throws obd::error on failure.
     static elio::coro::task<std::unique_ptr<Device>> create(
         const DeviceParams& params, source::BlobSourcePtr src,
@@ -47,7 +47,7 @@ public:
     /// ADR-0010: attaches to an EXISTING device created with
     /// UBLK_F_USER_RECOVERY after the previous server process died.
     /// Sequence: START_USER_RECOVERY (retrying EBUSY for up to 30s) → open
-    /// queues → queue threads re-park FETCH for every tag →
+    /// queues → fixed workers re-park FETCH for every tag →
     /// END_USER_RECOVERY (retrying EBUSY). The replacement must not open a
     /// queue cdev before START succeeds. The params' queue geometry must
     /// match the original device's. Must be
@@ -100,13 +100,13 @@ public:
     /// EOPNOTSUPP/95 on 6.15+)).
     uint64_t resize_blocking(uint64_t bytes);
 
-    /// Blocking drain and queue-thread join. Call off an Elio worker,
+    /// Blocking source/owner drain. Call off an Elio worker,
     /// with scheduler and any source blocking executor able to progress.
-    /// No resource is released while a bridge/handler still uses it.
+    /// No resource is released while an owner/handler still uses it.
     void stop() noexcept;
 
     /// Scheduler-side drain: leaves both workers and the blocking pool free
-    /// while source IO completes, then joins queue threads off-worker.
+    /// while source IO completes, then retires raw owners via cold control work.
     /// The caller must retain this Device until the await completes.
     elio::coro::task<void> stop_async();
     /// Read only after awaited stop_async (or blocking stop) has completed.
@@ -165,8 +165,11 @@ private:
     std::atomic<uint64_t> cur_bytes_{0};
 
     std::atomic<bool> stop_{false};
-    // One native handle per finite queue. Each bridge owns its tag handlers
-    // with TaskGroup and cannot return before they release their captures.
+    // One fixed-worker owner per production queue. It remains alive after
+    // handler/source drain until STOP and every raw command have retired.
+    std::vector<elio::coro::join_handle<void>> owner_tasks_;
+    // Legacy bridge/thread owners remain only for deterministic test fixtures
+    // whose synchronous gates model the older topology.
     std::vector<elio::coro::join_handle<void>> bridge_tasks_;
     std::mutex bridge_result_mu_;
     bool bridge_results_reported_ = false;

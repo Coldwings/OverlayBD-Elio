@@ -21,9 +21,9 @@ lower or a registry.
 
 All IO on request paths runs as Elio coroutines against the Elio IO
 backend (ADR-0002). No coroutine ever blocks on a synchronous syscall;
-synchronous syscalls are confined to setup/cold paths. The ublk queue
-threads are the single documented exception: they are plain threads that
-own their rings and hand work to the scheduler (A7).
+synchronous syscalls are confined to setup/cold paths. The raw ublk command
+pump uses nonblocking owner-task ring entry and parks through Elio native I/O
+(A7).
 
 ## A3. Sector alignment
 
@@ -62,12 +62,15 @@ pre-END recovery retains the old device and its required process/resources;
 explicit destroy must prove retirement before removal. Shutdown preserves
 operational list/status/destroy service while such owners remain.
 
-## A7. Ring ownership and the bridge
+## A7. Fixed-worker ublk ring ownership
 
-Each ublk per-queue ring is owned exclusively by its queue thread; the
-Elio scheduler never submits to a queue ring (ADR-0006). Requests cross
-into the scheduler through the eventfd bridge; completions cross back
-through the per-queue completion queue.
+Each ublk per-queue ring, bounded command pump, and reusable tag-handler set
+is owned by one fixed Elio worker (ADR-0023). Only that Linux task submits
+FETCH or COMMIT_AND_FETCH. Source continuations may migrate while suspended,
+but must restore the owner before touching queue-local state. Raw CQ progress
+wakes an Elio-native wait through a registered eventfd; normal request and
+completion flow has no cross-thread bridge. The owner survives source drain
+and STOP until every raw command is positively retired.
 
 ## A8. Writable uppers are optional and copy-on-write
 

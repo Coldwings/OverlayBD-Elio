@@ -7,6 +7,7 @@
 #include "ublk/control_task.hpp"
 
 #include <elio/log/macros.hpp>
+#include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/time/timer.hpp>
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <exception>
 #include <thread>
+#include <type_traits>
 
 namespace obd::ublk {
 
@@ -109,7 +111,9 @@ bool Device::try_publish_ready() {
     refresh_startup();
     for (size_t i = 0; i < queues_.size(); ++i) {
         const auto& q = queues_[i];
-        if (q->failed() || bridge_tasks_[i].is_ready())
+        const bool owner_ready = !owner_tasks_.empty()
+            ? owner_tasks_[i].is_ready() : bridge_tasks_[i].is_ready();
+        if (q->failed() || owner_ready)
             throw error(q->failure() ? q->failure() : EIO,
                         "ublk owner failed during startup control");
     }
@@ -190,19 +194,65 @@ void Device::observe_control(void* opaque, const CtrlProgress& progress) noexcep
 
 elio::coro::task<void> Device::prepare_owners() {
     open_queues();
-    threads_.reserve(queues_.size());
-    bridge_tasks_.reserve(queues_.size());
-    for (auto& queue : queues_) {
-        Queue* q = queue.get();
-        threads_.emplace_back([this, q]() noexcept {
-            try { q->run(stop_); }
-            catch (...) { q->fail(EIO); }
+    bool legacy_threads = false;
 #ifdef OBD_TEST_HOOKS
-            if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::owner_exit,
-                .queue = q->q_id(), .result = q->failure(), .value = q->owner_exited() ? 1U : 0U});
+    legacy_threads = test_hooks_ && test_hooks_->legacy_thread_topology();
 #endif
-        });
-        bridge_tasks_.push_back(elio::spawn(run_bridge, q, src_.get(), &stop_));
+    if (legacy_threads) {
+        threads_.reserve(queues_.size());
+        bridge_tasks_.reserve(queues_.size());
+        for (auto& queue : queues_) {
+            Queue* q = queue.get();
+            threads_.emplace_back([this, q]() noexcept {
+                try { q->run(stop_); }
+                catch (...) { q->fail(EIO); }
+#ifdef OBD_TEST_HOOKS
+                if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::owner_exit,
+                    .queue = q->q_id(), .result = q->failure(), .value = q->owner_exited() ? 1U : 0U});
+#endif
+            });
+            bridge_tasks_.push_back(elio::spawn(
+                run_bridge, q, src_.get(), &stop_));
+        }
+    } else {
+        auto abort_unstarted_from = [&](size_t first, int reason) noexcept {
+            for (size_t index = first; index < queues_.size(); ++index)
+                (void)queues_[index]->abort_unstarted_owner(reason);
+        };
+        auto* scheduler = elio::runtime::scheduler::current();
+        if (!scheduler || scheduler->num_threads(std::memory_order_acquire) == 0) {
+            abort_unstarted_from(0, EINVAL);
+            throw error(EINVAL, "ublk owner requires a running Elio scheduler");
+        }
+        const size_t workers = scheduler->num_threads(std::memory_order_acquire);
+        static_assert(std::is_nothrow_move_constructible_v<
+                      elio::coro::join_handle<void>>);
+        try {
+            owner_tasks_.reserve(queues_.size());
+        } catch (...) {
+            abort_unstarted_from(0, exception_errno(std::current_exception()));
+            throw;
+        }
+        for (size_t index = 0; index < queues_.size(); ++index) {
+            Queue* q = queues_[index].get();
+            try {
+#ifdef OBD_TEST_HOOKS
+                if (test_hooks_) test_hooks_->before_owner_spawn(q->q_id());
+#endif
+                const size_t owner = q->q_id() % workers;
+                owner_tasks_.push_back(scheduler->go_joinable_to(
+                    owner, run_owner_pump, q, src_.get(), &stop_));
+            } catch (...) {
+                abort_unstarted_from(index,
+                    exception_errno(std::current_exception()));
+                throw;
+            }
+            // Elio represents scheduler rejection as a ready exceptional join
+            // handle. If the body never won begin_owner(), explicitly seal the
+            // queue: it owns no SQE, source frame, or raw-ring debt.
+            if (owner_tasks_.back().is_ready() && !q->owner_started())
+                (void)q->abort_unstarted_owner(EIO);
+        }
     }
     for (;;) {
         if (startup_->release_request())
@@ -210,7 +260,11 @@ elio::coro::task<void> Device::prepare_owners() {
         bool ready = true;
         for (size_t i = 0; i < queues_.size(); ++i) {
             const auto& q = queues_[i];
-            if (q->failed() || bridge_tasks_[i].is_ready())
+            const bool owner_ready = !owner_tasks_.empty()
+                ? owner_tasks_[i].is_ready() : bridge_tasks_[i].is_ready();
+            if (!owner_tasks_.empty() && owner_ready && !q->owner_started())
+                (void)q->abort_unstarted_owner(EIO);
+            if (q->failed() || owner_ready)
                 throw error(q->failure() ? q->failure() : EIO,
                             "ublk owner failed before FETCH publication");
             ready &= q->setup_ready() && q->bridge_ready();
@@ -468,6 +522,18 @@ void Device::collect_bridge_results() noexcept {
     std::lock_guard lock(bridge_result_mu_);
     if (bridge_results_reported_) return;
     bridge_results_reported_ = true;
+    for (size_t index = 0; index < owner_tasks_.size(); ++index) {
+        auto& owner = owner_tasks_[index];
+#ifdef OBD_TEST_HOOKS
+        if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::bridge_destroyed,
+            .queue = static_cast<uint32_t>(index)});
+#endif
+        try { owner.await_resume(); }
+        catch (...) {
+            try { ELIO_LOG_ERROR("ublk owner failed while draining"); }
+            catch (...) {}
+        }
+    }
     for (auto& bridge : bridge_tasks_) {
         try { bridge.await_resume(); }
         catch (...) {
@@ -480,6 +546,24 @@ void Device::collect_bridge_results() noexcept {
 
 elio::coro::task<void> Device::drain_sources() {
     request_stop();
+    if (!owner_tasks_.empty()) {
+        for (;;) {
+            bool drained = true;
+            for (const auto& queue : queues_)
+                drained &= queue->source_handlers_drained();
+            if (drained) break;
+            try { co_await elio::time::sleep_for(std::chrono::milliseconds(1)); }
+            catch (...) {}
+        }
+#ifdef OBD_TEST_HOOKS
+        if (test_hooks_) {
+            for (const auto& queue : queues_)
+                test_hooks_->observe({.kind = detail::StartupTestKind::sources_drained,
+                    .queue = queue->q_id()});
+        }
+#endif
+        co_return;
+    }
     for (size_t index = 0; index < bridge_tasks_.size(); ++index) {
         auto& bridge = bridge_tasks_[index];
         while (!bridge.is_destroyed()) {
@@ -526,6 +610,8 @@ bool Device::release_once() noexcept {
     // This routine runs off-worker, after every accepted source frame has
     // retired. Queue owners remain runnable to COMMIT delivered requests and
     // collect original FETCH completions while STOP is in progress.
+    const size_t raw_owners = !owner_tasks_.empty()
+        ? owner_tasks_.size() : threads_.size();
     for (auto& q : queues_) {
         if (ctrl_) q->request_release();
         if (!publication_released_) q->abort_setup();
@@ -535,8 +621,8 @@ bool Device::release_once() noexcept {
     // before that cancellation pass; otherwise FETCH can park after STOP.
     // Source drain is a different fence and does not establish this ordering.
     if (publication_released_) {
-        for (size_t i = 0; i < threads_.size(); ++i) {
-            const auto& q = queues_[i];
+        for (size_t index = 0; index < raw_owners; ++index) {
+            const auto& q = queues_[index];
             if (!q->owner_exited() && !q->initial_fetches_issued()) {
                 release_error_ = EAGAIN;
                 return false;
@@ -555,9 +641,9 @@ bool Device::release_once() noexcept {
     }
     for (auto& q : queues_) q->request_owner_exit();
     // An initial snapshot can precede actual FETCH preparation. Require the
-    // owner thread's exit assertion as well, then re-read its final ledger.
-    for (size_t i = 0; i < threads_.size(); ++i) {
-        if (!queues_[i]->owner_exited()) {
+    // raw owner's exit assertion as well, then re-read its final ledger.
+    for (size_t index = 0; index < raw_owners; ++index) {
+        if (!queues_[index]->owner_exited()) {
             release_error_ = EAGAIN;
             return false;
         }
@@ -570,6 +656,13 @@ bool Device::release_once() noexcept {
     }
     for (auto& thread : threads_) if (thread.joinable()) thread.join();
     threads_.clear();
+    for (const auto& owner : owner_tasks_) {
+        if (!owner.is_destroyed()) {
+            release_error_ = EAGAIN;
+            return false;
+        }
+    }
+    collect_bridge_results();
     for (auto& q : queues_) q->close_retired();
     // No cdev descriptor remains. A terminal ambiguous DEL result is retained
     // in Ctrl and cannot cause another deletion of the same numeric ID.
@@ -601,9 +694,19 @@ elio::coro::task<void> Device::stop_async() {
 void Device::stop() noexcept {
     request_stop();
     // Blocking callers must leave source executors and the scheduler alive.
-    for (auto& bridge : bridge_tasks_) bridge.wait_destroyed();
-    collect_bridge_results();
-    for (auto& q : queues_) q->sources_drained();
+    if (!owner_tasks_.empty()) {
+        for (;;) {
+            bool drained = true;
+            for (const auto& queue : queues_)
+                drained &= queue->source_handlers_drained();
+            if (drained) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    } else {
+        for (auto& bridge : bridge_tasks_) bridge.wait_destroyed();
+        collect_bridge_results();
+        for (auto& q : queues_) q->sources_drained();
+    }
     while (!release_once())
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }

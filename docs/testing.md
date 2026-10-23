@@ -1024,9 +1024,10 @@ Every test, grouped by area, with the property it guards.
   production cancellation observer saves `ETIMEDOUT`, without releasing the
   pending original or any owner merely because cancellation has completed.
 
-These eight `[startup-coordinator]` cases share a cancel-CQE-first/original-held
-script and exercise the public `Device::create/attach` coordinator, actual
-queue owner threads, bridges, and Ctrl original/cancellation processing.
+These eight legacy-topology `[startup-coordinator]` cases share a
+cancel-CQE-first/original-held script and exercise the public
+`Device::create/attach` coordinator, actual queue owner threads, bridges, and
+Ctrl original/cancellation processing.
 Queue rings submit real commands to eventfd stand-ins; their rejected original
 CQEs are matched by cookie before cdev closure. Control CQEs and device identity
 are scripted: this is ordinary coordinator coverage, not ublk driver acceptance.
@@ -1036,6 +1037,13 @@ and releases only synthetic checkpoints, never assigns retirement facts.
 The eight cases also require source destruction after native owner/bridge drain,
 closed cdevs and Ctrl destruction. Test seams are absent with
 `OBD_BUILD_TESTS=OFF`; normal invocations retain the kernel dependencies.
+
+- `ublk: failed second fixed owner allocation seals its ownerless queue` — the
+  production fixed-worker topology admits queue 0, then injects failure in
+  queue 1's join-state allocation before any owner frame exists. Queue 1 must
+  publish zero raw commands yet report source drain and owner exit; queue 0
+  must drain its admitted owner frame. Both cdev stand-ins close before the
+  single STOP/DEL, and no START command is admitted.
 
 - `ublk: control task releases its device owner before final destruction` —
   actual control-loop EOF and frame/capture teardown precede final off-worker
@@ -1525,7 +1533,7 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   during the error wave, so a global zero-GET assertion would be invalid.
   Matching background traffic cannot be distinguished by originating process;
   a collision with the selected manifest fails rather than being ignored.
-  Initial bridge placement can give the
+  Initial queue-owner placement can give the
   queues one or two distinct worker owners; both are valid. Device/source
   ownership survives assertion failures through asynchronous drain; a native
   TaskGroup owns and joins the mock listener before its active sessions drain.
@@ -1549,7 +1557,7 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   status/list, an explicit destroy while issuance remains incomplete, and final
   release. A second section sends supervisor TERM and exercises its maintenance
   listener. Raw and control cookies are correlated with their own terminal CQEs;
-  the final checks cover native bridge retirement, owner exit, cdev closure,
+  the final checks cover queue-owner frame retirement, owner exit, cdev closure,
   one DEL, the admitted release sequence, actual child reap, and removal of
   pinned kernel node identities. A separate supervisor-owned waitpid record
   must show SIGKILL for the intentional original crash and normal exit zero
@@ -1577,7 +1585,8 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   and can include submission of its cancellation SQE. Only `control_original`
   and `control_cancel` identify the corresponding real terminal CQEs.
   `raw_prepared` describes preparation, `initial_issued` the existing submission
-  fence, and `raw_cqe` the actual original completion. `bridge_destroyed`,
+  fence, and `raw_cqe` the actual original completion. `bridge_destroyed`
+  (the legacy event name, recording queue-owner frame destruction in production),
   `sources_drained`, `owner_exit` and `cdev_closed` follow the respective real
   lifetime boundaries. `caller_fills_parked` follows the actual outer fill drain;
   `caller_terminal` records the caller's final owner facts before reporting them.
@@ -1627,11 +1636,11 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   and source loan remain held. Releasing only the checkpoint injects a local
   `EIO` after successful END, preserving adoption. Repeated status/list observations
   must retain that generation and protection while the source is still active;
-  no STOP/DEL, borrower bridge destruction, source destruction, queue owner exit
-  or false ready handoff is allowed. After the source gate opens, the real
+  no STOP/DEL, borrower owner-frame destruction, source destruction, queue
+  owner exit or false ready handoff is allowed. After the source gate opens, the real
   delegate must return the full count with the expected byte checksum. Each
-  source scope must exit before its borrowing bridge's native frame destruction,
-  and all bridges must retire before STOP. Actual control/raw originals, cdev
+  source scope must exit before its borrowing queue owner's frame destruction,
+  and all queue owners must retire before STOP. Actual control/raw originals, cdev
   closure, one DEL, caller terminal sequence and actual process reap remain
   independently required. Supervisor-owned raw waitpid evidence must match
   each pinned PID/generation and the supervisor PID: the original must have
@@ -1650,7 +1659,8 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   `source_enter`, `source_result` and `source_scope_exit` identify one wrapper
   loan. The result includes an FNV-1a checksum over the actual delegate bytes.
   Scope exit is a lexical lifetime observation, not native frame destruction;
-  the existing `bridge_destroyed` event supplies that separate proof.
+  the existing `bridge_destroyed` event (a legacy name for queue-owner frame
+  destruction in production) supplies that separate proof.
   `source_destroyed` marks wrapper destructor entry, not inner-source destructor
   completion. Source hooks never manufacture IO requests or alter kernel CQEs.
 
@@ -1692,7 +1702,7 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   failure, not evidence that a kernel STOP returned `ENOMEM`. Repeated truthful
   status/list and a failed destroy response must leave the same live owner.
   A fresh destroy admits sequence 2 and executes normal STOP/DEL. Existing raw
-  and control cookie checks, native bridge retirement, cdev-close ordering,
+  and control cookie checks, queue-owner frame retirement, cdev-close ordering,
   terminal release, matching supervisor-owned raw reap records (original
   SIGKILL, replacement normal exit zero), and kernel node removal still apply.
 

@@ -23,6 +23,9 @@ Design goals, and the decisions that fix them:
   layouts are treated as a wire format, not an implementation detail.
 - **ublk, not tcmu.** The block-device backend is the kernel ublk
   interface with per-queue io_uring uring-cmds (ADR-0003).
+- **One scheduler domain for ublk and image IO.** One fixed Elio worker owns
+  each queue ring, bounded command pump, and reusable tag handlers; normal IO
+  has no dedicated-thread bridge (ADR-0023).
 - **Per-device process isolation.** One `obd-device` child process serves
   exactly one block device, supervised by one `obd-supervisor` daemon; a
   device crash never takes down its siblings (ADR-0004).
@@ -44,22 +47,18 @@ rootfs-tar converter).
 
 ### Read path
 
-A read travels through four ownership boundaries:
+A read travels through three ownership boundaries:
 
-1. **Kernel → queue thread.** The kernel places an IO descriptor in the
-   queue's shared command buffer; the queue thread (one per ublk queue)
-   picks it up via a `UBLK_IO_FETCH_REQ` uring-cmd on its private
-   io_uring ring and decodes it into an `IoRequest`
+1. **Kernel → fixed Elio queue owner.** The kernel places an IO descriptor
+   in the queue's shared command buffer. One fixed Elio worker owns that
+   queue's raw io_uring, consumes its bounded CQ batches, and decodes each
+   successful `UBLK_IO_FETCH_REQ` into an `IoRequest`
    (`src/ublk/queue.hpp::IoRequest` — tag, op, start sector, sector
    count).
-2. **Queue thread → Elio scheduler.** The request is pushed onto the
-   queue's pending deque and the bridge is woken through the `elio_efd`
-   eventfd. The bridge coroutine (`src/ublk/elio_bridge.cpp`; see
-   `run_bridge`) pops pending requests and feeds a reusable tag engine
-   (`src/ublk/tag_engine.cpp`) with one coroutine per tag,
-   so per-tag IO overlaps; completion ordering across tags is irrelevant
-   to ublk.
-3. **Elio → image stack.** Each IO coroutine calls
+2. **Queue owner → image stack.** The owner feeds a reusable tag engine
+   (`src/ublk/tag_engine.cpp`) with one coroutine per tag, so per-tag IO
+   overlaps; completion ordering across tags is irrelevant to ublk. Each
+   handler calls
    `BlobSource::pread` on the device root (`src/source/blob_source.hpp::BlobSource`).
    The root is either a `MergedLsmt` (read-only image) or a
    `MergedWritable` (image with a writable upper). Reads walk the layer
@@ -81,18 +80,17 @@ A read travels through four ownership boundaries:
    DART is enabled and reachable, the registry client's requests go
    through the DART prefix proxy instead (ADR-0005). This assembly is
    built once at open time in `open_image` (see `src/image/image_file.cpp`).
-4. **Elio → queue thread → kernel.** The IO coroutine pushes the result
-   (bytes transferred, or a negative errno) onto the done deque and wakes
-   the queue thread via `done_efd`; the queue thread issues
-   `UBLK_IO_COMMIT_AND_FETCH_REQ` to complete the request and fetch the
-   next one. Short reads at end-of-blob are zero-padded so the device
-   always answers the full request length.
+3. **Queue owner → kernel.** After a source await, the reusable handler
+   restores its fixed worker and submits `UBLK_IO_COMMIT_AND_FETCH_REQ`
+   directly on the owner ring. The normal path has no cross-thread deque or
+   application eventfd write. Short reads at end-of-blob are zero-padded so
+   the device always answers the full request length.
 
 ### Write path (ADR-0008)
 
 Writes exist only when the image config carries a writable `upper`. The
 device root then implements `WritableBlobSource`
-(`src/source/blob_source.hpp::WritableBlobSource`), and the bridge
+(`src/source/blob_source.hpp::WritableBlobSource`), and the queue handler
 dispatches `UBLK_IO_OP_WRITE` to `pwrite` and `UBLK_IO_OP_FLUSH` to
 `flush`. `MergedWritable` resolves each write against the upper layer
 first: data already covered by the upper is overwritten in place;
@@ -139,26 +137,27 @@ cannot affect its siblings.
 
 ## Thread Model
 
-Two thread families meet only at the documented bridge (ADR-0006):
+The data plane and image stack share the Elio scheduler (ADR-0023, which
+supersedes ADR-0006's dedicated queue-thread bridge):
 
-- **ublk queue threads** (one per queue per device) each own one
-  io_uring ring *exclusively*: only the queue thread submits
-  FETCH/COMMIT uring-cmds, because the kernel pins `io->task` at FETCH
-  time and requires the COMMIT from the same task. The queue thread also
-  parks a `POLL_ADD` on `done_efd` in its ring, so Elio-side completions
-  wake its io_uring wait without a separate poll thread.
-- **Elio scheduler threads** run everything else: the bridge coroutine,
-  one IO coroutine per in-flight tag, the whole image/source stack, HTTP,
-  downloads, and (in the supervisor) the accept loop, monitors, and
-  reaper. The Elio scheduler never submits to a queue ring.
+- **Fixed queue owners.** Each ublk queue is assigned to one Elio worker.
+  Coroutines restored to that worker exclusively create, submit and consume
+  the queue's raw io_uring. This preserves `SINGLE_ISSUER` and the Linux task
+  identity that ublk binds at FETCH.
+- **Reusable tag handlers.** Independent tags are TaskGroup children in the
+  same scheduler domain. A source await may suspend or migrate, but the
+  handler restores the queue worker before touching owner-local state or
+  submitting COMMIT_AND_FETCH.
+- **Nonblocking idle wait.** The raw ring registers an eventfd, which the
+  owner awaits through Elio native IO. A bounded CQ turn prevents a busy
+  queue from monopolizing its worker. Multiple queues may share a worker;
+  remote and slow-source requests still overlap across tag handlers.
 
-Crossing the boundary is message-passing only: requests travel
-queue-thread → Elio via the pending deque plus `elio_efd`; completions
-travel Elio → queue-thread via the done deque plus `done_efd`. Both
-deques are guarded by a short mutex section (`src/ublk/queue.hpp::Queue`).
-The per-tag IO buffers live in the device process's vm space; the kernel
-copies request data in and out of them, and Elio workers write read
-payloads into them before completing the tag.
+The per-tag IO buffers live in the device process's vm space. The kernel
+copies request data in and out of them, and an accepted handler keeps its tag
+loan until it publishes the completion. Teardown joins all source handlers
+before STOP, then keeps the owner alive until every raw command is positively
+retired.
 
 ## Module Map
 
@@ -215,7 +214,8 @@ views, and attaches either a `MergedLsmt` or, when `upper.dir` is set, a
 
 The data plane: the control channel (`Ctrl`, device lifecycle over
 `/dev/ublk-control`, parameter setup), the per-queue data plane
-(`Queue`, the ADR-0006 ring-ownership boundary), the Elio bridge, and
+(`Queue`, the ADR-0023 fixed-worker ring owner), its bounded owner pump and
+reusable tag engine, and
 `uapi_compat.hpp` — the only place where kernel-header gaps are filled,
 via `#ifndef`-guarded additions over `<linux/ublk_cmd.h>`. Device
 parameters advertise exactly the operations the image stack implements;
@@ -255,10 +255,10 @@ their own local rules):
   coroutine on a synchronous syscall is forbidden — use the Elio IO
   backend. Setup/cold paths may throw exceptions; hot IO paths return
   negative errnos and never throw.
-- **Ring ownership (ADR-0006).** Only the queue thread submits to its
-  queue's io_uring ring. Elio threads touch a `Queue` exclusively
-  through `try_pop_request`, `push_completion`, `io_buf`, and
-  `elio_efd`. No other cross-thread use of a `Queue` is permitted.
+- **Ring ownership (ADR-0023).** Only coroutines restored to a queue's fixed
+  Elio worker may inspect its owner-local state or submit to its raw ring.
+  Foreign handler destruction can publish only generation-tagged mailbox
+  facts and an eventfd wake; the owner validates and consumes them.
 - **Positional, stateless reads.** `pread` never mutates shared read
   state, so concurrent IO coroutines against one source are safe unless
   a concrete type documents otherwise. Writable layers serialize their
@@ -269,10 +269,9 @@ their own local rules):
   memory is allocated pre-fork. The status socketpair is `SOCK_CLOEXEC`
   on the parent side and explicitly cleared on the child's fd 3 so it
   survives `execve`. No other fds leak into device processes.
-- **Buffer ownership.** ublk per-tag IO buffers are owned by the
-  `Queue`; an IO coroutine may write a read payload into its tag's
-  buffer between popping the request and pushing the completion, and
-  must not touch it afterwards.
+- **Buffer ownership.** ublk per-tag IO buffers are owned by the `Queue`; an
+  accepted tag handler may access its buffer until it publishes the matching
+  generation's completion, and must not touch it afterwards.
 
 ## Stability Contract
 

@@ -27,7 +27,7 @@
 
 namespace obd::ublk {
 
-// Compile-time pinning of the kernel ABI we program against (ADR-0006
+// Compile-time pinning of the kernel ABI we program against (ADR-0023
 // cites these invariants; if a future kernel header changes them, the
 // build must break loudly rather than corrupt the ring protocol).
 static_assert(sizeof(ublksrv_io_desc) == 24,
