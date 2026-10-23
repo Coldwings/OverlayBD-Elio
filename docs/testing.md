@@ -195,6 +195,17 @@ self-skip the same way. The privileged CI job
 `ublk_drv` and runs these tests individually by exact name under `sudo`,
 with a separate bounded step and log for each. The remote-LSMT step accepts
 only its explicit unsupported CPU-map skip, with a warning and retained log.
+Driver-source preparation uses the matching mainline release archive from
+`cdn.kernel.org`, verifies its published SHA-256, and extracts only
+`drivers/block/ublk_drv.c`. The extracted source is cached by release and its
+own checksum is checked before reuse. The archive and checksum list are
+retrieved over HTTPS; this check does not assert PGP signature verification.
+Cold preparation permits four transient retries per download with exponential
+backoff and server `Retry-After` handling, a 15-second connection limit and
+60-second per-transfer limit. Each download has a 150-second retry budget and
+180-second outer deadline; the complete helper, including extraction, has a
+300-second deadline. Each outer deadline has a five-second termination grace.
+Permanent, exhausted, checksum or extraction failures stop before compilation.
 The online-grow step has a
 120-second process timeout and records the commit, kernel, command exit status
 and the test-output `tee` exit status in `build/ublk-e2e-grow.log`, included
