@@ -47,7 +47,10 @@ A **mock registry server with HTTP Range support** (`MockRegistry` in
 endpoints plus a bearer-token endpoint; the token endpoint counts
 exchanges and can issue `expires_in`, per-exchange serial tokens, and
 selective rejections, so single-flight and cache-lifetime behavior is
-observable. The integration tests reuse the
+observable. Unit tests retain its listener task through `with_mock_registry`:
+normal return and exceptions both stop the server, join and destroy the
+listener task, and then await zero active connections before destroying the
+fixture (issue #149). The integration tests reuse the
 same style of in-process server, so no test touches the network; the
 multi-blob variant (`BlobMapServer` in
 `tests/integration/test_integration.cpp`) adds per-blob GET/extent
@@ -580,6 +583,9 @@ Every test, grouped by area, with the property it guards.
   DNS budget consumption, with matching logical DNS/timer deadlines.
 - `source: DART literal probes bypass DNS and report TCP reachability` —
   loopback literals skip DNS; listening/refused peers produce true/false.
+- `source: mock registry joins listener on normal and exceptional exit` —
+  verifies stopped/drained state after either consumer outcome and preserves
+  the consumer's exception; ASAN checks fixture lifetime after return.
 - `source: mock registry refreshes port after bind collision` — forces a
   deterministic close-to-bind `EADDRINUSE` collision on the first reserved
   mock-registry port, then verifies the fixture publishes a fresh port and
