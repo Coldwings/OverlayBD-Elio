@@ -90,9 +90,11 @@ the replacement process successfully flushes it, including without new writes.
 
 - A 512-byte DATA write and adjacent INHERIT sectors remain distinct across a
   process restart on ext4, XFS, and filesystems with different extent rules.
-- Ordinary writes update one 4160-byte inactive metadata slot per affected
+- Writes that change ownership update one 4160-byte inactive metadata slot per affected
   8 MiB region, plus an eight-byte commit write. This costs metadata I/O but
   avoids full-sidecar rewrites and lower-layer copy-up.
+- A write wholly within DATA keeps the existing mapping and coverage bytes;
+  it performs only the backing write after pending ZERO transitions settle.
 - The sparse artifact's virtual size is roughly 1 GiB per TiB of device
   because every logical page reserves two slots. Untouched pages remain holes;
   recovery enumerates allocated metadata ranges and falls back to a full scan

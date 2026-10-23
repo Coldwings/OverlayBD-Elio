@@ -433,11 +433,27 @@ TEST_CASE("format: sparse completed operations survive process exit without flus
     SECTION("DATA") { operation = "write"; }
     SECTION("ZERO") { operation = "discard"; }
     SECTION("actual zero DATA write") { operation = "write-zero"; }
+    SECTION("ZERO survives failed physical reclamation") {
+        operation = "discard-readonly";
+        const int prepared = run_sparse_crash_writer(
+            upper, "write", lower_raw.size(), 9 * 512, 512);
+        REQUIRE(WIFEXITED(prepared));
+        REQUIRE(WEXITSTATUS(prepared) == 0);
+    }
 
     const int child_status = run_sparse_crash_writer(
         upper, operation, lower_raw.size(), 9 * 512, 512);
     REQUIRE(WIFEXITED(child_status));
     REQUIRE(WEXITSTATUS(child_status) == 0);
+    if (operation == "discard-readonly") {
+        CoverageTestFd backing(::open(upper.c_str(), O_RDONLY | O_CLOEXEC));
+        REQUIRE(backing.value >= 0);
+        std::array<uint8_t, 512> retained_data{};
+        REQUIRE(::pread(backing.value, retained_data.data(), retained_data.size(),
+                         9 * 512) == static_cast<ssize_t>(retained_data.size()));
+        REQUIRE(std::all_of(retained_data.begin(), retained_data.end(),
+                            [](uint8_t value) { return value == 0xa5; }));
+    }
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         std::vector<std::unique_ptr<format::LsmtLayer>> layers;
@@ -449,7 +465,8 @@ TEST_CASE("format: sparse completed operations survive process exit without flus
         const auto covered = std::find_if(top->segments().begin(), top->segments().end(),
             [](const auto& segment) { return segment.offset <= 9 && segment.end() > 9; });
         REQUIRE(covered != top->segments().end());
-        REQUIRE(covered->zeroed == (operation == "discard"));
+        REQUIRE(covered->zeroed == (operation == "discard" ||
+                                    operation == "discard-readonly"));
         auto merged = co_await format::MergedWritable::open(
             std::move(layers), std::move(top));
 
@@ -460,6 +477,167 @@ TEST_CASE("format: sparse completed operations survive process exit without flus
         auto expected = lower_raw;
         std::fill(expected.begin() + 9 * 512, expected.begin() + 10 * 512,
                   operation == "write" ? 0xa5 : 0);
+        REQUIRE(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse coverage packs mixed and uniform sector states",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "packed.sparse";
+    constexpr uint64_t vsize = 64 * 512;
+    const auto first = test::pattern_bytes(2 * 512, 14405);
+    const auto second = test::pattern_bytes(2 * 512, 14406);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer = co_await format::SparseRwLayer::open(path, vsize);
+            auto written = co_await layer->pwrite(first.data(), first.size(), 512);
+            REQUIRE(written == static_cast<ssize_t>(first.size()));
+            auto discarded = co_await layer->discard(4 * 512, 8 * 512);
+            REQUIRE(discarded == 0);
+            written = co_await layer->pwrite(second.data(), second.size(), 7 * 512);
+            REQUIRE(written == static_cast<ssize_t>(second.size()));
+            discarded = co_await layer->discard(16 * 512, 32 * 512);
+            REQUIRE(discarded == 0);
+        }
+        CoverageTestFd metadata(::open((path + ".coverage").c_str(), O_RDONLY | O_CLOEXEC));
+        REQUIRE(metadata.value >= 0);
+        std::array<uint8_t, 4160> slot{};
+        REQUIRE(::pread(metadata.value, slot.data(), slot.size(), 4096 + 4160) ==
+                static_cast<ssize_t>(slot.size()));
+        REQUIRE(bytes::load_u64_le(slot.data() + 16) == 4);
+        // Independent golden bytes: 00 INHERIT, 01 DATA, 10 ZERO, low pair first.
+        std::array<uint8_t, 4096> expected_payload{};
+        expected_payload[0] = 0x14;
+        expected_payload[1] = 0x6a;
+        expected_payload[2] = 0xa9;
+        std::fill(expected_payload.begin() + 4, expected_payload.begin() + 12, 0xaa);
+        const bool matches = std::equal(expected_payload.begin(), expected_payload.end(),
+                                        slot.begin() + 24);
+        REQUIRE(matches);
+
+        auto layer = co_await format::SparseRwLayer::open(path, vsize);
+        const auto& segments = layer->segments();
+        REQUIRE(segments.size() == 5);
+        const std::array<uint64_t, 5> offsets{1, 4, 7, 9, 16};
+        const std::array<uint32_t, 5> lengths{2, 3, 2, 3, 32};
+        const std::array<bool, 5> zeroed{false, true, false, true, true};
+        for (size_t i = 0; i < segments.size(); ++i) {
+            REQUIRE(segments[i].offset == offsets[i]);
+            REQUIRE(segments[i].length == lengths[i]);
+            REQUIRE(segments[i].zeroed == zeroed[i]);
+        }
+        std::vector<uint8_t> actual(vsize);
+        const auto read = co_await layer->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        std::vector<uint8_t> expected(vsize, 0);
+        std::copy(first.begin(), first.end(), expected.begin() + 512);
+        std::copy(second.begin(), second.end(), expected.begin() + 7 * 512);
+        REQUIRE(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse coverage rejects invalid packed states and runs",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "invalid-packed.sparse";
+    constexpr uint64_t vsize = 33 * 512;
+    uint64_t reopened_vsize = vsize;
+    size_t byte = 0;
+    uint8_t value = 0;
+    std::string expected_error;
+    SECTION("invalid state inside a mixed byte") {
+        value = 0xc1;
+        expected_error = "invalid sector state";
+    }
+    SECTION("uniform ZERO run crosses the virtual-size boundary") {
+        byte = 8;
+        value = 0xaa;
+        expected_error = "extends past vsize";
+    }
+    SECTION("uniform DATA run crosses the retained data EOF") {
+        byte = 8;
+        value = 0x55;
+        reopened_vsize = 64 * 512;
+        expected_error = "DATA extends past data EOF";
+    }
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer = co_await format::SparseRwLayer::open(path, vsize);
+            const std::array<uint8_t, 512> data{};
+            const auto written = co_await layer->pwrite(data.data(), data.size(), 0);
+            REQUIRE(written == static_cast<ssize_t>(data.size()));
+        }
+        {
+            CoverageTestFd metadata(::open((path + ".coverage").c_str(), O_RDWR | O_CLOEXEC));
+            REQUIRE(metadata.value >= 0);
+            std::array<uint8_t, 4160> slot{};
+            REQUIRE(::pread(metadata.value, slot.data(), slot.size(), 4096) ==
+                    static_cast<ssize_t>(slot.size()));
+            slot[24 + byte] = value;
+            bytes::store_u32_le(slot.data() + 4120, crc32::crc32c(slot.data(), 4120));
+            REQUIRE(::pwrite(metadata.value, slot.data(), slot.size(), 4096) ==
+                    static_cast<ssize_t>(slot.size()));
+        }
+        bool rejected = false;
+        try {
+            auto layer = co_await format::SparseRwLayer::open(path, reopened_vsize);
+            (void)layer;
+        } catch (const format_error& error) {
+            rejected = true;
+            REQUIRE(std::string(error.what()).find(expected_error) != std::string::npos);
+        }
+        REQUIRE(rejected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse DATA rewrite preserves coverage publication",
+          "[format]") {
+    TempDir dir;
+    constexpr uint64_t boundary = bytes::segment_mapping::kMaxLength;
+    constexpr uint64_t vsize = (boundary + 4) * 512;
+    constexpr uint64_t offset = (boundary - 1) * 512;
+    const std::string path = dir / "rewrite.sparse";
+    const std::vector<uint8_t> original(vsize, 0xa5);
+    const auto replacement = test::pattern_bytes(3 * 512, 14404);
+    auto coverage_bytes = [&] {
+        CoverageTestFd fd(::open((path + ".coverage").c_str(), O_RDONLY | O_CLOEXEC));
+        REQUIRE(fd.value >= 0);
+        struct stat st {};
+        REQUIRE(::fstat(fd.value, &st) == 0);
+        REQUIRE(st.st_size > 0);
+        REQUIRE(st.st_size < 32768);
+        std::vector<uint8_t> result(static_cast<size_t>(st.st_size));
+        REQUIRE(::pread(fd.value, result.data(), result.size(), 0) ==
+                static_cast<ssize_t>(result.size()));
+        return result;
+    };
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto layer = co_await format::SparseRwLayer::open(path, vsize);
+            auto written = co_await layer->pwrite(original.data(), original.size(), 0);
+            REQUIRE(written == static_cast<ssize_t>(original.size()));
+            REQUIRE(layer->segments().size() >= 2);
+            const auto before = coverage_bytes();
+            const auto generation = layer->segments_generation();
+            // This crosses adjacent DATA segments and a coverage-page boundary.
+            written = co_await layer->pwrite(replacement.data(), replacement.size(), offset);
+            REQUIRE(written == static_cast<ssize_t>(replacement.size()));
+            CHECK(coverage_bytes() == before);
+            CHECK(layer->segments_generation() == generation);
+        }
+        auto layer = co_await format::SparseRwLayer::open(path, vsize);
+        std::vector<uint8_t> actual(5 * 512);
+        const auto read = co_await layer->pread(actual.data(), actual.size(), offset - 512);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        std::vector<uint8_t> expected(actual.size(), 0xa5);
+        std::copy(replacement.begin(), replacement.end(), expected.begin() + 512);
         REQUIRE(actual == expected);
         co_return 0;
     });

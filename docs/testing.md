@@ -367,6 +367,18 @@ Every test, grouped by area, with the property it guards.
   write (the source path used by NOUNMAP), or logical ZERO
   publication and calls `_exit` without destructors or guest FLUSH; reopening
   in the parent recovers the completed state and its adjacent lower bytes.
+  Another section forces physical reclamation to fail through a read-only
+  data descriptor, verifies old backing bytes remain, then recovers logical
+  ZERO and adjacent lower bytes after the child exits without flushing.
+- `format: sparse coverage packs mixed and uniform sector states` — independent
+  golden payload bytes and exact reopened segments cover mixed boundary bytes,
+  uniform ZERO runs, DATA, and INHERIT.
+- `format: sparse coverage rejects invalid packed states and runs` — valid
+  checksums cannot hide an invalid mixed-byte state, a uniform ZERO run past
+  virtual size, or a uniform DATA run past the retained backing EOF.
+- `format: sparse DATA rewrite preserves coverage publication` — a rewrite
+  across DATA segments and coverage pages preserves metadata/generation while
+  the replacement bytes and neighbors survive reopen.
 - `format: sparse coverage rejects corruption and stale identity` — malformed
   headers, invalid sector states, unsupported flags, size mismatches, and a
   coverage artifact paired with the wrong data inode or identity fail closed.

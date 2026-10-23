@@ -527,6 +527,24 @@ std::vector<bytes::segment_mapping> overlay_zero_masks(
     return out;
 }
 
+bool range_is_data(const std::vector<bytes::segment_mapping>& segments,
+                   uint64_t lo, uint64_t hi) {
+    auto it = std::upper_bound(
+        segments.begin(), segments.end(), lo,
+        [](uint64_t sector, const bytes::segment_mapping& segment) {
+            return sector < segment.offset;
+        });
+    if (it != segments.begin()) --it;
+    uint64_t covered = lo;
+    while (it != segments.end() && covered < hi) {
+        if (it->zeroed || it->offset > covered || it->end() <= covered)
+            return false;
+        covered = it->end();
+        ++it;
+    }
+    return covered >= hi;
+}
+
 void erase_range_from(std::vector<bytes::segment_mapping>& segments,
                       uint64_t lo, uint64_t hi) {
     if (lo >= hi) return;
@@ -603,8 +621,19 @@ std::array<uint8_t, kCoveragePayloadSize> coverage_payload_from_segments(
         const uint64_t hi = std::min(segment.end(), page_hi);
         const CoverageState state = segment.zeroed ? CoverageState::kZero
                                                    : CoverageState::kData;
-        for (uint64_t sector = lo; sector < hi; ++sector) {
-            set_coverage_state(payload, sector - page_lo, state);
+        uint64_t first = lo - page_lo;
+        const uint64_t end = hi - page_lo;
+        while (first < end && first % 4 != 0) {
+            set_coverage_state(payload, first++, state);
+        }
+        // Four adjacent sectors share a byte. Fill aligned ownership runs
+        // directly instead of repeatedly masking every sector in a dense page.
+        const uint64_t whole_bytes = (end - first) / 4;
+        const uint8_t packed = static_cast<uint8_t>(state) * uint8_t{0x55};
+        std::fill_n(payload.begin() + first / 4, whole_bytes, packed);
+        first += whole_bytes * 4;
+        while (first < end) {
+            set_coverage_state(payload, first++, state);
         }
     }
     return payload;
@@ -632,37 +661,47 @@ void decode_coverage_payload(
     const uint64_t page_lo = page * kCoverageSectorsPerPage;
     const uint64_t page_hi = std::min(page_lo + kCoverageSectorsPerPage,
                                       max_sector);
+    const uint64_t physical_page_hi = page_lo + kCoverageSectorsPerPage;
     CoverageState run_state = CoverageState::kInherit;
     uint64_t run_lo = page_lo;
-    for (uint64_t sector = page_lo;
-         sector < page_lo + kCoverageSectorsPerPage; ++sector) {
+    uint64_t sector = page_lo;
+    while (sector < physical_page_hi) {
         const CoverageState state =
             get_coverage_state(payload, sector - page_lo);
         if (static_cast<uint8_t>(state) == 3) {
             throw format_error("sparse coverage has invalid sector state: " +
                                path);
         }
-        if (sector >= page_hi && state != CoverageState::kInherit) {
+        uint64_t next = sector + 1;
+        if ((sector - page_lo) % 4 == 0) {
+            const uint8_t packed = static_cast<uint8_t>(state) * uint8_t{0x55};
+            // Uniform bytes can be validated as one run, including its far
+            // endpoint; mixed bytes still inspect every sector state.
+            size_t byte = static_cast<size_t>((sector - page_lo) / 4);
+            if (payload[byte] == packed) {
+                do {
+                    ++byte;
+                } while (byte < payload.size() && payload[byte] == packed);
+                next = page_lo + byte * 4;
+            }
+        }
+        if (next > page_hi && state != CoverageState::kInherit) {
             throw format_error("sparse coverage extends past vsize: " + path);
         }
-        if (state == CoverageState::kData && sector >= data_sector_limit) {
+        if (state == CoverageState::kData && next > data_sector_limit) {
             throw format_error("sparse coverage DATA extends past data EOF: " +
                                path);
         }
-        if (sector == page_lo) {
+        if (state != run_state) {
+            if (run_state != CoverageState::kInherit && run_lo < page_hi) {
+                append_coverage_run(*segments, run_lo,
+                                    std::min(sector, page_hi), run_state);
+            }
             run_state = state;
             run_lo = sector;
-            continue;
         }
-        if (state == run_state) continue;
-        if (run_state != CoverageState::kInherit && run_lo < page_hi) {
-            append_coverage_run(*segments, run_lo,
-                                std::min(sector, page_hi), run_state);
-        }
-        run_state = state;
-        run_lo = sector;
+        sector = next;
     }
-    const uint64_t physical_page_hi = page_lo + kCoverageSectorsPerPage;
     if (run_state != CoverageState::kInherit && run_lo < page_hi) {
         append_coverage_run(*segments, run_lo,
                             std::min(physical_page_hi, page_hi), run_state);
@@ -1959,6 +1998,14 @@ elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
         const int rc = co_await flush_locked();
         if (rc != 0) co_return rc;
     }
+    bool already_data = false;
+    {
+        std::lock_guard lock(meta_mu_);
+        already_data = range_is_data(segments_, request_lo, request_hi);
+    }
+    // op_mu_ keeps ownership stable through the backing write. Rewriting
+    // existing DATA needs no coverage publication or mapping generation bump;
+    // pending ZERO transitions were settled above and FLUSH still syncs data.
     const uint8_t* p = static_cast<const uint8_t*>(buf);
     size_t done = 0;
     int write_error = 0;
@@ -1990,7 +2037,7 @@ elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
             }
 
             const size_t indexable = (written / kSector) * kSector;
-            if (indexable > indexed) {
+            if (indexable > indexed && !already_data) {
                 const uint64_t lo = (offset + done + indexed) / kSector;
                 const uint64_t hi = (offset + done + indexable) / kSector;
                 std::vector<bytes::segment_mapping> next;

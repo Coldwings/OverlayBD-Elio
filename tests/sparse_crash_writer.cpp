@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace obd::format {
@@ -19,6 +20,25 @@ struct SparseRwLayerTestAccess {
     static void interrupt_import_at(int stage) {
         SparseRwLayer::coverage_install_fail_stage_for_test_.store(
             stage, std::memory_order_release);
+    }
+    static elio::coro::task<int> discard_with_readonly_data(
+        SparseRwLayer& layer, const std::string& path, uint64_t offset,
+        uint64_t length) {
+        const int readonly = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (readonly < 0) co_return -errno;
+        struct Restore {
+            int& descriptor;
+            int original;
+            int temporary;
+            ~Restore() {
+                descriptor = original;
+                ::close(temporary);
+            }
+        } restore{layer.fd_, layer.fd_, readonly};
+        // The kernel rejects reclamation through this read-only descriptor.
+        // Metadata publication still uses the ordinary writable sidecars.
+        layer.fd_ = readonly;
+        co_return co_await layer.discard(offset, length);
     }
 };
 }  // namespace obd::format
@@ -74,6 +94,9 @@ int main(int argc, char** argv) {
                                                                   : -EIO;
             } else if (operation == "discard") {
                 rc = co_await layer->discard(offset, length);
+            } else if (operation == "discard-readonly") {
+                rc = co_await obd::format::SparseRwLayerTestAccess::
+                    discard_with_readonly_data(*layer, path, offset, length);
             }
             ::_exit(rc == 0 ? 0 : 65);
         }, runtime);

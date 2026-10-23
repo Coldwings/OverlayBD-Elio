@@ -611,7 +611,10 @@ upper; the implementation then attempts legacy import.
 Writes are split at the 14-bit segment-length cap, write backing bytes, then
 publish every affected coverage page before updating the in-memory index and
 returning success. Adjacent DATA extents coalesce without absorbing INHERIT
-sectors. `discard` first publishes exact ZERO coverage and the protective
+sectors. Rewrites wholly inside existing DATA skip ownership publication and
+leave the mapping generation unchanged; backing bytes still participate in
+FLUSH. Pending ZERO-to-DATA transitions settle before this check. `discard`
+first publishes exact ZERO coverage and the protective
 compatibility mask in `<path>.zeroes`, then performs
 `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`. Punch-hole remains
 best-effort physical reclamation: coverage preserves zero reads if it is
