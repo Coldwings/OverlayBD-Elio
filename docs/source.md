@@ -1304,10 +1304,10 @@ server. Run everything with `ctest --test-dir build --output-on-failure`
   queued Prefetch/Fill requests stay parked while an on-demand request is
   in flight (even with window room) and enter once it completes.
 - `source: admission funnel bounded scavenger acquire times out and dequeues` —
-  issue #35: a bounded scavenger acquire whose gate stays closed returns
-  `std::nullopt` at its timeout, dequeues without leaking a slot, is
+  issues #35/#148: a bounded Prefetch or Fill acquire whose gate stays
+  closed returns `std::nullopt` at its timeout, dequeues without leaking a slot, is
   still admitted when the gate opens before the deadline, and refuses
-  OnDemand outright.
+  OnDemand outright. ASAN checks waiter ownership during timeout teardown.
 - `source: admission funnel grows additively on flat latency and halves on rise` —
   flat samples at the EMA baseline raise the window by one each; a sample
   above 150% of the baseline halves it (AIMD, ADR-0012).

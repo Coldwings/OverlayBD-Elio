@@ -176,14 +176,18 @@ TEST_CASE("source: admission funnel bounded scavenger acquire times out and dequ
         }
         // Hold the gate closed with an on-demand request.
         auto od = co_await funnel.acquire(ReadClass::OnDemand);
-        const auto t0 = std::chrono::steady_clock::now();
-        auto timed_out = co_await funnel.acquire_scavenger_bounded(
-            ReadClass::Prefetch, milliseconds(60));
-        const auto elapsed = std::chrono::steady_clock::now() - t0;
-        REQUIRE(!timed_out.has_value());
-        REQUIRE(elapsed >= milliseconds(50));
-        REQUIRE(elapsed < std::chrono::seconds(2));
-        REQUIRE(funnel.scavenger_waits() == 1);
+        // Exercise both queues. ASAN also checks issue #148: timeout
+        // teardown must not release the waiter owner twice.
+        for (const auto cls : {ReadClass::Prefetch, ReadClass::Fill}) {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto timed_out = co_await funnel.acquire_scavenger_bounded(
+                cls, milliseconds(60));
+            const auto elapsed = std::chrono::steady_clock::now() - t0;
+            REQUIRE(!timed_out.has_value());
+            REQUIRE(elapsed >= milliseconds(50));
+            REQUIRE(elapsed < std::chrono::seconds(2));
+        }
+        REQUIRE(funnel.scavenger_waits() == 2);
         // The timeout dequeued the waiter and reserved nothing: only the
         // held on-demand permit remains in flight.
         REQUIRE(funnel.inflight_total() == 1);

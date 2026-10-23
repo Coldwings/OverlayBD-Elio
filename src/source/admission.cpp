@@ -166,9 +166,17 @@ AdmissionFunnel::acquire_scavenger_bounded(
         // Self-admitted synchronously by our own admit_locked above.
         co_return Permit(this, cls, start);
     }
+    // with_timeout is structured: it joins the wait child before returning,
+    // so the local shared_ptr keeps this event alive for the complete wait.
+    // Keep the nested coroutine capture trivial. Passing another shared_ptr
+    // copy through this path makes GCC 12 double-release its control block
+    // during timeout teardown.
+    auto* const admitted_event = &w->admitted;
     auto admitted = co_await elio::with_timeout(
-        timeout, [w](elio::coro::cancel_token tok) -> elio::coro::task<bool> {
-            const auto r = co_await w->admitted.wait(std::move(tok));
+        timeout,
+        [admitted_event](elio::coro::cancel_token tok)
+            -> elio::coro::task<bool> {
+            const auto r = co_await admitted_event->wait(std::move(tok));
             co_return r == elio::coro::cancel_result::completed;
         });
     if (admitted && *admitted) {
