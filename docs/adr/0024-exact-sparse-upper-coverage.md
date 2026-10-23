@@ -1,6 +1,6 @@
 # ADR-0024: Persist exact sector coverage for sparse uppers
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-22
 - Supersedes: none
 - Amends: ADR-0009 (replaces its sparse recovery mechanism while preserving
@@ -111,6 +111,11 @@ the replacement process successfully flushes it, including without new writes.
   but cannot detect loss of all sidecars and will attempt legacy import.
 - Corrupt authoritative headers, identity mismatches, invalid sector states,
   and corrupt recognized committed pages without a valid rollback stop open.
+- Buffered 4 KiB first writes still pay for ownership publication. Local
+  controls measured about 70 versus 23 CPU microseconds per request; DATA
+  rewrites and reads do not republish ownership. The dated filesystem matrix,
+  recovery costs, and measurement limits are recorded in
+  [format.md](../format.md#validated-filesystem-coordinates-and-costs).
 
 ## Alternatives considered
 

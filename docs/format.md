@@ -542,7 +542,8 @@ New uppers persist exact 512-byte INHERIT, DATA, and ZERO ownership in
 `<path>.coverage` (ADR-0024). A sparse two-bit map page describes 8 MiB and
 has two 4160-byte generation slots; CRC and a commit word let reopen select
 the newest complete slot and fall back to the other slot after an interrupted
-update. Header, page, identity, state, and size errors fail open closed. A
+update. Invalid headers, recognized committed pages without a valid rollback,
+identity mismatches, invalid states, and size errors stop open. A
 random ID stored in a user xattr binds coverage to the data file and is the
 primary identity even if the inode changes; filesystems without user xattrs
 use the weaker device+inode fallback documented by ADR-0024.
@@ -650,6 +651,92 @@ top-layer zero mask independently of physical hole-punch granularity.
 Opening this format with a pre-v2 binary is unsafe because that binary ignores
 `.coverage` and reconstructs ownership from allocation extents. There is no
 in-place downgrade contract.
+
+#### Validated filesystem coordinates and costs
+
+The 2026-10-23 validation used a Linux `6.18.18.c1126-trim` guest with
+separate, newly formatted regular-file disks and no networking. ext4 and XFS
+used 4096-byte blocks, `noatime`, and their default allocation settings.
+
+| Filesystem coordinate | Identity | Observed validation |
+|---|---|---|
+| ext4 | user-xattr ID | 46 sparse/migration/merged cases, 35,599 assertions |
+| XFS | user-xattr ID | 46 sparse/migration/merged cases, 35,599 assertions |
+| VFAT, FAT16, 4096-byte clusters | device/inode fallback | three bounded cases, 82 assertions; coverage header flags confirmed the weak binding |
+
+A separate fixture fed real `TagEngine` handlers WRITE_ZEROES with and
+without NOUNMAP, plus DISCARD, through `MergedWritable` into the sparse upper.
+On all three filesystems, completed requests followed by `_exit` without an
+upper FLUSH or destructors recovered ZERO/DATA/ZERO respectively and preserved
+every adjacent nonzero lower byte. Request inputs were scripted; this fixture
+did not register a kernel ublk device. A read-only data descriptor also forced
+physical reclamation to fail while preserving old backing bytes; logical ZERO
+still survived process exit.
+
+VFAT returned `EOPNOTSUPP` for user xattrs, FIEMAP, ZERO_RANGE, and punch-hole;
+actual zero writes and the NOUNMAP DATA path succeeded. The selected metadata
+design uses persisted ZERO for logical discard, replacing the physical-zero
+fallback proposed for extent-based recovery (ADR-0024). It does not depend on
+FIEMAP or ZERO_RANGE. VFAT is a bounded feature-absence fixture, subject to its
+file-size and allocation limits; this result establishes neither a
+production-capacity nor a cross-mount inode-identity guarantee.
+
+Both ext4 and XFS also passed six cases (137 assertions each) with only
+coverage-file `SEEK_DATA`/`SEEK_HOLE` calls forced to return `EINVAL`;
+legacy data-file discovery remained real. This verifies the full-scan fallback,
+without claiming those filesystems lack extent enumeration. On both reference
+filesystems, earlier FIEMAP probes widened a 512-byte DATA write to a written
+4096-byte extent after synchronization. A partial ZERO_RANGE and plain
+preallocation both produced UNWRITTEN extents. A genuine 4096-byte gap between
+two DATA extents remained a gap; the suspected gap-coalescing behavior did not
+reproduce. Other kernels, allocation hints, and power cuts were not validated
+by this matrix.
+
+A local public-API control compared the
+[pre-v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/96515944e0d3e0be48b95660aed568e0aa99ce6c)
+with the
+[v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/55b5736964518f5bd8e0e6f32be59e75fd846281).
+Both used test-enabled RelWithDebInfo builds on an Intel i3-N305, one Elio
+worker and one blocking thread, buffered files, 64 MiB, and 16,384 random
+4096-byte requests per trial. The same measurement program used each
+variant's actual headers, compiler options, and libraries. Three repetitions
+alternated variant order; observed peak API depth matched the requested depth.
+Values below are medians of the three per-trial results.
+
+| Operation / depth | CPU us/request, v1 → v2 | Mean API latency us, v1 → v2 |
+|---|---:|---:|
+| First write / 1 | 23.40 → 70.41 | 23.68 → 70.59 |
+| First write / 16 | 24.06 → 72.01 | 389.64 → 1158.72 |
+| DATA rewrite / 1 | 11.20 → 11.09 | 11.38 → 11.20 |
+| DATA rewrite / 16 | 14.16 → 13.70 | 232.26 → 224.83 |
+| Read / 1 | 2.03 → 2.02 | 1.99 → 1.99 |
+| Read / 16 | 1.20 → 1.55 | 19.00 → 24.63 |
+
+First-write publication remains a measured cost. Read/depth-16 CPU observations
+ranged from 1.19–1.51 us in v1 and 1.05–1.63 us in v2; these short, overlapping
+samples do not establish a stable improvement or regression. CPU includes
+coroutine dispatch and joins; final FLUSH and content checks were outside the
+timing window. Rewrite/read files were filled and flushed first, but residency,
+host load, and frequency were uncontrolled. These are source-API diagnostics,
+not ublk/fio latency or a device scaling claim.
+
+Fresh-process recovery controls used a 1 TiB sparse virtual device, one 4 KiB
+DATA block in each of 64/512/4096 distinct 8 MiB regions, with the same kernel
+remaining alive after preparation and FLUSH. Cache eviction was not requested
+and residency was not verified. All prepared DATA blocks were checked.
+
+| Touched regions | Open wall ms, v1 → v2 | Open CPU ms, v1 → v2 | Process RSS delta KiB, v1 → v2 |
+|---|---:|---:|---:|
+| 64 | 0.14 → 0.75 | 0.12 → 0.71 | 148 → 172 |
+| 512 | 0.61 → 4.63 | 0.58 → 4.63 | 88 → 252 |
+| 4096 | 10.07 → 34.28 | 10.10 → 34.30 | 312 → 900 |
+
+The coverage file's logical length was 1,090,523,136 bytes; allocated storage
+was 520/4108/32824 KiB respectively. RSS deltas include allocator/runtime
+effects and are not pure metadata residency. These recovery timings used
+allocated-range enumeration. Without metadata `SEEK_DATA`, recovery scans the
+entire logical coverage file and builds its candidate-page set by capacity;
+large-capacity fallback time and temporary memory were not benchmarked here.
 
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 
