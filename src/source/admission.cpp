@@ -6,6 +6,7 @@
 #include <elio/log/macros.hpp>
 
 #include <algorithm>
+#include <exception>
 
 namespace obd::source {
 
@@ -172,13 +173,43 @@ AdmissionFunnel::acquire_scavenger_bounded(
     // copy through this path makes GCC 12 double-release its control block
     // during timeout teardown.
     auto* const admitted_event = &w->admitted;
-    auto admitted = co_await elio::with_timeout(
-        timeout,
-        [admitted_event](elio::coro::cancel_token tok)
-            -> elio::coro::task<bool> {
-            const auto r = co_await admitted_event->wait(std::move(tok));
-            co_return r == elio::coro::cancel_result::completed;
-        });
+    elio::timeout_result<bool> admitted{true, std::nullopt};
+    try {
+        admitted = co_await elio::with_timeout(
+            timeout,
+            [admitted_event](elio::coro::cancel_token tok)
+                -> elio::coro::task<bool> {
+                const auto r = co_await admitted_event->wait(std::move(tok));
+                co_return r == elio::coro::cancel_result::completed;
+            });
+    } catch (...) {
+        // Inherited cancellation and launch failures can throw after queue
+        // insertion. with_timeout has joined its accepted children before
+        // throwing, so reconcile ownership before this frame can unwind.
+        const auto failure = std::current_exception();
+#ifdef OBD_TEST_HOOKS
+        try {
+            if (bounded_exception_hook_) bounded_exception_hook_();
+        } catch (...) {
+            // An observer failure cannot bypass mandatory waiter cleanup.
+        }
+#endif
+        bool reserved = false;
+        {
+            std::lock_guard lk(mu_);
+            reserved = w->reserved;
+            if (!reserved) {
+                auto& q = (cls == ReadClass::Prefetch ? prefetch_q_ : fill_q_);
+                const auto it = std::find(q.begin(), q.end(), w);
+                if (it != q.end()) q.erase(it);
+            }
+        }
+        // No Permit reaches the caller on this path. Release a reservation
+        // outside mu_ so another waiter can enter; scavengers add no AIMD
+        // latency sample. A delayed notifier retains its own waiter owner.
+        if (reserved) release(cls, std::chrono::nanoseconds::zero());
+        std::rethrow_exception(failure);
+    }
     if (admitted && *admitted) {
         // Woken by a releaser: admit_locked reserved our slot before
         // setting the event, so the Permit adoption is exactly
@@ -214,7 +245,15 @@ void AdmissionFunnel::release(ReadClass cls,
         }
         admit_locked(wake);
     }
-    for (auto& w : wake) w->admitted.set();
+    for (auto& w : wake) {
+#ifdef OBD_TEST_HOOKS
+        if (deferred_wake_hook_) {
+            deferred_wake_hook_([waiter = w] { waiter->admitted.set(); });
+            continue;
+        }
+#endif
+        w->admitted.set();
+    }
 }
 
 void AdmissionFunnel::note_on_demand_latency(

@@ -20,12 +20,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <elio/runtime/spawn.hpp>
+#include <elio/coro/with_timeout.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -215,6 +217,125 @@ TEST_CASE("source: admission funnel bounded scavenger acquire times out and dequ
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: bounded admission cancellation removes queued waiters", "[source]") {
+    for (const auto cls : {ReadClass::Prefetch, ReadClass::Fill}) {
+        const int rc = test::run_coro([cls]() -> elio::coro::task<int> {
+            AdmissionFunnel funnel;
+            auto on_demand = co_await funnel.acquire(ReadClass::OnDemand);
+            elio::sync::event entered;
+            elio::sync::event proceed;
+            auto acquiring = elio::spawn([&]() -> elio::coro::task<bool> {
+                entered.set();
+                // This uncancellable event keeps the existing child alive
+                // until its parent has cancelled it. A newly launched
+                // cancelled TaskGroup child could skip the acquire entirely.
+                co_await proceed.wait();
+                try {
+                    auto permit = co_await funnel.acquire_scavenger_bounded(
+                        cls, std::chrono::seconds(5));
+                    co_return false;
+                } catch (const elio::combinator_cancelled&) {
+                    co_return true;
+                }
+            });
+            co_await entered.wait();
+            acquiring.request_cancel();
+            proceed.set();
+            const bool cancelled = co_await acquiring;
+            co_await acquiring.wait_destroyed_async();
+
+            // All accepted child frames are gone before assertions can
+            // unwind the funnel. Opening the gate must not reserve a slot
+            // for the cancelled acquire's abandoned waiter.
+            on_demand.reset();
+            CHECK(cancelled);
+            CHECK(funnel.scavenger_waits() == 1);
+            CHECK(funnel.inflight_total() == 0);
+            auto first = co_await funnel.acquire_scavenger_bounded(
+                ReadClass::Prefetch, milliseconds(100));
+            auto second = co_await funnel.acquire_scavenger_bounded(
+                ReadClass::Fill, milliseconds(100));
+            CHECK(first.has_value());
+            CHECK(second.has_value());
+            first.reset();
+            second.reset();
+            CHECK(funnel.inflight_total() == 0);
+            co_return 0;
+        });
+        REQUIRE(rc == 0);
+    }
+}
+
+TEST_CASE("source: bounded admission cancellation releases a reserved slot before a delayed wake", "[source]") {
+    for (const auto cls : {ReadClass::Prefetch, ReadClass::Fill}) {
+        const int rc = test::run_coro([cls]() -> elio::coro::task<int> {
+            bool cleanup_entered = false;
+            uint64_t inflight_before_cleanup = 0;
+            std::function<void()> delayed_wake;
+            AdmissionFunnel funnel;
+            auto on_demand = co_await funnel.acquire(ReadClass::OnDemand);
+            elio::sync::event entered;
+            elio::sync::event proceed;
+            funnel.set_deferred_wake_hook_for_test(
+                [&](std::function<void()> wake) {
+                    delayed_wake = std::move(wake);
+                });
+            funnel.set_bounded_exception_hook_for_test([&] {
+                cleanup_entered = true;
+                // The waiter has already finished its structured wait.
+                // Reserve its slot now, but retain the releaser's wake
+                // until after the acquiring coroutine frame is destroyed.
+                on_demand.reset();
+                inflight_before_cleanup = funnel.inflight_total();
+            });
+            auto acquiring = elio::spawn([&]() -> elio::coro::task<bool> {
+                entered.set();
+                co_await proceed.wait();
+                try {
+                    auto permit = co_await funnel.acquire_scavenger_bounded(
+                        cls, std::chrono::seconds(5));
+                    co_return false;
+                } catch (const elio::combinator_cancelled&) {
+                    co_return true;
+                }
+            });
+            co_await entered.wait();
+            acquiring.request_cancel();
+            proceed.set();
+            const bool cancelled = co_await acquiring;
+            co_await acquiring.wait_destroyed_async();
+            on_demand.reset();
+            const auto inflight_after_cleanup = funnel.inflight_total();
+            const bool wake_retained = static_cast<bool>(delayed_wake);
+            if (delayed_wake) {
+                delayed_wake();
+                delayed_wake = {};
+            }
+            funnel.set_bounded_exception_hook_for_test({});
+            funnel.set_deferred_wake_hook_for_test({});
+
+            CHECK(cancelled);
+            CHECK(cleanup_entered);
+            CHECK(inflight_before_cleanup == 1);
+            CHECK(wake_retained);
+            CHECK(inflight_after_cleanup == 0);
+            CHECK(funnel.inflight_total() == 0);
+            CHECK(funnel.scavenger_admissions() == 1);
+            auto first = co_await funnel.acquire_scavenger_bounded(
+                ReadClass::Prefetch, milliseconds(100));
+            auto second = co_await funnel.acquire_scavenger_bounded(
+                ReadClass::Fill, milliseconds(100));
+            CHECK(first.has_value());
+            CHECK(second.has_value());
+            first.reset();
+            second.reset();
+            CHECK(funnel.inflight_total() == 0);
+            co_return 0;
+        });
+        REQUIRE(rc == 0);
+    }
 }
 
 TEST_CASE("source: layer store populate skips the extent when the funnel gate stays closed",
