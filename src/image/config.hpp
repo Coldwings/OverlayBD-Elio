@@ -11,6 +11,8 @@
 //     resultFile, and optionally `upper` — a writable layer (ADR-0008).
 #pragma once
 
+#include "common/device_topology.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -66,6 +68,10 @@ struct GlobalConfig {
     /// UBLK_F_USER_RECOVERY so a crashed device process can be replaced
     /// without failing the block device. Default on.
     bool ublk_recovery = true;
+
+    /// ublkConfig.queues/workers (ADR-0025): zero selects automatic sizing;
+    /// manual workers may exceed queues, but cannot be fewer than queues.
+    DeviceTopologyConfig device_topology;
 
     /// Parses overlaybd.json. Throws obd::error on IO failure,
     /// obd::format_error on malformed JSON.

@@ -120,6 +120,41 @@ failures are logged and skipped, never a bring-up error; see
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `enableRecovery` | bool | `true` | ADR-0010: create devices with `UBLK_F_USER_RECOVERY` so a crashed device process can be replaced without failing the block device. Disable only for debugging; kernels without the feature fall back automatically. |
+| `queues` | int, 0..256 | `0` | Production queue count; zero selects automatic sizing or matches an explicit `workers` value (ADR-0025). |
+| `workers` | int, 0..256 | `0` | Elio runtime worker count; zero matches explicit queues or participates in automatic sizing. Explicit workers must be at least the queue count. |
+
+When both counts are zero, a newly created device uses equal queue and worker
+counts: at least one pair, at most eight, and no more than the detected CPU
+budget. That budget combines process CPU affinity and visible cgroup v1/v2
+CPU quotas; fractional quotas round up. If quota files are unavailable, affinity
+is used; affinity-probe failure falls back to hardware concurrency, then one.
+Restrictions hidden outside the mount namespace cannot be inferred.
+
+If exactly one count is positive, the other matches it. Set both fields to
+provision additional workers, for example `{"queues": 4, "workers": 6}`.
+Manual counts may exceed the eight-pair automatic ceiling. Negative, fractional,
+boolean, null, string and out-of-range count values are configuration errors,
+as is an explicit worker count smaller than the queue count. Validation occurs
+before scheduler construction and new-device creation.
+
+Invalid topology fields are usage errors (exit 2). Operational global-config
+or recovery-probe failures keep the existing startup control-endpoint cleanup
+path and exit 1. Image assembly diagnostics retain their original precedence
+over a failed recovery probe.
+
+These global settings apply to image and blank devices, including supervised
+and standalone startup. The file is read once per process startup. A recovery
+uses the existing kernel queue count, depth and maximum buffer size; automatic
+workers match that queue count even if the detected CPU budget has changed.
+An explicit queue mismatch, insufficient workers or unsupported geometry is
+rejected before recovery admission. The automatic eight-pair ceiling applies
+to new creation, not to a previously created layout. Geometry is revalidated
+before the recovery handshake. Counts do not change while serving requests.
+
+Each queue's default request buffers occupy 16 MiB (128 tags × 128 KiB), so
+eight queues allocate 128 MiB of those buffers per device, plus ring, worker,
+handler and source memory. Startup logs show requested counts, resolved queues,
+actual runtime workers and serving queues; see [operations.md](./operations.md).
 
 Recovery flags do not authorize cleanup of an unadopted old device. Under
 ADR-0022, failed startup with outstanding ownership retains its process and

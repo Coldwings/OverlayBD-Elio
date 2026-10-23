@@ -72,7 +72,7 @@ obd-device (--config PATH | --blank-size BYTES --blank-dir PATH)
 | `--config PATH` | — | Per-image `config.json` (overlaybd-snapshotter format). Mutually exclusive with the blank form. |
 | `--blank-size BYTES` | — | ADR-0014 modes 2/3: create a blank (raw) device of this many bytes (no config) — the empty LSMT zero base + a writable LSMT-RW upper are assembled in `--blank-dir`. Strictly validated here too (positive, 512-aligned, ≤ 16 TiB; a negative or overflowing value is a usage error, exit 2), not only by the supervisor's `parse_blank_spec`. |
 | `--blank-dir PATH` | — | ADR-0014: per-device workspace for a blank device (files `overlaybd.zero` / `overlaybd.rw`). |
-| `--global PATH` | empty = built-in defaults | Global `overlaybd.json`; when omitted, a default-constructed `GlobalConfig` is used. |
+| `--global PATH` | empty = built-in defaults | Global `overlaybd.json`, including `ublkConfig.queues` and `.workers` (ADR-0025). When omitted, built-in defaults select up to eight matched pairs from the process CPU budget. |
 | `--control-fd N` | `-1` (standalone socket) | Inherited fd for JSON-lines lifecycle status reports (the socketpair end installed by the supervisor). |
 | `--startup-generation N` | fresh random nonzero value in standalone mode | Required with `--control-fd`; the supervisor supplies it and grants startup on that channel before device publication (ADR-0022). Standalone commands must use the generation returned by status. |
 | `--startup-socket @NAME` | `@obd-device-<effective-uid>-<pid>` | Standalone startup status/release endpoint, established before image assembly for both create and recovery. Linux abstract Unix socket; exclusive bind, no filesystem entry or unlink. Mutually exclusive with `--control-fd`. |
@@ -82,6 +82,13 @@ obd-device (--config PATH | --blank-size BYTES --blank-dir PATH)
 
 Requires a build with `OBD_ENABLE_UBLK=ON` (the only supported block-device
 backend; the source does not compile otherwise).
+
+Topology settings are resolved before constructing the runtime. Explicit counts
+may exceed the automatic ceiling; workers must be at least queues. Recovery
+preserves the existing kernel queue count, depth and buffer size, and rejects
+incompatible explicit counts before recovery admission. Startup logs report
+resolved queues and actual runtime workers. See `docs/config.md` for the full
+automatic sizing and recovery rules.
 
 ### obdctl
 
@@ -245,6 +252,10 @@ with many files, rather than a known output-correctness incompatibility.
   option). obdctl exits `0` exactly when the supervisor's reply carries
   `"ok": true`, `1` otherwise (including connection failures and malformed
   replies).
+- Invalid `ublkConfig` topology values and incompatible recovery topology are
+  obd-device usage errors (exit `2`) before runtime construction. Operational
+  global-configuration and recovery-query failures keep the owned startup path
+  and its existing assembly-diagnostic precedence; they return `1` after cleanup.
 - obd-device exit `0` covers clean ready-device stop and completed explicit
   startup release. A retained failure stays alive instead of exiting; a
   `failed` status alone is not an exit notification. Exit `1` covers completed

@@ -34,6 +34,7 @@ set_tests_properties(
 
 add_executable(obd_unit_tests
     unit/test_common.cpp
+    unit/test_device_topology.cpp
     unit/test_format.cpp
     unit/test_trace.cpp
     unit/test_trace_replay.cpp

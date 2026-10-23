@@ -80,6 +80,17 @@ trial finishes its own drain and then stops the matrix. Detection is diagnostic,
 not proof that an otherwise shared machine is idle. This tool never terminates
 another process or device.
 
+The privileged CI topology observation runs this same committed build under
+both variant labels, once with one queue/worker and once with two pairs. It
+records QD1/QD16 for zero and local-LSMT sources with one repetition, one-second
+warm-up and three-second measurements. This is a diagnostic topology comparison,
+with no cross-revision or performance threshold claim. Server JSON records the
+actual Device queue count and scheduler worker count. Startup logs identify
+each queue's owner worker and Linux TID; per-thread CPU snapshots allow those
+owners to be correlated with measured process activity. CPU placement, clock
+frequency and competing hosted load remain unmanaged, so these short results
+do not establish multicore scaling or predict production performance.
+
 For each trial the driver creates its own Device, starts fio with `posix_spawn`
 and waits off-worker. The Device owner lives in synchronous `main`, outside
 `elio::run`; the

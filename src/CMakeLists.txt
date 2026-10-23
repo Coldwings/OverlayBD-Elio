@@ -5,6 +5,7 @@
 add_library(obd_core STATIC
     common/crc32c.cpp
     common/sha256.cpp
+    common/device_topology.cpp
     format/block_codec.cpp
     format/zfile_format.cpp
     format/zfile.cpp

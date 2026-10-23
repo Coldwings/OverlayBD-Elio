@@ -16,7 +16,7 @@ public:
         directory_ = directory;
         socket_ = directory_ + "/s.sock";
         write_text(directory_ + "/adopted-source-v1", "successful END; real source buffer loan\n");
-        write_text(directory_ + "/global.json", "{\"ublkConfig\":{\"enableRecovery\":true}}\n");
+        write_text(directory_ + "/global.json", "{\"ublkConfig\":{\"enableRecovery\":true,\"queues\":2,\"workers\":3}}\n");
         payload_ = obd::test::pattern_bytes(256 * 1024, 117);
         const auto raw = obd::test::write_file(directory_ + "/raw", payload_);
         const int input = ::open(raw.c_str(), O_RDONLY | O_CLOEXEC);

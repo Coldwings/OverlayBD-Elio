@@ -145,3 +145,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0021](./0021-reuse-tag-handlers-on-the-bridge-worker.md) | Reuse tag handlers on their bridge worker | accepted |
 | [0022](./0022-retain-failed-startup-owners.md) | Retain failed startup owners until positive retirement | proposed |
 | [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | accepted |
+| [0025](./0025-configure-device-queue-and-worker-topology.md) | Resolve device queues and workers together before startup | proposed |

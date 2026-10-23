@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -69,6 +70,12 @@ struct Args {
     bool blank = false;
     uint64_t blank_size = 0;
     std::string blank_dir;
+    // Loaded once off-scheduler, before the worker count is committed.
+    obd::image::GlobalConfig global_config;
+    obd::DeviceTopology topology;
+    std::optional<obd::ublk::DeviceParams> recovery_layout;
+    std::exception_ptr global_config_failure;
+    std::exception_ptr recovery_probe_failure;
 };
 
 void write_status(const obd::supervisor::ControlChannelWriterPtr& channel,
@@ -102,6 +109,19 @@ struct ReportedDeviceFailure {};
 
 elio::coro::task<int> device_main(Args args) {
     using obd::supervisor::DeviceStatus;
+    const auto* scheduler = elio::runtime::scheduler::current();
+    if (args.global_config_failure || args.recovery_probe_failure ||
+        (args.recover && !args.recovery_layout)) {
+        std::fprintf(stderr, "device topology: unresolved (startup preflight unavailable)\n");
+    } else std::fprintf(stderr,
+        "device topology: requested_queues=%u requested_workers=%u "
+        "resolved_queues=%u workers=%zu cpu_budget=%u affinity_cpus=%u "
+        "visible_quota_cpus=%u recovery=%s\n",
+        args.global_config.device_topology.queues,
+        args.global_config.device_topology.workers, unsigned(args.topology.queues),
+        scheduler->num_threads(std::memory_order_acquire),
+        args.topology.cpu.available_cpus(), args.topology.cpu.affinity_cpus,
+        args.topology.cpu.quota_cpus, args.recover ? "true" : "false");
     // ONE serialized writer for every channel writer (status reports,
     // trace replies, the expiry event) — see ControlChannelWriter.
     const obd::supervisor::ControlChannelWriterPtr channel =
@@ -313,10 +333,8 @@ elio::coro::task<int> device_main(Args args) {
             }
             co_await elio::time::sleep_for(std::chrono::milliseconds(10));
         }
-        obd::image::GlobalConfig global =
-            args.global.empty()
-                ? obd::image::GlobalConfig{}
-                : obd::image::GlobalConfig::from_file(args.global);
+        if (args.global_config_failure) std::rethrow_exception(args.global_config_failure);
+        const auto& global = args.global_config;
         if (args.blank) {
             if (args.blank_size == 0 || args.blank_size % 512 != 0) {
                 ELIO_LOG_ERROR("blank size {} is not sector aligned",
@@ -379,6 +397,11 @@ elio::coro::task<int> device_main(Args args) {
         }
 
         obd::ublk::DeviceParams params;
+        params.nr_queues = args.topology.queues;
+        if (args.recovery_layout) {
+            params.queue_depth = args.recovery_layout->queue_depth;
+            params.max_io_buf_bytes = args.recovery_layout->max_io_buf_bytes;
+        }
 #ifdef OBD_TEST_HOOKS
         if (startup_fixture) {
             params.nr_queues = 2;
@@ -419,6 +442,9 @@ elio::coro::task<int> device_main(Args args) {
         // resize in flight can never outlive the Device (destroyed only
         // when the LAST reference drops, after the control loop exits).
         if (args.recover) {
+            // Assembly diagnostics keep their original precedence. Probe
+            // errors still use the owned control/source cleanup path.
+            if (args.recovery_probe_failure) std::rethrow_exception(args.recovery_probe_failure);
             // ADR-0010: replace a crashed server for an existing device.
             if (args.dev_id < 0) {
                 report(channel, DeviceStatus{"failed", "",
@@ -436,6 +462,8 @@ elio::coro::task<int> device_main(Args args) {
         // Conversion can allocate a shared control block. Its failure leaves
         // this outer unique owner intact for awaited cleanup off the worker.
         dev = std::shared_ptr<obd::ublk::Device>(std::move(unshared_dev));
+        std::fprintf(stderr, "device serving topology: queues=%zu workers=%zu\n",
+            dev->queue_count(), scheduler->num_threads(std::memory_order_acquire));
 
         // Serve the supervisor's device commands (ADR-0013 trace record
         // path, D3 resize) on the control channel (EOF = supervisor
@@ -848,5 +876,48 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot block signals\n");
         return 1;
     }
-    return elio::run(device_main, std::move(args));
+    elio::run_config runtime;
+    try {
+        try {
+            args.global_config = args.global.empty()
+                ? obd::image::GlobalConfig{}
+                : obd::image::GlobalConfig::from_file(args.global);
+        } catch (const obd::DeviceTopologyError&) {
+            throw;
+        } catch (...) {
+            args.global_config_failure = std::current_exception();
+        }
+        std::optional<uint32_t> recovery_queues;
+        if (!args.global_config_failure && args.recover && args.dev_id >= 0) {
+            // Read-only cold query: no device adoption, recovery admission,
+            // queue mapping or FETCH obligation is acquired here.
+            std::optional<ublksrv_ctrl_dev_info> info;
+            try {
+                obd::ublk::Ctrl reader;
+                info = reader.get_dev_info(static_cast<uint32_t>(args.dev_id));
+            } catch (...) {
+                args.recovery_probe_failure = std::current_exception();
+            }
+            if (info) {
+                if (!info->queue_depth || info->queue_depth > UBLK_MAX_QUEUE_DEPTH ||
+                    !info->max_io_buf_bytes) {
+                    throw obd::DeviceTopologyError("existing ublk device has invalid queue geometry");
+                }
+                obd::ublk::DeviceParams layout;
+                layout.nr_queues = info->nr_hw_queues;
+                layout.queue_depth = info->queue_depth;
+                layout.max_io_buf_bytes = info->max_io_buf_bytes;
+                args.recovery_layout = layout;
+                recovery_queues = info->nr_hw_queues;
+            }
+        }
+        args.topology = obd::resolve_device_topology(
+            args.global_config.device_topology, obd::probe_device_cpu_budget(),
+            recovery_queues);
+        runtime.num_threads = args.topology.workers;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "device topology/configuration error: %s\n", error.what());
+        return 2;
+    }
+    return elio::run(runtime, device_main, std::move(args));
 }

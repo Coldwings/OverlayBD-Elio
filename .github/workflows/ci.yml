@@ -135,6 +135,9 @@ jobs:
             liburing-dev zlib1g-dev libssl-dev linux-libc-dev \
             cmake ninja-build g++
 
+      - name: Install topology observation tool
+        run: sudo apt-get install -y --no-install-recommends fio
+
       - name: Build and load ublk_drv
         # Ubuntu kernels do not ship ublk_drv (CONFIG_BLK_DEV_UBLK=n in
         # every noble package), so modprobe alone cannot work. Build the
@@ -172,7 +175,7 @@ jobs:
         run: >
           cmake -S . -B build -G Ninja
           -DOBD_BUILD_TESTS=ON
-          -DOBD_BUILD_BENCHMARKS=OFF
+          -DOBD_BUILD_BENCHMARKS=ON
           -DOBD_ENABLE_UBLK=ON
           -DOBD_ENABLE_LIBE2FS_BACKEND=OFF
 
@@ -345,6 +348,28 @@ jobs:
             fi
             if (( rc != 0 )); then exit "$rc"; fi
           done
+
+      - name: Observe single and multiple queue topology
+        timeout-minutes: 7
+        run: |
+          # Both variant labels use this same binary: this is a topology
+          # observation, with no cross-revision or performance threshold claim.
+          # Build is complete and no compiler runs during the measurements.
+          for pairs in 1 2; do
+            python3 benchmarks/run_ublk_read.py \
+              --baseline-build build --candidate-build build \
+              --out "$RUNNER_TEMP/obd-topology-$pairs" \
+              --workers "$pairs" --queues "$pairs" \
+              --qds 1 16 --repeats 1 --warm-seconds 1 --run-seconds 3 --sudo
+          done
+
+      - name: Preserve topology observations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ublk-topology-observations
+          path: ${{ runner.temp }}/obd-topology-*
+          if-no-files-found: ignore
 
       - name: Preserve retained-recovery evidence
         if: always()
