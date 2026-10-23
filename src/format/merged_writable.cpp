@@ -270,7 +270,17 @@ elio::coro::task<int> MergedWritable::flush() {
     ActiveOpGuard active(active_ops_, AdoptActiveOp{});
     co_await op_mu_.lock();
     SyncMutexGuard op_guard(op_mu_);
-    co_return co_await top_->flush();
+    const uint64_t segments_before = top_->segments_generation();
+    const int r = co_await top_->flush();
+    // A sparse top may complete a previously failed compatibility-sidecar
+    // transition during flush, changing ZERO coverage to DATA even when this
+    // flush later reports a durability error. Keep the merged live view in
+    // step with the top on both success and failure.
+    const int rebuild = top_->segments_generation() != segments_before
+                            ? rebuild_index()
+                            : 0;
+    if (r != 0) co_return r;
+    co_return rebuild;
 }
 
 int MergedWritable::grow(uint64_t vsize) {
@@ -287,8 +297,15 @@ int MergedWritable::grow(uint64_t vsize) {
     if (vsize < cur) return -EINVAL;  // grow-only (equal = no-op)
     if (vsize == cur) return 0;
     if (vsize > top_->virtual_size()) {
+        const uint64_t segments_before = top_->segments_generation();
         const int r = top_->grow(vsize);
+        // Sparse grow retries pending sidecar publication before resizing and
+        // can therefore change the top index even when it returns an error.
+        const int rebuild = top_->segments_generation() != segments_before
+                                ? rebuild_index()
+                                : 0;
         if (r != 0) return r;
+        if (rebuild != 0) return rebuild;
     }
     vsize_.store(vsize, std::memory_order_release);
     grow_guard.armed = false;

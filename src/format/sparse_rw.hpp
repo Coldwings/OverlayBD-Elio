@@ -1,10 +1,9 @@
-// Sparse writable layer: a sparse file whose written extents form the
-// layer's segment index with identity mapping (moffset == offset).
-// Live extents are rebuilt from the kernel fiemap (SEEK_DATA/SEEK_HOLE)
-// when an existing file is opened, and discard zero masks are recovered
-// from a small sidecar. Note: fiemap is filesystem-block granular, so a
-// sub-block discard may recover as a fatter live extent; reads are
-// unaffected because punched bytes read back as zeroes.
+// Sparse writable layer: exact logical coverage forms the segment index,
+// with identity mapping for DATA (moffset == offset).
+// New uppers persist exact sector-granular DATA/ZERO ownership in a
+// checksummed coverage sidecar. SEEK_DATA/SEEK_HOLE is used only once when
+// importing an old upper that has no coverage sidecar; it is never used to
+// expand ownership after the v2 sidecar exists.
 #pragma once
 
 #include "format/writable.hpp"
@@ -12,19 +11,29 @@
 #include <elio/sync/mutex.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace obd::format {
+
+struct ZeroMaskPersistResult {
+    int rc = 0;
+    bool namespace_committed = false;
+};
 
 class SparseRwLayer final : public WritableLayer {
 public:
     ~SparseRwLayer() override;
 
     /// Opens (creating if needed) `path` as a sparse file of `vsize` bytes.
-    /// Existing content is kept; written extents are recovered via fiemap.
+    /// Existing content is kept. V2 content is recovered from exact coverage
+    /// metadata; legacy content is imported once from SEEK_DATA/SEEK_HOLE and
+    /// the existing `.zeroes` sidecar.
     static elio::coro::task<std::unique_ptr<SparseRwLayer>> open(
         const std::string& path, uint64_t vsize);
 
@@ -52,11 +61,16 @@ public:
         return segments_;
     }
     std::vector<bytes::segment_mapping> segments_snapshot() const override;
+    uint64_t segments_generation() const noexcept override {
+        return segments_generation_.load(std::memory_order_acquire);
+    }
     source::BlobSource& data_source() override;
 
 private:
     class View;
+#ifdef OBD_TEST_HOOKS
     friend struct SparseRwLayerTestAccess;
+#endif
 
     enum class Lifecycle {
         kOpen,
@@ -65,9 +79,9 @@ private:
         kCheckpointed,
     };
 
-    struct ZeroMaskPersistResult {
-        int rc = 0;
-        bool namespace_committed = false;
+    struct CoveragePageVersion {
+        uint64_t generation = 0;
+        uint8_t slot = 0;
     };
 
     SparseRwLayer() = default;
@@ -89,17 +103,32 @@ private:
         uint64_t vsize) const;
     int sync_data_file() const;
     void load_zero_masks();
-    elio::coro::task<int> publish_data_first_zero_masks_locked();
+    static std::unique_ptr<SparseRwLayer> open_sync(std::string path,
+                                                    uint64_t vsize);
+    void create_coverage_snapshot(bool legacy_import);
+    void load_coverage(const std::string& artifact_path,
+                       uint64_t data_size, bool verify_xattr = true);
+    elio::coro::task<int> publish_coverage_locked(
+        const std::vector<bytes::segment_mapping>& exact_next,
+        const std::vector<bytes::segment_mapping>& runtime_next,
+        uint64_t lo, uint64_t hi, uint64_t* committed_hi);
+    elio::coro::task<int> publish_data_first_zero_masks_locked(
+        std::vector<bytes::segment_mapping> exact_next,
+        std::vector<bytes::segment_mapping> next_zeroes);
     elio::coro::task<int> flush_locked();
 
     int fd_ = -1;                    // RW fd (writes + flushes)
+    int coverage_fd_ = -1;           // exact sector ownership metadata
     std::unique_ptr<View> ro_;       // RO view for data_source()
     /// Declared size in bytes. Atomic: the device resize executor (a
     /// spawn_blocking pool thread) grows the layer while bridge
     /// coroutines on Elio workers read/write through it.
     std::atomic<uint64_t> vsize_{0}; // bytes
     std::string zero_mask_path_;
+    std::string coverage_path_;
     std::vector<bytes::segment_mapping> segments_;
+    std::atomic<uint64_t> segments_generation_{0};
+    std::unordered_map<uint64_t, CoveragePageVersion> coverage_pages_;
     /// Serializes pwrite/discard/flush durability ordering without
     /// blocking an Elio worker while disk work is offloaded.
     elio::sync::mutex op_mu_;
@@ -114,6 +143,19 @@ private:
     uint64_t zero_masks_generation_ = 0;
     bool zero_masks_dirty_ = false;
     bool zero_masks_data_first_ = false;
+    bool zero_masks_pending_view_ = false;
+    std::vector<bytes::segment_mapping> pending_zero_masks_;
+    std::vector<bytes::segment_mapping> pending_data_segments_;
+    uint64_t coverage_generation_ = 0;
+    bool coverage_dirty_ = false;
+#ifdef OBD_TEST_HOOKS
+    std::optional<uint64_t> fail_coverage_page_for_test_;
+    std::optional<uint64_t> fail_coverage_map_prepare_page_for_test_;
+    std::optional<uint64_t> fail_coverage_runtime_prepare_page_for_test_;
+    bool fail_zero_mask_dirsync_after_commit_for_test_ = false;
+    static std::shared_ptr<std::atomic<int>> open_park_for_test_;
+    static std::atomic<int> coverage_install_fail_stage_for_test_;
+#endif
 };
 
 }  // namespace obd::format

@@ -1,7 +1,7 @@
 // Writable layer interface (ADR-0008). A writable layer is the topmost
 // layer of an image stack; two implementations exist:
-//   * SparseRwLayer (sparse_rw.hpp) — a sparse file with fiemap extent
-//     tracking, identity segment mapping.
+//   * SparseRwLayer (sparse_rw.hpp) — a sparse data file with exact persisted
+//     sector coverage and identity segment mapping.
 //   * LsmtRwLayer   (lsmt_rw.hpp)   — an unsealed LSMT file with in-place
 //     edit: subranges covered by live segments overwrite their data blocks
 //     in place; uncovered or discarded (zeroed) subranges are appended.
@@ -74,6 +74,11 @@ public:
     virtual std::vector<bytes::segment_mapping> segments_snapshot() const {
         return segments();
     }
+
+    /// Monotonic best-effort notification for operations such as flush/grow
+    /// that may finish a deferred index transition. Implementations that do
+    /// not change their segment view in those operations may keep the default.
+    virtual uint64_t segments_generation() const noexcept { return 0; }
 
     /// The file view segment data is read from (identity for sparse). A
     /// grow-capable writable layer may expose a view whose size() tracks

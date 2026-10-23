@@ -1,0 +1,113 @@
+# ADR-0024: Persist exact sector coverage for sparse uppers
+
+- Status: proposed
+- Date: 2026-10-22
+- Supersedes: none
+- Amends: ADR-0009 (replaces its sparse recovery mechanism while preserving
+  mask-with-zeroes semantics)
+- Binds: src/format/sparse_rw.cpp, src/format/sparse_rw.hpp,
+  src/format/writable.hpp, src/format/merged_writable.cpp, docs/design-assumptions.md,
+  docs/architecture.md, docs/config.md, docs/format.md, docs/image.md,
+  docs/operations.md, docs/testing.md, docs/ublk.md
+
+## Context
+
+A sparse upper has three states for every 512-byte sector: INHERIT reads the
+lower layer, DATA reads bytes from the upper file, and ZERO masks the lower
+with zeroes. The backing filesystem exposes allocation extents, not these
+application states. ext4 and XFS both report a single 4 KiB extent after a
+512-byte write, so reconstructing DATA from `SEEK_DATA`/`SEEK_HOLE` or FIEMAP
+hides seven adjacent lower sectors after a device-process restart. FIEMAP's
+UNWRITTEN flag also cannot distinguish an intentional ZERO from filesystem
+preallocation.
+
+Sparse uppers must survive a device-server process crash while the kernel and
+page cache remain alive. Whole-machine power-loss durability is required only
+after a successful guest FLUSH. Existing `.zeroes` files must remain readable
+for migration and rolling compatibility.
+
+## Decision
+
+Make a versioned, checksummed `<upper>.coverage` artifact authoritative for
+sector-granular DATA and ZERO ownership; publish backing bytes before DATA
+coverage, publish ZERO coverage before reclamation, and sync the data file
+before the coverage artifact at every successful guest FLUSH.
+
+The artifact is a sparse two-bit-per-sector map. One logical metadata page
+describes 8 MiB of virtual device space and has two generation-numbered slots.
+A writer clears the inactive slot's commit word, writes its complete body and
+CRC, then writes the commit word last. Recovery selects the newest valid slot.
+An uncommitted or checksum-invalid slot falls back to the other valid slot;
+recovery fails closed when no valid committed slot survives. Sparse holes in
+the artifact mean INHERIT.
+
+Each modifying request writes the backing data or zero operation first where
+required. Before publishing a page it allocates that page's complete runtime
+index replacement; after the commit word becomes visible it performs only a
+non-throwing swap and scalar updates. A crash partway through a multi-page publication may
+leave a prefix of the uncompleted request visible; ublk USER_RECOVERY reissues
+the whole idempotent request. A returned metadata error has the same partial
+write boundary. Guest FLUSH first synchronizes the data file and compatibility
+zero-mask changes, then synchronizes coverage.
+
+The header binds coverage to a random 128-bit upper identity stored in a user
+xattr. When the header requires that marker, it is the strong identity and a
+copy or atomic replacement that preserves it may change device/inode. On a
+filesystem that cannot store user xattrs, device and inode form the documented
+weaker fallback binding; replacing the data inode still fails closed, while
+inode reuse after removal is outside that fallback's guarantee.
+
+When coverage is absent, open imports the currently observable legacy view
+once: it enumerates `SEEK_DATA`/`SEEK_HOLE`, overlays `.zeroes`, then atomically
+installs and directory-syncs v2 coverage before serving I/O. This migration
+freezes existing behavior but cannot recover historical sub-block intent that
+v1 never recorded. With v2 present, recovery loads it first and applies
+`.zeroes` as a protective ZERO-only overlay; extent enumeration no longer
+widens ownership.
+
+Creation and migration use `<upper>.coverage.tmp`. The implementation writes,
+syncs, and fully validates the temporary artifact, installs the xattr marker,
+syncs the data inode so the marker and file size precede publication, renames
+the artifact, then syncs its parent directory. If a marker exists while the
+final artifact is missing, open resumes only a fully valid temporary artifact;
+without one it fails closed. A pre-existing zero-length data inode is never
+classified as newly created, so its metadata is not silently removed.
+
+## Consequences
+
+- A 512-byte DATA write and adjacent INHERIT sectors remain distinct across a
+  process restart on ext4, XFS, and filesystems with different extent rules.
+- Ordinary writes update one 4160-byte inactive metadata slot per affected
+  8 MiB region, plus an eight-byte commit write. This costs metadata I/O but
+  avoids full-sidecar rewrites and lower-layer copy-up.
+- The sparse artifact's virtual size is roughly 1 GiB per TiB of device
+  because every logical page reserves two slots. Untouched pages remain holes;
+  recovery enumerates allocated metadata ranges and falls back to a full scan
+  only where `SEEK_DATA` is unavailable for the metadata file.
+- `.zeroes` remains a compatibility artifact and always wins as ZERO during
+  reopen. New exact DATA recovery does not depend on it.
+- An old binary that ignores `.coverage` cannot safely open a v2 upper: it can
+  widen DATA to filesystem allocation extents and lose exact INHERIT intent.
+  Downgrade requires exporting or recreating the upper in an old-format-aware
+  workflow; merely retaining `.zeroes` is insufficient.
+- On a filesystem without user xattrs, deleting every coverage sidecar while
+  leaving the data inode intact is indistinguishable from a genuine v1 upper.
+  The documented device+inode fallback detects mismatched surviving sidecars,
+  but cannot detect loss of all sidecars and will attempt legacy import.
+- Corrupt headers, identity mismatches, invalid sector states, and pages with
+  no valid committed slot stop open rather than exposing lower data.
+
+## Alternatives considered
+
+- FIEMAP plus ZERO_RANGE cannot recover guest intent: written extents are
+  filesystem-block granular and UNWRITTEN extents carry no origin tag.
+- Copying a complete filesystem block from the merged view before every
+  partial write would make extent-wide DATA truthful, but adds lower reads and
+  write amplification to the latency-sensitive path and makes filesystem
+  allocation units part of the format contract.
+- Requiring recovery-unit-aligned guest I/O would break the existing 512-byte
+  block contract.
+- A single bitmap slot cannot distinguish an interrupted page rewrite from
+  corruption. An append log avoids fixed virtual address space but needs
+  replay bounds and compaction; dual sparse slots provide bounded recovery
+  with a local rollback point.

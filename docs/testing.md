@@ -356,8 +356,51 @@ Every test, grouped by area, with the property it guards.
 - `format: zfile reader rejects a corrupted block digest` — a bit-flipped
   compressed block fails verification instead of returning bad data.
 - `format: sparse layer writes, reads and recovers extents` — the
-  `SparseRwLayer` persists writes, reads them back, and rebuilds its
-  extent map from the fiemap across a reopen (ADR-0008).
+  `SparseRwLayer` persists writes, reads them back, and rebuilds exact
+  sector ownership from v2 coverage across a reopen (ADR-0024).
+- `format: sparse exact data coverage preserves adjacent lowers on reopen` —
+  a 512-byte DATA write between untouched sectors remains exact after reopen;
+  surrounding nonzero lower bytes still fall through instead of being hidden
+  by the backing filesystem's wider allocation extent.
+- `format: sparse completed operations survive process exit without flush` —
+  an exec-isolated writer completes either a 512-byte DATA write or ZERO
+  publication and calls `_exit` without destructors or guest FLUSH; reopening
+  in the parent recovers the completed state and its adjacent lower bytes.
+- `format: sparse coverage rejects corruption and stale identity` — malformed
+  headers, invalid sector states, unsupported flags, size mismatches, and a
+  coverage artifact paired with the wrong data inode or identity fail closed.
+- `format: sparse coverage falls back from an invalid inactive slot` — an
+  interrupted or corrupt newer slot falls back to the other valid generation,
+  while equal committed generations are rejected as noncanonical.
+- `format: sparse multi-page coverage failure is retryable` — failures before
+  the second DATA page commit leave the first page's committed prefix aligned
+  between the live view and reopen, and reissuing the write completes it.
+- `format: sparse new coverage page allocates before commit` — failure to
+  allocate a new page's version node occurs before its commit word is written,
+  leaving both the live and recovered views unchanged.
+- `format: sparse multi-page zero coverage failure is retryable` — the same
+  committed-prefix and idempotent-retry rule holds for ZERO publication.
+- `format: sparse DATA view follows committed zero-mask namespace` — after
+  data replaces a compatibility ZERO, an injected directory-sync failure
+  exposes DATA only if sidecar removal already changed the namespace.
+- `format: sparse grown tail data coverage survives reopen` — DATA written in
+  the grown tail remains owned after reopening with the original configured
+  size.
+- `format: sparse legacy coverage imports zero masks once` — one-time v1
+  extent import overlays the legacy `.zeroes` mask, then freezes that combined
+  view into v2 coverage without repeating extent discovery.
+- `format: sparse coverage install state recovers or fails closed` — failures
+  around marker sync and rename preserve a validated temporary artifact for
+  recovery; missing or corrupt installation evidence is rejected.
+- `format: sparse coverage rejects data truncation without cleanup` — an
+  existing zero-length inode is not mistaken for a new file, and any recovered
+  DATA sector past the retained backing EOF fails closed.
+- `format: sparse no-xattr fallback cannot detect sidecar deletion` — records
+  the documented weaker device/inode fallback limit: with no durable xattr
+  marker and every artifact removed, open must treat the file as legacy.
+- `format: sparse open blocking callable owns its inputs` — destroying the
+  awaiting open task while its blocking job is parked does not invalidate the
+  job's path, test state, or eventual layer ownership.
 - `format: lsmt rw overwrites covered data in place` — rewriting a
   range already covered by the RW layer edits it in place; uncovering
   writes append.
@@ -468,10 +511,10 @@ Every test, grouped by area, with the property it guards.
   a sparse grow after discard but before `flush()` keeps the protective
   zero-mask sidecar recoverable, so a reopened merged view still masks
   lower-layer bytes.
-- `format: sparse zero mask sidecar overrides live fiemap coverage` — a
-  recovered sidecar zero range overlays an overlapping live extent from
-  fiemap, preserving sub-block discard masks across filesystems with
-  coarse extent reporting.
+- `format: sparse zero mask overlays legacy extent import` — during one-time
+  v1 migration, a recovered sidecar zero range overlays overlapping backing
+  allocation, preserving sub-block discard masks before the observable view
+  is frozen into v2 coverage.
 - `format: sparse layer reopen accepts a published grown zero mask` —
   recovery accepts a sidecar recorded at a larger online-grow size than
   the supplied configuration and keeps that larger sparse write window.
@@ -503,6 +546,14 @@ Every test, grouped by area, with the property it guards.
   if publishing a write's zero-mask removal fails after data reaches the
   sparse file, later writes first retry that pending data-first transition
   instead of returning success while the stale sidecar still masks data.
+- `format: sparse grow retries pending zero-mask removal` — a grow first
+  retries a failed data-first sidecar transition; it leaves the old virtual
+  size unchanged while the sidecar path is blocked, then grows and exposes
+  the already-written data after the namespace transition can complete.
+- `format: merged writable rebuilds after retrying sparse sidecar transition` —
+  when a failed sparse write leaves the compatibility sidecar transition
+  pending, either `flush()` or `grow()` refreshes the merged index as it
+  completes that transition, so live reads expose the newly owned DATA.
 - `format: merged writable sparse write over discard survives reopen without flush` —
   after a sparse discard publishes lower-mask coverage, a later write into
   part of that range syncs the data file and republishes the sidecar removal

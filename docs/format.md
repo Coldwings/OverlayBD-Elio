@@ -20,7 +20,8 @@ images built by upstream `overlaybd-*` tools load identically here:
   wins, holes read as zeroes).
 - **Writable layers** (`writable.hpp`, `sparse_rw.hpp`, `lsmt_rw.hpp`,
   `merged_writable.hpp`) — the ADR-0008 writable top of an image stack:
-  `SparseRwLayer` (sparse file, fiemap recovery), `LsmtRwLayer` (unsealed
+  `SparseRwLayer` (sparse data plus exact persisted coverage, ADR-0024),
+  `LsmtRwLayer` (unsealed
   single-file LSMT with in-place edit and seal compaction), and
   `MergedWritable` (copy-on-write merged view implementing
   `source::WritableBlobSource`).
@@ -525,43 +526,97 @@ public:
 };
 ```
 
-A sparse file whose live written extents form identity mappings
-(`moffset == offset`) plus zero-mask mappings for discarded ranges. `open`
+A sparse data file whose live DATA sectors form identity mappings
+(`moffset == offset`) plus ZERO mappings for discarded ranges. `open`
 requires `vsize` to be a non-zero multiple of 512 (throws
-`obd::error(EINVAL)` otherwise), opens `path` with `O_RDWR | O_CREAT`
-(existing content is reused), and sizes it to the maximum of the supplied
+`obd::error(EINVAL)` otherwise), first opens an existing inode and otherwise
+creates one with `O_CREAT | O_EXCL`, and sizes it to the maximum of the supplied
 `vsize` and the current sparse file length. A valid `<path>.zeroes`
 sidecar may declare that same trusted size or any smaller sector-aligned
-size; sidecars that declare a larger size are rejected as corrupted.
-This preserves online-grown uppers when the data file or caller-supplied
-size already records the grown window without allowing sidecar metadata
-alone to expand the device. For a pre-existing file, `open` rebuilds live
-coverage from the kernel fiemap (`SEEK_DATA`/`SEEK_HOLE`) before loading
-discard masks from the sidecar. Fiemap boundaries are rounded outward to
-whole sectors (only whole sectors are ever written). Filesystem or
-malformed sidecar errors throw `obd::error`; sidecars also reject entry
-counts above the read-only LSMT index maximum before allocating the
-encoded segment array. A sidecar recorded at an older, smaller vsize marks
-the sidecar dirty so the next durability boundary rewrites it at the
-current effective size.
+size; sidecars that declare a larger size are rejected as corrupted. This
+preserves online-grown uppers when the data file or caller-supplied size
+already records the grown window without allowing sidecar metadata alone to
+expand the device.
 
-`pwrite`/`pread` return `-EINVAL` on unaligned or out-of-`vsize` requests;
-writes are split at the 14-bit segment-length cap, replace any overlapping
-zero-mask coverage, and merge into the identity segment set (overlapping
-and adjacent live extents coalesce). `discard` first publishes protective
-zero-mask coverage to `<path>.zeroes`, then performs the real
-`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` and marks the data
-file dirty, so a later size-changing `fdatasync` cannot make a lower-only
-hole durable without top-layer coverage. After the sidecar commit,
-punch-hole is a best-effort space-reclamation step: if it fails, the
-discard still succeeds semantically and reads remain masked by the zero
-sidecar. `pwrite`, `discard`, and `flush`
-serialize their sparse metadata updates so a durability publication cannot
-overtake an earlier write or discard. `flush()` offloads the blocking
-durability work and orders data-file sync versus sidecar rewrite by the
-pending zero-mask transition: writes that remove zero masks sync data
-before removing sidecar coverage, while new discard masks publish sidecar
-coverage before syncing the punched sparse file. It returns 0 or `-errno`.
+New uppers persist exact 512-byte INHERIT, DATA, and ZERO ownership in
+`<path>.coverage` (ADR-0024). A sparse two-bit map page describes 8 MiB and
+has two 4160-byte generation slots; CRC and a commit word let reopen select
+the newest complete slot and fall back to the other slot after an interrupted
+update. Header, page, identity, state, and size errors fail open closed. A
+random ID stored in a user xattr binds coverage to the data file and is the
+primary identity even if the inode changes; filesystems without user xattrs
+use the weaker device+inode fallback documented by ADR-0024.
+
+The coverage artifact has this little-endian v2 layout:
+
+| Region | Bytes | Meaning |
+|---|---:|---|
+| header | `0..4095` | magic `OBDSPCV2`, version 2, header size 4096, sector size 512, flags, initial virtual size, backing `st_dev`/`st_ino`, 128-bit identity, then CRC-32C over bytes `0..63` |
+| page `p`, slot `s` | `4096 + p*8320 + s*4160` | 4160-byte generation record; `s` is 0 or 1 |
+
+The header fields are: magic at 0 (8 bytes), `u32` version at 8, `u32` header
+size at 12, `u32` sector size at 16, `u32` flags at 20, `u64` initial virtual
+size at 24, `u64 st_dev` at 32, `u64 st_ino` at 40, identity at 48 (16 bytes),
+and `u32` CRC at 64. Flag bit 0 requires the identity xattr; bit 1 marks a
+legacy import; other bits are rejected. Bytes 68 through 4095 are reserved and
+ignored by this version.
+
+Each slot contains magic `OBDCVP2\0` at 0 (8 bytes), `u64` page number at 8,
+nonzero `u64` generation at 16, a 4096-byte payload at 24, `u32` CRC at 4120
+over slot bytes `0..4119`, reserved bytes at 4124 through 4151, and an eight-byte
+commit word at 4152. Payload byte
+`q/4`, bits `(q%4)*2..+1`, records sector `p*16384+q`: `00` INHERIT, `01`
+DATA, `10` ZERO, and `11` invalid. The writer clears the inactive slot's
+commit word, writes bytes `0..4151`, then writes the commit word. The file's
+logical size is `4096 + ceil(vsize/(512*16384))*8320`; untouched page regions
+remain sparse holes. The virtual size cannot exceed the 50-bit segment offset
+window.
+
+For a pre-existing v1 file with no coverage sidecar, `open` performs a
+one-time `SEEK_DATA`/`SEEK_HOLE` import, overlays `.zeroes`, then atomically
+publishes v2 coverage. The imported view preserves what v1 currently exposes;
+it cannot reconstruct original sub-block write intent. Once v2 exists,
+filesystem extents never broaden ownership. `.zeroes` is loaded after v2 and
+remains a protective ZERO-only overlay for migration and rolling
+compatibility. A `.zeroes` file recorded at an older, smaller vsize is dirty
+until the next durability boundary republishes its current size.
+
+Migration writes and syncs `<path>.coverage.tmp`, validates every header and
+committed page, installs the data-inode identity xattr, syncs the data inode,
+then renames the sidecar and syncs the parent directory. A marker with neither
+final coverage nor a valid temporary artifact fails closed. Existing
+zero-length inodes remain existing and cannot trigger stale-sidecar cleanup.
+Recovery also rejects an initial virtual size or any DATA sector beyond the
+backing file's pre-open EOF. On no-xattr filesystems, deletion of all coverage
+artifacts leaves no durable marker and is indistinguishable from a legacy v1
+upper; the implementation then attempts legacy import.
+
+`pwrite`/`pread` return `-EINVAL` on unaligned or out-of-`vsize` requests.
+Writes are split at the 14-bit segment-length cap, write backing bytes, then
+publish every affected coverage page before updating the in-memory index and
+returning success. Adjacent DATA extents coalesce without absorbing INHERIT
+sectors. `discard` first publishes exact ZERO coverage and the protective
+compatibility mask in `<path>.zeroes`, then performs
+`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`. Punch-hole remains
+best-effort physical reclamation: coverage preserves zero reads if it is
+unsupported or fails.
+
+`pwrite`, `discard`, and `flush` serialize metadata updates so publication
+cannot overtake an earlier operation. A failure partway through a multi-page
+coverage update can leave the committed prefix visible; the request has not
+completed, the running index and reopen both expose that prefix, and
+USER_RECOVERY reissues the whole idempotent operation.
+For each page, all vector/map allocation precedes the first slot write and the
+commit is followed only by a non-throwing runtime swap. When DATA replaces a
+legacy ZERO mask, the runtime retains that ZERO until `.zeroes` removal changes
+the namespace; a rename/unlink followed by directory-sync failure exposes the
+new DATA view while retaining dirty state for a later durability retry.
+`flush()` offloads blocking compatibility-sidecar work and preserves the
+existing zero-mask order: writes that remove ZERO sync data before removing
+`.zeroes`, while discard publishes ZERO before syncing a punched file. It
+then syncs exact coverage, so a successful guest FLUSH never makes DATA
+ownership durable ahead of its backing bytes. It returns 0 or `-errno`.
+
 Direct `grow()` calls are rejected with `-EBUSY` while
 `pwrite()`/`discard()`/`flush()` or `checkpoint()` is active, and those
 coroutine operations likewise reject a concurrently active grow with
@@ -569,11 +624,13 @@ coroutine operations likewise reject a concurrently active grow with
 upper terminal: later `pwrite()`, `discard()`, `grow()`, and a second
 `checkpoint()` return `-EROFS`.
 
-On reopen, the sidecar zero-mask coverage overlays the fiemap live
-coverage. That preserves correct reads across filesystem-block granularity
-differences: a sub-block punch may recover as a fatter live extent, but
-the recorded zero mask still wins over that live range and lower-only
-discards remain top-layer zero masks.
+On reopen, exact coverage is authoritative and `.zeroes` overlays only ZERO.
+Thus a 512-byte write inside a filesystem-reported 4 KiB extent does not hide
+the seven adjacent lower sectors, while a sub-block discard remains a
+top-layer zero mask independently of physical hole-punch granularity.
+Opening this format with a pre-v2 binary is unsafe because that binary ignores
+`.coverage` and reconstructs ownership from allocation extents. There is no
+in-place downgrade contract.
 
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 
@@ -1070,8 +1127,10 @@ writers and readers agree on the same bytes.
 - `format: sparse layer writes, reads and recovers extents` — write,
   partial rewrite (identity segments merge into one extent), unaligned-write
   rejection, holes-read-as-zero, then **reopen** and require the same
-  coverage recovered from the fiemap. Guards extent merging and
-  SEEK_DATA/SEEK_HOLE recovery.
+  exact coverage recovered from v2 metadata. Additional sparse-coverage tests
+  pin adjacent lower fall-through, legacy `.zeroes` import, dual-slot
+  rollback, corruption/identity rejection, multi-page retry, and grown-tail
+  reopen semantics.
 - `format: lsmt rw overwrites covered data in place` — the ADR-0008
   in-place-edit rule: a fully covered rewrite must not grow the file;
   disjoint and straddling writes append exactly their uncovered bytes; the
@@ -1194,10 +1253,10 @@ writers and readers agree on the same bytes.
   writable layer across restarts (`create()` truncates any existing file),
   and a crash before the graceful-shutdown checkpoint loses the unsealed
   writes. Full RW restart recovery is future work.
-- **`SparseRwLayer` extent granularity:** fiemap extent boundaries are
-  rounded outward to whole sectors on recovery, so a filesystem that splits
-  extents sub-sector could mark unwritten sectors covered (harmless: they
-  read back as the on-disk zeros).
+- **Legacy sparse migration freezes the v1 view.** A v1 file did not record
+  exact DATA intent, so its one-time extent import can retain an already
+  over-wide filesystem-block extent. All writes after v2 publication and all
+  fresh uppers recover exactly (ADR-0024).
 - **Merged index rebuild is O(index) per write.** `MergedWritable` rebuilds
   after every `pwrite`; read requests reuse the published immutable snapshot
   instead of copying the full index. Write-heavy workloads should batch writes.
