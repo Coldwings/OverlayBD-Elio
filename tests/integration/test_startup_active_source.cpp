@@ -569,10 +569,11 @@ void ActiveSourceFixture::validate_retirement() {
     }
     require_fixture(targets == 1, "target block request missing or duplicated");
     for (unsigned queue = 0; queue != 2; ++queue)
-        require_fixture(bridges[queue] < drained[queue] && drained[queue] < stop &&
-            stop < exited[queue] && exited[queue] < closed[queue] && closed[queue] < remove,
-            "native bridge/source drain/STOP/owner/cdev/DEL order invalid");
-    report_["validation"] = "real queue-origin buffer loans delegated exact bytes; all native bridges destroyed before STOP; raw/control originals retired; sequence 1 released";
+        require_fixture(drained[queue] < stop && stop < exited[queue] &&
+            exited[queue] < bridges[queue] && bridges[queue] < closed[queue] &&
+            closed[queue] < remove,
+            "source drain/STOP/owner/frame/cdev/DEL order invalid");
+    report_["validation"] = "real queue-origin buffer loans delegated exact bytes; source drain preceded STOP; owner frames retired before cdev close and DEL; raw/control originals retired; sequence 1 released";
 }
 } // namespace
 

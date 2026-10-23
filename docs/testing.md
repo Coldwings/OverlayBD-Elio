@@ -1658,8 +1658,9 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   owner exit or false ready handoff is allowed. After the source gate opens, the real
   delegate must return the full count with the expected byte checksum. Each
   source scope must exit before its borrowing queue owner's frame destruction,
-  and all queue owners must retire before STOP. Actual control/raw originals, cdev
-  closure, one DEL, caller terminal sequence and actual process reap remain
+  source drain must precede STOP, and each queue owner must exit before its
+  joinable frame is destroyed and its cdev is closed. One later DEL, actual
+  control/raw originals, caller terminal sequence and actual process reap remain
   independently required. Supervisor-owned raw waitpid evidence must match
   each pinned PID/generation and the supervisor PID: the original must have
   SIGKILL and the replacement must exit normally with status zero. A completed

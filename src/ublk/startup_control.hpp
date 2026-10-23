@@ -98,7 +98,15 @@ public:
         // between two owner-published even revisions; without it the parent
         // must reject changed facts at the same revision. Only the Device
         // owner writes fields_.
-        if ((request & closed_bit) == 0 && request != acknowledged) {
+        // A refusal is published before its mailbox acknowledgment so a new
+        // request cannot enter before the terminal observation exists. Do not
+        // project that already-persisted attempt back to pending in the gap.
+        const bool request_persisted = s.release_sequence == request &&
+            (s.release == StartupRelease::pending ||
+             s.release == StartupRelease::refused ||
+             s.release == StartupRelease::released);
+        if ((request & closed_bit) == 0 && request != acknowledged &&
+            !request_persisted) {
             s.version = version + 1;
             s.phase = StartupPhase::releasing;
             s.release_sequence = request;

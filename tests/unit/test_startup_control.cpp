@@ -97,6 +97,24 @@ TEST_CASE("ublk: accepted release prevents ready handoff until resolved",
         REQUIRE_FALSE(Owner::ready(control));
         REQUIRE(Owner::pending(control) == 8);
     }
+    SECTION("a published refusal is not projected back to pending before ack") {
+        StartupSnapshot refusal;
+        refusal.phase = StartupPhase::retained;
+        refusal.reason_errno = EIO;
+        refusal.release_sequence = 7;
+        refusal.release = StartupRelease::refused;
+        refusal.release_errno = EIO;
+        Owner::publish(control, refusal);
+        const auto before_ack = control.snapshot();
+        REQUIRE(before_ack.version % 2 == 0);
+        REQUIRE(before_ack.phase == StartupPhase::retained);
+        REQUIRE(before_ack.release_sequence == 7);
+        REQUIRE(before_ack.release == StartupRelease::refused);
+        REQUIRE(before_ack.release_errno == EIO);
+        Owner::refuse(control, 7);
+        REQUIRE(Owner::pending(control) == 0);
+        REQUIRE(control.snapshot().release == StartupRelease::refused);
+    }
     SECTION("ready can take over after the refusal is settled") {
         Owner::refuse(control, 7);
         REQUIRE(Owner::ready(control));
