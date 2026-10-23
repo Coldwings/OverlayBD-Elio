@@ -317,7 +317,7 @@ Encodes `s` into 16 bytes. Field values are masked to their bit widths
   spent. The OpenSSL context is owned by the instance and freed in the
   destructor.
 - None of this module is coroutine-aware: everything here is synchronous CPU
-  work and may run on an Elio worker, a queue thread, or a plain thread.
+  work and may run on an Elio worker or a plain thread.
   `Sha256` performs no IO.
 - These are cold/support utilities: throwing (`obd::error`, `format_error`)
   is permitted here, but callers on hot IO paths must not let these

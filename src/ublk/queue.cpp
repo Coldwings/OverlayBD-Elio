@@ -1,22 +1,26 @@
-// ublk per-queue data plane. See queue.hpp and ADR-0006.
+// ublk per-queue data plane. See queue.hpp and ADR-0023.
 #include "ublk/queue.hpp"
 
 #include "common/errors.hpp"
 #include "ublk/ctrl.hpp"
 
 #include <elio/log/macros.hpp>
+#include <elio/runtime/affinity.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <stdexcept>
 #include <vector>
 
 namespace obd::ublk {
@@ -121,22 +125,15 @@ void Queue::open(int shared_cdev_fd) {
 }
 
 void Queue::init_ring() {
-    // Must run on the queue thread (the first statement of run()), for
-    // two chained reasons, both verified against real-kernel E2E
-    // failures:
+    // SINGLE_ISSUER binds the creating task as the only legal submitter, so
+    // the ring must be created on the fixed Elio worker which also resumes
+    // handlers and drives every later FETCH/COMMIT submission.
     //
-    // 1. UBLK_F_URING_CMD_COMP_IN_TASK (dev_info_flags) makes the
-    //    driver complete uring-cmds as task_work of the issuing task.
-    //    A task_work only runs inside io_uring_enter when the ring has
-    //    IORING_SETUP_DEFER_TASKRUN; without it a queue thread blocked
-    //    in io_cqring_wait never reaps FETCH completions (observed: the
-    //    START_DEV partition scan deadlocked in folio_wait_bit_common
-    //    because its read was never serviced).
-    // 2. DEFER_TASKRUN requires IORING_SETUP_SINGLE_ISSUER, and
-    //    SINGLE_ISSUER binds the creating task as the only legal
-    //    submitter — so the ring must be created by the queue thread
-    //    itself, not by the device-creating Elio worker (otherwise
-    //    every queue-thread io_uring_enter fails with EEXIST).
+    // With DEFER_TASKRUN, io_req_local_work_add() signals a registered
+    // eventfd when ctx->work_list changes from empty to nonempty, before the
+    // local work has published its CQE. The Elio-native eventfd read therefore
+    // wakes this task without blocking the worker; drive_owner_cq() must then
+    // enter this raw ring with GETEVENTS to execute that local work.
     io_uring_params ring_params {};
     ring_params.flags = IORING_SETUP_SINGLE_ISSUER |
                         IORING_SETUP_DEFER_TASKRUN;
@@ -147,11 +144,114 @@ void Queue::init_ring() {
     ring_ok_ = true;
 }
 
+void Queue::register_owner_eventfd() {
+    const int rc = io_uring_register_eventfd(&ring_, elio_efd_);
+    if (rc < 0) throw_errno(-rc, "cannot register ublk queue eventfd");
+}
+
+void Queue::assert_owner() const {
+    const auto worker = elio::current_worker_id();
+    if (!same_owner_pump_ || worker != owner_worker_ ||
+        std::this_thread::get_id() != owner_thread_id_)
+        throw std::logic_error("ublk raw ring accessed outside its owner task");
+}
+
+pid_t Queue::capture_owner_tid() noexcept {
+#ifdef OBD_TEST_HOOKS
+    ++owner_tid_syscalls_for_test_;
+#endif
+    return static_cast<pid_t>(::syscall(SYS_gettid));
+}
+
+bool Queue::begin_owner() noexcept {
+    uint8_t unclaimed = 0;
+    return owner_admission_.compare_exchange_strong(
+        unclaimed, 1, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+bool Queue::abort_unstarted_owner(int error) noexcept {
+    uint8_t unclaimed = 0;
+    if (!owner_admission_.compare_exchange_strong(
+            unclaimed, 2, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        return false;
+    failure_.store(error, std::memory_order_release);
+    failed_.store(true, std::memory_order_release);
+    publication_gate_.store(2, std::memory_order_release);
+    publication_gate_.notify_all();
+    sources_drained_.store(true, std::memory_order_release);
+    publish_retirement();
+    owner_exited_.store(true, std::memory_order_release);
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::owner_exit,
+        .queue = q_id_, .result = error, .value = 0});
+#endif
+    wakeup();
+    return true;
+}
+
+void Queue::init_owner_pump(size_t owner_worker) {
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->before_queue_setup(*this);
+#endif
+    owner_worker_ = owner_worker;
+    owner_thread_id_ = std::this_thread::get_id();
+    owner_tid_ = capture_owner_tid();
+    same_owner_pump_ = true;
+    owner_wakeup_on_elio_.store(true, std::memory_order_release);
+    assert_owner();
+    init_ring();
+    raw_.resize(depth_);
+    owner_cqes_.resize(depth_ * 2);
+    owner_pending_.resize(depth_);
+    register_owner_eventfd();
+    setup_ready_.store(true, std::memory_order_release);
+}
+
+void Queue::submit_owner() {
+    bool fresh = false;
+    if (owner_submit_remaining_ == 0) {
+        owner_submit_remaining_ = io_uring_sq_ready(&ring_);
+        fresh = owner_submit_remaining_ != 0;
+    }
+    const auto drained = detail::drain_submissions(
+        owner_submit_remaining_, fresh,
+        [&] { return io_uring_submit(&ring_); },
+        [&](unsigned remaining) {
+            return io_uring_enter(ring_.ring_fd, remaining, 0, 0, nullptr);
+        });
+    owner_submit_remaining_ = drained.remaining;
+    if (drained.error != 0) {
+        fail(drained.error);
+        return;
+    }
+    if (!initial_fetches_issued_.load(std::memory_order_acquire) &&
+        !owner_initial_preparing_ && publication_ready() &&
+        raw_published_ != 0) {
+#ifdef OBD_TEST_HOOKS
+        if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::initial_issued,
+            .queue = q_id_, .result = drained.last, .value = raw_published_});
+#endif
+        initial_fetches_issued_.store(true, std::memory_order_release);
+    }
+}
+
 void* Queue::io_buf(uint16_t tag) noexcept {
     return io_bufs_ + static_cast<size_t>(tag) * max_io_buf_bytes_;
 }
 
 bool Queue::try_pop_request(IoRequest& out) {
+    if (same_owner_pump_) {
+        assert_owner();
+        if (releasing_.load(std::memory_order_acquire) ||
+            owner_pending_count_ == 0)
+            return false;
+        out = owner_pending_[owner_pending_head_];
+        owner_pending_head_ = static_cast<uint16_t>(
+            (owner_pending_head_ + 1) % depth_);
+        --owner_pending_count_;
+        return true;
+    }
     std::lock_guard<std::mutex> lk(mu_);
     if (releasing_.load()) return false;
     if (pending_.empty()) return false;
@@ -176,7 +276,8 @@ void Queue::notify_elio() noexcept {
 }
 
 void Queue::wakeup() noexcept {
-    write_efd(done_efd_);
+    write_efd(owner_wakeup_on_elio_.load(std::memory_order_acquire)
+                  ? elio_efd_ : done_efd_);
 }
 
 void Queue::prep_io_cmd(uint32_t cmd_op, uint16_t tag, int32_t result) {
@@ -186,7 +287,12 @@ void Queue::prep_io_cmd(uint32_t cmd_op, uint16_t tag, int32_t result) {
         fail(EPROTO);
         return;
     }
-    if (kernel_stopped_.load()) return;
+    // STOP prevents a fresh FETCH loan, but does not erase an already
+    // delivered request. A success CQE can become visible to this task after
+    // STOP has settled; its COMMIT_AND_FETCH must still be issued so the
+    // driver can retire that exact obligation (normally with terminal
+    // ENODEV for the fetch half).
+    if (kernel_stopped_.load() && cmd_op == UBLK_U_IO_FETCH_REQ) return;
     auto* sqe = io_uring_get_sqe(&ring_);
     if (!sqe) {
         const int rc = io_uring_submit(&ring_);
@@ -296,8 +402,17 @@ void Queue::dispatch_cqe(const io_uring_cqe* cqe) {
         .length = req.byte_len(), .tag = tag});
 #endif
     try {
-        std::lock_guard lock(mu_);
-        pending_.push_back(req);
+        if (same_owner_pump_) {
+            if (owner_pending_count_ == depth_)
+                throw std::logic_error("ublk owner request ring overflow");
+            owner_pending_[owner_pending_tail_] = req;
+            owner_pending_tail_ = static_cast<uint16_t>(
+                (owner_pending_tail_ + 1) % depth_);
+            ++owner_pending_count_;
+        } else {
+            std::lock_guard lock(mu_);
+            pending_.push_back(req);
+        }
     } catch (...) {
         slot.reply = -ENOMEM;
         slot.reply_ready = true;
@@ -309,12 +424,28 @@ void Queue::prepare_replies() {
     // Cold maintenance only; normal completion batches touch just their tags.
     for (uint16_t tag = 0; tag < depth_; ++tag) {
         auto& slot = raw_[tag];
-        if (slot.reply_ready && !slot.pending && !kernel_stopped_.load())
+        if (slot.reply_ready && !slot.pending)
             prep_io_cmd(UBLK_U_IO_COMMIT_AND_FETCH_REQ, tag, slot.reply);
     }
 }
 
 void Queue::reject_pending() {
+    if (same_owner_pump_) {
+        while (owner_pending_count_ != 0) {
+            const auto tag = owner_pending_[owner_pending_head_].tag;
+            owner_pending_head_ = static_cast<uint16_t>(
+                (owner_pending_head_ + 1) % depth_);
+            --owner_pending_count_;
+            if (tag >= raw_.size() || !raw_[tag].delivered) {
+                debt_known_ = false;
+                fail(EPROTO);
+                continue;
+            }
+            raw_[tag].reply = -ECANCELED;
+            raw_[tag].reply_ready = true;
+        }
+        return;
+    }
     std::lock_guard lock(mu_);
     while (!pending_.empty()) {
         const auto tag = pending_.front().tag;
@@ -370,6 +501,125 @@ Queue::Retirement Queue::retirement() const noexcept {
                                 complete_snapshot_.load()};
         if (version == retirement_version_.load()) return result;
     }
+}
+
+void Queue::prepare_owner_fetches() {
+    assert_owner();
+    if (!publication_ready() || initial_fetches_issued_.load()) return;
+    complete_snapshot_.store(false, std::memory_order_release);
+    owner_initial_preparing_ = true;
+    for (uint16_t tag = 0; tag < depth_; ++tag) {
+        prep_io_cmd(UBLK_U_IO_FETCH_REQ, tag, 0);
+        if (failed_.load(std::memory_order_acquire)) break;
+    }
+    owner_initial_preparing_ = false;
+#ifdef OBD_TEST_HOOKS
+    publish_retirement();
+#endif
+}
+
+#ifdef OBD_TEST_HOOKS
+elio::coro::task<void> Queue::await_initial_submit_for_test() {
+    if (test_hooks_) co_await test_hooks_->before_initial_submit_async(q_id_);
+    if (initial_submit_hook_for_test_) initial_submit_hook_for_test_();
+}
+#endif
+
+void Queue::submit_owner_fetches() {
+    assert_owner();
+    submit_owner();
+    publish_retirement();
+}
+
+bool Queue::drive_owner_cq(unsigned budget) {
+    assert_owner();
+    if (budget == 0) return io_uring_cq_ready(&ring_) != 0;
+
+    const auto turn = detail::drain_owner_cq_turn(
+        budget,
+        [&] {
+            // An eventfd wake is a hint that deferred local work or a CQE is
+            // available. GETEVENTS executes that work on the issuing task.
+            return io_uring_enter(ring_.ring_fd, 0, 0,
+                                  IORING_ENTER_GETEVENTS, nullptr);
+        },
+        [&](unsigned remaining) {
+            detail::CqDrain drained;
+            while (drained.consumed < remaining) {
+                const unsigned want = std::min<unsigned>(
+                    remaining - drained.consumed,
+                    static_cast<unsigned>(owner_cqes_.size()));
+                const unsigned count = io_uring_peek_batch_cqe(
+                    &ring_, owner_cqes_.data(), want);
+                if (count == 0) break;
+                for (unsigned index = 0; index < count; ++index) {
+                    auto* cqe = owner_cqes_[index];
+#ifdef OBD_TEST_HOOKS
+                    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::raw_cqe,
+                        .queue = q_id_, .result = cqe->res, .flags = cqe->flags,
+                        .cookie = cqe->user_data});
+#endif
+                    try {
+                        if (cqe->user_data & kPollMarker) {
+                            debt_known_ = false;
+                            fail(EPROTO);
+                        } else {
+                            dispatch_cqe(cqe);
+                        }
+                    } catch (...) {
+                        fail(EIO);
+                    }
+                    io_uring_cqe_seen(&ring_, cqe);
+                }
+                drained.consumed += count;
+            }
+            drained.more = io_uring_cq_ready(&ring_) != 0;
+            return drained;
+        },
+        [&] {
+            uint64_t counter = 0;
+            const ssize_t read = ::read(elio_efd_, &counter, sizeof(counter));
+            if (read == static_cast<ssize_t>(sizeof(counter))) return 1;
+            if (read < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+                return -errno;
+            }
+            return -EIO;
+        });
+    if (turn.error != 0) fail(turn.error);
+    return turn.immediate;
+}
+
+void Queue::complete_on_owner(uint16_t tag, int32_t result) {
+    assert_owner();
+    if (tag >= raw_.size() || !raw_[tag].delivered ||
+        raw_[tag].pending || raw_[tag].reply_ready) {
+        debt_known_ = false;
+        fail(EPROTO);
+        return;
+    }
+    raw_[tag].reply = result;
+    raw_[tag].reply_ready = true;
+    prep_io_cmd(UBLK_U_IO_COMMIT_AND_FETCH_REQ, tag, result);
+    submit_owner();
+}
+
+void Queue::maintain_owner() {
+    assert_owner();
+    reject_pending();
+    recover_lost_replies();
+    prepare_replies();
+    submit_owner();
+    publish_retirement();
+}
+
+void Queue::finish_owner() noexcept {
+    publish_retirement();
+    owner_exited_.store(true, std::memory_order_release);
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::owner_exit,
+        .queue = q_id_, .result = failure(), .value = 1});
+#endif
 }
 
 void Queue::run(std::atomic<bool>& stop) {

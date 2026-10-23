@@ -1,10 +1,10 @@
 // Reusable Elio-side tag handlers for one ublk queue.
 //
-// The engine owns no raw ring. Its caller remains the only owner of request
-// admission and result consumption. The current ADR-0006 bridge feeds it from
-// Queue::pending_ and uses a sink that forwards results to Queue::done_. A
-// future same-owner ring pump can replace that sink without changing handler
-// lifetime or letting a foreign continuation touch ring state.
+// The engine owns no raw ring. Its fixed-worker caller remains the only owner
+// of request admission and result consumption. Production feeds it from the
+// owner-local request ring and uses a sink that submits raw completion on that
+// same worker. A legacy fixture sink can still forward into Queue::done_ without
+// changing handler lifetime or letting a foreign continuation touch ring state.
 #pragma once
 
 #include "ublk/queue.hpp"

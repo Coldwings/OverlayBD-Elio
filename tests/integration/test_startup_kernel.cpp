@@ -609,9 +609,13 @@ private:
         }
         for (unsigned queue = 0; queue != 2; ++queue) {
             require_fixture(fetches[queue] == 4, "partial recovery did not prepare four FETCH per queue");
-            require_fixture(issued[queue] < stop && bridges[queue] < stop &&
-                            stop < exited[queue] && exited[queue] < closed[queue] && closed[queue] < remove,
-                            "issuance/native retirement/owner exit/cdev close ordering invalid");
+            // ADR-0023 keeps the fixed-owner coroutine alive to collect every
+            // post-STOP raw CQE. bridge_destroyed is the historical event name
+            // for destruction of that final owner frame.
+            require_fixture(issued[queue] < stop && stop < exited[queue] &&
+                            exited[queue] < bridges[queue] &&
+                            bridges[queue] < closed[queue] && closed[queue] < remove,
+                            "issuance/STOP/owner exit/frame destruction/cdev close ordering invalid");
         }
         require_fixture(!replacement_log_->has(Kind::adopted), "unadopted case crossed adoption");
         if (report_refusal_) {

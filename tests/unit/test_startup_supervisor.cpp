@@ -1,3 +1,4 @@
+#include "cmd/startup_socket.hpp"
 #include "supervisor/child.hpp"
 #include "supervisor/protocol.hpp"
 
@@ -468,4 +469,30 @@ TEST_CASE("supervisor: startup release admission preserves identity and retry se
     REQUIRE(child->observe_startup(owner, false));
     REQUIRE_FALSE(child->startup_protected());
     REQUIRE_FALSE(child->admit_startup_release());
+}
+
+TEST_CASE("supervisor: projected startup release advances observation revision",
+          "[supervisor][startup-supervisor]") {
+    obd::supervisor::ChildSpec spec;
+    spec.id = "projected-release";
+    spec.device_bin = "/bin/true";
+    spec.startup_generation = 19;
+    auto child = obd::supervisor::Child::spawn(spec);
+    REQUIRE(child->protect_startup(19));
+
+    obd::ublk::StartupControl control(19);
+    const auto initial = obd::cmd::startup_status(control.snapshot());
+    REQUIRE(child->observe_startup(initial, false));
+    const auto sequence = child->admit_startup_release();
+    REQUIRE(sequence == 1);
+    REQUIRE(control.request_release(19, *sequence) ==
+            obd::ublk::ReleaseRequestResult::accepted);
+
+    const auto pending = obd::cmd::startup_status(control.snapshot());
+    REQUIRE(pending.revision > initial.revision);
+    REQUIRE(pending.phase == "releasing");
+    REQUIRE(pending.release_sequence == *sequence);
+    REQUIRE(pending.release == "pending");
+    REQUIRE(child->observe_startup(pending, false));
+    REQUIRE(child->startup_status() == pending);
 }

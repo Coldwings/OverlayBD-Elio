@@ -120,8 +120,12 @@ public:
                  "local post-END failure did not execute");
         wait_for([&] {
             const auto current = call({{"cmd", "status"}, {"id", "borrower"}});
-            return current.at("startup_owner").at("phase") == "retained";
-        }, 5s, "adopted failure not observed while source loan is held");
+            const auto& owner = current.at("startup_owner");
+            return owner.at("phase") == "releasing" &&
+                owner.at("reason_errno") == EIO &&
+                owner.at("release") == "pending" &&
+                owner.at("release_sequence") == 1;
+        }, 5s, "accepted release not observed while source loan is held");
         for (unsigned observation = 0; observation != 3; ++observation) {
             assert_held(true);
             std::this_thread::sleep_for(30ms);
@@ -244,13 +248,21 @@ private:
         require_fixture(status.at("pid") == replacement_pid_ && status.at("recoveries") == 1 &&
             status.at("startup_protected") == true && status.at("state") != "ready" &&
             status.at("startup_owner").at("generation") == generation_, "borrower lost protected startup identity");
-        if (failed) require_fixture(status.at("startup_owner").at("phase") == "retained" &&
-            status.at("startup_owner").at("reason_errno") == EIO, "local post-END failure not preserved");
+        auto require_pending_failure = [&](const Json& owner) {
+            require_fixture(owner.at("phase") == "releasing" &&
+                owner.at("reason_errno") == EIO &&
+                owner.at("release") == "pending" &&
+                owner.at("release_sequence") == 1,
+                "accepted release/local post-END failure facts not preserved");
+        };
+        if (failed) require_pending_failure(status.at("startup_owner"));
         require_fixture(!replacement_->reaped(), "source owner disappeared while buffer borrowed");
         const auto list = call({{"cmd", "list"}});
         remember("held-list", list);
         require_fixture(list.at("devices").size() == 1 && list.at("devices").at(0).at("pid") == replacement_pid_,
                         "source fixture spawned competing replacement");
+        if (failed) require_pending_failure(
+            list.at("devices").at(0).at("startup_owner"));
         const auto events = replacement_log_->events();
         std::set<uint32_t> borrowed_queues;
         for (const auto& loan : events) {
@@ -557,10 +569,11 @@ void ActiveSourceFixture::validate_retirement() {
     }
     require_fixture(targets == 1, "target block request missing or duplicated");
     for (unsigned queue = 0; queue != 2; ++queue)
-        require_fixture(bridges[queue] < drained[queue] && drained[queue] < stop &&
-            stop < exited[queue] && exited[queue] < closed[queue] && closed[queue] < remove,
-            "native bridge/source drain/STOP/owner/cdev/DEL order invalid");
-    report_["validation"] = "real queue-origin buffer loans delegated exact bytes; all native bridges destroyed before STOP; raw/control originals retired; sequence 1 released";
+        require_fixture(drained[queue] < stop && stop < exited[queue] &&
+            exited[queue] < bridges[queue] && bridges[queue] < closed[queue] &&
+            closed[queue] < remove,
+            "source drain/STOP/owner/frame/cdev/DEL order invalid");
+    report_["validation"] = "real queue-origin buffer loans delegated exact bytes; source drain preceded STOP; owner frames retired before cdev close and DEL; raw/control originals retired; sequence 1 released";
 }
 } // namespace
 

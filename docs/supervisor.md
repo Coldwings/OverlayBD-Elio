@@ -257,8 +257,8 @@ Contract:
   (no `--virtual-size` needed; `commit --virtual-size` remains the
   explicit re-baseline for layers whose header was not grown). A
   read-only image has no data plane to grow: its headroom is
-  dev-size-only (reads past the image's end are zero-filled by the
-  bridge).
+  dev-size-only (reads past the image's end are zero-filled by the queue
+  handler).
 - **Recovery (ADR-0010).** A grown device that crashes keeps its kernel
   capacity across USER_RECOVERY (the driver never resets it, and the
   replacement re-attaches without SET_PARAMS/UPDATE_SIZE). The
@@ -554,7 +554,7 @@ Acceptance reports pending. The private release ledger survives the client's
 wait, failed delivery and timeout. Retrying observes the pending attempt;
 a terminal refusal permits a newer attempt. Ready versus release admission is
 serialized in the device, so release acceptance cannot be lost at handoff.
-The child settles original control/raw commands and native frames, closes
+The child settles original control/raw commands and queue-owner frames, closes
 queue/cdev resources, and performs one authorized DEL before reporting release.
 The supervisor additionally requires actual reap before removing that entry.
 Unknown outcomes remain retained; timeout never escalates to TERM/KILL.

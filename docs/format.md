@@ -978,7 +978,7 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
 - **Readers.** `ZFileSource`, `LsmtLayer`, and `MergedLsmt` are immutable
   after `open` returns; concurrent `pread`s on one instance are safe (the
   `source::BlobSource` contract), including from multiple coroutines and
-  ublk queue threads. Accessor-returned references (`header()`,
+  fixed ublk tag handlers. Accessor-returned references (`header()`,
   `segments()`, `MergedLsmt::merged_index()`, `jump_table()`) borrow the
   instance — they are invalidated by destruction. `MergedWritable::pread()`
   uses an immutable shared index snapshot; `MergedWritable::merged_index()`

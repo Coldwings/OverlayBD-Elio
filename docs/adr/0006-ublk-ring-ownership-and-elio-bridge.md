@@ -1,6 +1,6 @@
 # ADR-0006: Queue rings belong to queue threads; Elio bridges by completion
 
-- Status: accepted
+- Status: superseded by ADR-0023
 - Date: 2026-09-07
 - Supersedes: none
 - Binds: src/ublk/, AGENTS.md

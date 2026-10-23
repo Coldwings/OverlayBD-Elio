@@ -1,4 +1,4 @@
-# ublk — kernel control plane, per-queue data plane, Elio bridge
+# ublk — kernel control plane and fixed-worker queue owners
 
 ## Overview
 
@@ -18,10 +18,10 @@ three layers:
   `UBLK_IO_FETCH_REQ` / `UBLK_IO_COMMIT_AND_FETCH_REQ` uring-cmds to
   `/dev/ublkc<N>`, plus the kernel-shared command buffer (mmap) and per-tag
   IO buffers.
-- **Elio bridge** (`src/ublk/elio_bridge.hpp`) — coroutines that take
-  requests off a queue, serve them from the merged `BlobSource` stack, and
-  hand completions back to the queue thread (ADR-0006: queue rings belong to
-  queue threads; Elio bridges by completion).
+- **Elio queue owner** (`src/ublk/elio_bridge.hpp`) — one fixed-worker
+  coroutine per queue creates and drives the raw ring, owns reusable tag
+  handlers, and serves requests from the merged `BlobSource` stack
+  (ADR-0023).
 
 `src/ublk/uapi_compat.hpp` is the module's single view of the kernel uapi:
 it includes `<linux/ublk_cmd.h>` and adds — `#ifndef`-guarded — only what a
@@ -33,35 +33,43 @@ image inside one `obd-device` process (ADR-0004 isolation).
 
 ## Concepts
 
-### Queue rings and the ADR-0006 ownership rule
+### Queue rings and the ADR-0023 ownership rule
 
-Every hardware queue has exactly one **queue thread**, and that thread owns
-its io_uring ring *exclusively*: only it submits `FETCH` / `COMMIT_AND_FETCH`
-uring-cmds. This is not a style choice — the kernel pins `io->task` when a
-`FETCH_REQ` is issued and requires the matching `COMMIT_AND_FETCH_REQ` to
-come from the same task. The Elio scheduler therefore **never submits** to a
-queue ring; the two worlds exchange work through two mutex-guarded deques
-plus eventfds (see `src/ublk/queue.hpp`):
+Every hardware queue has exactly one fixed **Elio worker owner**. That Linux
+task creates the queue's raw io_uring and is the only task that submits
+`FETCH` / `COMMIT_AND_FETCH` uring-cmds. This preserves both
+`IORING_SETUP_SINGLE_ISSUER` and the ublk rule that binds a tag's FETCH and
+COMMIT to the same task.
 
-```
-queue thread --(pending_ + elio_efd)--> Elio bridge coroutines
-Elio workers --(done_ + done_efd)-----> queue thread
-```
+The raw ring registers a nonblocking eventfd. Its owner coroutine waits for
+that descriptor through the worker's separate Elio-native I/O ring. With
+`IORING_SETUP_DEFER_TASKRUN`, Linux `io_req_local_work_add()` signals the
+registered eventfd when the ring's local-work list changes from empty to
+nonempty, before that work publishes a CQE. The eventfd is therefore a hint,
+not CQ evidence: after every wake the same Linux task enters the raw ring with
+`GETEVENTS` and minimum zero to execute local work. Waiting never blocks the
+worker.
 
-The queue thread parks a `POLL_ADD` on `done_efd` inside its own ring, so
-Elio-side completions wake its `io_uring_submit_and_wait` without a separate
-poll thread.
+A completed FETCH is admitted directly to that queue's reusable TagEngine.
+Source operations can suspend and resume on another worker, but each handler
+restores the queue owner before touching tag state or submitting
+COMMIT_AND_FETCH. The normal request and completion path therefore has no
+mutex deque or application eventfd handoff. Only stop/failure and exceptional
+foreign handler retirement write the owner eventfd.
+
+The pump consumes at most 32 raw CQEs per turn. If CQ work remains, it takes a
+native-timer turn before continuing so older local tasks, Elio native I/O,
+control work, and other queues can progress. An idle queue parks directly on
+its eventfd, so QD1 adds no fairness timer.
 
 `Device::create` and `Device::attach` open `/dev/ublkc<N>` once for the
 device: the driver's open exclusion applies to the whole device, including
 all hardware queues. The first `Queue` owns that descriptor; each additional
 queue owns a close-on-exec duplicate sharing its open file description.
-Every queue still has its own command-buffer mapping, tag buffers, eventfds,
-ring and issuer thread. Queue destruction closes only its owned descriptor;
-the existing mapping and command lifetime barriers still apply. Final kernel
-file release waits for all references, including mappings and accepted
-io_uring commands. Recovery opens the first descriptor only after
-`START_USER_RECOVERY` succeeds.
+Every queue still has its own command-buffer mapping, tag buffers, eventfd,
+raw ring, and fixed owner. Queue destruction closes only its owned descriptor;
+the existing mapping and command lifetime barriers still apply. Recovery opens
+the first descriptor only after `START_USER_RECOVERY` succeeds.
 
 ### Command buffer mmap geometry
 
@@ -89,28 +97,27 @@ in (writes) and out (reads).
 
 ### Tag lifecycle
 
-1. The queue thread parks one `UBLK_IO_FETCH_REQ` per tag. The driver
-   refuses `START_DEV` with `EBUSY` until every tag of every queue is
-   parked — `Device::create` therefore starts queue threads first and
-   retries `START_DEV`.
-2. A completed FETCH cqe means tag `t`'s `ublksrv_io_desc` in the shared
-   window is now valid; the queue thread extracts an `IoRequest`
-   (op, start_sector, nr_sectors) and pushes it to `pending_`, then writes
-   `elio_efd`.
-3. A bridge coroutine pops the request, serves it from the block source
-   (each tag in its own coroutine, so per-tag IO overlaps; ublk does not
-   care about cross-tag completion ordering), and calls
-   `Queue::push_completion(tag, result)`, which appends to `done_` and
-   writes `done_efd`.
-4. The queue thread's parked poll wakes; it drains `done_` and issues
-   `UBLK_U_IO_COMMIT_AND_FETCH_REQ` per finished tag — committing the result
-   *and* re-parking the fetch for the next IO in one command.
+1. The queue owner parks one `UBLK_IO_FETCH_REQ` per tag. The driver refuses
+   `START_DEV` with `EBUSY` until every tag of every queue is parked, so
+   `Device::create` waits for all fixed owners before releasing initial FETCH
+   publication and retrying START.
+2. A completed FETCH CQE makes tag `t`'s shared `ublksrv_io_desc` valid. The
+   owner copies it into a preallocated owner-local request ring and admits it
+   to the reusable handler for that tag. Different tags remain independent
+   TaskGroup children and can overlap remote or local source I/O.
+3. After source I/O, the handler restores its fixed owner, validates the exact
+   tag generation, and directly prepares and submits
+   `UBLK_U_IO_COMMIT_AND_FETCH_REQ`. No foreign worker may inspect raw slot or
+   ring state.
+4. The next raw CQE retires the command's unique cookie and either delivers the
+   next request for that tag or records its terminal kernel result.
 
-`user_data` encoding on the ring (`src/ublk/queue.cpp`): data cookies combine
-an increasing command generation with the low 16-bit tag; bit 63 reserves a
-separate namespace for done_efd polls. Each original completion must match its
-pending cookie. Duplicate, foreign or ambiguous completion facts make debt
-unknown rather than retiring a different command.
+Data `user_data` cookies combine an increasing command generation with the low
+16-bit tag. Each completion must match its pending cookie. Duplicate, foreign,
+or ambiguous completion facts make debt unknown rather than retiring another
+command. The generation mailbox is separate: it covers only exceptional
+handler retirement after a foreign scheduler rejection and is consumed by the
+owner before any queue state changes.
 
 ### Op dispatch table
 
@@ -158,7 +165,7 @@ but wait for different conditions:
   command is not preempted. The replacement must not open any queue cdev
   before START succeeds, as an open cdev itself makes START return `EBUSY`.
 - `END_USER_RECOVERY` and `START_DEV` share a five-second monotonic startup
-  budget with queue/bridge preparation. Transient `EBUSY` retries yield between
+  budget with fixed-owner preparation. Transient `EBUSY` retries yield between
   attempts. Queue failure, deadline or explicit release can request control
   cancellation; an original result must still settle before cleanup proceeds.
 
@@ -172,9 +179,9 @@ to a non-recoverable device when the kernel rejects recovery flags with EINVAL.
 
 ### Failed startup ownership and explicit release (ADR-0022)
 
-All queue rings and native bridges must become ready before the coordinator
-opens initial FETCH publication. After publication, a failed queue enters
-maintenance on its original issuing thread rather than destroying the ring.
+All queue rings and reusable TagEngines must become ready before the
+coordinator opens initial FETCH publication. After publication, a failed queue
+enters maintenance on its original fixed worker rather than destroying the ring.
 Original raw command cookies and terminal CQEs account for kernel loans;
 cancellation CQEs and native coroutine completion are separate facts.
 
@@ -191,7 +198,7 @@ then accepts the coherent ready record and switches to ordinary lifecycle
 management; historical cancellation intent cannot strand startup protection.
 
 Explicit release settles startup control work, stops new source admission and
-awaits native bridge/handler frame destruction while retaining queue owners.
+awaits tag-handler/source retirement while retaining the raw-ring owners.
 Initial FETCH issuance must be fenced before the authorized STOP cancellation
 pass: a prepared request must not be submitted afterward. The current fence
 relies on synchronous, non-SQPOLL owner submission with no ASYNC/LINK/DRAIN
@@ -200,9 +207,8 @@ these constraints is an issuance boundary, not proof of driver acceptance or
 readiness. Each original CQE still has to be observed.
 
 STOP does not replace the retirement ledger. Queue owners remain runnable to
-COMMIT delivered requests and consume original completions. Only known raw
-retirement, native-frame retirement and owner exit permit thread joins and
-ring/mapping/cdev closure. All queue cdev references close before one DEL;
+COMMIT delivered requests and consume original completions. Only known raw retirement, tag-frame retirement, owner exit and final
+owner-frame destruction permit ring/mapping/cdev closure. All queue cdev references close before one DEL;
 its cached result prevents blind deletion of a reused numeric device ID.
 Refused or unknown outcomes retain the owner and attempt ledger. The supervisor
 also requires correlated release and actual process reap before erasing its
@@ -324,9 +330,9 @@ on an owned thread and retains its frame until join, leaving the sole source
 blocking worker available. Other cold operations such as resize use
 `elio::spawn_blocking`. Kernel control commands may sleep on our own
 data plane — START_DEV's `add_disk` partition scan issues device reads
-serviced by the bridges, and END_USER_RECOVERY waits for reissued IO.
+serviced by fixed queue owners, and END_USER_RECOVERY waits for reissued IO.
 A synchronous control call on a scheduler worker deadlocks it (the
-worker stalls, the bridge coroutine never runs). Never invoke them on
+worker stalls, so queue-owner and source coroutines cannot progress). Never invoke them on
 a coroutine hot path.
 
 ### `src/ublk/queue.hpp` — `obd::ublk::IoRequest`, `obd::ublk::Queue`
@@ -346,9 +352,9 @@ mapping, buffers, fds.
   keeps the borrowed descriptor valid through this call. Mmaps the command buffer at
   `q_id * cmd_buf_stride(...)` with length `cmd_buf_size(depth, 24)`
   (PROT_READ, MAP_SHARED | MAP_POPULATE), allocates and zeroes the per-tag
-  IO buffers, creates the two eventfds (`EFD_CLOEXEC | EFD_NONBLOCK`), and
-  leaves ring creation to `run()` on the issuing queue thread. Throws
-  `obd::error`.
+  IO buffers, and creates nonblocking close-on-exec wake descriptors. The
+  production raw ring is created later by `init_owner_pump()` on its fixed
+  worker and registers the owner descriptor. Throws `obd::error`.
 - `uint16_t q_id() const`, `uint16_t depth() const`.
 - `int cdev_fd() const noexcept` — borrows the queue's owned descriptor for
   subsequent queue setup; returns `-1` before descriptor acquisition. Do not
@@ -359,47 +365,49 @@ mapping, buffers, fds.
   into it; write handlers read from it. No bounds check — `tag < depth` is a
   kernel-guaranteed precondition.
 
-Elio side (any Elio worker thread):
+Fixed-worker owner side (ADR-0023):
 
-- `int elio_efd() const` — eventfd signaled when `pending_` is non-empty;
-  register it with the Elio IO backend.
-- `bool try_pop_request(IoRequest& out)` — pops one pending request; false
-  when empty. Short mutex section; safe against the queue thread.
-- `void push_completion(uint16_t tag, int32_t result)` — completes a
-  request: `result >= 0` = bytes transferred, `< 0` = `-errno`. Wakes the
-  queue thread via `done_efd`.
-- `void fail(int err) noexcept` — publishes the failure errno and sticky
-  flag, then wakes the queue thread through the same `done_efd`. A completion
-  that cannot be enqueued can therefore end the ring wait without another
-  request or a device stop.
-
-Queue thread side:
-
-- `void run(std::atomic<bool>& stop)` — the blocking queue loop: parks the
-  per-tag FETCH commands, then waits on the ring, dispatching new requests
-  to `pending_` and committing finished ones. Stop/failure enters maintenance;
-  return requires owner-exit permission and positive raw retirement. Before
-  publication, aborting setup can leave without publishing commands.
-- `bool setup_ready() const noexcept`, `bool bridge_ready() const noexcept`,
-  `void mark_bridge_ready() noexcept` — owner/bridge preparation handshake.
-- `void publish_initial_fetches() noexcept`, `void abort_setup() noexcept` —
-  release or abort the pre-publication gate.
-- `void request_release() noexcept`, `void kernel_stopped() noexcept`,
-  `void request_owner_exit() noexcept` — coordinator facts/intent; none alone
-  proves original-command retirement.
-- `bool owner_exited() const noexcept`,
-  `bool initial_fetches_issued() const noexcept` — owner exit and initial-batch
-  issuance observations. Issuance orders STOP; it is not driver readiness.
+- `void init_owner_pump(size_t owner_worker)` — creates the raw ring on the
+  current fixed worker with SINGLE_ISSUER and DEFER_TASKRUN, preallocates CQ
+  and request storage, registers the queue eventfd, and publishes setup-ready.
+  It prepares no ublk command before the publication gate.
+- `int owner_eventfd() const noexcept` — registered raw-CQ and control wake
+  descriptor. The pump awaits it through Elio native I/O.
+- `void prepare_owner_fetches()`, `void submit_owner_fetches()` — prepare and
+  synchronously submit the initial FETCH batch on the owner. The split lets
+  the opt-in recovery fixture hold the exact boundary through an async gate
+  without blocking the fixed worker; production calls them consecutively.
+  Once preparation begins, even a fixture failure must reach submission before
+  STOP. `initial_fetches_issued()` becomes true only after the SQ is consumed
+  under the documented non-SQPOLL constraints.
+- `bool drive_owner_cq(unsigned budget)` — treats the eventfd wake as a hint,
+  enters GETEVENTS with minimum zero to execute owner task-work, consumes at
+  most `budget` exact-cookie CQEs, and places delivered requests in
+  preallocated owner-local storage. It returns whether CQ work remains.
+- `bool try_pop_request(IoRequest&)` — owner-only pop from that storage.
+- `void complete_on_owner(uint16_t tag, int32_t result)` — owner-only exact
+  obligation check plus direct COMMIT_AND_FETCH preparation and submission.
+- `void maintain_owner()` — after source admission closes, rejects unadmitted
+  delivered requests, repairs missing handler results only after the source
+  fence, prepares cancellation replies, submits them, and republishes the
+  retirement ledger.
+- `bool source_handlers_drained() const`,
+  `void mark_source_handlers_drained()` — the TaskGroup/source-buffer fence.
+  This is deliberately earlier than raw owner exit.
+- `bool owner_may_exit() const`, `void finish_owner()` — exit requires explicit
+  coordinator permission and positive raw retirement; finish publishes the
+  final snapshot.
+- `void fail(int err) noexcept`, `void wakeup() noexcept` — publish sticky
+  failure/control facts and wake the registered owner eventfd. Saturated
+  eventfd writes are harmless because an unread wake already exists.
 - `Retirement retirement() const noexcept` — `published`, `retired`,
   `delivered`, `known`, `complete`; unknown debt prevents safe release.
-- `void sources_drained() noexcept` — publish only after transitive native
-  source frames retire, permitting repair of missing completion publication.
-- `void close_retired() noexcept` — after owner-thread join and positive raw
-  retirement, close ring/mapping/cdev before DEL; retain diagnostic buffers.
-- `void wakeup() noexcept` — interrupts the `run()` wait.
-- `bool failed() const`, `int failure() const` — sticky ring-failure flag
-  and errno. `-ENODEV` / `-EINTR` / `-ECANCELED` cqes are treated as normal
-  teardown, not failures.
+- `void close_retired() noexcept` — only after owner-frame destruction and
+  positive raw retirement, close ring/mapping/cdev before DEL.
+
+The old `run` / request-completion bridge functions remain compiled only to
+support deterministic coordinator fixtures with synchronous native-thread
+gates. `Device` never selects them in production or in real-kernel fixtures.
 
 ### `src/ublk/tag_engine.hpp` — reusable tag processing
 
@@ -469,76 +477,40 @@ The owner validates that generation before clearing busy state or invoking the
 sink, so a delayed result cannot complete a reused tag. TaskGroup frame lifetime
 and the per-request completion obligation remain separate facts.
 
-The current sink still calls `Queue::push_completion`, so this extraction does
-not change ADR-0006: queue threads continue to own raw rings, and both eventfd
-handoffs remain. The mailbox and sink are preparation for issue
-[#120](https://github.com/Coldwings/OverlayBD-Elio/issues/120); no same-owner raw
-ring pump is implemented here.
+The production sink calls `Queue::complete_on_owner`, so a normal handler
+submits COMMIT_AND_FETCH directly after restoring the fixed worker. The legacy
+fixture sink still targets `Queue::push_completion`; it is not selected by a
+production or real-kernel Device.
 
-### `src/ublk/elio_bridge.hpp` — `obd::ublk::run_bridge`
+### `src/ublk/elio_bridge.hpp` — `obd::ublk::run_owner_pump`
 
 ```cpp
-elio::coro::task<void> run_bridge(Queue* q, source::BlobSource* src,
-                                  std::atomic<bool>* stop);
+elio::coro::task<void> run_owner_pump(Queue* q, source::BlobSource* src,
+                                      std::atomic<bool>* stop);
 ```
 
-Runs the bridge loop for one queue against the block source until `stop`
-becomes true (or the efd watch errors out on teardown). Launch an independent
-joinable task from the device process; one bridge per queue. Waits on
-`q->elio_efd()` and drains `try_pop_request`. On a tag's first request, it
-admits one long-lived handler through native TaskGroup and binds that handler
-to the bridge's worker. Later requests for that tag use a native event rather
-than another scheduler admission. Tags remain independent: a source await on
-one tag does not serialize the other tags (ADR-0021).
-`-EINTR` / `-EAGAIN` on the eventfd read are retried.
-Each bridge owns a `TagEngine`, whose Elio collect-all TaskGroup owns the tag
-handlers and joins them before returning. Ordinary stop wakes the bridge without
-cancelling admitted source IO; parked handlers are signaled to leave. Each
-handler checks the sticky close predicate before parking again, so a pending
-request and close notification may coalesce without requiring a second wake.
-Accepted source work still finishes before that handler leaves. Each request
-checks the group's cooperative cancellation token before invoking
-the source, including requests on a previously used tag. An admitted request's
-mailbox records `-EIO` if its initial child is rejected or skipped; a source
-exception also produces `-EIO`. A failed initial handler can be admitted again
-for a later generation. Lifetime ownership stays with Elio, while the
-generation-checked result records the kernel completion obligation (ADR-0006).
-The bridge and handlers access tag state on the bridge worker. Elio user
-affinity is best effort: a stolen continuation can execute on another worker
-when owner re-enqueue fails. Every relevant suspension return therefore
-restores affinity and verifies the actual worker before accessing tag state:
-request-event wakes, source returns, bridge reads, notification retry yields,
-cleanup entry, and the handler join. Rejected migration retains the same frame,
-request and pool, yielding and retrying until the owner is reached. The native
-already-local affinity awaitable allocates no helper frame or scheduler task.
-A source may deliberately migrate while running; the same restoration applies
-before clearing busy state or publishing completion. Failed/skipped child
-destructors on foreign workers publish only into the preallocated generation
-mailbox and notify the bridge; they do not invoke the owner result sink or
-mutate owner-only tag state. Failure facts are consumed
-before admitting a reused tag. Native event dispatch allocation failure retains
-the request and retries notification from the same bridge frame, including
-stop notifications. Admission and close preparation are synchronous, and the
-bridge directly awaits TaskGroup's non-coroutine join awaitable; once a handler
-exists, no cleanup coroutine frame is required before that lifetime fence.
-Sustained event allocation failure can extend this drain.
-If the fallback completion itself cannot be enqueued, the sink marks the queue
-failed and wakes its waiter. The same failure publication is used after
-the bridge drains admitted handlers when a loop exception escapes, and on
-cold handler-pool setup failure.
+`Device` launches one joinable owner with `go_joinable_to`; queue IDs are
+spread round-robin across the runtime's existing workers. The task creates the
+raw ring on that worker, constructs one reusable `TagEngine`, publishes both
+setup facts, and waits asynchronously for the initial-FETCH gate.
 
-This placement policy retains the dedicated queue thread and both eventfd
-handoffs in ADR-0006. It does not make the whole request path allocation-free:
-source tasks and unset native event waits can still allocate. Performance issue
-[#120](https://github.com/Coldwings/OverlayBD-Elio/issues/120) also requires
-evaluation of those remaining handoffs and concurrent workload trade-offs.
+In service, each wake restores and verifies the owner before raw-ring access,
+drives at most 32 CQEs, admits fixed-storage requests, and parks again when the
+CQ is empty. Normal handler results go straight to `complete_on_owner`. A
+foreign rejection can publish only into the generation mailbox and write the
+owner eventfd. The next owner turn validates that exact generation before any
+tag or raw state changes.
 
-The default prioritizes LSMT latency, throughput and CPU cost. Tags can overlap
-asynchronous I/O, but CPU work for one queue runs on its bridge worker. A
-CPU-intensive gzip source may therefore use fewer cores and lose high-depth
-throughput. The runtime's worker count is unchanged; this policy does not
-guarantee the same performance trade-off for every source or queue geometry
-(ADR-0021).
+Stop closes admission and signals every reusable handler. The pump awaits the
+TaskGroup's non-coroutine join awaitable in its already-allocated owner frame;
+an internal join error with a live child fail-stops rather than freeing tag
+state. Once all children and exceptional mailbox results have retired, it
+publishes `source_handlers_drained`. The Device can then issue STOP while this
+same task remains alive to drive terminal raw CQEs. The task returns only after
+an explicit exit request and a known-complete ledger.
+
+`run_bridge` is retained for deterministic legacy unit fixtures. Production
+and real-kernel Device startup always use `run_owner_pump`.
 
 ### `src/ublk/device.hpp` — `obd::ublk::Device`
 
@@ -550,7 +522,7 @@ Full lifecycle of one image as one ublk device. Non-copyable.
 - `static elio::coro::task<std::unique_ptr<Device>> create(const DeviceParams&,
   source::BlobSourcePtr, FailureCleanup = {})` and the overload with
   `StartupControl&` before `FailureCleanup` — await on the Elio scheduler.
-  Open Ctrl, ADD/SET_PARAMS, prepare all queue/bridge owners, publish FETCH,
+  Open Ctrl, ADD/SET_PARAMS, prepare all fixed-worker queue owners, publish FETCH,
   then START with the shared startup deadline. Null source, zero sectors or
   zero queues fail with EINVAL. Failures return only after eligible cleanup;
   unresolved ownership keeps the operation and its callers alive.
@@ -584,16 +556,16 @@ Full lifecycle of one image as one ublk device. Non-copyable.
   `/dev/ublkb<N>`.
 - `bool started() const` — true once the kernel gendisk is live
   (`START_DEV` succeeded).
-- `void stop() noexcept` — blocking: signals queue threads and bridges,
-  waits for every bridge frame and its grouped I/O handlers to release,
-  then joins queue
-  threads. Idempotent. Call off an Elio worker with source executors still
-  able to progress; elapsed time never permits release of unfinished I/O.
-- `elio::coro::task<void> stop_async()` — scheduler-side equivalent: signals
-  stop and uses native async frame-destruction observation without
-  occupying a worker or the blocking
-  pool, then joins queue threads off-worker. Retain the Device until the
-  await completes. Use this from coroutines, including setup-error cleanup.
+- `void stop() noexcept` — blocking: signals each owner, waits for every
+  grouped source handler to release its buffer, drives STOP/retirement through
+  the still-running owner tasks, and waits for their final frame destruction
+  before closing ring resources. Idempotent. Call off an Elio worker with the
+  scheduler and source executors still able to progress.
+- `elio::coro::task<void> stop_async()` — scheduler-side equivalent: awaits the
+  source-drained fence without occupying a worker, then routes blocking control
+  operations off-worker while fixed owners finish raw retirement. Retain the
+  Device until the await completes. Use this from coroutines, including
+  setup-error cleanup.
 - `StartupSnapshot released_snapshot() const noexcept` — final queue/control
   ledger; read only after stop/stop_async completes.
 - `~Device()` — blocking stop and explicit proven teardown. Managed Ctrl
@@ -604,7 +576,9 @@ Full lifecycle of one image as one ublk device. Non-copyable.
 - `explicit StartupControl(uint64_t generation)` — rejects zero; non-copyable.
 - `StartupSnapshot snapshot() const noexcept` — allocation-free coherent facts:
   phase/operation, identity/revision, original/cancel results and known flags,
-  control/raw debt, and release sequence/result. It transfers no ownership.
+  control/raw debt, and release sequence/result. An accepted mailbox request
+  projects an odd revision between the owner's even publications so protocol
+  consumers can accept the changed pending facts. It transfers no ownership.
 - `ReleaseRequestResult request_release(uint64_t generation, uint64_t sequence)
   noexcept` — one outstanding increasing sequence in `[1, 2^63)`; returns
   accepted, stale, busy or not_startup. Ready closure and acceptance use one
@@ -624,67 +598,51 @@ startup mailbox; the returned Device's ordinary owner handles later shutdown.
 
 ## Invariants & Guarantees
 
-- **Ring ownership**: a queue ring is touched (submit, peek, advance) only
-  by its queue thread. This is kernel-required (task-pinned IO), not just a
-  convention (ADR-0006). Anchor: `src/ublk/queue.hpp::Queue`.
+- **Ring ownership**: a queue ring is touched (submit, enter, peek, advance)
+  only on its recorded fixed Elio worker and Linux task. FETCH and its matching
+  COMMIT therefore retain exact task identity (ADR-0023).
 - **Full-request reads**: a READ completion always reports the requested
   length on success; EOF short reads from the source are zero-filled in the
   tag buffer. The kernel copies exactly `nr_sectors * 512` bytes out.
-  (Implementation: `handle_io` in src/ublk/tag_engine.cpp.)
-- **Sector math**: all offsets/lengths crossing the bridge are 512-byte
-  sector based (`IoRequest::byte_offset` / `byte_len`); sources see
-  byte-granular positional IO. Anchor: `src/ublk/queue.hpp::IoRequest`.
-- **Startup ordering**: queue/bridge preparation precedes FETCH publication.
-  START/END readiness is decided by the original kernel control result;
-  publication or SQ consumption alone is not readiness. EBUSY retries share
-  the startup budget. Anchor: `src/ublk/device.cpp::Device::create`.
-- **Teardown ownership**: stop is idempotent and retains unresolved loans.
-  Failure may intentionally retain a device/process indefinitely (ADR-0022).
-  Original CQEs and native-frame retirement precede resource closure; elapsed
-  time, STOP completion or a cancellation result cannot replace those fences.
-- **Error discipline**: setup/cold paths throw `obd::error`; the per-IO hot
-  path never throws — failures are negative-errno completions.
-- **Result contract**: bridge results follow the ublk convention —
-  `>= 0` bytes transferred, `< 0` `-errno` — enforced at
-  `Queue::push_completion` / `COMMIT_AND_FETCH_REQ` time.
+- **Sector math**: all request offsets and lengths are 512-byte sector based;
+  sources see byte-granular positional I/O.
+- **Startup ordering**: every owner ring and TagEngine is ready before FETCH
+  publication. START/END readiness is decided by the original kernel control
+  result; publication or SQ consumption alone is not readiness.
+- **Teardown ownership**: source handler join precedes STOP, but owner lifetime
+  extends beyond it. Original CQEs, a known-complete ledger, owner exit, and
+  final owner-frame destruction all precede ring/mapping/cdev closure. Failure
+  may intentionally retain the device process indefinitely (ADR-0022).
+- **Exactly-once completion**: one raw cookie identifies each command and one
+  TagEngine generation identifies each admitted source obligation. Duplicate,
+  stale, foreign, or mismatched facts fail the queue instead of completing a
+  later request.
+- **Error discipline**: setup/cold paths throw `obd::error`; per-I/O results use
+  the ublk convention `>= 0` bytes and `< 0` negative errno. Source exceptions
+  are normalized to `-EIO` before owner submission.
 
 ## Concurrency & Call Permissions
 
-Three distinct execution contexts, with strict permissions:
-
-| Context | Threads | May touch |
+| Context | Execution | May touch |
 |---|---|---|
-| Control path | owned cold-controller thread, coordinated by the startup coroutine | Ctrl commands and their original/cancel ledger; blocking, cold path only |
-| ublk queue threads | one `std::thread` per `Queue` | **exclusively** their ring, the read-only mmap window, `pending_` push, `done_` drain |
-| Elio scheduler threads | bridge + owner-only `TagEngine` + per-tag `handle_io` coroutines | `try_pop_request`, tag IO buffers, `BlobSource` stack; only the selected owner consumes foreign results and calls the result sink |
+| Control path | owned cold-controller thread, coordinated by startup coroutine | Ctrl commands and original/cancel ledger; blocking, cold path only |
+| Queue owner | one fixed Elio worker per Queue; workers may host multiple queues | that queue's raw ring, CQ/SQ, command mmap, raw slots, request ring, TagEngine owner state |
+| Tag handler | TaskGroup child, restored to its queue owner before queue access | tag buffer and BlobSource while suspended; raw ring only after verified owner restoration |
+| Foreign failure path | any worker during rejected/destroyed handler cleanup | atomic generation mailbox, sticky failure, owner eventfd wake only |
 
-- `pending_` / `done_` are the only cross-thread shared state, guarded by
-  `Queue::mu_`; wakeup is via `elio_efd_` / `done_efd_` (nonblocking,
-  EAGAIN-tolerant writes). Anchor: `src/ublk/queue.hpp::Queue`.
-- Tag IO buffers are effectively single-writer: the kernel owns a tag's
-  buffer between FETCH and COMMIT for writes (data-in), the bridge owns it
-  for reads (data-out). One tag is in flight on exactly one side at a time
-  because only the queue thread re-parks it.
-- `Device::create` must run on the Elio scheduler; `Ctrl` methods are plain
-  blocking calls and must not be issued from a latency-sensitive coroutine
-  path. `Device::stop` / `~Device` join threads — call them from a context
-  where blocking is acceptable and source completion can still progress.
-  Coroutine callers await `stop_async()` before offloading final destruction;
-  they must do so on exceptions and early returns as well as success. Awaiting
-  source I/O must not occupy the sole blocking thread: the source may need it
-  to complete. Stop calls for a Device are sequential, not concurrent.
-  Native destruction-observer allocation failure retries in the existing
-  stop coroutine frame; owners remain retained until the bridge frame departs.
-- `run_bridge`, `TagEngine` handlers and `handle_io` are Elio coroutines; all source IO goes
-  through the Elio IO backend (no blocking syscalls on the scheduler).
-- Inputs are not mutated: `DeviceParams` is read-only after `create`;
-  `src` ownership moves into `Device` and outlives all bridges (destruction
-  order: stop drains bridges and handlers and joins queue threads before
-  members die). The daemon retains its owner until the control task body and
-  captures are destroyed, then releases the Device off-worker. Its successful
-  shutdown closes command admission and retires the private reader before
-  destroying its hooks, drains device/source work, completes image cleanup,
-  destroys Device off-worker and only then emits terminal ownership facts.
+- The registered queue eventfd is the only cross-thread wake in production.
+  Raw completions and stop/failure increment it; normal request and completion
+  data stays in owner-local preallocated state.
+- Tag buffers transfer ownership with the protocol: kernel before FETCH CQE,
+  one source handler until it publishes a result, then kernel after the owner
+  submits COMMIT_AND_FETCH. Reuse waits for both exact-generation and raw-cookie
+  retirement.
+- `Device::create` requires a running Elio scheduler. The worker count remains
+  stable for the Device lifetime; current `obd-device` does not resize it.
+- Control methods remain blocking and never run on scheduler workers. `stop()`
+  and destruction are off-worker; coroutine callers await `stop_async()`.
+- Device owns the source graph until all owner tasks are destroyed. A
+  source-drained flag permits STOP but does not permit object or ring teardown.
 
 ## Stability Contract
 
@@ -693,17 +651,17 @@ Three distinct execution contexts, with strict permissions:
   `ublksrv_io_cmd`, depth 4096, mmap stride/size formulas) are the project's
   contract with the kernel. We add, never redefine; any change to this view
   is a wire-format change and requires an ADR (T1, per AGENTS.md and
-  ADR-0006).
+  ADR-0023).
 - **Op dispatch semantics** are user-visible contract: READ zero-fill at
   EOF; WRITE → writable root `pwrite` else `-EROFS`; FLUSH → writable root
   `flush` else `0`; DISCARD → writable root `discard` else `-EROFS`;
   WRITE_ZEROES → `discard`, or a real zero-write under `UBLK_IO_F_NOUNMAP`;
   WRITE_SAME / unknown → `-EOPNOTSUPP` (ADR-0009). Changing any of these
   is breaking for callers that depend on the errno surface.
-- **Bridge contract**: `Queue::push_completion` result convention
-  (`>= 0` bytes, `< 0` `-errno`) and the eventfd handoff are internal but
-  cross-module (source layer depends on the read/write semantics through
-  `BlobSource` / `WritableBlobSource`, ADR-0008).
+- **Owner completion contract**: `Queue::complete_on_owner` accepts the ublk
+  result convention (`>= 0` bytes, `< 0` negative errno) only on the fixed
+  ring owner. Source modules depend on the read/write semantics through
+  `BlobSource` / `WritableBlobSource` (ADR-0008).
 - **DeviceParams defaults** (queue depth 128, 128 KiB max IO buf, 512 B
   logical / 4 K physical block, read-only by default) are behavioral
   contract; changing defaults is breaking.
@@ -742,7 +700,7 @@ case exercises a successful END followed by a real block request holding an
 actual queue buffer in the source coroutine, a local pre-ready failure and
 explicit release. Its async gates preserve the native borrower until controlled
 release, and its observations distinguish delegate bytes, source scope exit,
-bridge frame destruction and block-client completion. Runtime results remain
+queue-owner frame destruction and block-client completion. Runtime results remain
 bound to their recorded source head and kernel; this case does not establish
 every reporting or release-error variant.
 
@@ -771,6 +729,19 @@ Unit tests live in `tests/unit/test_ublk*.cpp` (built only when
 `OBD_ENABLE_UBLK` is on); the kernel-dependent end-to-end test lives in
 `tests/integration/test_ublk_e2e.cpp`.
 
+- `ublk: fixed worker pump retires rejected commands through raw eventfd` —
+  launches a real two-worker Elio runtime, creates the raw ring on worker one,
+  registers its eventfd, and issues URING_CMD against an eventfd stand-in. The
+  rejecting kernel path must wake the native waiter, preserve the recorded
+  worker/Linux task, and retire every exact cookie without a ublk device. It
+  also pins SINGLE_ISSUER plus DEFER_TASKRUN and exercises the required
+  wake-then-GETEVENTS pump. The stand-in does not exercise ublk's
+  COMP_IN_TASK local-work path; that conclusion still requires the hosted
+  ublk E2E.
+- `ublk: STOP preserves a delivered request's COMMIT obligation` — pins the
+  late-CQE interleaving: STOP has settled before the owner observes a successful
+  FETCH CQE, so the delivered slot must still transition to a prepared
+  COMMIT_AND_FETCH rather than becoming unretirable debt.
 - `ublk: repeated tag reads stay on the bridge worker` — four runtime workers
   retain source entry/resume on the explicitly selected bridge worker.
 - `ublk: foreign result mailbox enforces tag generations` — one preallocated
@@ -824,8 +795,9 @@ Unit tests live in `tests/unit/test_ublk*.cpp` (built only when
 - `ublk: replacement queue open failure never repeats accepted recovery` —
   even `EBUSY` from opening replacement queues propagates immediately;
   START may not be repeated once it has reset the old queue state.
-- The eight public startup coordinator cases (`[startup-coordinator]`, listed
-  in [testing.md](testing.md#ublk)) cover create/attach setup failures, a paused
+- The first eight public startup coordinator cases (`[startup-coordinator]`,
+  listed in [testing.md](testing.md#ublk)) use the deterministic legacy-thread
+  fixture and cover create/attach setup failures, a paused
   second owner with all-zero publication, the prerequisite-to-START/END
   admission gap, post-START queue failure with sole blocking-pool source
   progress, and the admitted START deadline. Their real coordinator and Ctrl
@@ -833,7 +805,20 @@ Unit tests live in `tests/unit/test_ublk*.cpp` (built only when
   `ETIMEDOUT`, and distinguish new-device cleanup authority from explicit
   release of a published, unadopted recovery. The queue rings retire real
   eventfd-rejected commands; scripted control CQEs do not establish driver
-  acceptance. These ordinary tests complement the privileged #137 fixtures.
+  acceptance. A ninth production-topology case,
+  `ublk: failed second fixed owner allocation seals its ownerless queue`, forces
+  the second join-state allocation to fail. It requires the admitted first
+  owner to drain, seals the ownerless queue with zero raw publication, and
+  closes both cdevs before one STOP/DEL. These ordinary tests complement the
+  privileged #137 fixtures. A tenth production-topology case,
+  `ublk: release admission is published while initial FETCH remains held`,
+  proves that an accepted sequence becomes observable while initial submission
+  still fences STOP. An eleventh,
+  `ublk: release admission is visible while failure cleanup remains held`,
+  admits after source drain while caller cleanup is suspended and requires the
+  mailbox-backed snapshot to expose that same sequence immediately. Both use
+  scripted control CQEs and rejecting eventfd queue stand-ins rather than real
+  ublk-driver acceptance.
 - `ublk: failed startup drains sources before propagating its original error` —
   the production failure coordinator drains partial bridge registration and
   publishes released state before rethrowing the original failure. Source
@@ -886,7 +871,7 @@ Unit tests live in `tests/unit/test_ublk*.cpp` (built only when
   and checks that the same owner still drains successfully.
 - `ublk: async stop handles a partially initialized device` — cleanup before
   any queue is opened. These unit tests bypass kernel registration, command
-  mappings, queue rings and queue threads; each has a 30-second CTest timeout.
+  mappings, queue rings and fixed owner tasks; each has a 30-second CTest timeout.
 - `ublk: task group drains every admitted tag including source failures` —
   two held reads remain owned during stop and use the sole blocking thread;
   both publish terminal completions, including `-EIO` for a throwing source.
@@ -912,13 +897,13 @@ Unit tests live in `tests/unit/test_ublk*.cpp` (built only when
   exercise the kernel's ublk commands.
 - `ublk: IoRequest byte math is sector based` — pins the 512-byte sector
   conversion (`start_sector 100` → offset 51200; 8 sectors → 4096 bytes)
-  that every bridge handler relies on.
+  that every tag handler relies on.
 - `integration: ublk device serves sector reads from a blob` — privileged
   E2E: creates a real `Device` over an in-memory source, opens
   `/dev/ublkb<N>`, and verifies a 4 KiB `pread` at byte offset 1024 returns
   the exact source bytes with one and two hardware queues. Guards the whole
-  path: control plane, queue
-  thread, bridge dispatch, zero-copy buffer addressing, and teardown. It
+  path: control plane, fixed-worker queue-owner dispatch, zero-copy buffer
+  addressing, and teardown. It
   **self-skips** when the shared prerequisite probe finds the control node
   missing/unavailable, an `O_RDWR` open denied, or effective `CAP_SYS_ADMIN`
   absent. All privileged ublk tests perform this check before constructing

@@ -6,6 +6,7 @@
 
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/runtime/scheduler.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <sys/eventfd.h>
@@ -76,6 +77,7 @@ struct SourceState {
     std::atomic<bool> entered{false}, pool_ran{false}, returned{false}, destroyed{false};
     std::atomic<unsigned> owners{0}, bridges{0}, closed{0}, controls{0};
     unsigned expected_queues = 1;
+    unsigned expected_bridges = 1;
     std::atomic<bool> destroyed_after_retirement{false};
 };
 class PoolSource final : public obd::source::BlobSource {
@@ -84,7 +86,7 @@ public:
     ~PoolSource() override {
         state_.destroyed_after_retirement.store(
             state_.owners.load() == state_.expected_queues &&
-            state_.bridges.load() == state_.expected_queues &&
+            state_.bridges.load() == state_.expected_bridges &&
             state_.closed.load() == state_.expected_queues && state_.controls.load() == 1);
         state_.destroyed.store(true);
     }
@@ -227,7 +229,10 @@ private:
     std::chrono::steady_clock::time_point admitted_at_;
 };
 
-enum class Scenario { setup_single, setup_pair, admission_gap, source_progress, deadline };
+enum class Scenario {
+    setup_single, setup_pair, admission_gap, source_progress, deadline,
+    owner_reject, owner_pending_release, owner_cleanup_release,
+};
 class Hooks final : public detail::StartupTestHooks {
 public:
     explicit Hooks(Scenario which) : scenario(which) {}
@@ -240,6 +245,11 @@ public:
     std::atomic<bool> native_setup{true}, native_admission{true}, overflow{false};
 
     detail::CtrlTransport* control_transport() noexcept override { return &script; }
+    bool legacy_thread_topology() const noexcept override {
+        return scenario != Scenario::owner_reject &&
+               scenario != Scenario::owner_pending_release &&
+               scenario != Scenario::owner_cleanup_release;
+    }
     bool open_queue(Queue& queue, int shared) override {
         StartupCoordinatorTestAccess::open(queue, shared);
         queues.at(queue.q_id()) = &queue;
@@ -255,11 +265,34 @@ public:
             paused_setup.wait();
         }
     }
+    void before_owner_spawn(uint16_t queue) override {
+        if (scenario == Scenario::owner_reject && queue == 1)
+            elio::runtime::detail::fail_next_join_state_allocation_for_test.store(
+                true, std::memory_order_release);
+    }
     void before_start_admission() override {
         if (elio::runtime::worker_thread::current()) native_admission.store(false);
         if (scenario == Scenario::admission_gap) admission.wait();
     }
-    void before_initial_submit(uint16_t) noexcept override { initial.wait(); }
+    void before_initial_submit(uint16_t) noexcept override {
+        if (scenario != Scenario::owner_pending_release) initial.wait();
+    }
+    elio::coro::task<void> before_initial_submit_async(uint16_t) override {
+        if (scenario != Scenario::owner_pending_release) co_return;
+        initial.entered.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        for (;;) {
+            {
+                std::lock_guard lock(initial.mutex);
+                if (initial.open) co_return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                initial.escaped.store(true);
+                co_return;
+            }
+            co_await elio::time::sleep_for(1ms);
+        }
+    }
     std::chrono::steady_clock::time_point startup_now() noexcept override {
         return std::chrono::steady_clock::time_point{} + std::chrono::seconds(clock_seconds.load());
     }
@@ -302,6 +335,7 @@ void run_scenario(bool recovery, Scenario scenario) {
     SourceState source_state;
     hooks.source_state = &source_state;
     source_state.expected_queues = scenario == Scenario::setup_pair ? 2 : 1;
+    source_state.expected_bridges = source_state.expected_queues;
     hooks.script.source = &source_state;
     hooks.script.source_required.store(scenario == Scenario::source_progress);
     Outcome outcome;
@@ -583,6 +617,299 @@ void run_scenario(bool recovery, Scenario scenario) {
         CHECK(startup.snapshot().release == StartupRelease::released);
     }
 }
+
+void run_owner_rejection_scenario() {
+    Hooks hooks(Scenario::owner_reject);
+    StartupControl startup(136);
+    startup.set_test_hooks(&hooks);
+    SourceState source_state;
+    source_state.expected_queues = 2;
+    // Queue 1 fails before a coroutine frame is admitted, so only queue 0 has
+    // a join handle whose destruction can be observed.
+    source_state.expected_bridges = 1;
+    hooks.source_state = &source_state;
+    hooks.script.source = &source_state;
+    Outcome outcome;
+
+    elio::runtime::detail::fail_next_join_state_allocation_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::run_config config;
+    config.num_threads = 2;
+    config.blocking_threads = 1;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto source = std::make_unique<PoolSource>(source_state);
+        DeviceParams params;
+        params.nr_queues = 2;
+        params.queue_depth = 2;
+        params.max_io_buf_bytes = 4096;
+        params.dev_sectors = 128;
+        try {
+            auto device = co_await Device::create(
+                params, std::move(source), startup);
+            outcome.ready = true;
+            co_await device->stop_async();
+        } catch (const std::system_error& error) {
+            outcome.error = error.code().value();
+        } catch (const std::bad_alloc&) {
+            outcome.error = ENOMEM;
+        } catch (...) {
+            outcome.error = -1;
+        }
+        outcome.returned = true;
+    }, config);
+    elio::runtime::detail::fail_next_join_state_allocation_for_test.store(
+        false, std::memory_order_release);
+
+    CHECK(outcome.returned);
+    CHECK_FALSE(outcome.ready);
+    CHECK(outcome.error == ENOMEM);
+    CHECK_FALSE(hooks.overflow.load());
+    CHECK_FALSE(elio::runtime::detail::fail_next_join_state_allocation_for_test.load());
+    CHECK(source_state.destroyed.load());
+    CHECK(source_state.destroyed_after_retirement.load());
+    CHECK(hooks.count(Kind::sources_drained) == 2);
+    CHECK(hooks.count(Kind::owner_exit) == 2);
+    CHECK(hooks.count(Kind::bridge_destroyed) == 1);
+    CHECK(hooks.count(Kind::cdev_closed) == 2);
+    CHECK(hooks.count(Kind::control_destroyed) == 1);
+    CHECK(hooks.count(Kind::initial_issued) == 0);
+    CHECK(hooks.count(Kind::adopted) == 0);
+    CHECK(hooks.script.starts.load() == 0);
+    CHECK(hooks.script.stops.load() == 1);
+    CHECK(hooks.script.deletes.load() == 1);
+    CHECK(startup.snapshot().kernel_debt_known);
+    CHECK(startup.snapshot().raw_published == 0);
+    CHECK(startup.snapshot().raw_retired == 0);
+
+    unsigned admitted = 0, absent = 0;
+    for (const auto& event : hooks.events()) {
+        if (event.kind != Kind::owner_exit) continue;
+        if (event.value == 1) ++admitted;
+        if (event.value == 0) ++absent;
+    }
+    CHECK(admitted == 1);
+    CHECK(absent == 1);
+}
+
+void run_pending_release_before_initial_submit() {
+    Hooks hooks(Scenario::owner_pending_release);
+    StartupControl startup(137);
+    startup.set_test_hooks(&hooks);
+    SourceState source_state;
+    hooks.source_state = &source_state;
+    hooks.script.source = &source_state;
+    Outcome outcome;
+    bool pending_before_submit = false;
+
+    elio::runtime::run_config config;
+    config.num_threads = 2;
+    config.blocking_threads = 1;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto source = std::make_unique<PoolSource>(source_state);
+        DeviceParams params;
+        params.nr_queues = 1;
+        params.queue_depth = 2;
+        params.max_io_buf_bytes = 4096;
+        params.dev_sectors = 128;
+        auto launch = [&]() -> elio::coro::task<void> {
+            try {
+                (void)co_await Device::attach(
+                    42, params, std::move(source), startup);
+                outcome.ready = true;
+            } catch (const StartupReleased&) {
+                outcome.released = true;
+            } catch (const std::system_error& error) {
+                outcome.error = error.code().value();
+            } catch (...) {
+                outcome.error = -1;
+            }
+            outcome.returned = true;
+        };
+        auto operation = elio::spawn(launch);
+        std::exception_ptr failure;
+        try {
+            const bool initial_held = co_await until([&] {
+                return hooks.initial.entered.load();
+            });
+            CHECK(initial_held);
+            const bool end_admitted = co_await until([&] {
+                return hooks.script.admitted.load();
+            });
+            CHECK(end_admitted);
+            hooks.clock_seconds.store(6);
+            const bool cancellation_observed = co_await until([&] {
+                const auto snapshot = startup.snapshot();
+                return snapshot.cancel_known && snapshot.control_pending;
+            });
+            CHECK(cancellation_observed);
+            hooks.script.release_original.store(true);
+            const bool failure_settled = co_await until([&] {
+                const auto snapshot = startup.snapshot();
+                return snapshot.original_known && !snapshot.control_pending &&
+                       snapshot.phase == StartupPhase::retained;
+            });
+            CHECK(failure_settled);
+            CHECK(startup.request_release(137, 1) ==
+                  ReleaseRequestResult::accepted);
+            pending_before_submit = co_await until([&] {
+                const auto snapshot = startup.snapshot();
+                return snapshot.phase == StartupPhase::releasing &&
+                       snapshot.release == StartupRelease::pending &&
+                       snapshot.release_sequence == 1;
+            });
+            CHECK(pending_before_submit);
+            CHECK_FALSE(hooks.queues[0]->initial_fetches_issued());
+            CHECK(hooks.script.stops.load() == 0);
+            CHECK(hooks.script.deletes.load() == 0);
+            CHECK_FALSE(operation.is_ready());
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        hooks.rescue();
+        (void)startup.request_release(137, 1);
+        co_await operation;
+        co_await operation.wait_destroyed_async();
+        if (failure) std::rethrow_exception(failure);
+    }, config);
+
+    CHECK(pending_before_submit);
+    CHECK(outcome.returned);
+    CHECK(outcome.released);
+    CHECK_FALSE(outcome.ready);
+    CHECK(outcome.error == 0);
+    CHECK_FALSE(hooks.initial.escaped.load());
+    CHECK_FALSE(hooks.script.escaped.load());
+    CHECK(source_state.destroyed.load());
+    CHECK(hooks.count(Kind::retained_entered) == 1);
+    CHECK(hooks.count(Kind::initial_issued) == 1);
+    CHECK(hooks.count(Kind::owner_exit) == 1);
+    CHECK(hooks.count(Kind::bridge_destroyed) == 1);
+    CHECK(hooks.count(Kind::cdev_closed) == 1);
+    CHECK(hooks.script.stops.load() == 1);
+    CHECK(hooks.script.deletes.load() == 1);
+    const auto final = startup.snapshot();
+    CHECK(final.phase == StartupPhase::released);
+    CHECK(final.release == StartupRelease::released);
+    CHECK(final.release_sequence == 1);
+    CHECK(final.kernel_debt_known);
+    CHECK(final.raw_published == final.raw_retired);
+}
+
+void run_pending_release_during_failure_cleanup() {
+    Hooks hooks(Scenario::owner_cleanup_release);
+    StartupControl startup(138);
+    startup.set_test_hooks(&hooks);
+    SourceState source_state;
+    hooks.source_state = &source_state;
+    hooks.script.source = &source_state;
+    Outcome outcome;
+    Gate cleanup;
+    bool pending_during_cleanup = false;
+
+    elio::runtime::run_config config;
+    config.num_threads = 2;
+    config.blocking_threads = 1;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto source = std::make_unique<PoolSource>(source_state);
+        DeviceParams params;
+        params.nr_queues = 1;
+        params.queue_depth = 2;
+        params.max_io_buf_bytes = 4096;
+        params.dev_sectors = 128;
+        Device::FailureCleanup failure_cleanup = [&]() -> elio::coro::task<void> {
+            cleanup.entered.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + 5s;
+            for (;;) {
+                {
+                    std::lock_guard lock(cleanup.mutex);
+                    if (cleanup.open) co_return;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    cleanup.escaped.store(true);
+                    co_return;
+                }
+                co_await elio::time::sleep_for(1ms);
+            }
+        };
+        auto launch = [&]() -> elio::coro::task<void> {
+            try {
+                (void)co_await Device::attach(
+                    42, params, std::move(source), startup, failure_cleanup);
+                outcome.ready = true;
+            } catch (const StartupReleased&) {
+                outcome.released = true;
+            } catch (const std::system_error& error) {
+                outcome.error = error.code().value();
+            } catch (...) {
+                outcome.error = -1;
+            }
+            outcome.returned = true;
+        };
+        auto operation = elio::spawn(launch);
+        std::exception_ptr failure;
+        try {
+            const bool end_admitted = co_await until([&] {
+                return hooks.script.admitted.load();
+            });
+            CHECK(end_admitted);
+            hooks.clock_seconds.store(6);
+            const bool cancellation_observed = co_await until([&] {
+                const auto snapshot = startup.snapshot();
+                return snapshot.cancel_known && snapshot.control_pending;
+            });
+            CHECK(cancellation_observed);
+            hooks.script.release_original.store(true);
+            const bool cleanup_held = co_await until([&] {
+                return cleanup.entered.load();
+            });
+            CHECK(cleanup_held);
+            CHECK(hooks.count(Kind::sources_drained) == 1);
+            CHECK(hooks.count(Kind::retained_entered) == 0);
+            CHECK(startup.snapshot().release == StartupRelease::none);
+            CHECK(startup.request_release(138, 1) ==
+                  ReleaseRequestResult::accepted);
+            const auto pending = startup.snapshot();
+            pending_during_cleanup =
+                pending.phase == StartupPhase::releasing &&
+                pending.release == StartupRelease::pending &&
+                pending.release_sequence == 1;
+            CHECK(pending_during_cleanup);
+            CHECK_FALSE(operation.is_ready());
+            CHECK(hooks.script.stops.load() == 0);
+            CHECK(hooks.script.deletes.load() == 0);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        cleanup.release();
+        hooks.rescue();
+        (void)startup.request_release(138, 1);
+        co_await operation;
+        co_await operation.wait_destroyed_async();
+        if (failure) std::rethrow_exception(failure);
+    }, config);
+
+    CHECK(pending_during_cleanup);
+    CHECK(outcome.returned);
+    CHECK(outcome.released);
+    CHECK_FALSE(outcome.ready);
+    CHECK(outcome.error == 0);
+    CHECK_FALSE(cleanup.escaped.load());
+    CHECK_FALSE(hooks.script.escaped.load());
+    CHECK(source_state.destroyed.load());
+    CHECK(hooks.count(Kind::retained_entered) == 1);
+    CHECK(hooks.count(Kind::initial_issued) == 1);
+    CHECK(hooks.count(Kind::owner_exit) == 1);
+    CHECK(hooks.count(Kind::bridge_destroyed) == 1);
+    CHECK(hooks.count(Kind::cdev_closed) == 1);
+    CHECK(hooks.script.stops.load() == 1);
+    CHECK(hooks.script.deletes.load() == 1);
+    const auto final = startup.snapshot();
+    CHECK(final.phase == StartupPhase::released);
+    CHECK(final.release == StartupRelease::released);
+    CHECK(final.release_sequence == 1);
+    CHECK(final.kernel_debt_known);
+    CHECK(final.raw_published == final.raw_retired);
+}
 }
 
 TEST_CASE("ublk: public create catches single queue setup failure", "[ublk][startup-coordinator]") {
@@ -608,4 +935,16 @@ TEST_CASE("ublk: public START cancellation leaves sole source blocking worker fr
 }
 TEST_CASE("ublk: public START deadline retains original after cancellation CQE", "[ublk][startup-coordinator]") {
     run_scenario(false, Scenario::deadline);
+}
+TEST_CASE("ublk: failed second fixed owner allocation seals its ownerless queue",
+          "[ublk][startup-coordinator][owner-pump]") {
+    run_owner_rejection_scenario();
+}
+TEST_CASE("ublk: release admission is published while initial FETCH remains held",
+          "[ublk][startup-coordinator][owner-pump]") {
+    run_pending_release_before_initial_submit();
+}
+TEST_CASE("ublk: release admission is visible while failure cleanup remains held",
+          "[ublk][startup-coordinator][owner-pump]") {
+    run_pending_release_during_failure_cleanup();
 }

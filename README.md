@@ -39,7 +39,7 @@ of pulling and unpacking full image layers first.
                                       ▼
             /dev/ublkbN ◀── ublk rings ── obd-device (one per device)
                                       │
-   queue threads ──eventfd──▶ Elio scheduler
+       fixed queue owners ──▶ Elio scheduler
                                       │
         MergedWritable (optional upper) / MergedLsmt
         ├─ LsmtLayer ◀─ ZFileSource? ◀─ TarOffsetSource?
@@ -96,7 +96,7 @@ src/common/       shared utilities: errors, crc32c, digest, byte ranges
 src/format/       ZFile/LSMT readers, layer merge, writable uppers (+ fixture writers)
 src/source/       blob sources: local, registry, layer store with background fill, DART proxy
 src/image/        image assembly from overlaybd-compatible config.json
-src/ublk/         ublk control + per-queue data plane + Elio bridge
+src/ublk/         ublk control + fixed-worker per-queue data plane
 src/supervisor/   daemon, child lifecycle, control protocol
 src/cmd/          obd-supervisor, obd-device
 tools/            obdctl, obd-mkimage, obd-convert

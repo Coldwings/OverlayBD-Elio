@@ -88,14 +88,14 @@ then `main` resets the owner only after `elio::run` returns, off every Elio
 worker. An exception from stop-task creation, async drain or blocking-pool
 admission therefore cannot destroy the live Device during worker-frame unwind.
 The runtime explicitly uses its public unbounded graceful shutdown contract.
-Long-lived bridge tasks do not stop merely because shutdown begins: an
+Long-lived queue-owner tasks do not stop merely because shutdown begins: an
 allocation failure before stop starts can leave `elio::run` waiting indefinitely
 with the main-owned Device retained. Even exceptional runtime return can leave
 main-thread stop/destruction waiting. This is a documented liveness limit, not
 a bounded cleanup guarantee; no finite force-stop or private retry machinery
 is substituted. Normal body failures request the same public async drain. It
-never copies internal Queue,
-bridge, cancellation or recovery logic. Recovery is disabled for this control.
+never copies internal Queue, owner-pump, cancellation or recovery logic.
+Recovery is disabled for this control.
 
 The result directory retains config files, driver logs, actual-owner records,
 full warm/measured fio JSON, server rusage/proc/TID snapshots, actual fio argv,
