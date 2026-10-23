@@ -2077,6 +2077,7 @@ snapshots. This has no latency/throughput threshold and supplies no cross-revisi
 or multicore scaling conclusion. Hosted CPU placement, frequency and competing
 load are unmanaged; one repetition is diagnostic evidence only. Existing remote,
 write/discard and recovery E2E tests remain the functional acceptance gates.
+The write/discard E2E runs its existing assertions with one and two queues.
 For example, after configuring equivalent isolated revisions:
 
 ```sh

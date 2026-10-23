@@ -259,11 +259,14 @@ TEST_CASE("integration: ublk writable device serves writes and discard",
         !reason.empty()) {
         SKIP(reason);
     }
-    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+    const uint16_t nr_queues = GENERATE(1, 2);
+    INFO("nr_queues=" << nr_queues);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto data = test::pattern_bytes(512 * 64, 82);
         auto src = std::make_unique<MemWritable>(data);
         MemWritable* raw = src.get();
         ublk::DeviceParams params;
+        params.nr_queues = nr_queues;
         params.dev_sectors = data.size() / 512;
         params.read_only = false;  // advertises discard (ADR-0009)
         stage("writes: create");

@@ -1,6 +1,6 @@
 # ADR-0025: Resolve device queues and workers together before startup
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-23
 - Supersedes: none
 - Binds: docs/design-assumptions.md, docs/config.md, docs/common.md, docs/ublk.md, docs/operations.md, docs/binaries.md, src/common/device_topology.hpp, src/image/config.hpp, src/cmd/obd_device_main.cpp, src/ublk/device.cpp
