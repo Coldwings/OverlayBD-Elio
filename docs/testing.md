@@ -312,6 +312,19 @@ Every test, grouped by area, with the property it guards.
 
 ### common
 
+- `common: device topology matches automatic workers and queues` — CPU budget,
+  one-pair floor, eight-pair ceiling and equal automatic counts (ADR-0025).
+- `common: device topology validates manual and recovery counts` — manual
+  counts above eight, spare workers, rejected mismatches and recovery of an
+  existing layout despite a changed CPU budget.
+- `common: CPU budget honors cgroup v2 ancestors and affinity` — visible
+  ancestor quotas, fractional quota rounding and the affinity upper bound.
+- `common: CPU budget follows cgroup v1 mounted roots` — combined CPU
+  controllers, a non-root mount and escaped mount-point spaces.
+- `common: CPU budget ignores unavailable and malformed quota files` —
+  affinity fallback and rejection of paths outside the visible cgroup mount
+  or containing namespace-relative parent components.
+
 - `common: crc32c matches the OverlayBD raw running CRC` — the CRC32C
   variant matches the exact running-CRC semantics OverlayBD segment
   digests use (raw, non-inverted), cross-validated against upstream.
@@ -840,6 +853,22 @@ Every test, grouped by area, with the property it guards.
 
 ### image
 
+- `image: global config validates device queue and worker settings` —
+  automatic defaults, manual counts, unknown fields and invalid count types,
+  ranges and worker/queue relationships.
+- `cli: device topology config sets the actual runtime worker count` — runs
+  the real device entry point with manual and automatic settings, observes
+  the actual scheduler size, then fails on a missing image before device IO.
+- `cli: device topology is validated before image or blank startup` — invalid
+  counts fail before runtime/control setup or blank-workspace creation.
+- `cli: device topology reaches blank and supervised startup` — the real
+  entry point reports its actual worker count for image/blank and standalone/
+  parent-channel startup. The parent-channel cases process a normal startup
+  grant. Assembly fails before host device operations.
+- `cli: device preserves operational global config failure cleanup` — missing
+  or malformed global configuration keeps the owned control-endpoint cleanup
+  path and operational exit status; invalid topology fields remain usage errors.
+
 - `image: global config parses overlaybd.json fields` — credential,
   p2p, download, prefetch (`enable` honored, ADR-0012; `head_kb`/
   `tail_kb` pinned separately), and log
@@ -1022,6 +1051,16 @@ Every test, grouped by area, with the property it guards.
   headroom (equal is a no-op); a smaller override is rejected with a
   grow-only reason (ADR-0014).
 ### ublk
+
+- `ublk: production topology distributes queue owners and leaves extra workers runnable` —
+  two production owner tasks prepare on workers zero and one while an extra
+  task progresses on worker two. Scripted queues/control exercise actual
+  scheduling and retirement; this is not kernel or throughput evidence.
+
+- `ublk: attach rejects changed queue geometry before recovery admission` —
+  mismatched queue count, depth or buffer geometry fails after a read-only
+  info query, without START recovery, queue owners, raw commands or old-device
+  STOP/delete authority. The complete source/control graph is retired.
 
 - `ublk: public create catches single queue setup failure` and
   `ublk: public attach catches single queue setup failure` — enter the public
@@ -2040,6 +2079,15 @@ Configure `OBD_BUILD_BENCHMARKS=ON` with `OBD_ENABLE_UBLK=ON` to build
 runner and full operating procedure are in
 [`benchmarks/README.md`](../benchmarks/README.md). These controls use fio and
 explicit device permissions; they are outside the default test/CTest path.
+The privileged CI job also records a short one-pair/two-pair observation with
+the same binary under both runner variant labels, at QD1/QD16 on zero/local-LSMT
+sources. It retains full provenance, individual trial output, actual scheduler
+and queue counts, queue-owner worker/TID startup logs, and per-thread CPU
+snapshots. This has no latency/throughput threshold and supplies no cross-revision
+or multicore scaling conclusion. Hosted CPU placement, frequency and competing
+load are unmanaged; one repetition is diagnostic evidence only. Existing remote,
+write/discard and recovery E2E tests remain the functional acceptance gates.
+The write/discard E2E runs its existing assertions with one and two queues.
 For example, after configuring equivalent isolated revisions:
 
 ```sh

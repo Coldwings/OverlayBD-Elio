@@ -1,7 +1,8 @@
 # common — shared utilities
 
 Module document for `src/common/`: error types, CRC-32C, SHA-256, and
-little-endian byte accessors (including the LSMT `SegmentMapping` encoding).
+little-endian byte accessors (including the LSMT `SegmentMapping` encoding),
+and device startup CPU/topology policy.
 Shape: `module` (see `docs/README.md`).
 
 ## Overview
@@ -27,9 +28,12 @@ What it provides today:
   fixed-width LE load/store helpers and the 16-byte LSMT `SegmentMapping`
   codec, so on-disk parsing is identical on every supported platform.
 
-There is deliberately nothing else here: no logging glue (logging comes from
-Elio directly) and no byte-range type (range arithmetic lives inline in the
-format module where the units are sectors).
+- **Device startup topology** (`src/common/device_topology.hpp`) — cold CPU
+  budget discovery and pure queue/worker count resolution shared by global
+  configuration and the production device entry point (ADR-0025).
+
+Logging comes from Elio directly. Range arithmetic lives in the format module
+where the units are sectors.
 
 ## Concepts
 
@@ -88,6 +92,33 @@ word1: bits  0..54  moffset  (mapped offset in the layer blob, sectors)
 ```
 
 ## Public API
+
+### `src/common/device_topology.hpp` — `namespace obd`
+
+`DeviceTopologyConfig` carries `queues` and `workers`; zero is the automatic
+sentinel. `validate_device_topology_config` rejects values above 256 and an
+explicit worker count below the explicit queue count with
+`DeviceTopologyError`, derived from `obd::error(EINVAL)`.
+`resolve_device_topology(config, cpu, recovery_queues)` returns fixed queue and
+worker counts. Automatic new creation uses at most eight matched pairs;
+one explicit count supplies its counterpart. Recovery preserves the supplied
+existing queue count and rejects mismatched explicit queues or too few workers.
+
+`probe_device_cpu_budget()` is synchronous cold setup and must run before the
+scheduler starts. It combines `sched_getaffinity` with finite cgroup v1/v2 CPU
+quotas discovered through `/proc/self/cgroup` and `/proc/self/mountinfo`, taking
+the tightest visible ancestor quota. Fractional quotas round up. Missing or
+malformed quota files leave affinity as the budget; unavailable affinity falls
+back to hardware concurrency, then one. `DeviceCpuBudget::available_cpus()`
+returns at least one; `quota_cpus == 0` means no finite quota was discovered.
+
+Namespace-relative parent markers in cgroup paths cannot be mapped as ordinary
+filesystem paths; those unavailable quota paths also fall back to affinity.
+See [Linux cgroup namespace semantics](https://man7.org/linux/man-pages/man7/cgroup_namespaces.7.html).
+
+`detail::device_cpu_budget_from_cgroups` uses the same parser with an injected
+file reader, allowing mount-root, escaped-path, hierarchy and quota fixtures
+without changing the host's affinity or cgroups.
 
 ### `src/common/errors.hpp` — `namespace obd`
 

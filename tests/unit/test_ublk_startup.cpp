@@ -2,6 +2,9 @@
 // are real and submit URING_CMD to an eventfd that rejects it. No ublk device,
 // fake delivered request, or manually assigned lifecycle state is involved.
 #include "ublk/device.hpp"
+#include "common/device_topology.hpp"
+
+#include <elio/runtime/affinity.hpp>
 #include "../support.hpp"
 
 #include <elio/runtime/spawn.hpp>
@@ -120,6 +123,9 @@ elio::coro::task<void> read_device_source(PoolSource* source) {
 class Script final : public detail::CtrlTransport {
 public:
     using Command = std::pair<uint32_t, uint64_t>;
+    uint16_t reported_queues = 1;
+    uint16_t reported_depth = 2;
+    uint32_t reported_buffer = 4096;
     std::atomic<bool> admitted{false}, release_original{false}, escaped{false};
     std::atomic<unsigned> starts{0}, stops{0}, deletes{0}, cancels{0};
     std::atomic<uint64_t> original_cookie{0}, cancel_cookie{0}, cancel_target{0};
@@ -149,6 +155,13 @@ public:
         std::memcpy(&cmd, sqe_[0].cmd, sizeof(cmd));
         if (opcode == UBLK_U_CMD_ADD_DEV)
             reinterpret_cast<ublksrv_ctrl_dev_info*>(cmd.addr)->dev_id = 42;
+        if (opcode == UBLK_U_CMD_GET_DEV_INFO) {
+            auto* info = reinterpret_cast<ublksrv_ctrl_dev_info*>(cmd.addr);
+            info->dev_id = 42;
+            info->nr_hw_queues = reported_queues;
+            info->queue_depth = reported_depth;
+            info->max_io_buf_bytes = reported_buffer;
+        }
         if (opcode == UBLK_U_CMD_GET_PARAMS) {
             auto* params = reinterpret_cast<ublk_params*>(cmd.addr);
             params->types = UBLK_PARAM_TYPE_BASIC;
@@ -232,15 +245,19 @@ private:
 enum class Scenario {
     setup_single, setup_pair, admission_gap, source_progress, deadline,
     owner_reject, owner_pending_release, owner_cleanup_release,
+    owner_mapping,
 };
 class Hooks final : public detail::StartupTestHooks {
 public:
-    explicit Hooks(Scenario which) : scenario(which) {}
+    explicit Hooks(Scenario which) : scenario(which) {
+        for (auto& worker : owner_workers) worker.store(static_cast<size_t>(-1));
+    }
     Scenario scenario;
     Script script;
     SourceState* source_state = nullptr;
     Gate failed_setup, paused_setup, admission, initial;
     std::array<Queue*, 2> queues{};
+    std::array<std::atomic<size_t>, 2> owner_workers;
     std::atomic<int> clock_seconds{0};
     std::atomic<bool> native_setup{true}, native_admission{true}, overflow{false};
 
@@ -248,7 +265,8 @@ public:
     bool legacy_thread_topology() const noexcept override {
         return scenario != Scenario::owner_reject &&
                scenario != Scenario::owner_pending_release &&
-               scenario != Scenario::owner_cleanup_release;
+               scenario != Scenario::owner_cleanup_release &&
+               scenario != Scenario::owner_mapping;
     }
     bool open_queue(Queue& queue, int shared) override {
         StartupCoordinatorTestAccess::open(queue, shared);
@@ -275,10 +293,12 @@ public:
         if (scenario == Scenario::admission_gap) admission.wait();
     }
     void before_initial_submit(uint16_t) noexcept override {
-        if (scenario != Scenario::owner_pending_release) initial.wait();
+        if (scenario != Scenario::owner_pending_release &&
+            scenario != Scenario::owner_mapping) initial.wait();
     }
     elio::coro::task<void> before_initial_submit_async(uint16_t) override {
-        if (scenario != Scenario::owner_pending_release) co_return;
+        if (scenario != Scenario::owner_pending_release &&
+            scenario != Scenario::owner_mapping) co_return;
         initial.entered.store(true);
         const auto deadline = std::chrono::steady_clock::now() + 5s;
         for (;;) {
@@ -298,6 +318,9 @@ public:
     }
     void observe(detail::StartupTestEvent event) noexcept override {
         std::lock_guard lock(mutex_);
+        if (scenario == Scenario::owner_mapping && event.kind == Kind::raw_prepared) {
+            owner_workers[event.queue].store(elio::current_worker_id());
+        }
         if (source_state) {
             if (event.kind == Kind::owner_exit) source_state->owners.fetch_add(1);
             if (event.kind == Kind::bridge_destroyed) source_state->bridges.fetch_add(1);
@@ -353,6 +376,7 @@ void run_scenario(bool recovery, Scenario scenario) {
         params.queue_depth = 2;
         params.max_io_buf_bytes = 4096;
         params.dev_sectors = 128;
+        hooks.script.reported_queues = params.nr_queues;
         const bool setup = scenario == Scenario::setup_single || scenario == Scenario::setup_pair;
         // This callback fences the separate source/pool dependency task even
         // if the script's bounded failure escape fires. Device still owns src.
@@ -523,7 +547,8 @@ void run_scenario(bool recovery, Scenario scenario) {
     }
     std::vector<uint32_t> expected_opcodes;
     if (recovery) {
-        expected_opcodes = {UBLK_U_CMD_START_USER_RECOVERY, UBLK_U_CMD_GET_PARAMS};
+        expected_opcodes = {UBLK_U_CMD_GET_DEV_INFO,
+                            UBLK_U_CMD_START_USER_RECOVERY, UBLK_U_CMD_GET_PARAMS};
         if (!setup) {
             expected_opcodes.push_back(UBLK_U_CMD_END_USER_RECOVERY);
             expected_opcodes.push_back(UBLK_U_CMD_STOP_DEV);
@@ -947,4 +972,142 @@ TEST_CASE("ublk: release admission is published while initial FETCH remains held
 TEST_CASE("ublk: release admission is visible while failure cleanup remains held",
           "[ublk][startup-coordinator][owner-pump]") {
     run_pending_release_during_failure_cleanup();
+}
+
+TEST_CASE("ublk: attach rejects changed queue geometry before recovery admission", "[ublk][startup-coordinator]") {
+    for (const auto changed : {0, 1, 2}) {
+        Hooks hooks(Scenario::owner_reject);
+        hooks.rescue();
+        if (changed == 0) hooks.script.reported_queues = 2;
+        if (changed == 1) hooks.script.reported_depth = 4;
+        if (changed == 2) hooks.script.reported_buffer = 8192;
+        StartupControl startup(155);
+        startup.set_test_hooks(&hooks);
+        SourceState source_state;
+        source_state.expected_queues = 0;
+        source_state.expected_bridges = 0;
+        hooks.source_state = &source_state;
+        Outcome outcome;
+        bool finished = false;
+        elio::run_config config;
+        config.num_threads = 1;
+        config.blocking_threads = 1;
+        elio::run([&]() -> elio::coro::task<void> {
+            DeviceParams params;
+            params.dev_sectors = 128;
+            params.queue_depth = 2;
+            params.max_io_buf_bytes = 4096;
+            auto launch = [&]() -> elio::coro::task<void> {
+                try {
+                    auto source = std::make_unique<PoolSource>(source_state);
+                    auto device = co_await Device::attach(42, params,
+                        std::move(source), startup);
+                    outcome.ready = true;
+                    co_await device->stop_async();
+                } catch (const StartupReleased&) {
+                    outcome.released = true;
+                } catch (const std::system_error& failure) {
+                    outcome.error = failure.code().value();
+                } catch (...) {
+                    outcome.error = -1;
+                }
+                outcome.returned = true;
+            };
+            auto operation = elio::spawn(launch);
+            finished = co_await until([&] { return operation.is_ready(); });
+            // Rescue only an unexpected later startup path. The expected
+            // mismatch returns without obtaining old-device cleanup authority.
+            if (!finished) (void)startup.request_release(155, 1);
+            co_await operation;
+            co_await operation.wait_destroyed_async();
+        }, config);
+        CHECK(finished);
+        CHECK(outcome.returned);
+        CHECK_FALSE(outcome.ready);
+        CHECK_FALSE(outcome.released);
+        CHECK(outcome.error == EINVAL);
+        CHECK(source_state.destroyed.load());
+        CHECK(source_state.destroyed_after_retirement.load());
+        CHECK(hooks.count(Kind::owner_exit) == 0);
+        CHECK(hooks.count(Kind::raw_prepared) == 0);
+        CHECK(hooks.script.starts.load() == 0);
+        CHECK(hooks.script.stops.load() == 0);
+        CHECK(hooks.script.deletes.load() == 0);
+        const auto commands = hooks.script.commands();
+        REQUIRE(commands.size() == 1);
+        CHECK(commands.front().first == UBLK_U_CMD_GET_DEV_INFO);
+    }
+}
+
+TEST_CASE("ublk: production topology distributes queue owners and leaves extra workers runnable", "[ublk][startup-coordinator]") {
+    Hooks hooks(Scenario::owner_mapping);
+    StartupControl startup(156);
+    startup.set_test_hooks(&hooks);
+    SourceState source_state;
+    source_state.expected_queues = 2;
+    source_state.expected_bridges = 2;
+    hooks.source_state = &source_state;
+    Outcome outcome;
+    bool both_prepared = false;
+    size_t extra_worker = static_cast<size_t>(-1);
+    const auto topology = obd::resolve_device_topology({2, 3}, {3, 0});
+    elio::run_config config;
+    config.num_threads = topology.workers;
+    config.blocking_threads = 1;
+    elio::run([&]() -> elio::coro::task<void> {
+        DeviceParams params;
+        params.nr_queues = topology.queues;
+        params.queue_depth = 2;
+        params.max_io_buf_bytes = 4096;
+        params.dev_sectors = 128;
+        auto launch = [&]() -> elio::coro::task<void> {
+            auto source = std::make_unique<PoolSource>(source_state);
+            try {
+                auto device = co_await Device::create(params, std::move(source), startup);
+                outcome.ready = true;
+                co_await device->stop_async();
+            } catch (const std::system_error& failure) {
+                outcome.error = failure.code().value();
+            } catch (...) {
+                outcome.error = -1;
+            }
+            outcome.returned = true;
+        };
+        auto operation = elio::spawn(launch);
+        std::exception_ptr failure;
+        try {
+            both_prepared = co_await until([&] {
+                return hooks.owner_workers[0].load() != static_cast<size_t>(-1) &&
+                       hooks.owner_workers[1].load() != static_cast<size_t>(-1);
+            });
+            if (both_prepared) {
+                auto extra = elio::runtime::scheduler::current()->go_joinable_to(
+                    2, []() -> elio::coro::task<size_t> {
+                        co_return elio::current_worker_id();
+                    });
+                extra_worker = co_await extra;
+                co_await extra.wait_destroyed_async();
+            }
+        } catch (...) { failure = std::current_exception(); }
+        // The scripted original START completes with EINTR after rescue.
+        // No borrowed Queue pointer is needed to force failure or cleanup.
+        hooks.rescue();
+        co_await operation;
+        co_await operation.wait_destroyed_async();
+        if (failure) std::rethrow_exception(failure);
+    }, config);
+    CHECK(both_prepared);
+    CHECK(hooks.owner_workers[0].load() == 0);
+    CHECK(hooks.owner_workers[1].load() == 1);
+    CHECK(extra_worker == 2);
+    CHECK(outcome.returned);
+    CHECK_FALSE(outcome.ready);
+    CHECK(outcome.error > 0);
+    CHECK(source_state.destroyed.load());
+    CHECK(source_state.destroyed_after_retirement.load());
+    CHECK(hooks.count(Kind::owner_exit) == 2);
+    CHECK(hooks.count(Kind::bridge_destroyed) == 2);
+    CHECK(hooks.count(Kind::cdev_closed) == 2);
+    CHECK_FALSE(hooks.initial.escaped.load());
+    CHECK_FALSE(hooks.script.escaped.load());
 }

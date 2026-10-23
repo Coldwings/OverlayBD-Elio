@@ -318,6 +318,14 @@ elio::coro::task<std::unique_ptr<Device>> Device::start_impl(
                                       complete_control, observe_control});
         });
         if (recovery) {
+            co_await detail::run_control([&] {
+                const auto info = dev->ctrl_->get_dev_info(dev_id);
+                if (info.nr_hw_queues != dev->params_.nr_queues ||
+                    info.queue_depth != dev->params_.queue_depth ||
+                    info.max_io_buf_bytes != dev->params_.max_io_buf_bytes) {
+                    throw error(EINVAL, "ublk recovery queue geometry changed or mismatches caller");
+                }
+            });
             co_await detail::start_recovery_and_open_queues(
                 [&] {
                     return detail::run_control([&] {

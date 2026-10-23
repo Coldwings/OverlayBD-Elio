@@ -108,6 +108,27 @@ uint32_t prefetch_window_kb(const nlohmann::json& j, const char* key) {
     return static_cast<uint32_t>(v);
 }
 
+uint32_t topology_count(const nlohmann::json& object, const char* key) {
+    const auto value = object.find(key);
+    if (value == object.end()) return 0;
+    const std::string context = std::string("ublkConfig.") + key;
+    if (!value->is_number_integer()) {
+        throw DeviceTopologyError(context + " must be an integer in range 0..256");
+    }
+    uint64_t count = 0;
+    if (value->is_number_unsigned()) {
+        count = value->get<uint64_t>();
+    } else {
+        const auto signed_count = value->get<int64_t>();
+        if (signed_count < 0) throw DeviceTopologyError(context + " must not be negative");
+        count = static_cast<uint64_t>(signed_count);
+    }
+    if (count > kMaxDeviceWorkers) {
+        throw DeviceTopologyError(context + " must be in range 0..256");
+    }
+    return static_cast<uint32_t>(count);
+}
+
 }  // namespace
 
 GlobalConfig GlobalConfig::from_file(const std::string& path) {
@@ -138,6 +159,9 @@ GlobalConfig GlobalConfig::from_json_text(const std::string& text) {
     validate_download_config(cfg.download, "global");
     if (const auto it = j.find("ublkConfig"); it != j.end() && it->is_object()) {
         cfg.ublk_recovery = it->value("enableRecovery", true);
+        cfg.device_topology.queues = topology_count(*it, "queues");
+        cfg.device_topology.workers = topology_count(*it, "workers");
+        validate_device_topology_config(cfg.device_topology);
     }
     if (const auto it = j.find("logConfig"); it != j.end() && it->is_object()) {
         cfg.log_level = it->value("logLevel", 1);

@@ -205,6 +205,8 @@ void Queue::init_owner_pump(size_t owner_worker) {
     owner_cqes_.resize(depth_ * 2);
     owner_pending_.resize(depth_);
     register_owner_eventfd();
+    ELIO_LOG_INFO("ublk queue {} owner: worker={} tid={}",
+                  q_id_, owner_worker_, owner_tid_);
     setup_ready_.store(true, std::memory_order_release);
 }
 

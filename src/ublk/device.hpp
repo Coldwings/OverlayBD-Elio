@@ -46,11 +46,13 @@ public:
 
     /// ADR-0010: attaches to an EXISTING device created with
     /// UBLK_F_USER_RECOVERY after the previous server process died.
-    /// Sequence: START_USER_RECOVERY (retrying EBUSY for up to 30s) → open
+    /// Sequence: GET_DEV_INFO geometry validation → START_USER_RECOVERY
+    /// (retrying EBUSY for up to 30s) → open
     /// queues → fixed workers re-park FETCH for every tag →
     /// END_USER_RECOVERY (retrying EBUSY). The replacement must not open a
     /// queue cdev before START succeeds. The params' queue geometry must
-    /// match the original device's. Must be
+    /// match the original device's; a mismatch fails before START recovery.
+    /// Must be
     /// awaited on the Elio scheduler. The caller must supply a StartupControl
     /// accessible to a concurrent observer/release service and keep both it and
     /// the runtime alive until this operation finishes. Published, unadopted
@@ -72,6 +74,7 @@ public:
     Device& operator=(const Device&) = delete;
 
     uint32_t dev_id() const noexcept { return dev_id_; }
+    size_t queue_count() const noexcept { return queues_.size(); }
     std::string bdev_path() const { return Ctrl::bdev_path(dev_id_); }
 
     /// True once the kernel gendisk is live (START_DEV succeeded).

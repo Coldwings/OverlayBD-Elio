@@ -88,6 +88,40 @@ keep their overlaybd meaning):
 
 Field-by-field reference: [config.md](./config.md).
 
+### Device queues and workers
+
+Global `ublkConfig` controls the production device topology (ADR-0025). With
+both counts absent or zero, new devices choose the same positive queue and
+worker count from process CPU affinity and visible cgroup CPU quota, at most
+eight pairs. Each device has its own process. Default request buffers alone
+cost 16 MiB per queue; eight queues allocate 128 MiB before ring, worker,
+handler and source memory.
+
+To allocate four queue owners and two additional runtime workers:
+
+```json
+{"ublkConfig": {"queues": 4, "workers": 6}}
+```
+
+Explicit values may be 1 through 256 and workers must be at least queues.
+If only one count is positive, the other matches it. Set both to zero to
+restore automatic new-device selection. Supply this global file through
+`obd-supervisor --global`, a create request's existing global override, or
+standalone `obd-device --global`; image and blank devices share the policy.
+
+Startup stderr includes `device topology:` with requested counts, resolved
+queues, actual runtime workers, affinity and visible quota budget. After a
+successful start, `device serving topology:` reports the serving queue and
+worker counts. A topology-resolution message alone does not mean a device
+has reached ready.
+
+Recovery uses the kernel device's existing queue geometry, including layouts
+above eight pairs, rather than recomputing it from the current CPU budget.
+An incompatible explicit queue count or too few workers fails before recovery
+admission. Keep the worker set stable while the device is serving. Automatic
+sizing can only account for quota information visible in the process namespace;
+use explicit counts when deployment policy requires a smaller allocation.
+
 ## Running
 
 Start the daemon in the foreground (under your init system of choice):

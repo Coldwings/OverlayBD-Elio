@@ -192,7 +192,9 @@ elio::coro::task<int> exercise(Settings settings, json* report,
     int status = 0;
     try {
         result = {{"mode", settings.mode}, {"bytes", settings.bytes},
-                  {"queues", settings.queues}, {"queue_depth", settings.depth},
+                  {"queues", device->queue_count()},
+                  {"workers", elio::runtime::scheduler::current()->num_threads(std::memory_order_acquire)},
+                  {"queue_depth", settings.depth},
                   {"qd", settings.qd}, {"segments", segments}};
         const auto path = device->bdev_path();
         // Persist the actual owner before fio can block; the runner never

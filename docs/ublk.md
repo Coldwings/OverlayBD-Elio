@@ -33,6 +33,25 @@ image inside one `obd-device` process (ADR-0004 isolation).
 
 ## Concepts
 
+### Production queue and worker topology
+
+`obd-device` resolves `ublkConfig.queues` and `ublkConfig.workers` before
+constructing its scheduler (ADR-0025; [config.md](./config.md)). Automatic
+creation uses equal counts bounded by the process CPU budget and eight pairs.
+Manual settings can provide extra workers, with workers at least equal to
+queues. Queue `q` starts on worker `q % workers`, so production queues have
+distinct owners. The lower-level `DeviceParams` default remains one queue;
+the production entry point supplies its resolved count explicitly.
+
+Recovery first reads the existing kernel queue count, depth and buffer size
+without adopting the device. Automatic settings follow that layout, and
+explicit incompatible counts fail before recovery admission. `Device::attach`
+rechecks the supplied geometry before START recovery. Counts remain fixed
+through service and retirement. Startup logs report requested counts,
+resolved queues, actual runtime workers and the serving Device's queue count.
+Each initialized queue also logs its owner worker and Linux TID once, allowing
+operators to correlate owner placement with per-thread CPU observations.
+
 ### Queue rings and the ADR-0023 ownership rule
 
 Every hardware queue has exactly one fixed **Elio worker owner**. That Linux
@@ -273,6 +292,10 @@ that capacity nor the parameters.
 size / 512), `logical_bs_shift` (9 = 512 B), `physical_bs_shift` (12 = 4 K),
 `max_sectors` (256 = 128 KiB per request), `read_only` (true →
 `UBLK_ATTR_READ_ONLY`).
+
+These are the lower-level API defaults. Production startup sets `nr_queues`
+from `ublkConfig`; recovery also supplies the kernel's existing depth and
+maximum buffer size.
 
 `Ctrl` — one instance per device process; owns the `/dev/ublk-control` fd
   and the SQE128 control ring

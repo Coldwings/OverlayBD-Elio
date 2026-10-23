@@ -72,6 +72,12 @@ wakes an Elio-native wait through a registered eventfd; normal request and
 completion flow has no cross-thread bridge. The owner survives source drain
 and STOP until every raw command is positively retired.
 
+Production device startup resolves queue and worker counts together before
+constructing its scheduler (ADR-0025). Automatic creation uses equal counts
+from the process CPU budget, at most eight pairs; manual settings may add
+workers but must keep workers at least equal to queues. Recovery preserves
+the existing kernel queue geometry. The serving worker set remains fixed.
+
 ## A8. Writable uppers are optional and copy-on-write
 
 A writable upper engages only when the per-image config names it

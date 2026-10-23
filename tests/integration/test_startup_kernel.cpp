@@ -16,7 +16,7 @@ public:
         socket_ = directory_ + "/s.sock";
         write_text(directory_ + (report_refusal_ ? "/report-refusal-v1" : "/partial-recovery-v1"),
                    "two queues; depth four; recovery queue one gate\n");
-        write_text(directory_ + "/global.json", "{\"ublkConfig\":{\"enableRecovery\":true}}\n");
+        write_text(directory_ + "/global.json", "{\"ublkConfig\":{\"enableRecovery\":true,\"queues\":2,\"workers\":3}}\n");
         // A real local LSMT image goes through the production assembler.
         payload_ = obd::test::pattern_bytes(256 * 1024, 93);
         const auto raw = obd::test::write_file(directory_ + "/raw", payload_);
