@@ -775,6 +775,16 @@ Every test, grouped by area, with the property it guards.
   slot taken) when mis-called with OnDemand.
   Both Prefetch and Fill timeout queues are exercised; under ASAN this
   also detects the waiter ownership use-after-free from issue #148.
+- `source: bounded admission cancellation removes queued waiters` —
+  cancels an already executing child before its direct bounded acquire,
+  then joins and destroys that child before opening the on-demand gate.
+  Both Prefetch and Fill must leave zero in-flight reservations and allow
+  subsequent requests to use the full window (issue #150).
+- `source: bounded admission cancellation releases a reserved slot before a delayed wake` —
+  per-funnel test observers reserve a cancelled waiter's slot before
+  exception reconciliation and retain the releaser's wake until after
+  the acquiring frame is destroyed. Both classes restore the full window;
+  ASAN checks the retained late notification's lifetime (issue #150).
 - `source: admission funnel grows additively on flat latency and halves on rise` —
   flat samples at the EMA baseline raise the window by one each; a
   sample above 150% of the baseline halves it; the drifted baseline
