@@ -99,7 +99,7 @@ src/image/        image assembly from overlaybd-compatible config.json
 src/ublk/         ublk control + fixed-worker per-queue data plane
 src/supervisor/   daemon, child lifecycle, control protocol
 src/cmd/          obd-supervisor, obd-device
-tools/            obdctl, obd-mkimage, obd-convert
+tools/            obdctl, obd-mkimage, obd-convert, obd-export-sparse
 tests/            Catch2 unit + integration tests
 docs/             official documentation (see docs/README.md)
 docs/adr/         Architecture Decision Records

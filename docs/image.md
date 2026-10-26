@@ -303,7 +303,10 @@ mode:
   virtual sizes); writes land in the upper, reads fall through (copy-on-write
   — the lowers are never modified);
 - the root then implements `WritableBlobSource`, and `OpenedImage` reports
-  `writable = true` plus the `upper_path`;
+  `writable = true` plus the `upper_path` and `upper_parent_uuid`. The UUID
+  comes from the actual top data lower before moving layers into the merged
+  root; an acceleration layer is excluded. Empty means no data parent. The
+  device reports this identity for Sparse export admission (ADR-0027);
 - an **unknown** `upper.type` is rejected at parse time with
   `obd::error(EINVAL)`; an absent or empty `upper` object keeps the
   read-only behavior exactly.
@@ -473,6 +476,7 @@ struct OpenedImage {
     size_t layer_count = 0;       // data layers (trace layer excluded)
     bool writable = false;
     std::string upper_path;
+    std::string upper_parent_uuid; // actual immediate data lower (ADR-0027)
     TraceReplayStats trace;       // ADR-0013 replay outcome
     StructuralWarmupStats warmup; // ADR-0012 structural warm-up outcome
     std::vector<source::LayerStore*> layer_stores;  // non-owning

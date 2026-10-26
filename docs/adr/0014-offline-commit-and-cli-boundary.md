@@ -1,6 +1,6 @@
 # ADR-0014: Commit offline with deterministic seal, grow-only resize, and an external CLI boundary
 
-- Status: accepted
+- Status: superseded by ADR-0027
 - Date: 2026-09-08
 - Supersedes: none
 - Updated by: ADR-0019 (converter backend scope)

@@ -82,6 +82,7 @@ target_compile_definitions(obd_unit_tests
     PRIVATE OBD_TEST_TURBO_IMPORT_HOOK=1
             OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>"
             OBD_TEST_OBD_CONVERT_BIN="$<TARGET_FILE:obd-convert>"
+            OBD_TEST_SPARSE_EXPORT_BIN="$<TARGET_FILE:obd-export-sparse>"
             OBD_TEST_SPARSE_CRASH_WRITER_BIN="$<TARGET_FILE:obd-test-sparse-crash-writer>"
             OBD_TEST_HAVE_LIBE2FS=$<BOOL:${OBD_ENABLE_LIBE2FS_BACKEND}>)
 find_program(OBD_E2FSCK_EXECUTABLE e2fsck PATHS /usr/sbin /sbin)
@@ -89,7 +90,7 @@ if(OBD_E2FSCK_EXECUTABLE)
     target_compile_definitions(obd_unit_tests PRIVATE
         OBD_TEST_E2FSCK_BIN="${OBD_E2FSCK_EXECUTABLE}")
 endif()
-add_dependencies(obd_unit_tests obdctl obd-convert obd-test-sparse-crash-writer)
+add_dependencies(obd_unit_tests obdctl obd-convert obd-export-sparse obd-test-sparse-crash-writer)
 catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
     PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
                TIMEOUT 60)

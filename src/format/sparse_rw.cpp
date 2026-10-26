@@ -1,5 +1,8 @@
 // Sparse writable layer. See sparse_rw.hpp.
 #include "format/sparse_rw.hpp"
+#include "format/sparse_export_plan.hpp"
+#include "format/sparse_export_output.hpp"
+#include "common/sha256.hpp"
 
 #include "common/crc32c.hpp"
 #include "common/errors.hpp"
@@ -11,6 +14,7 @@
 
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
@@ -1217,8 +1221,9 @@ elio::coro::task<int> SparseRwLayer::publish_coverage_locked(
 }
 
 std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
-                                                        uint64_t vsize) {
-    if (vsize == 0 || vsize % kSector != 0) {
+                                                        uint64_t vsize,
+                                                        bool existing_only) {
+    if (!existing_only && (vsize == 0 || vsize % kSector != 0)) {
         throw error(EINVAL, "sparse layer vsize must be sector aligned");
     }
     if (vsize > kMaxZeroMaskVsize) {
@@ -1227,7 +1232,7 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
 
     bool created = false;
     int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd < 0 && errno == ENOENT) {
+    if (fd < 0 && errno == ENOENT && !existing_only) {
         fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
                     0644);
         if (fd >= 0) {
@@ -1238,15 +1243,35 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
     }
     if (fd < 0) throw_errno(errno, "cannot open sparse layer " + path);
     FdGuard opened(fd);
+    // Lock before recovery can modify metadata or grow the data file. Every
+    // project writer participates, including ordinary image assembly opens.
+    // Separate opens through hardlinks contend on this same inode.
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        const int e = errno;
+        throw_errno(e == EWOULDBLOCK ? EBUSY : e,
+                    "sparse layer is already owned: " + path);
+    }
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
         const int e = errno;
         throw_errno(e, "cannot stat sparse layer " + path);
     }
+    if (!S_ISREG(st.st_mode)) {
+        throw error(EINVAL, "sparse layer must be a regular file: " + path);
+    }
     if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) % kSector != 0) {
         throw format_error("sparse layer size is not sector aligned: " + path);
     }
     const uint64_t original_data_size = static_cast<uint64_t>(st.st_size);
+    // Another opener may initialize and release the new inode between our
+    // O_EXCL creation and flock. Its completed state is now an existing source;
+    // do not remove its coverage as stale metadata from an older inode.
+    if (original_data_size != 0) created = false;
+    if (existing_only) {
+        if (original_data_size == 0)
+            throw error(EINVAL, "existing sparse layer has zero size: " + path);
+        vsize = original_data_size;
+    }
     uint64_t effective_vsize = vsize;
     const std::string zero_mask_path = path + ".zeroes";
     effective_vsize = std::max(effective_vsize, original_data_size);
@@ -1479,7 +1504,96 @@ elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
     co_return std::move(layer);
 }
 
+elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open_existing(
+    std::string path) {
+    auto job = [path = std::move(path)] {
+        return SparseRwLayer::open_sync(path, 0, true);
+    };
+    using Job = decltype(job);
+    auto layer = co_await run_owned_blocking(new Job(std::move(job)));
+    co_return std::move(layer);
+}
+
+elio::coro::task<SparseExportResult> SparseRwLayer::export_file(
+    std::string source_path, std::string destination,
+    std::string parent_uuid, std::string user_tag, uint64_t virtual_size) {
+    if (source_path.find('\0') != std::string::npos || destination.find('\0') != std::string::npos)
+        throw error(EINVAL, "sparse export: invalid pathname");
+    auto source = co_await open_existing(source_path);
+    if (virtual_size == 0) virtual_size = source->virtual_size();
+    if (virtual_size < source->virtual_size() || virtual_size % 512 != 0 ||
+        virtual_size / 512 > bytes::segment_mapping::kMaxOffset)
+        throw error(EINVAL, "sparse export: virtual size override must be aligned and grow-only");
+    auto prepare = [&] {
+        return sparse_export_detail::Output::prepare(
+            source_path, source->fd_, source->coverage_fd_, destination);
+    };
+    using Prepare = decltype(prepare);
+    auto output = co_await run_owned_blocking(new Prepare(std::move(prepare)));
+    SparseExportResult result;
+    std::exception_ptr failure;
+    try {
+        const int checkpointed = co_await source->checkpoint();
+        if (checkpointed != 0) throw error(-checkpointed, "sparse export: checkpoint source");
+        const auto ownership = source->segments_snapshot();
+        auto encoded = co_await sparse_export_detail::write_delta(source->data_source(),
+            output->fd(), virtual_size, ownership, std::move(parent_uuid), std::move(user_tag));
+        result.uuid = std::move(encoded.uuid);
+        result.size = encoded.file_bytes;
+        common::Sha256 digest;
+        std::vector<std::byte> buffer(1 << 20), existing(buffer.size());
+        for (uint64_t offset = 0; offset < result.size;) {
+            const auto count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), result.size - offset));
+            const auto read = co_await elio::io::pread_exactly(output->fd(),
+                std::span(buffer).first(count), offset);
+            if (read.error) throw error(read.error.value(), "sparse export: digest read");
+            if (read.end != elio::io::transfer_end::complete)
+                throw error(EIO, "sparse export: incomplete digest read");
+            digest.update(buffer.data(), count);
+            offset += count;
+        }
+        result.sha256 = digest.final_hex();
+        auto publish = [active = output.get()] { return active->publish(); };
+        using Publish = decltype(publish);
+        const bool published = co_await run_owned_blocking(new Publish(std::move(publish)));
+        if (!published) {
+            for (uint64_t offset = 0; offset < result.size;) {
+                const auto count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), result.size - offset));
+                const auto staged = co_await elio::io::pread_exactly(output->fd(),
+                    std::span(buffer).first(count), offset);
+                const auto prior = co_await elio::io::pread_exactly(output->existing_fd(),
+                    std::span(existing).first(count), offset);
+                if (staged.error || prior.error || staged.end != elio::io::transfer_end::complete ||
+                    prior.end != elio::io::transfer_end::complete)
+                    throw error(EIO, "sparse export: cannot verify existing output");
+                if (!std::equal(buffer.begin(), buffer.begin() + count, existing.begin()))
+                    throw error(EEXIST, "sparse export: different output already exists");
+                offset += count;
+            }
+            const auto synced = co_await elio::io::sync_file(output->existing_fd(),
+                elio::io::file_sync_mode::data_and_metadata);
+            if (!synced) throw error(synced.error_value(), "sparse export: sync existing output");
+        }
+        auto sync_directory = [active = output.get()] { active->sync_directory(); return 0; };
+        using Sync = decltype(sync_directory);
+        co_await run_owned_blocking(new Sync(std::move(sync_directory)));
+    } catch (...) { failure = std::current_exception(); }
+    // Cleanup normally runs off workers too. A pre-publication failure removes
+    // only our private staging name; a published output is never removed.
+    auto cleanup = [owned = std::move(output)]() mutable { owned.reset(); return 0; };
+    using Cleanup = decltype(cleanup);
+    co_await run_owned_blocking(new Cleanup(std::move(cleanup)));
+    if (failure) std::rethrow_exception(failure);
+    co_return result;
+}
+
 SparseRwLayer::~SparseRwLayer() {
+    // Elio can defer the actual close on io_uring. End exclusive ownership now,
+    // after the caller has drained operations, so a subsequent open need not
+    // wait for an unrelated worker's close submission to reach the kernel.
+    if (fd_ >= 0) {
+        while (::flock(fd_, LOCK_UN) != 0 && errno == EINTR) {}
+    }
     if (coverage_fd_ >= 0) elio::io::close_fd_for_destructor(coverage_fd_);
     if (fd_ >= 0) elio::io::close_fd_for_destructor(fd_);
 }
