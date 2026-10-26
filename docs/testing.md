@@ -1583,8 +1583,9 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   (`tests/fake_device_main.cpp`) that, like the real device, checkpoints
   its LSMT-RW upper only on SIGTERM — so a commit that sealed without
   stopping the device first could not succeed (stop-then-seal is pinned,
-  not just narrated): commit on unknown id, sparse upper, and upper-less
-  devices fails with precise errors; malformed field types (non-string
+  not just narrated): commit on unknown id and upper-less devices fails with
+  precise errors; Sparse commit exports a separate artifact with deterministic
+  retry and explicit-output coverage. Malformed field types (non-string
   `id`/`user_tag`) are answered as protocol errors and the daemon keeps
   serving; editing the config file after create
   does not redirect commit (upper path provenance); commit on a live
@@ -1592,6 +1593,14 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   upper, replying `path`/`sha256`/`size`; a second commit fails with
   "already sealed"; the sealed file re-opens as a valid LSMT RO layer
   with the fake's payload (ADR-0014). Runs without privileges.
+- `supervisor: sparse export preserves the opened parent and reusable source` —
+  real parent-backed image assembly and a simulated device child exercise
+  graceful stop, recovery with the same parent, and rejection after a changed
+  parent. Checks refusal before stop, full nonzero-parent DATA/ZERO/INHERIT
+  readback, output-only growth and source reuse. No ublk device is required.
+- `cli: obdctl commit forwards sparse export destination and geometry` —
+  executes the CLI against a test-owned socket and validates the JSON fields,
+  path containing spaces, default omission and failure exit codes.
 - `supervisor: successful commit disables recovery respawn` — with
   `max_recovery_attempts` positive, a successful commit leaves the stopped
   child exited with the original PID and zero recoveries instead of

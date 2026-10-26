@@ -159,7 +159,7 @@ elio::coro::task<int> fake_body(
         };
         // D3 resize/checkpoint handles: `upper` is the image's writable
         // top (lsmt/sparse, sized at the headroom override); `blank_top`
-        // is the blank device's merged writable top and `blank_merged`
+        // is the assembled blank/Sparse image's writable top and `blank_merged`
         // that merged root itself (the resize executor grows the merged
         // DATA PLANE through it, exactly like the real device).
         std::shared_ptr<obd::format::WritableLayer> upper;
@@ -240,7 +240,7 @@ elio::coro::task<int> fake_body(
                 // extents, recording nothing.
                 obd::image::GlobalConfig g;
                 g.prefetch_enable = false;
-                opened.emplace(co_await obd::image::open_image(img, g));
+                opened.emplace(co_await obd::image::open_image(img, g, args.virtual_size));
             }
 
             // D3 create-time headroom: mirror the real device's grow-only
@@ -289,9 +289,23 @@ elio::coro::task<int> fake_body(
                     co_return 1;
                 }
                 upper = std::move(lsmt);
+            } else if (img.writable() && opened) {
+                // Real image assembly already owns the Sparse inode. Reuse
+                // its merged root for IO, resize and shutdown checkpoint.
+                auto* merged = dynamic_cast<obd::format::MergedWritable*>(
+                    opened->root.get());
+                if (!merged) throw std::runtime_error("missing writable image root");
+                blank_top = &merged->writable_top();
+                blank_merged = merged;
+                const auto payload =
+                    obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
+                const auto written = co_await merged->pwrite(
+                    payload.data(), payload.size(), 0);
+                const auto zeroed = co_await blank_top->discard(kPayloadBytes, 512);
+                if (written != static_cast<ssize_t>(payload.size()) || zeroed != 0)
+                    throw std::runtime_error("sparse fixture payload write failed");
             } else if (img.writable()) {
-                // Sparse: open the file so the device is plausible; sparse
-                // state is durable via fiemap and never seals.
+                // A no-lower fixture owns its Sparse instance directly.
                 std::filesystem::create_directories(img.upper.dir);
                 auto sparse = co_await obd::format::SparseRwLayer::open(
                     img.upper.dir + "/overlaybd.sparse", layer_vsize);
@@ -304,9 +318,15 @@ elio::coro::task<int> fake_body(
         ready_owner.phase = "ready";
         ready_owner.device_id = 70;
         if (owner) *owner = ready_owner;
+        // Test-only marker models a child predating parent-identity reports.
+        const bool omit_parent = !args.config.empty() &&
+            std::filesystem::exists(args.config + ".omit-parent-uuid");
         publish(channel, DeviceStatus{"ready", "/dev/ublkb70", "",
             args.startup_generation
-                ? std::optional{ready_owner} : std::nullopt});
+                ? std::optional{ready_owner} : std::nullopt,
+            omit_parent ? std::nullopt :
+                (opened ? std::optional{opened->upper_parent_uuid}
+                        : std::optional<std::string>{""})});
 
         // Serve the supervisor's device commands on the control channel
         // (trace record path + D3 resize), exactly like the real

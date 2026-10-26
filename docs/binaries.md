@@ -1,8 +1,8 @@
-# Binaries: obd-supervisor, obd-device, obdctl, obd-mkimage, obd-convert
+# Binaries: obd-supervisor, obd-device, obdctl, obd-mkimage, obd-convert, obd-export-sparse
 
 ## Overview
 
-The repository builds five executables:
+The repository builds six executables:
 
 - **obd-supervisor** — the per-node daemon. It owns the control plane: a
   Unix domain socket accepting JSON-lines commands, and one isolated child
@@ -24,6 +24,10 @@ The repository builds five executables:
   reads a ustar archive from a file or stdin, builds a bounded ext2-compatible
   filesystem image without a device, mount, or host mkfs subprocess, seals it
   as an LSMT-RO layer, and prints manifest metadata.
+
+- **obd-export-sparse** — exports a stopped sparse upper to a separate standard
+  LSMT delta using the existing exact ownership/recovery rules. It retains the
+  reusable source and prints artifact metadata; no daemon or block device is needed.
 
 Interactions: `obdctl → obd-supervisor` over the supervisor UDS (default
 `/run/overlaybd-elio/supervisor.sock`); `obd-supervisor → obd-device` by
@@ -134,11 +138,13 @@ present, must precede the command word. Commands:
   its entry; success requires retirement and actual reap (ADR-0022).
 - `list` — list known devices and their states.
 - `status <id>` — query one device.
-- `commit <id> [--tag TAG]` — offline commit (ADR-0014): stop
-  the device when live, then seal its LSMT-RW upper in place and reply
-  with the sealed file's `path`, hex `sha256`, and byte `size`. `--tag`
-  is recorded as the sealed layer's `user_tag`. Sparse and upper-less
-  devices are errors; the full contract is in
+- `commit <id> [--tag TAG] [--virtual-size BYTES] [--output PATH]` — offline
+  commit: stop the live device, then seal LSMT-RW in place (ADR-0014) or
+  export Sparse to a separate file (ADR-0027). Replies include `path`, hex
+  `sha256`, and byte `size`; Sparse also returns `uuid` and `parent_uuid`.
+  `--tag` is the sealed layer's `user_tag`. `--output` is Sparse-only, defaulting
+  to `<upper.dir>/overlaybd.sparse.lsmt`. Upper-less devices are errors.
+  The full contract is in
   [supervisor.md](./supervisor.md) and the runbook in
   [operations.md](./operations.md).
 
@@ -176,6 +182,34 @@ stdout:
 
 which can be dropped into a per-image `config.json` for tests (see
 [config.md](./config.md)).
+
+### obd-export-sparse
+
+```sh
+obd-export-sparse /images/upper.raw /images/delta.lsmt \
+  --parent 01234567-89ab-cdef-0123-456789abcdef --tag "offline snapshot"
+```
+
+Stop the source device and release other Sparse owners first. The tool reads
+existing source data and coverage; a missing source fails without creation.
+DATA becomes owned payload, ZERO masks the same parent ranges, and INHERIT
+remains unmapped. Supply the immediate parent's UUID for a delta over a parent
+chain; omit `--parent` only for a bottom layer. `--tag` is optional.
+
+A successful invocation prints one JSON object containing `path`, `sha256`,
+`size`, `uuid`, and `parent_uuid`. Exit 0 means the artifact and destination
+namespace are synchronized; exit 1 reports an operation failure on stderr,
+and exit 2 reports invalid command syntax. An output-stream failure can return
+1 after a successful export; the identical-output retry remains safe.
+
+The destination is never overwritten. A byte-identical existing destination
+is verified and synchronized as a retry; conflicting content is rejected.
+After a directory-sync failure the artifact may already be visible: retry the
+same command to establish durability. Source files remain independently
+reopenable read-write, and future source changes cannot alter owned bytes in
+an exported artifact. Keep source artifact names and the output directory
+stable during export. The tool uses two Elio workers and two blocking workers;
+file contents use asynchronous IO and namespace operations run off workers.
 
 ### obd-convert
 
@@ -294,7 +328,10 @@ obd-device reports `starting` → `ready` (with the `/dev/ublkb<N>` path) →
 `stopped`, or `failed` with an error string, as JSON-lines on the inherited
 `--control-fd` (`src/supervisor/protocol.hpp::DeviceStatus`, built via
 `src/supervisor/protocol.hpp::make_device_status`). Reports use a serialized best-effort writer. Protocol v5 adds `startup_owner`
-version 1 with generation/revision, phase, debt and release facts. Missing or
+version 1 with generation/revision, phase, debt and release facts. Protocol v6
+adds optional `upper_parent_uuid` to ready status: empty is a known bottom-layer
+parent, absent is unknown. Sparse commit requires a consistent known identity
+across recovery generations (ADR-0027). Missing or
 malformed reports and channel EOF never weaken installed startup protection;
 waitpid proves process exit, not kernel retirement. Without `--control-fd`
 (standalone runs), an abstract Unix socket provides the same startup-owner
@@ -342,6 +379,8 @@ output).
 
 ### Concurrency and stability notes
 
+- obd-export-sparse owns an isolated Elio runtime for one offline export and
+  retains an exclusive source inode lock until the transaction finishes.
 - obdctl, obd-mkimage and obd-convert are single-threaded, synchronous
   tools; they hold no state between invocations.
 - The supervisor↔obdctl command protocol and the supervisor↔obd-device
@@ -395,6 +434,12 @@ output).
 - `integration: registry pipeline serves a zfile-compressed image` —
   exercises the full image-assembly path obd-device runs, over a mock
   registry with a ZFile-compressed layer.
+- `cli: obdctl commit forwards sparse export destination and geometry` —
+  actual CLI-to-JSON translation of output, tag and virtual size.
+- `cli: sparse export writes an independent delta and reports its digest` —
+  executes the real built binary, verifies retry metadata and exact
+  digest, rejects missing/aliased sources and invalid options, and reopens the
+  source read-write.
 - obd-mkimage's writers are pinned by round-trip tests:
   `format: lsmt round-trip and multi-layer merge semantics` (the LSMT
   single-layer writer output reads back and merges correctly) and
