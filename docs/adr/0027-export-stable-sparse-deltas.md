@@ -80,5 +80,4 @@ not require Hybrid. Tests must distinguish DATA/ZERO/INHERIT with nonzero
 parents, exercise independent readers, deterministic histories, publication
 faults, source reuse, aliases, process recovery and the actual operator paths.
 Acceptance includes the standalone CLI and supervisor workflow, ordinary tests,
-independent upstream readback, and sparse-capacity scaling measurements. The ADR
-remains proposed until the carrying PR merges.
+independent upstream readback, and sparse-capacity scaling measurements. The decision and implementation take effect together when the carrying PR merges.

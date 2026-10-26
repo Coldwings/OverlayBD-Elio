@@ -220,7 +220,7 @@ uses the real image assembly and a simulated device child, a nonzero parent,
 DATA/ZERO/INHERIT readback, changed config, and output-only capacity expansion.
 It exercises the control socket and stop/reap path without a kernel ublk device.
 
-Sparse uppers use the separate export path described by proposed ADR-0027.
+Sparse uppers use the separate export path described by ADR-0027.
 After stopping and reaping the child, commit recovers exact ownership and writes
 an ordinary sealed LSMT delta to `<upper.dir>/overlaybd.sparse.lsmt`, or to the
 explicit `output` path (`obdctl commit ID --output PATH`). DATA is copied, ZERO
