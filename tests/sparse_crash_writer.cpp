@@ -17,6 +17,9 @@
 
 namespace obd::format {
 struct SparseRwLayerTestAccess {
+    static void fail_coverage_page(SparseRwLayer& layer, uint64_t page) {
+        layer.fail_coverage_page_for_test_ = page;
+    }
     static void interrupt_import_at(int stage) {
         SparseRwLayer::coverage_install_fail_stage_for_test_.store(
             stage, std::memory_order_release);
@@ -98,6 +101,10 @@ int main(int argc, char** argv) {
                                                                   : -EIO;
             } else if (operation == "discard") {
                 rc = co_await layer->discard(offset, length);
+            } else if (operation == "discard-partial") {
+                obd::format::SparseRwLayerTestAccess::fail_coverage_page(*layer, 1);
+                rc = co_await layer->discard(offset, length);
+                ::_exit(rc == -EIO ? 87 : 65);
             } else if (operation == "discard-readonly") {
                 rc = co_await obd::format::SparseRwLayerTestAccess::
                     discard_with_readonly_data(*layer, path, offset, length);

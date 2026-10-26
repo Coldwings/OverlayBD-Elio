@@ -1087,6 +1087,10 @@ void SparseRwLayer::load_coverage(const std::string& artifact_path,
     // A completed prior-process operation may exist only in the surviving
     // page cache. Reopen cannot infer that a successful FLUSH persisted it.
     coverage_dirty_ = true;
+    // DISCARD can commit exact ZERO before reaching the compatibility sidecar.
+    // Reestablish a complete protective mask before a recovered ZERO-to-DATA
+    // write can publish only a prefix and retain ZERO in its runtime view.
+    if (has_zero_masks_locked()) zero_masks_dirty_ = true;
 }
 
 elio::coro::task<int> SparseRwLayer::publish_coverage_locked(

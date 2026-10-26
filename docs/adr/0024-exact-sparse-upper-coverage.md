@@ -90,6 +90,10 @@ matching xattr marker exists, a complete temporary must match
 the recorded device/inode. A recovered complete temporary is synchronized before
 marker installation. Every reopened coverage file is potentially dirty until
 the replacement process successfully flushes it, including without new writes.
+Recovered ZERO also requires republishing a complete compatibility mask before
+a write removes it: a prior discard may have committed exact ZERO before
+publishing `.zeroes`. This keeps a later failed multi-page DATA publication's
+runtime ZERO view consistent with reopening.
 
 ## Consequences
 

@@ -1124,6 +1124,96 @@ TEST_CASE("format: sparse multi-page zero coverage failure is retryable",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("format: sparse recovered ZERO stays coherent after partial write failure",
+          "[format]") {
+    bool stale_sidecar = false;
+    bool flush_after_failure = false;
+    SECTION("missing sidecar without FLUSH") {}
+    SECTION("missing sidecar with FLUSH") { flush_after_failure = true; }
+    SECTION("stale sidecar without FLUSH") { stale_sidecar = true; }
+    SECTION("stale sidecar with FLUSH") {
+        stale_sidecar = true;
+        flush_after_failure = true;
+    }
+    constexpr uint64_t first_sector = 4096 * 4 - 1;
+    constexpr uint64_t vsize = (first_sector + 3) * 512;
+    TempDir dir;
+    const std::string path = dir / "recovered-zero.sparse";
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", std::vector<uint8_t>(vsize, 0x5a), &lower);
+    if (stale_sidecar) {
+        const int setup = test::run_coro([&]() -> elio::coro::task<int> {
+            auto top = co_await format::SparseRwLayer::open(path, vsize);
+            co_return co_await top->discard(0, 512);
+        });
+        REQUIRE(setup == 0);
+    }
+    // The child commits the first ZERO page, fails the second, and exits
+    // without FLUSH/destructors. No in-memory dirty flag survives recovery.
+    const int child = run_sparse_crash_writer(
+        path, "discard-partial", vsize, first_sector * 512, 2 * 512);
+    REQUIRE(WIFEXITED(child));
+    REQUIRE(WEXITSTATUS(child) == 87);
+    REQUIRE(std::filesystem::exists(path + ".zeroes") == stale_sidecar);
+
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto open_merged = [&]() -> elio::coro::task<std::unique_ptr<format::MergedWritable>> {
+            auto local = co_await source::LocalFileSource::open(lower);
+            source::BlobSourcePtr blob = std::move(local);
+            std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+            lowers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
+            auto top = co_await format::SparseRwLayer::open(path, vsize);
+            co_return co_await format::MergedWritable::open(std::move(lowers), std::move(top));
+        };
+        std::vector<uint8_t> live(4 * 512);
+        const std::vector<uint8_t> data(2 * 512, 0xa5);
+        const uint64_t read_offset = (first_sector - 1) * 512;
+        {
+            auto merged = co_await open_merged();
+            auto& top = static_cast<format::SparseRwLayer&>(merged->writable_top());
+            format::SparseRwLayerTestAccess::fail_coverage_page(top, 1);
+            const auto written = co_await merged->pwrite(
+                data.data(), data.size(), first_sector * 512);
+            REQUIRE(written == -EIO);
+            auto read = co_await merged->pread(live.data(), live.size(), read_offset);
+            REQUIRE(read == static_cast<ssize_t>(live.size()));
+            auto expected = std::vector<uint8_t>(live.size(), 0x5a);
+            std::fill_n(expected.begin() + 512, 512, 0);
+            CHECK(live == expected);
+            if (flush_after_failure) {
+                const int flushed = co_await merged->flush();
+                REQUIRE(flushed == 0);
+                std::vector<uint8_t> after_flush(live.size());
+                read = co_await merged->pread(after_flush.data(), after_flush.size(), read_offset);
+                REQUIRE(read == static_cast<ssize_t>(after_flush.size()));
+                CHECK(after_flush == live);
+            }
+        }
+        {
+            auto reopened = co_await open_merged();
+            std::vector<uint8_t> recovered(live.size());
+            auto read = co_await reopened->pread(recovered.data(), recovered.size(), read_offset);
+            REQUIRE(read == static_cast<ssize_t>(recovered.size()));
+            const bool same_view = recovered == live;
+            CHECK(same_view);
+            const auto retried = co_await reopened->pwrite(
+                data.data(), data.size(), first_sector * 512);
+            REQUIRE(retried == static_cast<ssize_t>(data.size()));
+            const int flushed = co_await reopened->flush();
+            REQUIRE(flushed == 0);
+        }
+        auto reopened = co_await open_merged();
+        std::vector<uint8_t> actual(live.size());
+        const auto read = co_await reopened->pread(actual.data(), actual.size(), read_offset);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        auto expected = std::vector<uint8_t>(actual.size(), 0x5a);
+        std::fill_n(expected.begin() + 512, data.size(), 0xa5);
+        CHECK(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("format: sparse DATA view follows committed zero-mask namespace",
           "[format]") {
     TempDir dir;

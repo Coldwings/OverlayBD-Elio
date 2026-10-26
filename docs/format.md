@@ -588,6 +588,10 @@ device/inode; afterwards a matching marker permits marker-preserving inode
 replacement. Recovery synchronizes a complete temporary before installing its
 marker and treats reopened coverage as potentially dirty, so FLUSH after a
 process restart synchronizes it even without a new write.
+Recovered exact ZERO also marks the compatibility mask dirty: an interrupted
+discard may have committed ZERO before publishing `.zeroes`. Before a write
+removes such ZERO, the complete protective mask is republished. A later
+partial DATA publication can then retain the same ZERO view live and on reopen.
 
 For a pre-existing v1 file with no coverage sidecar, `open` performs a
 one-time `SEEK_DATA`/`SEEK_HOLE` import bounded by the original EOF, overlays
@@ -1257,6 +1261,10 @@ writers and readers agree on the same bytes.
   expansion preserve every lower byte without fabricating DATA ownership.
 - `format: sparse legacy growth leaves new sectors inherited` — importing a
   smaller legacy upper owns only the original EOF range, live and on reopen.
+- `format: sparse recovered ZERO stays coherent after partial write failure`
+  — a child exits after partial ZERO publication; missing and stale compatibility
+  masks preserve the same merged view after a later cross-page write fails,
+  with or without a subsequent FLUSH. Retrying the write publishes DATA.
 - `format: merged sparse allocation failure preserves committed prefix` — a
   controlled allocation failure after the first large-request piece returns
   `-ENOMEM` and preserves the same live/recovered prefix and untouched lower.
