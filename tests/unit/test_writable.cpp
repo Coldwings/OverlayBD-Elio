@@ -5377,7 +5377,8 @@ TEST_CASE("cli: sparse export writes an independent delta and reports its digest
         std::vector<uint8_t> raw(static_cast<size_t>(file->size()));
         const auto read = co_await file->pread(raw.data(), raw.size(), 0);
         REQUIRE(read == static_cast<ssize_t>(raw.size()));
-        REQUIRE(common::Sha256::hex(raw.data(), raw.size()) == first.at("sha256"));
+        REQUIRE(common::Sha256::hex(raw.data(), raw.size()) ==
+                first.at("sha256").get<std::string>());
         auto layer = co_await format::LsmtLayer::open(std::move(file));
         REQUIRE(layer->header().parent_uuid == parent);
         REQUIRE(layer->header().user_tag == "cli-export");
