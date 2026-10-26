@@ -676,9 +676,9 @@ used 4096-byte blocks, `noatime`, and their default allocation settings.
 
 | Filesystem coordinate | Identity | Observed validation |
 |---|---|---|
-| ext4 | user-xattr ID | 50 sparse/migration/merged cases, 35,666 assertions |
-| XFS | user-xattr ID | 50 sparse/migration/merged cases, 35,666 assertions |
-| VFAT, FAT16, 4096-byte clusters | device/inode fallback | seven bounded cases, 149 assertions; coverage header flags confirmed the weak binding |
+| ext4 | user-xattr ID | 51 sparse/migration/merged cases, 35,730 assertions |
+| XFS | user-xattr ID | 51 sparse/migration/merged cases, 35,730 assertions |
+| VFAT, FAT16, 4096-byte clusters | device/inode fallback | eight bounded cases, 213 assertions; coverage header flags confirmed the weak binding |
 
 A separate fixture fed real `TagEngine` handlers WRITE_ZEROES with and
 without NOUNMAP, plus DISCARD, through `MergedWritable` into the sparse upper.
@@ -711,7 +711,7 @@ by this matrix.
 A local public-API control compared the
 [pre-v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/96515944e0d3e0be48b95660aed568e0aa99ce6c)
 with the
-[v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/1261c8ebcc288b3a61624ab60c75aba265c4fd66).
+[v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/22b187bde3670021dc0ce0613cd59708320be93d).
 Both used test-enabled RelWithDebInfo builds on an Intel i3-N305, one Elio
 worker and one blocking thread, buffered files, 64 MiB, and 16,384 random
 4096-byte requests per trial. The same measurement program used each
@@ -721,15 +721,15 @@ Values below are medians of the three per-trial results.
 
 | Operation / depth | CPU us/request, v1 → v2 | Mean API latency us, v1 → v2 |
 |---|---:|---:|
-| First write / 1 | 33.44 → 94.56 | 34.58 → 96.23 |
-| First write / 16 | 36.19 → 99.71 | 593.14 → 1630.36 |
-| DATA rewrite / 1 | 18.40 → 19.48 | 18.94 → 20.42 |
-| DATA rewrite / 16 | 25.03 → 19.46 | 417.10 → 321.69 |
-| Read / 1 | 2.09 → 2.06 | 2.06 → 2.02 |
-| Read / 16 | 1.67 → 1.68 | 26.48 → 26.65 |
+| First write / 1 | 31.61 → 91.57 | 32.66 → 92.75 |
+| First write / 16 | 35.23 → 95.92 | 577.88 → 1559.98 |
+| DATA rewrite / 1 | 20.94 → 19.87 | 21.74 → 20.59 |
+| DATA rewrite / 16 | 20.90 → 21.79 | 354.34 → 356.99 |
+| Read / 1 | 2.03 → 2.13 | 2.00 → 2.10 |
+| Read / 16 | 1.66 → 1.66 | 26.41 → 26.42 |
 
 First-write publication remains a measured cost. Read/depth-16 CPU observations
-ranged from 1.56–1.68 us in v1 and 1.60–1.72 us in v2; these short, overlapping
+ranged from 1.58–1.68 us in v1 and 1.54–1.70 us in v2; these short, overlapping
 samples do not establish a stable improvement or regression. CPU includes
 coroutine dispatch and joins; final FLUSH and content checks were outside the
 timing window. Rewrite/read files were filled and flushed first, but residency,
@@ -743,9 +743,9 @@ and residency was not verified. All prepared DATA blocks were checked.
 
 | Touched regions | Open wall ms, v1 → v2 | Open CPU ms, v1 → v2 | Process RSS delta KiB, v1 → v2 |
 |---|---:|---:|---:|
-| 64 | 0.14 → 0.71 | 0.12 → 0.72 | 72 → 172 |
-| 512 | 0.69 → 5.24 | 0.68 → 5.24 | 172 → 252 |
-| 4096 | 10.91 → 37.13 | 10.91 → 37.23 | 336 → 900 |
+| 64 | 0.17 → 0.84 | 0.14 → 0.84 | 60 → 168 |
+| 512 | 0.68 → 4.99 | 0.65 → 5.03 | 172 → 252 |
+| 4096 | 10.32 → 40.91 | 10.29 → 40.99 | 400 → 900 |
 
 The coverage file's logical length was 1,090,523,136 bytes; allocated storage
 was 520/4108/32824 KiB respectively. RSS deltas include allocator/runtime
