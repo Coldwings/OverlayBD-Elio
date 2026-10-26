@@ -1,6 +1,6 @@
 # ADR-0027: Export stable sparse ownership as an independent LSMT delta
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-26
 - Supersedes: ADR-0014
 - Binds: src/format/sparse_rw.hpp, src/format/sparse_rw.cpp,
