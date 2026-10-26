@@ -602,7 +602,7 @@ until the next durability boundary republishes its current size.
 Creation and migration write and sync `<path>.coverage.tmp`, validate every
 header and committed page, then expand the data file, install the data-inode
 identity xattr, and sync the data inode,
-then renames the sidecar and syncs the parent directory. A marker with neither
+then rename the sidecar and sync the parent directory. A marker with neither
 final coverage nor a valid temporary artifact fails closed. Existing
 zero-length inodes remain existing and cannot trigger stale-sidecar cleanup.
 The complete snapshot precedes expansion even on filesystems that allocate
@@ -666,15 +666,15 @@ in-place downgrade contract.
 
 #### Validated filesystem coordinates and costs
 
-The 2026-10-23 validation used a Linux `6.18.18.c1126-trim` guest with
+The 2026-10-26 validation used a Linux `6.18.18.c1126-trim` guest with
 separate, newly formatted regular-file disks and no networking. ext4 and XFS
 used 4096-byte blocks, `noatime`, and their default allocation settings.
 
 | Filesystem coordinate | Identity | Observed validation |
 |---|---|---|
-| ext4 | user-xattr ID | 46 sparse/migration/merged cases, 35,599 assertions |
-| XFS | user-xattr ID | 46 sparse/migration/merged cases, 35,599 assertions |
-| VFAT, FAT16, 4096-byte clusters | device/inode fallback | three bounded cases, 82 assertions; coverage header flags confirmed the weak binding |
+| ext4 | user-xattr ID | 50 sparse/migration/merged cases, 35,666 assertions |
+| XFS | user-xattr ID | 50 sparse/migration/merged cases, 35,666 assertions |
+| VFAT, FAT16, 4096-byte clusters | device/inode fallback | seven bounded cases, 149 assertions; coverage header flags confirmed the weak binding |
 
 A separate fixture fed real `TagEngine` handlers WRITE_ZEROES with and
 without NOUNMAP, plus DISCARD, through `MergedWritable` into the sparse upper.
@@ -707,7 +707,7 @@ by this matrix.
 A local public-API control compared the
 [pre-v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/96515944e0d3e0be48b95660aed568e0aa99ce6c)
 with the
-[v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/55b5736964518f5bd8e0e6f32be59e75fd846281).
+[v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/1261c8ebcc288b3a61624ab60c75aba265c4fd66).
 Both used test-enabled RelWithDebInfo builds on an Intel i3-N305, one Elio
 worker and one blocking thread, buffered files, 64 MiB, and 16,384 random
 4096-byte requests per trial. The same measurement program used each
@@ -717,15 +717,15 @@ Values below are medians of the three per-trial results.
 
 | Operation / depth | CPU us/request, v1 → v2 | Mean API latency us, v1 → v2 |
 |---|---:|---:|
-| First write / 1 | 23.40 → 70.41 | 23.68 → 70.59 |
-| First write / 16 | 24.06 → 72.01 | 389.64 → 1158.72 |
-| DATA rewrite / 1 | 11.20 → 11.09 | 11.38 → 11.20 |
-| DATA rewrite / 16 | 14.16 → 13.70 | 232.26 → 224.83 |
-| Read / 1 | 2.03 → 2.02 | 1.99 → 1.99 |
-| Read / 16 | 1.20 → 1.55 | 19.00 → 24.63 |
+| First write / 1 | 33.44 → 94.56 | 34.58 → 96.23 |
+| First write / 16 | 36.19 → 99.71 | 593.14 → 1630.36 |
+| DATA rewrite / 1 | 18.40 → 19.48 | 18.94 → 20.42 |
+| DATA rewrite / 16 | 25.03 → 19.46 | 417.10 → 321.69 |
+| Read / 1 | 2.09 → 2.06 | 2.06 → 2.02 |
+| Read / 16 | 1.67 → 1.68 | 26.48 → 26.65 |
 
 First-write publication remains a measured cost. Read/depth-16 CPU observations
-ranged from 1.19–1.51 us in v1 and 1.05–1.63 us in v2; these short, overlapping
+ranged from 1.56–1.68 us in v1 and 1.60–1.72 us in v2; these short, overlapping
 samples do not establish a stable improvement or regression. CPU includes
 coroutine dispatch and joins; final FLUSH and content checks were outside the
 timing window. Rewrite/read files were filled and flushed first, but residency,
@@ -739,9 +739,9 @@ and residency was not verified. All prepared DATA blocks were checked.
 
 | Touched regions | Open wall ms, v1 → v2 | Open CPU ms, v1 → v2 | Process RSS delta KiB, v1 → v2 |
 |---|---:|---:|---:|
-| 64 | 0.14 → 0.75 | 0.12 → 0.71 | 148 → 172 |
-| 512 | 0.61 → 4.63 | 0.58 → 4.63 | 88 → 252 |
-| 4096 | 10.07 → 34.28 | 10.10 → 34.30 | 312 → 900 |
+| 64 | 0.14 → 0.71 | 0.12 → 0.72 | 72 → 172 |
+| 512 | 0.69 → 5.24 | 0.68 → 5.24 | 172 → 252 |
+| 4096 | 10.91 → 37.13 | 10.91 → 37.23 | 336 → 900 |
 
 The coverage file's logical length was 1,090,523,136 bytes; allocated storage
 was 520/4108/32824 KiB respectively. RSS deltas include allocator/runtime

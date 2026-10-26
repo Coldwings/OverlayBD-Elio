@@ -117,7 +117,7 @@ the replacement process successfully flushes it, including without new writes.
 - Corrupt authoritative headers, identity mismatches, invalid sector states,
   and corrupt recognized committed pages without a valid rollback stop open.
 - Buffered 4 KiB first writes still pay for ownership publication. Local
-  controls measured about 70 versus 23 CPU microseconds per request; DATA
+  controls measured about 95 versus 33 CPU microseconds per request; DATA
   rewrites and reads do not republish ownership. The dated filesystem matrix,
   recovery costs, and measurement limits are recorded in
   [format.md](../format.md#validated-filesystem-coordinates-and-costs).
