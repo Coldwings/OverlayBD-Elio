@@ -581,8 +581,8 @@ that is never treated as a completed export. After publication, a directory-sync
 failure returns an error but retains the visible output. Retry verifies the
 complete identical artifact and retries the durability boundary. Keep source
 paths and the destination directory stable against external replacement during
-export. The offline command is `obd-export-sparse`; supervisor integration remains
-work in progress.
+export. The offline command is `obd-export-sparse`; eligible supervisor devices
+use `obdctl commit` after the stop/reap boundary (ADR-0027).
 
 New uppers persist exact 512-byte INHERIT, DATA, and ZERO ownership in
 `<path>.coverage` (ADR-0024). A sparse two-bit map page describes 8 MiB and

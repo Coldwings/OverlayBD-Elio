@@ -5060,6 +5060,66 @@ TEST_CASE("format: sparse delta writer preserves parent bytes and deterministic 
 }
 
 
+TEST_CASE("format: sparse exports match across independent recovered write histories",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto payload = test::pattern_bytes(3 * 512, 1621);
+    const auto stale = test::pattern_bytes(3 * 512, 1622);
+    const std::string parent_uuid = "12345678-1234-5678-9abc-123456789abc";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::vector<format::SparseExportResult> results;
+        std::vector<std::vector<uint8_t>> artifacts;
+        for (int history = 0; history != 2; ++history) {
+            const auto path = dir / ("upper-" + std::to_string(history));
+            const auto output = dir / ("delta-" + std::to_string(history));
+            {
+                auto upper = co_await format::SparseRwLayer::open(path, 32 * 512);
+                if (history == 1) {
+                    const auto written = co_await upper->pwrite(stale.data(), stale.size(), 512);
+                    REQUIRE(written == static_cast<ssize_t>(stale.size()));
+                    const auto discarded = co_await upper->discard(512, payload.size());
+                    REQUIRE(discarded == 0);
+                    const auto old_zero = co_await upper->pwrite(stale.data(), 512, 8 * 512);
+                    REQUIRE(old_zero == 512);
+                    const auto flushed = co_await upper->flush();
+                    REQUIRE(flushed == 0);
+                }
+            }
+            {
+                auto upper = co_await format::SparseRwLayer::open_existing(path);
+                if (history == 0) {
+                    const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
+                    REQUIRE(written == static_cast<ssize_t>(payload.size()));
+                } else {
+                    for (int sector = 2; sector >= 0; --sector) {
+                        const auto written = co_await upper->pwrite(
+                            payload.data() + sector * 512, 512, (sector + 1) * 512);
+                        REQUIRE(written == 512);
+                    }
+                }
+                const auto discarded = co_await upper->discard(8 * 512, 512);
+                REQUIRE(discarded == 0);
+                const auto flushed = co_await upper->flush();
+                REQUIRE(flushed == 0);
+            }
+            // export_file performs another existing-source recovery itself.
+            results.push_back(co_await format::SparseRwLayer::export_file(
+                path, output, parent_uuid, "equivalent-state"));
+            auto blob = co_await source::LocalFileSource::open(output);
+            std::vector<uint8_t> bytes(blob->size());
+            const auto read = co_await blob->pread(bytes.data(), bytes.size(), 0);
+            REQUIRE(read == static_cast<ssize_t>(bytes.size()));
+            artifacts.push_back(std::move(bytes));
+        }
+        REQUIRE(results[0].uuid == results[1].uuid);
+        REQUIRE(results[0].sha256 == results[1].sha256);
+        REQUIRE(results[0].size == results[1].size);
+        REQUIRE(artifacts[0] == artifacts[1]);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
 TEST_CASE("format: sparse export transaction retains a reusable independent source",
           "[format][sparse-export]") {
     test::TempDir dir;
