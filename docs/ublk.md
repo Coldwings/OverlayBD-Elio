@@ -976,7 +976,8 @@ user namespace, and a loaded `ublk_drv` to actually execute).
 - **WRITE_SAME**: never advertised, defensively rejected.
 - **Recovery re-open data boundary**: `Device::attach` re-opens the image
   from disk; an unsealed LSMT-RW upper loses its unsealed writes on
-  recovery while a sparse upper recovers via fiemap (ADR-0008, ADR-0010).
+  recovery while a sparse upper recovers completed sector ownership from
+  its exact coverage artifact (ADR-0010, ADR-0024).
 - **Single device per `Ctrl` instance**: the class remembers one added
   device; multi-device processes would need one `Ctrl` each.
 - **Startup deadline**: owner preparation and START/END retries share a

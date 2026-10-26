@@ -255,7 +255,7 @@ empty `dir` keeps the device read-only.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `dir` | string | `""` | Directory holding the upper layer file; created if missing. Non-empty engages writable mode (`src/image/config.hpp::UpperConfig`). |
-| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` (unsealed in-place-edit LSMT); `"sparse"` → `<dir>/overlaybd.sparse` (fiemap sparse file). **Any other value is rejected** with `EINVAL`. |
+| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` (unsealed in-place-edit LSMT); `"sparse"` → `<dir>/overlaybd.sparse` plus exact `<dir>/overlaybd.sparse.coverage` metadata. **Any other value is rejected** with `EINVAL`. |
 
 Durability note: the `lsmt` upper keeps its segment index in memory
 until `checkpoint()`/`seal()`; unsealed data is not crash-durable (see

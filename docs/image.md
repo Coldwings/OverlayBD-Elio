@@ -297,7 +297,8 @@ mode:
   missing);
 - `upper.type` — `"lsmt"` (default) → `<dir>/overlaybd.rw`, an
   in-place-edit LSMT layer (`LsmtRwLayer`); `"sparse"` →
-  `<dir>/overlaybd.sparse`, a fiemap sparse file (`SparseRwLayer`);
+  `<dir>/overlaybd.sparse`, a sparse data file with an exact sector-coverage
+  sidecar (`SparseRwLayer`, ADR-0024);
 - the upper is sized to cover the whole image (the maximum of the lowers'
   virtual sizes); writes land in the upper, reads fall through (copy-on-write
   — the lowers are never modified);
@@ -1128,16 +1129,18 @@ single Range-capable blob. No external golden files.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically** — a
-  sparse upper can recover written extents from the file/fiemap across
-  reopen, while an unsealed LSMT-RW upper is not recovered by a later
+  sparse upper can recover exact DATA/ZERO ownership from its coverage
+  sidecar across reopen, while an unsealed LSMT-RW upper is not recovered by a later
   image open even after graceful shutdown writes its checkpoint; that
   checkpoint is consumed only by the supervisor's offline `commit`, and a
   fresh open truncates the unsealed file. Committing/sealing an upper into
   a new lower is an explicit, offline operation (ADR-0014);
   registry write-back remains out of scope (ADR-0007).
-- **Sparse uppers depend on filesystem fiemap support** for extent recovery
-  after reopen (see `docs/format.md`); exotic filesystems without
-  `SEEK_HOLE`/fiemap semantics are unsupported for `upper.type = "sparse"`.
+- **Legacy sparse uppers are imported once.** An upper without v2 coverage is
+  scanned with `SEEK_DATA`/`SEEK_HOLE`, overlaid with `.zeroes`, and frozen as
+  the currently observable view. Future reopen no longer depends on backing
+  extent granularity, but migration cannot recover sub-block intent v1 never
+  recorded (ADR-0024).
 - **One DART decision per open** — reachability is probed once at assembly;
   a proxy that appears later is not adopted until reopen, and a proxy that
   dies later degrades to per-request errors rather than re-fallback.

@@ -97,7 +97,8 @@ first: data already covered by the upper is overwritten in place;
 previously-uncovered ranges are copy-on-write — new data lands in the
 upper and shadows the sealed lowers, which are never mutated. The upper
 is either an in-place-edit unsealed LSMT file (`<dir>/overlaybd.rw`) or
-a fiemap sparse file (`<dir>/overlaybd.sparse`); see `docs/config.md`.
+a sparse data file with exact sector coverage metadata
+(`<dir>/overlaybd.sparse` plus `.coverage`); see `docs/config.md`.
 On a read-only device the root does not implement `WritableBlobSource`:
 `WRITE`, direct `DISCARD`, and direct `WRITE_ZEROES` return `-EROFS`, while
 read-only ublk params do not advertise discard/write-zeroes limits so the
@@ -178,7 +179,8 @@ ZFile (compressed, jump-table indexed) and LSMT (log-structured merge
 tree layers), plus `MergedLsmt`, which merges N sealed layers into one
 read-only block view with hole fall-through. Since ADR-0008 the module
 also hosts the writable layers: `LsmtRwLayer` (unsealed, in-place-edit
-LSMT with `seal()` compaction), `SparseRwLayer` (fiemap sparse file),
+LSMT with `seal()` compaction), `SparseRwLayer` (sparse data plus exact
+sector coverage),
 and `MergedWritable` (copy-on-write merge of a writable upper over
 sealed lowers). Header parsing is byte-exact against the upstream wire
 format; fixture writers exist only to produce test images. Any change

@@ -82,7 +82,8 @@ the existing kernel queue geometry. The serving worker set remains fixed.
 
 A writable upper engages only when the per-image config names it
 (`upper.dir` non-empty); otherwise the device is read-only (ADR-0008). Two
-sanctioned types exist: `sparse` (fiemap-recovered sparse file) and
+sanctioned types exist: `sparse` (sparse data file with exact persisted
+sector coverage, ADR-0024) and
 `lsmt` (in-place-edit LSMT-RW that seals into a standard LSMT lower).
 Writes are copy-on-write into the upper; unsealed LSMT-RW data is durable
 only at flush level and is not recoverable across restarts until sealed.
@@ -92,10 +93,10 @@ uppers never seal.
 Discard's intended device contract is mask-with-zeroes semantics
 (ADR-0009): a discarded range should read back as zeroes rather than fall
 through to the lowers. LSMT-RW satisfies this by recording zeroed segments;
-sparse satisfies it by first publishing sidecar zero-mask metadata for
-lower-layer masking, then punching holes as a best-effort space reclamation.
-`flush()`/`checkpoint()` sync the sparse data file and republish dirty sidecar
-state after later writes or grows.
+sparse satisfies it by publishing ZERO in the exact coverage sidecar and the
+compatibility zero-mask sidecar before punching holes as best-effort space
+reclamation. `flush()`/`checkpoint()` sync backing data before exact coverage;
+the old `.zeroes` artifact remains a protective ZERO-only reopen overlay.
 
 ## A9. DART is never on the required path
 
