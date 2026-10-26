@@ -822,10 +822,25 @@ void SparseRwLayer::create_coverage_snapshot(bool legacy_import) {
 
     // Validate the complete temporary artifact before installing the durable
     // identity marker. load_coverage owns a separate descriptor afterwards.
-    load_coverage(tmp, static_cast<uint64_t>(data_st.st_size), false);
+    load_coverage(tmp, static_cast<uint64_t>(data_st.st_size),
+                  CoverageLoadMode::kInstalling);
     // From here onward tmp is the only recovery artifact. Preserve it if
     // marker installation, inode sync, rename, or directory sync fails.
     guard.dismiss_unlink();
+#ifdef OBD_TEST_HOOKS
+    if (coverage_install_fail_stage_for_test_.load(std::memory_order_acquire) == -6)
+        ::_exit(87);  // Complete snapshot exists before data-file expansion.
+#endif
+    // A non-sparse filesystem may materialize this expansion as zero-filled
+    // DATA. Freeze the pre-expansion ownership first so an interrupted fresh
+    // creation or legacy grow never imports those new bytes as guest writes.
+    if (::ftruncate(fd_, static_cast<off_t>(cur_vsize)) != 0) {
+        throw_errno(errno, "cannot size sparse layer before coverage install");
+    }
+#ifdef OBD_TEST_HOOKS
+    if (coverage_install_fail_stage_for_test_.load(std::memory_order_acquire) == -7)
+        ::_exit(87);  // Recovery must use the complete snapshot, not extents.
+#endif
     if (identity.xattr) {
         if (::fsetxattr(fd_, kCoverageIdentityXattr.data(),
                        identity.value.data(), identity.value.size(),
@@ -865,7 +880,8 @@ void SparseRwLayer::create_coverage_snapshot(bool legacy_import) {
 }
 
 void SparseRwLayer::load_coverage(const std::string& artifact_path,
-                                  uint64_t data_size, bool verify_xattr) {
+                                  uint64_t data_size, CoverageLoadMode mode) {
+    const bool installing = mode == CoverageLoadMode::kInstalling;
     const int fd = ::open(artifact_path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         throw_errno(errno, "cannot open sparse coverage " + artifact_path);
@@ -924,7 +940,7 @@ void SparseRwLayer::load_coverage(const std::string& artifact_path,
                 throw format_error("sparse coverage data identity mismatch: " +
                                    artifact_path);
             }
-        } else if (verify_xattr || status != XattrIdentityStatus::kMissing ||
+        } else if (!installing || status != XattrIdentityStatus::kMissing ||
                    bytes::load_u64_le(header.data() + 32) !=
                        static_cast<uint64_t>(data_st.st_dev) ||
                    bytes::load_u64_le(header.data() + 40) !=
@@ -941,7 +957,10 @@ void SparseRwLayer::load_coverage(const std::string& artifact_path,
         throw format_error("sparse coverage data identity mismatch: " +
                            artifact_path);
     }
-    if (data_size < initial_vsize) {
+    // An installing snapshot may precede expansion of its still-bound data
+    // inode. Every DATA sector is nevertheless checked against the original
+    // EOF below. Authoritative files retain the strict truncation rejection.
+    if (!installing && data_size < initial_vsize) {
         throw format_error("sparse coverage DATA file is shorter than its "
                            "initial vsize: " + artifact_path);
     }
@@ -1328,13 +1347,18 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
         if (has_coverage_tmp) {
             // A temporary artifact is recoverable only after complete format,
             // slot and EOF validation. Its name remains non-authoritative.
-            layer->load_coverage(coverage_tmp, original_data_size, false);
+            layer->load_coverage(coverage_tmp, original_data_size,
+                                  CoverageLoadMode::kInstalling);
             const CoverageHeaderBinding binding =
                 read_coverage_binding(coverage_tmp);
             // A complete temporary might have survived process exit before
             // its creator's fsync. Persist it before making its marker durable.
             if (::fsync(layer->coverage_fd_) != 0) {
                 throw_errno(errno, "cannot sync sparse coverage temporary");
+            }
+            if (::ftruncate(layer->fd_,
+                            static_cast<off_t>(effective_vsize)) != 0) {
+                throw_errno(errno, "cannot size sparse layer " + path);
             }
             if ((binding.flags & kCoverageFlagXattrIdentity) != 0) {
                 if (installed_status == XattrIdentityStatus::kPresent) {
@@ -1373,10 +1397,6 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
                 throw_errno(drc, "cannot sync sparse coverage directory");
             }
             layer->load_zero_masks();
-            if (::ftruncate(layer->fd_,
-                            static_cast<off_t>(effective_vsize)) != 0) {
-                throw_errno(errno, "cannot size sparse layer " + path);
-            }
             if (::ftruncate(layer->coverage_fd_,
                             static_cast<off_t>(
                                 coverage_file_size(effective_vsize))) != 0) {
@@ -1389,15 +1409,12 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
                     "sparse coverage identity exists but coverage is missing: " +
                     layer->coverage_path_);
             }
-            if (::ftruncate(layer->fd_,
-                            static_cast<off_t>(effective_vsize)) != 0) {
-                throw_errno(errno, "cannot size sparse layer " + path);
-            }
             // One-time legacy import. SEEK_DATA/SEEK_HOLE may overstate
             // ownership at filesystem-block granularity; freezing that view
-            // is the only available migration for a v1 upper.
+            // is the only available migration for a v1 upper. Scan only its
+            // original EOF; expansion is ordered after the complete snapshot.
             uint64_t pos = 0;
-            while (!created && pos < effective_vsize) {
+            while (!created && pos < original_data_size) {
                 const off_t data =
                     ::lseek(fd, static_cast<off_t>(pos), SEEK_DATA);
                 if (data < 0) {
@@ -1410,7 +1427,7 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
                 }
                 const uint64_t d = static_cast<uint64_t>(data);
                 const uint64_t h =
-                    std::min(static_cast<uint64_t>(hole), effective_vsize);
+                    std::min(static_cast<uint64_t>(hole), original_data_size);
                 const uint64_t so = d / kSector;
                 const uint64_t se = (h + kSector - 1) / kSector;
                 if (se > so) layer->insert_live_extent(so, se - so);
@@ -1982,108 +1999,121 @@ elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
     if (offset % kSector != 0 || count % kSector != 0 || count == 0) {
         co_return -EINVAL;
     }
-    co_await op_mu_.lock();
-    SyncMutexGuard op_guard(op_mu_);
-    const uint64_t request_lo = offset / kSector;
-    const uint64_t request_hi = request_lo + count / kSector;
-    bool flush_before_write = false;
-    {
-        std::lock_guard lock(meta_mu_);
-        flush_before_write =
-            zero_masks_dirty_ &&
-            (zero_masks_data_first_ ||
-             range_intersects_zero_mask_locked(request_lo, request_hi));
-    }
-    if (flush_before_write) {
-        const int rc = co_await flush_locked();
-        if (rc != 0) co_return rc;
-    }
-    bool already_data = false;
-    {
-        std::lock_guard lock(meta_mu_);
-        already_data = range_is_data(segments_, request_lo, request_hi);
-    }
-    // op_mu_ keeps ownership stable through the backing write. Rewriting
-    // existing DATA needs no coverage publication or mapping generation bump;
-    // pending ZERO transitions were settled above and FLUSH still syncs data.
-    const uint8_t* p = static_cast<const uint8_t*>(buf);
-    size_t done = 0;
-    int write_error = 0;
-    while (done < count && write_error == 0) {
-        const size_t piece = std::min(
-            count - done,
-            static_cast<size_t>(bytes::segment_mapping::kMaxLength) * kSector);
-        // elio io backend: positional write, never blocks the worker.
-        // Publish full-sector prefixes as they land so an error after a
-        // positive short write cannot leave the sparse index behind the file.
-        size_t written = 0;
-        size_t indexed = 0;
-        while (written < piece) {
-            const auto result = co_await elio::io::pwrite_some(
-                fd_, std::as_bytes(std::span(p + done + written, piece - written)),
-                offset + done + written);
-            if (result.error) {
-                write_error = -result.error.value();
-                break;
-            }
-            if (result.transferred == 0) {
-                write_error = -EIO;
-                break;
-            }
-            written += result.transferred;
-            if (written > piece) {
-                write_error = -EIO;
-                break;
-            }
-
-            const size_t indexable = (written / kSector) * kSector;
-            if (indexable > indexed && !already_data) {
-                const uint64_t lo = (offset + done + indexed) / kSector;
-                const uint64_t hi = (offset + done + indexable) / kSector;
-                std::vector<bytes::segment_mapping> next;
-                std::vector<bytes::segment_mapping> runtime_next;
-                std::vector<bytes::segment_mapping> next_zeroes;
-                bool erased_zero = false;
-                {
-                    std::lock_guard lock(meta_mu_);
-                    erased_zero = range_intersects_zero_mask_locked(lo, hi);
-                    next = segments_;
-                }
-                erase_range_from(next, lo, hi);
-                insert_live_extent_into(next, lo, hi - lo);
-                runtime_next = next;
-                if (erased_zero) {
-                    std::vector<bytes::segment_mapping> old_zeroes;
-                    {
-                        std::lock_guard lock(meta_mu_);
-                        old_zeroes = zero_mask_segments_locked();
-                    }
-                    runtime_next = overlay_zero_masks(std::move(runtime_next),
-                                                      old_zeroes);
-                    next_zeroes = zero_mask_segments_from(next);
-                }
-                uint64_t committed_hi = lo;
-                const int coverage_rc = co_await publish_coverage_locked(
-                    next, runtime_next, lo, hi, &committed_hi);
-                if (coverage_rc != 0) {
-                    write_error = coverage_rc;
+    try {
+        co_await op_mu_.lock();
+        SyncMutexGuard op_guard(op_mu_);
+        const uint64_t request_lo = offset / kSector;
+        const uint64_t request_hi = request_lo + count / kSector;
+        bool flush_before_write = false;
+        {
+            std::lock_guard lock(meta_mu_);
+            flush_before_write =
+                zero_masks_dirty_ &&
+                (zero_masks_data_first_ ||
+                 range_intersects_zero_mask_locked(request_lo, request_hi));
+        }
+        if (flush_before_write) {
+            const int rc = co_await flush_locked();
+            if (rc != 0) co_return rc;
+        }
+        bool already_data = false;
+        {
+            std::lock_guard lock(meta_mu_);
+            already_data = range_is_data(segments_, request_lo, request_hi);
+        }
+        // op_mu_ keeps ownership stable through the backing write. Rewriting
+        // existing DATA needs no coverage publication or mapping generation bump;
+        // pending ZERO transitions were settled above and FLUSH still syncs data.
+        const uint8_t* p = static_cast<const uint8_t*>(buf);
+        size_t done = 0;
+        int write_error = 0;
+        while (done < count && write_error == 0) {
+            const size_t piece = std::min(
+                count - done,
+                static_cast<size_t>(bytes::segment_mapping::kMaxLength) * kSector);
+            // elio io backend: positional write, never blocks the worker.
+            // Publish full-sector prefixes as they land so an error after a
+            // positive short write cannot leave the sparse index behind the file.
+            size_t written = 0;
+            size_t indexed = 0;
+            while (written < piece) {
+                const auto result = co_await elio::io::pwrite_some(
+                    fd_, std::as_bytes(std::span(p + done + written, piece - written)),
+                    offset + done + written);
+                if (result.error) {
+                    write_error = -result.error.value();
                     break;
                 }
-                if (erased_zero) {
-                    const int rc = co_await publish_data_first_zero_masks_locked(
-                        std::move(next), std::move(next_zeroes));
-                    if (rc != 0) {
-                        write_error = rc;
+                if (result.transferred == 0) {
+                    write_error = -EIO;
+                    break;
+                }
+                written += result.transferred;
+                if (written > piece) {
+                    write_error = -EIO;
+                    break;
+                }
+
+                const size_t indexable = (written / kSector) * kSector;
+                if (indexable > indexed && !already_data) {
+#ifdef OBD_TEST_HOOKS
+                    if (fail_pwrite_prepare_after_bytes_for_test_ &&
+                        done >= *fail_pwrite_prepare_after_bytes_for_test_) {
+                        fail_pwrite_prepare_after_bytes_for_test_.reset();
+                        throw std::bad_alloc();
+                    }
+#endif
+                    const uint64_t lo = (offset + done + indexed) / kSector;
+                    const uint64_t hi = (offset + done + indexable) / kSector;
+                    std::vector<bytes::segment_mapping> next;
+                    std::vector<bytes::segment_mapping> runtime_next;
+                    std::vector<bytes::segment_mapping> next_zeroes;
+                    bool erased_zero = false;
+                    {
+                        std::lock_guard lock(meta_mu_);
+                        erased_zero = range_intersects_zero_mask_locked(lo, hi);
+                        next = segments_;
+                    }
+                    erase_range_from(next, lo, hi);
+                    insert_live_extent_into(next, lo, hi - lo);
+                    runtime_next = next;
+                    if (erased_zero) {
+                        std::vector<bytes::segment_mapping> old_zeroes;
+                        {
+                            std::lock_guard lock(meta_mu_);
+                            old_zeroes = zero_mask_segments_locked();
+                        }
+                        runtime_next = overlay_zero_masks(std::move(runtime_next),
+                                                          old_zeroes);
+                        next_zeroes = zero_mask_segments_from(next);
+                    }
+                    uint64_t committed_hi = lo;
+                    const int coverage_rc = co_await publish_coverage_locked(
+                        next, runtime_next, lo, hi, &committed_hi);
+                    if (coverage_rc != 0) {
+                        write_error = coverage_rc;
                         break;
                     }
+                    if (erased_zero) {
+                        const int rc = co_await publish_data_first_zero_masks_locked(
+                            std::move(next), std::move(next_zeroes));
+                        if (rc != 0) {
+                            write_error = rc;
+                            break;
+                        }
+                    }
+                    indexed = indexable;
                 }
-                indexed = indexable;
             }
+            done += piece;
         }
-        done += piece;
+        if (write_error != 0) co_return write_error;
+        co_return static_cast<ssize_t>(count);
+    } catch (const std::bad_alloc&) {
+        co_return -ENOMEM;
+    } catch (const std::length_error&) {
+        co_return -EFBIG;
     }
-    if (write_error != 0) co_return write_error;
-    co_return static_cast<ssize_t>(count);
 }
 
 elio::coro::task<ssize_t> SparseRwLayer::pread(void* buf, size_t count,
@@ -2147,74 +2177,80 @@ elio::coro::task<int> SparseRwLayer::discard(uint64_t offset, uint64_t len) {
     if (offset % kSector != 0 || len % kSector != 0 || len == 0) {
         co_return -EINVAL;
     }
-    co_await op_mu_.lock();
-    SyncMutexGuard op_guard(op_mu_);
-    if (dirty_zero_masks_need_data_first()) {
-        const int rc = co_await flush_locked();
-        if (rc != 0) co_return rc;
-    }
-    const uint64_t lo = offset / kSector;
-    const uint64_t hi = lo + len / kSector;
-    const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
+    try {
+        co_await op_mu_.lock();
+        SyncMutexGuard op_guard(op_mu_);
+        if (dirty_zero_masks_need_data_first()) {
+            const int rc = co_await flush_locked();
+            if (rc != 0) co_return rc;
+        }
+        const uint64_t lo = offset / kSector;
+        const uint64_t hi = lo + len / kSector;
+        const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
 
-    // Publish exact ZERO coverage before the compatibility zero-mask and
-    // before punching the sparse file. A process crash can therefore expose
-    // either the preceding committed coverage page or the complete ZERO
-    // transition, never filesystem-allocation guesses.
-    std::vector<bytes::segment_mapping> next_segments;
-    std::vector<bytes::segment_mapping> next_zeroes;
-    {
-        std::lock_guard lock(meta_mu_);
-        std::vector<bytes::segment_mapping> added_zero;
-        push_zero_range(added_zero, lo, hi);
-        next_segments = overlay_zero_masks(segments_, added_zero);
-        next_zeroes = zero_mask_segments_from(next_segments);
-    }
-    struct ZeroMaskSnapshot {
-        std::vector<bytes::segment_mapping> zeroes;
-        uint64_t vsize;
-    } snapshot{next_zeroes, cur_vsize};
-    uint64_t committed_hi = lo;
-    const int coverage_rc = co_await publish_coverage_locked(
-        next_segments, next_segments, lo, hi, &committed_hi);
-    if (coverage_rc != 0) {
-        if (committed_hi > lo) {
+        // Publish exact ZERO coverage before the compatibility zero-mask and
+        // before punching the sparse file. A process crash can therefore expose
+        // either the preceding committed coverage page or the complete ZERO
+        // transition, never filesystem-allocation guesses.
+        std::vector<bytes::segment_mapping> next_segments;
+        std::vector<bytes::segment_mapping> next_zeroes;
+        {
+            std::lock_guard lock(meta_mu_);
+            std::vector<bytes::segment_mapping> added_zero;
+            push_zero_range(added_zero, lo, hi);
+            next_segments = overlay_zero_masks(segments_, added_zero);
+            next_zeroes = zero_mask_segments_from(next_segments);
+        }
+        struct ZeroMaskSnapshot {
+            std::vector<bytes::segment_mapping> zeroes;
+            uint64_t vsize;
+        } snapshot{next_zeroes, cur_vsize};
+        uint64_t committed_hi = lo;
+        const int coverage_rc = co_await publish_coverage_locked(
+            next_segments, next_segments, lo, hi, &committed_hi);
+        if (coverage_rc != 0) {
+            if (committed_hi > lo) {
+                std::lock_guard lock(meta_mu_);
+                zero_masks_dirty_ = true;
+                zero_masks_data_first_ = false;
+                ++zero_masks_generation_;
+            }
+            co_return coverage_rc;
+        }
+        {
             std::lock_guard lock(meta_mu_);
             zero_masks_dirty_ = true;
             zero_masks_data_first_ = false;
             ++zero_masks_generation_;
         }
-        co_return coverage_rc;
-    }
-    {
-        std::lock_guard lock(meta_mu_);
-        zero_masks_dirty_ = true;
-        zero_masks_data_first_ = false;
-        ++zero_masks_generation_;
-    }
-    int prepare_error = 0;
-    ZeroMaskPersistJob* job = make_zero_mask_persist_job(
-        zero_mask_path_, std::move(snapshot.zeroes), snapshot.vsize, false,
-        &prepare_error);
-    if (job == nullptr) co_return prepare_error;
-    ZeroMaskPersistResult prc;
-    try {
-        prc = co_await run_owned_blocking(job);
+        int prepare_error = 0;
+        ZeroMaskPersistJob* job = make_zero_mask_persist_job(
+            zero_mask_path_, std::move(snapshot.zeroes), snapshot.vsize, false,
+            &prepare_error);
+        if (job == nullptr) co_return prepare_error;
+        ZeroMaskPersistResult prc;
+        try {
+            prc = co_await run_owned_blocking(job);
+        } catch (const std::bad_alloc&) {
+            co_return -ENOMEM;
+        }
+        if (prc.rc != 0) co_return prc.rc;
+
+        // Real deallocation: the blocks return to the filesystem and the range
+        // reads back as zeroes from this layer. The sidecar already carries the
+        // semantic mask, so the punch is no longer the first durable state change.
+        // If punch-hole is unsupported or otherwise fails after the mask commit,
+        // discard still succeeded semantically; only physical space reclamation is
+        // skipped for this request.
+        const auto reclaim = co_await elio::io::allocate_file_range(
+            fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
+        (void)reclaim;
+        co_return 0;
     } catch (const std::bad_alloc&) {
         co_return -ENOMEM;
+    } catch (const std::length_error&) {
+        co_return -EFBIG;
     }
-    if (prc.rc != 0) co_return prc.rc;
-
-    // Real deallocation: the blocks return to the filesystem and the range
-    // reads back as zeroes from this layer. The sidecar already carries the
-    // semantic mask, so the punch is no longer the first durable state change.
-    // If punch-hole is unsupported or otherwise fails after the mask commit,
-    // discard still succeeded semantically; only physical space reclamation is
-    // skipped for this request.
-    const auto reclaim = co_await elio::io::allocate_file_range(
-        fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
-    (void)reclaim;
-    co_return 0;
 }
 
 elio::coro::task<int> SparseRwLayer::flush() {

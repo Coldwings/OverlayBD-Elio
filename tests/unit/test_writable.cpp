@@ -86,6 +86,10 @@ struct SparseRwLayerTestAccess {
                                               uint64_t page) {
         layer.fail_coverage_runtime_prepare_page_for_test_ = page;
     }
+    static void fail_pwrite_prepare_after_bytes(SparseRwLayer& layer,
+                                                uint64_t bytes) {
+        layer.fail_pwrite_prepare_after_bytes_for_test_ = bytes;
+    }
     static void fail_zero_mask_dirsync_after_commit(SparseRwLayer& layer) {
         layer.fail_zero_mask_dirsync_after_commit_for_test_ = true;
     }
@@ -262,6 +266,53 @@ void make_lsmt_lower(const std::string& dir_path, const std::string& name,
     format::write_lsmt_single_layer(fd, raw.size(), *out, {});
     ::close(fd);
 }
+
+// Model an exceptional top that publishes ownership before unwinding. Reserve
+// the segment up front so the failure does not depend on global memory pressure.
+class ThrowingWritableLayer final : public format::WritableLayer {
+public:
+    ThrowingWritableLayer() : data_(std::vector<uint8_t>(32 * 512, 0xa5)) {
+        segments_.reserve(1);
+    }
+    elio::coro::task<ssize_t> pwrite(const void*, size_t, uint64_t) override {
+        publish(false);
+        throw std::bad_alloc();
+        co_return 0;
+    }
+    elio::coro::task<ssize_t> pread(void*, size_t, uint64_t) override {
+        co_return -EOPNOTSUPP;
+    }
+    elio::coro::task<int> discard(uint64_t, uint64_t) override {
+        publish(true);
+        throw std::bad_alloc();
+        co_return 0;
+    }
+    elio::coro::task<int> flush() override {
+        publish(true);
+        throw std::bad_alloc();
+        co_return 0;
+    }
+    elio::coro::task<int> checkpoint() override { co_return -EOPNOTSUPP; }
+    uint64_t virtual_size() const override { return data_.size(); }
+    int grow(uint64_t) override { return -EOPNOTSUPP; }
+    const std::vector<bytes::segment_mapping>& segments() const override {
+        return segments_;
+    }
+    uint64_t segments_generation() const noexcept override { return generation_; }
+    source::BlobSource& data_source() override { return data_; }
+
+private:
+    void publish(bool zero) {
+        bytes::segment_mapping segment {};
+        segment.length = 1;
+        segment.zeroed = zero;
+        segments_.push_back(segment);
+        ++generation_;
+    }
+    test::VectorSource data_;
+    std::vector<bytes::segment_mapping> segments_;
+    uint64_t generation_ = 0;
+};
 
 /// Synchronous whole-file sha256 (test-side digest oracle for the
 /// determinism assertions).
@@ -1434,6 +1485,170 @@ TEST_CASE("format: sparse legacy import survives process interruption",
             CHECK(actual == std::vector<uint8_t>(expected.begin() + offset,
                                                  expected.begin() + offset + actual.size()));
         }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse interrupted fresh creation preserves lower sectors",
+          "[format]") {
+    std::string operation;
+    SECTION("before the initial header") { operation = "import-before-header"; }
+    SECTION("after the incomplete initial header") { operation = "import-after-header"; }
+    SECTION("after the complete snapshot before data growth") {
+        operation = "init-before-data-growth";
+    }
+    SECTION("after data growth before marker installation") {
+        operation = "init-after-data-growth";
+    }
+    TempDir dir;
+    const auto expected = test::pattern_bytes(32 * 512, 14408);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", expected, &lower);
+    const std::string path = dir / "fresh-interrupted.sparse";
+    const int child = run_sparse_crash_writer(path, operation, expected.size(), 0, 0);
+    REQUIRE(WIFEXITED(child));
+    REQUIRE(WEXITSTATUS(child) == 87);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::SparseRwLayer::open(path, expected.size());
+        CHECK(top->segments().empty());
+        auto local = co_await source::LocalFileSource::open(lower);
+        source::BlobSourcePtr blob = std::move(local);
+        std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+        lowers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
+        auto merged = co_await format::MergedWritable::open(std::move(lowers), std::move(top));
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        const bool matches = actual == expected;
+        CHECK(matches);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse legacy growth leaves new sectors inherited",
+          "[format]") {
+    TempDir dir;
+    constexpr uint64_t vsize = 32 * 512;
+    const std::vector<uint8_t> lower_bytes(vsize, 0x5a);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", lower_bytes, &lower);
+    const std::string path = dir / "legacy-grow.sparse";
+    test::write_file(path, std::vector<uint8_t>(512, 0xa5));
+    auto expected = lower_bytes;
+    std::fill_n(expected.begin(), 512, 0xa5);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            INFO("open attempt: " << attempt);
+            auto top = co_await format::SparseRwLayer::open(path, vsize);
+            REQUIRE(top->segments().size() == 1);
+            CHECK(top->segments()[0].offset == 0);
+            CHECK(top->segments()[0].length == 1);
+            auto local = co_await source::LocalFileSource::open(lower);
+            source::BlobSourcePtr blob = std::move(local);
+            std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+            lowers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
+            auto merged = co_await format::MergedWritable::open(
+                std::move(lowers), std::move(top));
+            std::vector<uint8_t> actual(vsize);
+            const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+            REQUIRE(read == static_cast<ssize_t>(actual.size()));
+            CHECK(actual == expected);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged writable refreshes ownership after top exceptions",
+          "[format]") {
+    enum class Operation { kWrite, kDiscard, kFlush } operation = Operation::kWrite;
+    SECTION("write publishes DATA") { operation = Operation::kWrite; }
+    SECTION("discard publishes ZERO") { operation = Operation::kDiscard; }
+    SECTION("flush publishes deferred ZERO") { operation = Operation::kFlush; }
+    TempDir dir;
+    const std::vector<uint8_t> lower_bytes(32 * 512, 0x5a);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", lower_bytes, &lower);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto local = co_await source::LocalFileSource::open(lower);
+        source::BlobSourcePtr blob = std::move(local);
+        std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+        lowers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
+        auto merged = co_await format::MergedWritable::open(
+            std::move(lowers), std::make_unique<ThrowingWritableLayer>());
+        bool threw = false;
+        try {
+            if (operation == Operation::kWrite) {
+                const std::vector<uint8_t> data(512, 0xa5);
+                (void)co_await merged->pwrite(data.data(), data.size(), 0);
+            } else if (operation == Operation::kDiscard) {
+                (void)co_await merged->discard(0, 512);
+            } else {
+                (void)co_await merged->flush();
+            }
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        CHECK(threw);
+        auto expected = lower_bytes;
+        std::fill_n(expected.begin(), 512,
+                    operation == Operation::kWrite ? 0xa5 : 0);
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        CHECK(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged sparse allocation failure preserves committed prefix",
+          "[format]") {
+    TempDir dir;
+    constexpr uint64_t prefix_bytes = bytes::segment_mapping::kMaxLength * 512;
+    constexpr uint64_t vsize = prefix_bytes + 512;
+    const auto lower_bytes = test::pattern_bytes(vsize, 14409);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", lower_bytes, &lower);
+    const std::string path = dir / "allocation-prefix.sparse";
+    const std::vector<uint8_t> data(vsize, 0xa5);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto open_merged = [&]() -> elio::coro::task<std::unique_ptr<format::MergedWritable>> {
+            auto local = co_await source::LocalFileSource::open(lower);
+            source::BlobSourcePtr blob = std::move(local);
+            std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+            lowers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
+            auto top = co_await format::SparseRwLayer::open(path, vsize);
+            co_return co_await format::MergedWritable::open(std::move(lowers), std::move(top));
+        };
+        {
+            auto merged = co_await open_merged();
+            auto& top = static_cast<format::SparseRwLayer&>(merged->writable_top());
+            format::SparseRwLayerTestAccess::fail_pwrite_prepare_after_bytes(top, prefix_bytes);
+            ssize_t result = 0;
+            bool threw = false;
+            try { result = co_await merged->pwrite(data.data(), data.size(), 0); }
+            catch (const std::bad_alloc&) { threw = true; }
+            CHECK_FALSE(threw);
+            if (!threw) CHECK(result == -ENOMEM);
+            REQUIRE(top.segments().size() == 1);
+            REQUIRE(top.segments()[0].length == bytes::segment_mapping::kMaxLength);
+            std::vector<uint8_t> actual(512);
+            auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+            REQUIRE(read == static_cast<ssize_t>(actual.size()));
+            const bool prefix_visible = actual == std::vector<uint8_t>(512, 0xa5);
+            CHECK(prefix_visible);
+            read = co_await merged->pread(actual.data(), actual.size(), prefix_bytes);
+            REQUIRE(read == static_cast<ssize_t>(actual.size()));
+            CHECK(actual == std::vector<uint8_t>(lower_bytes.end() - 512, lower_bytes.end()));
+        }
+        auto reopened = co_await open_merged();
+        std::vector<uint8_t> actual(512);
+        const auto read = co_await reopened->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        CHECK(actual == std::vector<uint8_t>(512, 0xa5));
         co_return 0;
     });
     REQUIRE(rc == 0);

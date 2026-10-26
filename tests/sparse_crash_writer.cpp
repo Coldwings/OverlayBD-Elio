@@ -76,6 +76,10 @@ int main(int argc, char** argv) {
         obd::format::SparseRwLayerTestAccess::interrupt_import_at(-3);
     if (operation == "import-after-page")
         obd::format::SparseRwLayerTestAccess::interrupt_import_at(-4);
+    if (operation == "init-before-data-growth")
+        obd::format::SparseRwLayerTestAccess::interrupt_import_at(-6);
+    if (operation == "init-after-data-growth")
+        obd::format::SparseRwLayerTestAccess::interrupt_import_at(-7);
     try {
         elio::run_config runtime;
         runtime.num_threads = 1;

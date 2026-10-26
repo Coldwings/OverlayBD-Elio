@@ -83,6 +83,7 @@ private:
         uint64_t generation = 0;
         uint8_t slot = 0;
     };
+    enum class CoverageLoadMode { kAuthoritative, kInstalling };
 
     SparseRwLayer() = default;
     bool has_zero_masks_locked() const;
@@ -107,7 +108,8 @@ private:
                                                     uint64_t vsize);
     void create_coverage_snapshot(bool legacy_import);
     void load_coverage(const std::string& artifact_path,
-                       uint64_t data_size, bool verify_xattr = true);
+                       uint64_t data_size,
+                       CoverageLoadMode mode = CoverageLoadMode::kAuthoritative);
     elio::coro::task<int> publish_coverage_locked(
         const std::vector<bytes::segment_mapping>& exact_next,
         const std::vector<bytes::segment_mapping>& runtime_next,
@@ -152,6 +154,7 @@ private:
     std::optional<uint64_t> fail_coverage_page_for_test_;
     std::optional<uint64_t> fail_coverage_map_prepare_page_for_test_;
     std::optional<uint64_t> fail_coverage_runtime_prepare_page_for_test_;
+    std::optional<uint64_t> fail_pwrite_prepare_after_bytes_for_test_;
     bool fail_zero_mask_dirsync_after_commit_for_test_ = false;
     static std::shared_ptr<std::atomic<int>> open_park_for_test_;
     static std::atomic<int> coverage_install_fail_stage_for_test_;

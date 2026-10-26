@@ -590,7 +590,8 @@ marker and treats reopened coverage as potentially dirty, so FLUSH after a
 process restart synchronizes it even without a new write.
 
 For a pre-existing v1 file with no coverage sidecar, `open` performs a
-one-time `SEEK_DATA`/`SEEK_HOLE` import, overlays `.zeroes`, then atomically
+one-time `SEEK_DATA`/`SEEK_HOLE` import bounded by the original EOF, overlays
+`.zeroes`, then atomically
 publishes v2 coverage. The imported view preserves what v1 currently exposes;
 it cannot reconstruct original sub-block write intent. Once v2 exists,
 filesystem extents never broaden ownership. `.zeroes` is loaded after v2 and
@@ -598,13 +599,19 @@ remains a protective ZERO-only overlay for migration and rolling
 compatibility. A `.zeroes` file recorded at an older, smaller vsize is dirty
 until the next durability boundary republishes its current size.
 
-Migration writes and syncs `<path>.coverage.tmp`, validates every header and
-committed page, installs the data-inode identity xattr, syncs the data inode,
+Creation and migration write and sync `<path>.coverage.tmp`, validate every
+header and committed page, then expand the data file, install the data-inode
+identity xattr, and sync the data inode,
 then renames the sidecar and syncs the parent directory. A marker with neither
 final coverage nor a valid temporary artifact fails closed. Existing
 zero-length inodes remain existing and cannot trigger stale-sidecar cleanup.
-Recovery also rejects an initial virtual size or any DATA sector beyond the
-backing file's pre-open EOF. On no-xattr filesystems, deletion of all coverage
+The complete snapshot precedes expansion even on filesystems that allocate
+zero-filled bytes: interrupted fresh creation cannot import those bytes as
+guest DATA, and a legacy grow leaves its new tail inherited. A complete
+installing temporary may declare a virtual size beyond the pre-open EOF;
+all DATA sectors must still lie within that EOF. Authoritative final coverage
+also rejects an initial virtual size beyond EOF. On no-xattr filesystems,
+deletion of all coverage
 artifacts leaves no durable marker and is indistinguishable from a legacy v1
 upper; the implementation then attempts legacy import.
 
@@ -626,6 +633,11 @@ cannot overtake an earlier operation. A failure partway through a multi-page
 coverage update can leave the committed prefix visible; the request has not
 completed, the running index and reopen both expose that prefix, and
 USER_RECOVERY reissues the whole idempotent operation.
+Planning allocation failures in sparse `pwrite`/`discard` return `-ENOMEM`
+(or `-EFBIG` for an oversized container), including after an earlier piece
+commits. The merged view refreshes its index even on a negative result; if a
+top instead throws after publishing, it refreshes or invalidates the index
+before propagating the original exception.
 For each page, all vector/map allocation precedes the first slot write and the
 commit is followed only by a non-throwing runtime swap. When DATA replaces a
 legacy ZERO mask, the runtime retains that ZERO until `.zeroes` removal changes
@@ -928,7 +940,10 @@ plus a writable top layer, as one block source.
   `top_->pwrite` — **RO lowers are never modified** — and then rebuilds the
   merged index (`rebuild_index()`). Write-heavy workloads should batch,
   since the rebuild is O(index size) per write.
-- `flush()` delegates to the top layer's `flush()`.
+- `flush()` delegates to the top layer's `flush()` and rebuilds the merged
+  index if a deferred ownership transition changes its generation.
+  `pwrite()`, `discard()`, and `flush()` also rebuild or invalidate the index
+  before propagating an exception from the top.
 - `grow()` widens the writable top before publishing the merged view size;
   direct overlap with `pwrite()`/`discard()`/`flush()` returns `-EBUSY` so
   a resize cannot overtake a top mutation or durability boundary.
@@ -1237,6 +1252,17 @@ writers and readers agree on the same bytes.
   pin adjacent lower fall-through, legacy `.zeroes` import, dual-slot
   rollback, corruption/identity rejection, multi-page retry, and grown-tail
   reopen semantics.
+- `format: sparse interrupted fresh creation preserves lower sectors` — real
+  child-process exits before/after the initial header and before/after data
+  expansion preserve every lower byte without fabricating DATA ownership.
+- `format: sparse legacy growth leaves new sectors inherited` — importing a
+  smaller legacy upper owns only the original EOF range, live and on reopen.
+- `format: merged sparse allocation failure preserves committed prefix` — a
+  controlled allocation failure after the first large-request piece returns
+  `-ENOMEM` and preserves the same live/recovered prefix and untouched lower.
+- `format: merged writable refreshes ownership after top exceptions` — an
+  exceptional write, discard, or flush publishes its new DATA/ZERO ownership
+  to subsequent merged reads while preserving the original exception.
 - `format: lsmt rw overwrites covered data in place` — the ADR-0008
   in-place-edit rule: a fully covered rewrite must not grow the file;
   disjoint and straddling writes append exactly their uncovered bytes; the

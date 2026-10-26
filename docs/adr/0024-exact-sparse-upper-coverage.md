@@ -69,8 +69,9 @@ v1 never recorded. With v2 present, recovery loads it first and applies
 `.zeroes` as a protective ZERO-only overlay; extent enumeration no longer
 widens ownership.
 
-Creation and migration use `<upper>.coverage.tmp`. The implementation writes,
-syncs, and fully validates the temporary artifact, installs the xattr marker,
+Creation and migration use `<upper>.coverage.tmp`. Legacy import scans only the
+original data-file EOF. The implementation writes, syncs, and fully validates
+the temporary artifact before expanding the data file, installs the xattr marker,
 syncs the data inode so the marker and file size precede publication, renames
 the artifact, then syncs its parent directory. If a marker exists while the
 final artifact is missing, open resumes only a fully valid temporary artifact;
@@ -81,7 +82,11 @@ The initial header has its snapshot-complete flag clear. Only after every
 initial page is written does the creator set flag bit 2, refresh the header
 CRC and sync the temporary. An incomplete unmarked temporary is discarded and
 the legacy import restarts; absent snapshot pages cannot be mistaken for
-INHERIT. Before a matching xattr marker exists, a complete temporary must match
+INHERIT. Incomplete fresh creation leaves a zero-length data file, so even a
+filesystem that allocates zero-filled expansion cannot fabricate guest DATA
+on restart. A complete installing snapshot may declare a size beyond the
+current data EOF, but all DATA sectors must remain within that EOF. Before a
+matching xattr marker exists, a complete temporary must match
 the recorded device/inode. A recovered complete temporary is synchronized before
 marker installation. Every reopened coverage file is potentially dirty until
 the replacement process successfully flushes it, including without new writes.
