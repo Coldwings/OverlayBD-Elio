@@ -184,19 +184,30 @@ elio::coro::task<int> exercise(const Settings* s, json* report, Peak* peak) {
     } else if (s->mode == "lsmt") {
         const int rc = co_await dynamic_cast<format::LsmtRwLayer*>(layer)->seal();
         require(rc == 0, "lsmt seal failed");
+    } else {
+        // Offline Sparse export needs exclusive ownership of the source.
+        // Include releasing/reopening it and the API's digest in this timing.
+        root.reset();
+        layer = nullptr;
+        const auto result = co_await format::SparseRwLayer::export_file(
+            data_path, data_path + ".lsmt");
+        (*report)["export_sha256"] = result.sha256;
     }
     peak->active.store(false);
-    (*report)["seal_ms"] = s->mode == "sparse" ? json(nullptr) : json(milliseconds(seal_start));
-    (*report)["seal_note"] = s->mode == "sparse" ? "Sparse export is tracked separately in issue161; no seal API." : "Live seal, including format-required durability; no external digest pass.";
+    (*report)["seal_ms"] = milliseconds(seal_start);
+    (*report)["seal_note"] = s->mode == "sparse"
+        ? "Offline export to a separate LSMT delta, including owner release, reopen and API digest; source retained."
+        : "Live seal, including format-required durability; no external digest pass.";
     auto after = co_await snapshot(s);
     (*report)["seal_peak_allocated_bytes_sampled"] = std::max(
         peak->allocated.load(), after.at("allocated_bytes").get<uint64_t>());
     (*report)["seal_peak_sample_period_ms"] = 10;
     (*report)["after_seal"] = std::move(after);
     root.reset();
-    if (s->mode != "sparse") {
+    {
         const auto verify_start = Clock::now();
-        const auto sealed_path = s->mode == "hybrid" ? data_path + "/data" : data_path;
+        const auto sealed_path = s->mode == "hybrid" ? data_path + "/data"
+            : s->mode == "sparse" ? data_path + ".lsmt" : data_path;
         auto sealed_source = co_await source::LocalFileSource::open(sealed_path);
         std::vector<std::unique_ptr<format::LsmtLayer>> layers;
         layers.push_back(co_await format::LsmtLayer::open(std::move(sealed_source)));
@@ -221,8 +232,6 @@ elio::coro::task<int> exercise(const Settings* s, json* report, Peak* peak) {
         (*report)["sealed_verification"] = {{"populated_bytes", s->populate},
             {"sampled_tail_bytes", sampled_tail_bytes},
             {"wall_ms", milliseconds(verify_start)}, {"passed", true}};
-    } else {
-        (*report)["sealed_verification"] = nullptr;
     }
     co_return 0;
 }

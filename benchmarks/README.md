@@ -195,12 +195,16 @@ Full population follows the random phases, using 1 MiB requests, and is timed
 separately including its final FLUSH. Set `populate_bytes == size_bytes` for a
 fully populated trial; a larger virtual capacity alone is not a full-size write
 or seal benchmark. After writable reopen (sparse/Hybrid), every populated byte
-is checked. For LSMT/Hybrid, the sealed output is then reopened through the
+is checked. For all three modes, the sealed output is then reopened through the
 ordinary LSMT reader and checked across every populated byte plus sampled writes
 outside that region. This additional readback is outside seal timing and reported
 separately; process CPU/RSS include verification. Uncheckpointed LSMT has no equivalent resumable writable reopen, so
-that field is null, with an explanation. This driver does not time the separate
-sparse export API (ADR-0027), so its seal field is null rather than zero.
+that field is null, with an explanation. Sparse uses the separate export API
+(ADR-0027): its `seal_ms` includes owner release, source reopen, output publication
+and the API's digest. Its source remains reusable and contributes to retained
+and peak space. LSMT/Hybrid instead time their live seal APIs without an external
+digest pass. `seal_note` records that distinction; these are not identical APIs
+or equal durability contracts. Every mode receives full sealed-byte verification.
 
 The report includes per-file logical/allocated sizes after each random phase,
 reopen time, live-seal time, and peak allocated space sampled every 10 ms during
