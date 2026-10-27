@@ -2054,8 +2054,8 @@ private:
         // first (SIGTERM + bounded reap — the destroy mechanics without
         // removing the entry) and only then seals; a device that will not
         // stop is never sealed underneath. The graceful shutdown makes the
-        // device checkpoint its upper's index (obd-device), which the
-        // offline seal below requires. The loop re-reads entry->child: a
+        // device checkpoint its upper (obd-device). Persistent pairs also
+        // permit offline seal after process-crash recovery. The loop re-reads entry->child: a
         // recovery respawn that completed just before op_mu was taken
         // installed a fresh child, which is stopped here too; while op_mu
         // is held no further respawn can install another.

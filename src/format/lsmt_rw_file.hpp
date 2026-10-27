@@ -4,10 +4,13 @@
 #include "format/lsmt_rw_index.hpp"
 #include <elio/coro/task.hpp>
 #include <memory>
+#include <map>
 #include <string>
 
 namespace obd::format::lsmt_rw {
 #ifdef OBD_TEST_HOOKS
+// Lower admission ceiling for bounded tests; reset with 0. Replay limit is unchanged.
+void live_limit_for_test(uint64_t limit);
 // 1=partial append; 2/3/4=fail data/index/directory FLUSH;
 // 5/6/7=compact after data sync/new index sync/descriptor adoption.
 // Process-exit injection is supported for compact stages; reset with -1.
@@ -76,5 +79,7 @@ private:
     std::string index_name_;
     lsmt::HeaderTrailer header_;
     std::vector<bytes::segment_mapping> mappings_;
+    // Exact replay intervals, without the layer's DATA coalescing.
+    std::map<uint64_t, uint64_t> live_ranges_;
 };
 }  // namespace obd::format::lsmt_rw

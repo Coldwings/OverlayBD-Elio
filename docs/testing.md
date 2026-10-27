@@ -440,6 +440,15 @@ Every test, grouped by area, with the property it guards.
   ordinary and recovery assembly preserve DATA, ZERO masks over a nonzero lower,
   and grown-tail contents for image and blank devices; a missing index fails
   without replacing the upper.
+- `format: failed LSMT discard preserves masked lower bytes in the live merged view` —
+  failed journal publication preserves both prior DATA and ZERO over a nonzero
+  lower immediately and after reopen.
+- `format: LSMT partial admission requires reopen before further mutation` —
+  a rejected multi-record discard retains its completed prefix on disk and
+  refuses new mutations until reopen reconciles the staged visible map.
+- `format: LSMT admission counts replay splits and uncoalesced records before publication` —
+  a small test-only admission cap rejects both splitting and append growth
+  without publishing an unrecoverable record; rejection permits later writes.
 - `format: LSMT partial mapping append poisons writer until validated recovery` —
   an incomplete index record prevents later acknowledgements, is trimmed only
   by reopen, and does not fabricate ownership.

@@ -586,3 +586,74 @@ TEST_CASE("format: LSMT compaction retains the authoritative index after publica
     }
 }
 #endif
+
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("format: LSMT admission counts replay splits and uncoalesced records before publication",
+          "[format][lsmt-rw-file]") {
+    struct Reset { ~Reset() { format::lsmt_rw::live_limit_for_test(0); } } reset;
+    for (const bool split : {false, true}) {
+        CAPTURE(split);
+        test::TempDir directory;
+        const auto data = directory / "data", index = data + ".index";
+        const int rc = run_pair([&]() -> elio::coro::task<int> {
+            auto upper = co_await format::LsmtRwLayer::create(data, 4096);
+            std::array<uint8_t, 512> bytes{}; bytes.fill(0x42);
+            format::lsmt_rw::live_limit_for_test(split ? 2 : 3);
+            if (split) {
+                const int zero = co_await upper->discard(0, 3 * 512);
+                REQUIRE(zero == 0);
+            } else {
+                for (uint64_t sector = 0; sector < 3; ++sector) {
+                    const auto wrote = co_await upper->pwrite(bytes.data(), bytes.size(), sector * 512);
+                    REQUIRE(wrote == 512);
+                }
+                REQUIRE(upper->segments().size() == 1); // Replay still has three records.
+            }
+            const auto before = std::filesystem::file_size(index);
+            const auto rejected = co_await upper->pwrite(bytes.data(), bytes.size(), split ? 512 : 1536);
+            REQUIRE(rejected == -EFBIG);
+            REQUIRE(std::filesystem::file_size(index) == before);
+            const int flushed = co_await upper->flush();
+            REQUIRE(flushed == 0);
+            const int replaces = co_await upper->discard(0, 3 * 512);
+            REQUIRE(replaces == 0); // Rejection does not poison a usable writer.
+            const auto resumed = co_await upper->pwrite(bytes.data(), bytes.size(), 1536);
+            REQUIRE(resumed == 512);
+            upper.reset();
+            upper = co_await format::LsmtRwLayer::open_existing(data, index);
+            std::array<uint8_t, 2048> actual{};
+            const auto read = co_await upper->pread(actual.data(), actual.size(), 0);
+            REQUIRE(read == 2048);
+            for (size_t i = 0; i < actual.size(); ++i) REQUIRE(actual[i] == (i < 1536 ? 0 : 0x42));
+            co_return 0;
+        });
+        REQUIRE(rc == 0);
+    }
+}
+#endif
+
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("format: LSMT partial admission requires reopen before further mutation", "[format][lsmt-rw-file]") {
+    test::TempDir directory;
+    struct Reset { ~Reset() { format::lsmt_rw::live_limit_for_test(0); } } reset;
+    const auto data = directory / "data";
+    const int rc = run_pair([&]() -> elio::coro::task<int> {
+        auto upper = co_await format::LsmtRwLayer::create(data, 16384 * 512);
+        format::lsmt_rw::live_limit_for_test(1);
+        const int failed = co_await upper->discard(0, 16384 * 512);
+        REQUIRE(failed == -EFBIG); // First full-length record already published.
+        format::lsmt_rw::live_limit_for_test(0);
+        const int poisoned = co_await upper->discard(0, 512);
+        REQUIRE(poisoned == -EIO);
+        upper.reset();
+        upper = co_await format::LsmtRwLayer::open_existing(data, data + ".index");
+        REQUIRE(upper->segments().size() == 1);
+        REQUIRE(upper->segments()[0].length == 16383);
+        REQUIRE(upper->segments()[0].zeroed);
+        const int resumed = co_await upper->discard(16383 * 512, 512);
+        REQUIRE(resumed == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+#endif

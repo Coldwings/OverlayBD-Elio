@@ -1106,6 +1106,14 @@ not physically alias because writes can update payload in place.
   ZERO-covered subranges. New payload completes before its mapping record,
   which completes before success is returned. Mapping insertion splits/trims
   previous coverage. A failed mapping append poisons the writer until reopen.
+- Writer admission counts the exact replay partition, including splits and
+  records coalesced only in the live view. Exceeding the replay live-map ceiling
+  returns `-EFBIG` before the offending record is published. Rejection before
+  publication leaves the writer usable. If a multi-record operation already
+  published a prefix, reopen reconciles it before further mutation.
+- `discard` stages its visible map until all ZERO records publish. On error,
+  the live view retains prior masking rather than exposing inherited lower
+  bytes. Reopen can recover a completed prefix of that interrupted operation.
 - `discard` publishes ZERO mappings before reporting success; ZERO owns no
   physical payload. Splits preserve the placeholder offset. Holes inherit the
   lower in a merged view, while ZERO masks it. Direct upper reads return zero
@@ -1492,13 +1500,13 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
   (fixture writers, `seal` output): they must keep loading in upstream
   readers.
 - **Breaking (T1):** the writable-layer on-disk artifacts — the unsealed
-  LSMT RW header, the checkpoint trailer layout (`checkpoint()`'s index
-  region + unsealed trailer consumed by `seal_file`), the sealed output of
+  LSMT data/index headers and mapping records (ADR-0029), the legacy
+  checkpoint trailer layout accepted for migration, the sealed output of
   `LsmtRwLayer::seal` (including the content-derived uuid rule), and
   sparse-file extent semantics relied upon at reopen.
 - **Contract changes need ADRs.** The writable-layer rules on this page
   (interface shape, in-place edit, seal compaction, copy-on-write) are the
-  ADR-0008 contract; weakening or reversing them requires a superseding
+  ADR-0029 contract; weakening or reversing them requires a superseding
   ADR. Changes to this Stability Contract section are themselves a T3 ADR
   trigger. The module also follows the ADR-0001 minimalist-assumptions rule:
   only assumptions its consumers actually rely on are guaranteed here.

@@ -23,6 +23,7 @@ constexpr size_t kGrowBytes = 16 + 2 * lsmt::kSpace + 4;
 constexpr uint64_t kCreateMagic = 0x3154494e494d534cULL;
 constexpr size_t kCreateBytes = 8 + lsmt::kSpace + 4;
 #ifdef OBD_TEST_HOOKS
+std::atomic<uint64_t> live_limit{0};
 std::atomic<int> io_fault{-1};
 std::atomic<bool> io_exit{false};
 std::atomic<int> grow_fault{-1};
@@ -139,6 +140,7 @@ struct CompactRequest { FilePair* pair; std::vector<bytes::segment_mapping> live
 }
 
 #ifdef OBD_TEST_HOOKS
+void live_limit_for_test(uint64_t limit) { live_limit.store(limit); }
 void io_fault_for_test(int stage, bool exit_process) {
     io_exit.store(exit_process); io_fault.store(stage);
 }
@@ -221,6 +223,7 @@ std::unique_ptr<FilePair> FilePair::open_sync(const std::string& data,
         off += count;
     }
     pair->mappings_ = replay.finish();
+    for (const auto& m : pair->mappings_) pair->live_ranges_.emplace(m.offset, m.end());
     if (index_bytes != pair->index_bytes_ &&
         ::ftruncate(pair->index_fd_, static_cast<off_t>(pair->index_bytes_)) != 0)
         throw error(errno, "lsmt rw: retire interrupted index suffix");
@@ -474,6 +477,25 @@ elio::coro::task<std::unique_ptr<FilePair>> FilePair::migrate_checkpoint(
 elio::coro::task<int> FilePair::append(bytes::segment_mapping mapping) {
     if (poisoned_) co_return -EIO;
     if ((index_bytes_ - lsmt::kSpace) / 16 >= kMaxLogRecords) co_return -EFBIG;
+    // Admission uses the replay partition, not the layer's coalesced view:
+    // even adjacent DATA records remain separate during log replay.
+    auto first = live_ranges_.lower_bound(mapping.offset);
+    if (first != live_ranges_.begin() && std::prev(first)->second > mapping.offset) --first;
+    auto last = first;
+    std::map<uint64_t, uint64_t> replacement;
+    size_t removed = 0;
+    while (last != live_ranges_.end() && last->first < mapping.end()) {
+        if (last->first < mapping.offset) replacement.emplace(last->first, mapping.offset);
+        if (last->second > mapping.end()) replacement.emplace(mapping.end(), last->second);
+        ++last; ++removed;
+    }
+    replacement.emplace(mapping.offset, mapping.end());
+    uint64_t limit = lsmt::kMaxRoIndexSize;
+#ifdef OBD_TEST_HOOKS
+    if (const auto test_limit = live_limit.load(); test_limit != 0)
+        limit = std::min(limit, test_limit);
+#endif
+    if (live_ranges_.size() - removed + replacement.size() > limit) co_return -EFBIG;
     std::array<uint8_t, 16> raw{};
     bytes::store_segment_le(raw.data(), mapping);
     const bool partial = io_failure(1);
@@ -484,6 +506,8 @@ elio::coro::task<int> FilePair::append(bytes::segment_mapping mapping) {
         poisoned_ = true;
         co_return result.error ? -result.error.value() : -EIO;
     }
+    live_ranges_.erase(first, last);
+    live_ranges_.merge(replacement); // Nodes allocated before publication.
     index_bytes_ += raw.size();
     co_return 0;
 }
@@ -524,7 +548,9 @@ int FilePair::compact_sync(const std::vector<bytes::segment_mapping>& live) {
             bytes::store_segment_le(encoded.data(), m);
             replay.append(encoded);
         }
-        (void)replay.finish();
+        const auto replayed = replay.finish();
+        std::map<uint64_t, uint64_t> replacement_ranges;
+        for (const auto& m : replayed) replacement_ranges.emplace(m.offset, m.end());
         // Data must precede the compacted log's durable publication.
         if (::fdatasync(data_fd_) != 0) return -errno;
         if (io_failure(5)) return -EIO;
@@ -543,6 +569,7 @@ int FilePair::compact_sync(const std::vector<bytes::segment_mapping>& live) {
         cleanup.published = true;
         ::flock(index_fd_, LOCK_UN); ::close(index_fd_);
         index_fd_ = fd; cleanup.fd = -1; index_bytes_ = offset;
+        live_ranges_.swap(replacement_ranges);
         if (io_failure(7)) return -EIO;
         return ::fsync(directory_fd_) == 0 ? 0 : -errno;
     } catch (const error& e) { return -e.errno_value(); }

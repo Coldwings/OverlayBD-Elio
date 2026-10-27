@@ -516,13 +516,18 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
         // Publish new ownership only after payload completion. In-place DATA
         // overwrites retain their mapping and need no additional log record.
         if (pair_) {
+            bool ownership_published = false;
             for (const auto& op : ops) {
                 if (op.inplace) continue;
                 bytes::segment_mapping m;
                 m.offset = op.voff; m.length = static_cast<uint32_t>(op.nsector);
                 m.moffset = op.moff; m.zeroed = false; m.tag = 0;
                 const int published = co_await pair_->append(m);
-                if (published != 0) { journal_failed_ = true; co_return published; }
+                if (published != 0) {
+                    journal_failed_ = !pair_->healthy() || ownership_published;
+                    co_return published;
+                }
+                ownership_published = true;
             }
         }
         // Update the in-memory index: drop coverage of [lo,hi) from old
@@ -652,7 +657,6 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
             next.push_back(tail);
         }
     }
-    segments_.swap(next);
     // Insert zeroed segments (capped at the 14-bit length field). moffset
     // is never read for zeroed segments but must stay inside the data
     // region for LsmtLayer validation after seal — kHeaderSectors always
@@ -668,11 +672,17 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
         m.tag = 0;
         if (pair_) {
             const int published = co_await pair_->append(m);
-            if (published != 0) { journal_failed_ = true; co_return published; }
+            if (published != 0) {
+                // A completed prefix is not yet in the staged visible map.
+                // Reopen must reconcile it before further mutations.
+                journal_failed_ = !pair_->healthy() || cur != lo;
+                co_return published;
+            }
         }
-        insert_sorted(segments_, m);
+        insert_sorted(next, m);
         cur += n;
     }
+    segments_.swap(next);
     co_return 0;
 }
 
@@ -702,7 +712,7 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
 
     // Appended at the data end: index (SegmentMapping array, padded to
     // 4096B) | unsealed trailer (4096B). The trailer sits in the file's
-    // last 4096 bytes, which is how open_checkpointed locates it.
+    // last 4096 bytes, which is how legacy checkpoint migration locates it.
     const uint64_t index_sector =
         (data_end_sector_ + kHeaderSectors - 1) / kHeaderSectors *
         kHeaderSectors;

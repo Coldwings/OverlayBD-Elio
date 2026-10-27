@@ -5768,3 +5768,37 @@ TEST_CASE("format: sparse export recovers completed child operations and grown t
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("format: failed LSMT discard preserves masked lower bytes in the live merged view", "[format]") {
+    TempDir dir;
+    const std::vector<uint8_t> lower_bytes(4096, 0x5a);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", lower_bytes, &lower);
+    struct Reset { ~Reset() { format::lsmt_rw::io_fault_for_test(-1); } } reset;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::LsmtRwLayer::create(dir / "upper", 4096);
+        std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+        lowers.push_back(co_await format::LsmtLayer::open(co_await source::LocalFileSource::open(lower)));
+        auto merged = co_await format::MergedWritable::open(std::move(lowers), std::move(top));
+        std::vector<uint8_t> expected(4096, 0x31), actual(4096);
+        const auto write = co_await merged->pwrite(expected.data(), expected.size(), 0);
+        REQUIRE(write == 4096);
+        const int zero = co_await merged->discard(512, 512);
+        REQUIRE(zero == 0);
+        std::fill_n(expected.begin() + 512, 512, 0);
+        format::lsmt_rw::io_fault_for_test(1);
+        const int failed = co_await merged->discard(0, 4096);
+        REQUIRE(failed == -EIO);
+        format::lsmt_rw::io_fault_for_test(-1);
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 4096);
+        REQUIRE(actual == expected);
+        merged.reset();
+        auto recovered = co_await format::LsmtRwLayer::open_existing(dir / "upper", dir / "upper.index");
+        const auto reread = co_await recovered->pread(actual.data(), actual.size(), 0);
+        REQUIRE(reread == 4096);
+        REQUIRE(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}

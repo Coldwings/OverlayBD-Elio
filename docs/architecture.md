@@ -329,9 +329,9 @@ contracts above:
   (ADR-0010). Older kernels whose `ADD_DEV` call rejects the
   recovery flags with `EINVAL` degrade to a non-recoverable device at
   create time. Recovery reassembles the image
-  from restart-recoverable inputs: sealed lowers and sparse writable
-  extents can be reopened, but an unsealed LSMT-RW upper is not reopened
-  by recovery even if graceful shutdown wrote a checkpoint.
+  from restart-recoverable inputs: sealed lowers, Sparse coverage metadata,
+  and LSMT/Hybrid writable pairs. LSMT recovery reopens a valid pair or migrates
+  a complete legacy checkpoint without truncation (ADR-0029).
 - **Prefetch** covers only the active populate paths: structural
   head/tail warm-up (ADR-0012) and trace replay (the upstream trace blob
   IS replayed through `populate` when the image config marks an
