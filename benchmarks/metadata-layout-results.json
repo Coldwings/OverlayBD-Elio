@@ -4872,6 +4872,11 @@
           "median": 0.03,
           "min": 0.03,
           "max": 0.04
+        },
+        "retained_allocated_bytes": {
+          "median": 8970240,
+          "min": 8970240,
+          "max": 8970240
         }
       },
       {
@@ -4937,6 +4942,11 @@
           "median": 0.03,
           "min": 0.03,
           "max": 0.03
+        },
+        "retained_allocated_bytes": {
+          "median": 8970240,
+          "min": 8970240,
+          "max": 8970240
         }
       },
       {
@@ -5002,6 +5012,11 @@
           "median": 0.41000000000000003,
           "min": 0.41000000000000003,
           "max": 0.45999999999999996
+        },
+        "retained_allocated_bytes": {
+          "median": 167985152,
+          "min": 167985152,
+          "max": 167985152
         }
       },
       {
@@ -5067,6 +5082,11 @@
           "median": 0.38,
           "min": 0.37,
           "max": 0.42000000000000004
+        },
+        "retained_allocated_bytes": {
+          "median": 167985152,
+          "min": 167985152,
+          "max": 167985152
         }
       },
       {
@@ -5132,6 +5152,11 @@
           "median": 0.04,
           "min": 0.03,
           "max": 0.04
+        },
+        "retained_allocated_bytes": {
+          "median": 8953856,
+          "min": 8953856,
+          "max": 8953856
         }
       },
       {
@@ -5197,6 +5222,11 @@
           "median": 0.04,
           "min": 0.03,
           "max": 0.05
+        },
+        "retained_allocated_bytes": {
+          "median": 8953856,
+          "min": 8953856,
+          "max": 8953856
         }
       }
     ],
