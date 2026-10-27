@@ -20,6 +20,8 @@ add_library(obd_core STATIC
     format/trace.cpp
     format/writer.cpp
     format/sparse_rw.cpp
+    format/sparse_export_plan.cpp
+    format/sparse_export_output.cpp
     format/lsmt_rw.cpp
     format/merged_writable.cpp
     source/gzip_index_source.cpp

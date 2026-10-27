@@ -80,6 +80,13 @@ add_executable(obd_unit_tests
 obd_target_warnings(obd_unit_tests)
 target_include_directories(obd_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
+target_sources(obd_unit_tests PRIVATE ../tools/ext2_layout.cpp)
+target_compile_definitions(obd_unit_tests PRIVATE
+    OBD_HAVE_LIBE2FS=$<BOOL:${OBD_ENABLE_LIBE2FS_BACKEND}>)
+if(OBD_ENABLE_LIBE2FS_BACKEND)
+    target_link_libraries(obd_unit_tests PRIVATE obd_pinned_ext2fs obd_libe2fs_build_com_err)
+    add_dependencies(obd_unit_tests obd_libe2fs_build)
+endif()
 
 add_executable(obd-test-hybrid-fixture-writer hybrid_fixture_writer.cpp)
 obd_target_warnings(obd-test-hybrid-fixture-writer)
@@ -95,6 +102,7 @@ target_compile_definitions(obd_unit_tests
             OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>"
             OBD_TEST_OBD_CONVERT_BIN="$<TARGET_FILE:obd-convert>"
             OBD_TEST_HYBRID_WRITER_BIN="$<TARGET_FILE:obd-test-hybrid-fixture-writer>"
+            OBD_TEST_SPARSE_EXPORT_BIN="$<TARGET_FILE:obd-export-sparse>"
             OBD_TEST_SPARSE_CRASH_WRITER_BIN="$<TARGET_FILE:obd-test-sparse-crash-writer>"
             OBD_TEST_HAVE_LIBE2FS=$<BOOL:${OBD_ENABLE_LIBE2FS_BACKEND}>)
 find_program(OBD_E2FSCK_EXECUTABLE e2fsck PATHS /usr/sbin /sbin)
@@ -102,7 +110,7 @@ if(OBD_E2FSCK_EXECUTABLE)
     target_compile_definitions(obd_unit_tests PRIVATE
         OBD_TEST_E2FSCK_BIN="${OBD_E2FSCK_EXECUTABLE}")
 endif()
-add_dependencies(obd_unit_tests obdctl obd-convert obd-test-sparse-crash-writer obd-test-hybrid-fixture-writer)
+add_dependencies(obd_unit_tests obdctl obd-convert obd-export-sparse obd-test-sparse-crash-writer obd-test-hybrid-fixture-writer)
 catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
     PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
                TIMEOUT 60)

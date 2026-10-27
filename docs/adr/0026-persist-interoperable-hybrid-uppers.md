@@ -16,9 +16,9 @@ Issue [#146](https://github.com/Coldwings/OverlayBD-Elio/issues/146) requires a
 restart-recoverable writable upper that seals into a compatible LSMT layer
 without copying its live payload. Existing `lsmt` already reuses live upper
 mappings, but persists its index only at terminal checkpoint and copies live
-payload when sealing. Existing `sparse` has exact persistent ownership but
-cannot be sealed into an LSMT layer. Neither mode changes its default or contract
-under this decision.
+payload when sealing. Existing `sparse` has exact persistent ownership and
+exports a separate sealed LSMT delta while retaining its reusable source
+(ADR-0027). Neither mode changes its default or contract under this decision.
 
 Actual fixtures from pinned current OverlayBD and AgentENV writers show a
 compatibility difference that source-level flag matching cannot resolve.

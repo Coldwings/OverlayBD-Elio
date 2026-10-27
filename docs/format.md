@@ -741,6 +741,11 @@ class SparseRwLayer final : public WritableLayer {
 public:
     static elio::coro::task<std::unique_ptr<SparseRwLayer>> open(
         const std::string& path, uint64_t vsize);
+    static elio::coro::task<std::unique_ptr<SparseRwLayer>> open_existing(
+        std::string path);
+    static elio::coro::task<SparseExportResult> export_file(
+        std::string source, std::string destination,
+        std::string parent_uuid = {}, std::string user_tag = {});
     // + WritableLayer overrides
 };
 ```
@@ -756,6 +761,47 @@ size; sidecars that declare a larger size are rejected as corrupted. This
 preserves online-grown uppers when the data file or caller-supplied size
 already records the grown window without allowing sidecar metadata alone to
 expand the device.
+
+Both entrypoints require a regular file and hold a nonblocking exclusive
+advisory inode lock before metadata recovery or growth, until layer destruction.
+Another cooperating Sparse owner, including one opened through a hardlink,
+causes `EBUSY`; checkpoint retains the lock. External mutation or pathname
+replacement remains outside this cooperative locking contract. Keep the data
+and metadata names stable while owned (ADR-0027).
+
+`open_existing(path)` never creates a missing data file and never grows it.
+It derives capacity from the opened descriptor, rejects empty/invalid files,
+and uses the same exact coverage and compatibility-mask recovery rules.
+Recovery may repair or import metadata; this is not a read-only open. Closing
+its instance permits normal read-write reopen. This source-admission API does
+not by itself provide the sparse export operator workflow tracked in #161.
+
+The internal `sparse_export_detail` staging writer validates sorted exact
+ownership, combines adjacent same-state ranges before canonical 16,383-sector
+splitting, packs only DATA, emits ZERO, and omits INHERIT. It uses bounded
+payload/index buffers and native asynchronous writes followed by staging sync.
+Its UUID follows the existing deterministic seal digest convention: little-endian
+virtual size, packed DATA, then encoded index; parent/tag remain explicit header
+inputs. This internal entrypoint requires a stable source and a fresh staging
+file from the export transaction. It does not yet provide destination alias
+admission or publication itself; those belong to `SparseRwLayer::export_file`.
+
+`export_file` exclusively recovers the existing source, rejects destination
+names/inodes aliasing its data or metadata, checkpoints its own instance,
+then writes a fresh sibling staging file. It returns `uuid`, `sha256`, and
+`size` only after file synchronization and destination-directory synchronization.
+The source remains reusable and read-write reopenable. A different existing
+destination is never overwritten. A byte-identical destination is accepted as
+an idempotent retry only after verification and renewed synchronization.
+
+Publication uses a no-replace rename. Before publication, failures remove only
+the private staging file; abrupt process exit can leave an unpublished temporary
+that is never treated as a completed export. After publication, a directory-sync
+failure returns an error but retains the visible output. Retry verifies the
+complete identical artifact and retries the durability boundary. Keep source
+paths and the destination directory stable against external replacement during
+export. The offline command is `obd-export-sparse`; eligible supervisor devices
+use `obdctl commit` after the stop/reap boundary (ADR-0027).
 
 New uppers persist exact 512-byte INHERIT, DATA, and ZERO ownership in
 `<path>.coverage` (ADR-0024). A sparse two-bit map page describes 8 MiB and
@@ -1192,10 +1238,12 @@ Generates a random lowercase 8-4-4-4-12 UUID string (36 chars) from
 upstream treats the field as an opaque string).
 
 ```cpp
+struct LsmtPayloadRange { uint64_t offset = 0, length = 0; }; // sectors
 struct LsmtWriteOptions {
     std::string uuid;         // generated when empty
     std::string parent_uuid;  // may be empty (bottom layer)
     std::string user_tag;     // commit message, may be empty
+    std::vector<LsmtPayloadRange> tail_ranges = {};
 };
 ```
 
@@ -1213,6 +1261,20 @@ Builds a sealed single-layer LSMT file at `out_path` from the raw image at
 one segment per ≤ 16383-sector chunk, data region starting at sector 8.
 Throws `obd::error` / `obd::format_error` on IO or serialization failure.
 Layout: `header 4096 | data | index | trailer 4096`.
+Optional `tail_ranges` supply sorted, disjoint logical sector ranges for stable
+physical tail packing (ADR-0028). Ordinary payload comes first, then
+selected payload, both in logical order; the index remains logically sorted.
+No classification is serialized and full logical coverage is preserved.
+Adjacent ranges normalize before splitting at the ordinary segment-length bound.
+Invalid geometry, overlaps or excessive index counts fail before output mutation.
+An empty plan keeps the original layout. Classification and converter selection
+are separate responsibilities; this API does not infer filesystem structure.
+The regression cases `format: lsmt tail placement preserves bytes with ordinary logical mappings`
+and `format: lsmt invalid tail placement preserves an existing output` cover
+physical ordering, logical readback, normalized determinism and preflight errors.
+`format: lsmt tail packing splits wire boundaries and normalizes uniform classes`
+checks cross-segment physical offsets, full logical bytes and equality of uniform
+front/tail plans at the 16,383-sector wire boundary.
 
 ```cpp
 struct ZFileWriteOptions {
@@ -1438,6 +1500,32 @@ Unit tests live in `tests/unit/test_format.cpp`,
 `[format]`). Run with `ctest --test-dir build --output-on-failure` or
 `./build/tests/obd_unit_tests "[format]"`.
 
+Sparse export source-admission regressions cover:
+
+- `format: sparse existing open refuses a missing source without creation`.
+- `format: sparse ownership excludes ordinary and existing opens through aliases`.
+- `format: sparse existing open preserves persisted growth and exact ownership`.
+- `format: sparse export layout preserves gaps and explicit zero masks`.
+- `format: sparse export layout is independent of ownership fragmentation`.
+- `format: sparse export layout rejects invalid ownership before output`.
+- `format: sparse delta writer preserves parent bytes and deterministic output`.
+- `format: sparse export transaction retains a reusable independent source`.
+- `format: sparse export transaction rejects source aliases and active owners`.
+- `format: sparse export resolves directory symlinks before parent traversal`.
+- `format: sparse export recovers completed child operations and grown tails` —
+  real helper processes exit without flushing or destructors; checks process
+  recovery plus surviving compatibility masks, not host power-loss durability.
+- `format: sparse export failures preserve source and retry publication` —
+  deterministic partial-payload, index/header/trailer, file-sync, publication,
+  and post-publication directory-sync refusals; these are not power-loss tests.
+
+Sparse export recovery regression cases include
+`format: sparse export imports legacy zero masks without flattening parents`
+and `format: sparse export rejects damaged recovery metadata before publication`.
+They pin compatibility-mask import and exact DATA/ZERO/INHERIT composition,
+plus refusal without publication or source-artifact mutation when recovery
+metadata or the pinned data identity is invalid.
+
 Golden byte values (magics, field offsets, flag bits, CRC check values) come
 from the upstream OverlayBD sources and format specs
 (`src/overlaybd/zfile/zfile.cpp`, `src/overlaybd/lsmt/file.cpp`,
@@ -1626,9 +1714,9 @@ writers and readers agree on the same bytes.
   trace commands (`trace_record.hpp`, supervisor protocol v3) — but
   packaging the recorded blob as an image layer stays with the external
   CLI (ADR-0014 boundary).
-- **Writers are single-shot fixtures.** `write_lsmt_single_layer` covers the
-  whole input contiguously (no sparse/zero segments); general-purpose image
-  authoring belongs to upstream tools.
+- **The native raw-image writer has full coverage.** `write_lsmt_single_layer`
+  represents every logical input sector (no sparse/zero segments). Transient
+  tail placement changes physical order only; it is not a differential writer.
 
 ### TurboOCI warp mappings (ADR-0020)
 

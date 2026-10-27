@@ -735,6 +735,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         upper_path = cfg.upper.dir + "/overlaybd.rw";
         top = co_await format::LsmtRwLayer::create(upper_path, vsize);
     }
+    const std::string upper_parent_uuid = layers.empty() ? "" : layers.back()->header().uuid;
     auto merged = co_await format::MergedWritable::open(std::move(layers),
                                                         std::move(top));
     OpenedImage out;
@@ -742,6 +743,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     out.layer_count = n + 1;
     out.writable = true;
     out.upper_path = upper_path;
+    out.upper_parent_uuid = upper_parent_uuid;
     out.trace = trace_stats;
     out.warmup = warmup_stats;
     out.root = std::move(merged);
@@ -806,6 +808,7 @@ elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
     std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
     lowers.push_back(co_await format::LsmtLayer::open(std::move(base_src)));
 
+    const std::string upper_parent_uuid = lowers.back()->header().uuid;
     auto merged = co_await format::MergedWritable::open(std::move(lowers),
                                                         std::move(top));
 
@@ -814,6 +817,7 @@ elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
     out.layer_count = 1;  // one data layer: the empty zero base
     out.writable = true;
     out.upper_path = upper_path;
+    out.upper_parent_uuid = upper_parent_uuid;
     out.root = std::move(merged);
     // Idle recorder for shape parity with open_image (nothing remote to
     // tap on a blank device; trace_start records an empty trace).

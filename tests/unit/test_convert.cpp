@@ -2,10 +2,17 @@
 #include "common/bytes.hpp"
 #include "common/sha256.hpp"
 #include "format/lsmt.hpp"
+#include "format/zfile.hpp"
 #include "image/image_file.hpp"
 #include "source/local_file.hpp"
 
 #include "../support.hpp"
+#include "../../tools/ext2_layout.hpp"
+#if OBD_TEST_HAVE_LIBE2FS
+extern "C" {
+#include <ext2fs/ext2fs.h>
+}
+#endif
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -557,10 +564,12 @@ private:
     });
 }
 
-std::vector<uint8_t> read_layer_raw(const std::string& path) {
+std::vector<uint8_t> read_layer_raw(const std::string& path, bool compressed = false) {
     return test::run_coro([&]() -> elio::coro::task<std::vector<uint8_t>> {
         auto local = co_await source::LocalFileSource::open(path);
         source::BlobSourcePtr base = std::move(local);
+        if (compressed)
+            base = co_await format::ZFileSource::open(std::move(base), true);
         auto layer = co_await format::LsmtLayer::open(std::move(base));
         std::vector<std::unique_ptr<format::LsmtLayer>> layers;
         layers.push_back(std::move(layer));
@@ -1417,4 +1426,334 @@ TEST_CASE("cli: TurboOCI replaces explicit directory xattrs and preserves nanose
 #else
     SKIP("libe2fs backend disabled");
 #endif
+}
+
+TEST_CASE("cli: obd-convert metadata tail preserves the complete filesystem",
+          "[cli]") {
+    TempDir dir;
+    auto tar = make_rootfs_tar();
+#if OBD_TEST_HAVE_LIBE2FS
+    // At 60 bytes libe2fs uses a real symlink payload block, which must be
+    // classified as metadata rather than as ordinary regular-file payload.
+    tar.resize(tar.size() - 1024);
+    append_tar_entry(tar, "slow-link", '2', 0777, 0, 0, {}, std::string(60, 't'));
+    tar.resize(tar.size() + 1024, 0);
+#endif
+    const auto input = test::write_file(dir / "input.tar", tar);
+    const auto logical = run_convert({"--input", input, "--out-dir", dir / "logical",
+        "--name", "rootfs", "--lsmt-layout", "logical"}, nullptr, false);
+    const auto tail = run_convert({"--input", input, "--out-dir", dir / "tail",
+        "--name", "rootfs", "--lsmt-layout", "metadata-tail"}, nullptr, false);
+    const auto repeat = run_convert({"--input", input, "--out-dir", dir / "repeat",
+        "--name", "rootfs", "--lsmt-layout", "metadata-tail"}, nullptr, false);
+    INFO(tail.err);
+    REQUIRE(logical.exit_code == 0);
+    REQUIRE(tail.exit_code == 0);
+    REQUIRE(repeat.exit_code == 0);
+    const auto original_path = nlohmann::json::parse(logical.out)["lowers"][0]["file"].get<std::string>();
+    const auto tail_path = nlohmann::json::parse(tail.out)["lowers"][0]["file"].get<std::string>();
+    const auto repeat_path = nlohmann::json::parse(repeat.out)["lowers"][0]["file"].get<std::string>();
+    const auto raw = read_layer_raw(original_path);
+    REQUIRE(read_layer_raw(tail_path) == raw);
+    REQUIRE(file_sha256(tail_path) == file_sha256(repeat_path));
+    assert_rootfs_metadata(tail_path);
+    for (const auto algo : {format::zfile::kAlgoLz4, format::zfile::kAlgoZstd}) {
+        const auto wrapped = dir / ("tail-" + std::to_string(static_cast<int>(algo)) + ".zfile");
+        {
+            struct Input {
+                int fd;
+                ~Input() { if (fd >= 0) ::close(fd); }
+            } input_file{::open(tail_path.c_str(), O_RDONLY | O_CLOEXEC)};
+            REQUIRE(input_file.fd >= 0);
+            format::ZFileWriteOptions options;
+            options.algo = algo;
+            options.block_size = 65536;
+            // Wrap the actual reordered LSMT bytes, without rebuilding its
+            // mappings through mkimage or another logical-order writer.
+            format::write_zfile(input_file.fd, std::filesystem::file_size(tail_path),
+                                wrapped, options);
+        }
+        REQUIRE(read_layer_raw(wrapped, true) == raw);
+    }
+#if OBD_TEST_HAVE_LIBE2FS
+    REQUIRE(tail.err.find("LSMT metadata-tail:") != std::string::npos);
+    REQUIRE(file_sha256(tail_path) != file_sha256(original_path));
+    Ext2View filesystem(raw);
+    const auto root = filesystem.inode(2);
+    const auto tool = filesystem.inode(filesystem.lookup({"bin", "tool"}));
+    const auto slow_link_ino = filesystem.lookup({"slow-link"});
+    const auto slow_link = filesystem.inode(slow_link_ino);
+    REQUIRE(filesystem.symlink_target(slow_link_ino) == std::string(60, 't'));
+    REQUIRE(slow_link.blocks[0] != 0);
+    const auto inode_table = bytes::load_u32_le(raw.data() + 4096 + 8);
+    REQUIRE(tool.blocks[12] != 0); // The fixture needs a real indirect block.
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto blob = co_await source::LocalFileSource::open(tail_path);
+        auto layer = co_await format::LsmtLayer::open(std::move(blob));
+        REQUIRE(layer->header().flags == 6); // The reader exposes the trailer.
+        auto physical = [&](uint64_t block) {
+            const uint64_t sector = block * 8;
+            for (const auto& mapping : layer->segments()) {
+                if (sector >= mapping.offset && sector < mapping.end())
+                    return (mapping.moffset + sector - mapping.offset) * 512;
+            }
+            FAIL("filesystem block missing from full-coverage layer");
+            return uint64_t{0};
+        };
+        const auto file_payload = physical(tool.blocks[0]);
+        for (const uint64_t metadata : {uint64_t{0}, uint64_t{inode_table},
+                                        uint64_t{root.blocks[0]}, uint64_t{tool.blocks[12]},
+                                        uint64_t{slow_link.blocks[0]}}) {
+            REQUIRE(physical(metadata) > file_payload);
+            REQUIRE(physical(metadata) < layer->header().index_offset);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+#else
+    REQUIRE(tail.err.find("logical layout fallback") != std::string::npos);
+    REQUIRE(file_sha256(tail_path) == file_sha256(original_path));
+#endif
+}
+
+TEST_CASE("cli: obd-convert metadata tail preserves an empty filesystem", "[cli]") {
+    TempDir dir;
+    // The converter deliberately rejects a stream without any tar entry.
+    // A root-directory-only archive produces a valid empty filesystem.
+    std::vector<uint8_t> tar;
+    append_tar_entry(tar, "./", '5', 0755, 0, 0);
+    tar.resize(tar.size() + 1024, 0);
+    const auto input = test::write_file(dir / "empty.tar", tar);
+    const auto logical = run_convert({"--input", input, "--out-dir", dir / "logical",
+        "--name", "empty", "--size", "8388608", "--lsmt-layout", "logical"}, nullptr, false);
+    const auto tail = run_convert({"--input", input, "--out-dir", dir / "tail",
+        "--name", "empty", "--size", "8388608", "--lsmt-layout", "metadata-tail"}, nullptr, false);
+    INFO(logical.err);
+    INFO(tail.err);
+    REQUIRE(logical.exit_code == 0);
+    REQUIRE(tail.exit_code == 0);
+    const auto logical_path = nlohmann::json::parse(logical.out)["lowers"][0]["file"].get<std::string>();
+    const auto tail_path = nlohmann::json::parse(tail.out)["lowers"][0]["file"].get<std::string>();
+    const auto raw = read_layer_raw(logical_path);
+    REQUIRE(read_layer_raw(tail_path) == raw);
+    Ext2View filesystem(raw);
+    const auto entries = filesystem.list_dir(2);
+    REQUIRE(entries.size() == 2);
+    REQUIRE(entries.at(".") == 2);
+    REQUIRE(entries.at("..") == 2);
+#if OBD_TEST_HAVE_LIBE2FS
+    REQUIRE(tail.err.find("LSMT metadata-tail:") != std::string::npos);
+#else
+    REQUIRE(tail.err.find("logical layout fallback") != std::string::npos);
+#endif
+}
+
+TEST_CASE("convert: finalized ext2 classification preserves hardlinks and external xattrs", "[convert]") {
+#if OBD_TEST_HAVE_LIBE2FS
+    TempDir dir;
+    const auto input = test::write_file(dir / "input.tar", make_rootfs_tar());
+    const auto converted = run_convert({"--input", input, "--out-dir", dir / "out",
+        "--name", "rootfs", "--lsmt-layout", "logical"}, nullptr, false);
+    INFO(converted.err);
+    REQUIRE(converted.exit_code == 0);
+    const auto layer_path = nlohmann::json::parse(converted.out)["lowers"][0]["file"].get<std::string>();
+    const auto raw = read_layer_raw(layer_path);
+    const auto path = test::write_file(dir / "finalized.ext2", raw);
+    Ext2View original(raw);
+    const auto ino = original.lookup({"bin", "tool"});
+    const auto payload = original.inode(ino).blocks[0];
+    const auto reused_ino = original.lookup({"zero-file"});
+    const auto reused_block = original.inode(reused_ino).blocks[0];
+    REQUIRE(reused_block != 0);
+    const auto initial_layout = convert::classify_ext2_layout(path, raw.size());
+    INFO(initial_layout.reason);
+    REQUIRE(initial_layout.supported);
+    REQUIRE_FALSE(std::any_of(initial_layout.metadata.begin(), initial_layout.metadata.end(),
+        [&](const auto& range) {
+            return reused_block * 8 >= range.offset && reused_block * 8 < range.offset + range.length;
+        }));
+    uint64_t xattr_block = 0;
+    const std::string value(1024, 'x'); // Exceeds inode-inline xattr capacity.
+    {
+        struct Owner {
+            ext2_filsys fs = nullptr;
+            ~Owner() { if (fs) ext2fs_free(fs); }
+        } owner;
+        REQUIRE(ext2fs_open2(path.c_str(), nullptr, EXT2_FLAG_RW, 0, 0,
+                            unix_io_manager, &owner.fs) == 0);
+        REQUIRE(ext2fs_read_bitmaps(owner.fs) == 0);
+        const auto fs = owner.fs;
+        REQUIRE(ext2fs_read_bitmaps(fs) == 0);
+        // Native conversion emits no xattrs. Enable the feature before using
+        // the pinned xattr API, which rejects filesystems without EXT_ATTR.
+        ext2fs_set_feature_xattr(fs->super);
+        ext2fs_mark_super_dirty(fs);
+        REQUIRE(ext2fs_link(fs, EXT2_ROOT_INO, "tool-alias", ino, EXT2_FT_REG_FILE) == 0);
+        struct ext2_inode inode{};
+        REQUIRE(ext2fs_read_inode(fs, ino, &inode) == 0);
+        ++inode.i_links_count;
+        REQUIRE(ext2fs_write_inode(fs, ino, &inode) == 0);
+        struct Xattrs {
+            struct ext2_xattr_handle* handle = nullptr;
+            ~Xattrs() { if (handle) ext2fs_xattrs_close(&handle); }
+        } attrs;
+        REQUIRE(ext2fs_xattrs_open(fs, ino, &attrs.handle) == 0);
+        REQUIRE(ext2fs_xattrs_read(attrs.handle) == 0);
+        REQUIRE(ext2fs_xattr_set(attrs.handle, "user.layout", value.data(), value.size()) == 0);
+        REQUIRE(ext2fs_xattrs_write(attrs.handle) == 0);
+        REQUIRE(ext2fs_xattrs_close(&attrs.handle) == 0);
+        REQUIRE(ext2fs_read_inode(fs, ino, &inode) == 0);
+        xattr_block = ext2fs_file_acl_block(fs, &inode);
+        REQUIRE(xattr_block != 0);
+        // Delete an ordinary file, then deliberately reuse its freed payload
+        // block for a directory. The final classification must forget DATA.
+        REQUIRE(ext2fs_unlink(fs, EXT2_ROOT_INO, "zero-file", reused_ino, 0) == 0);
+        struct ext2_inode removed{};
+        REQUIRE(ext2fs_read_inode(fs, reused_ino, &removed) == 0);
+        REQUIRE(ext2fs_punch(fs, reused_ino, &removed, nullptr, 0, ~uint64_t{0}) == 0);
+        ext2fs_inode_alloc_stats2(fs, reused_ino, -1, 0);
+        REQUIRE_FALSE(ext2fs_test_block_bitmap2(fs->block_map, reused_block));
+        // Reserve the exact freed block; the pinned allocator ignores its goal.
+        const blk64_t allocated = reused_block;
+        ext2fs_block_alloc_stats2(fs, allocated, 1);
+        REQUIRE(ext2fs_test_block_bitmap2(fs->block_map, allocated));
+        struct ext2_inode directory{};
+        directory.i_mode = LINUX_S_IFDIR | 0755;
+        directory.i_size = fs->blocksize;
+        directory.i_blocks = fs->blocksize / 512;
+        directory.i_block[0] = reused_block;
+        directory.i_links_count = 2;
+        REQUIRE(ext2fs_write_new_inode(fs, reused_ino, &directory) == 0);
+        struct DirectoryBlock {
+            char* data = nullptr;
+            ~DirectoryBlock() { if (data) ext2fs_free_mem(&data); }
+        } directory_block;
+        REQUIRE(ext2fs_new_dir_block(fs, reused_ino, EXT2_ROOT_INO, &directory_block.data) == 0);
+        REQUIRE(ext2fs_write_dir_block4(fs, allocated, directory_block.data, 0, reused_ino) == 0);
+        ext2fs_inode_alloc_stats2(fs, reused_ino, 1, 1);
+        REQUIRE(ext2fs_link(fs, EXT2_ROOT_INO, "reused-directory", reused_ino, EXT2_FT_DIR) == 0);
+        struct ext2_inode root_inode{};
+        REQUIRE(ext2fs_read_inode(fs, EXT2_ROOT_INO, &root_inode) == 0);
+        ++root_inode.i_links_count;
+        REQUIRE(ext2fs_write_inode(fs, EXT2_ROOT_INO, &root_inode) == 0);
+        REQUIRE(ext2fs_write_bitmaps(fs) == 0);
+        auto closing = std::exchange(owner.fs, nullptr);
+        REQUIRE(ext2fs_close(closing) == 0);
+    }
+    const auto before = file_sha256(path);
+    const auto layout = convert::classify_ext2_layout(path, raw.size());
+    INFO(layout.reason);
+    REQUIRE(layout.supported);
+    auto metadata = [&](uint64_t block) {
+        return std::any_of(layout.metadata.begin(), layout.metadata.end(), [&](const auto& range) {
+            return block * 8 >= range.offset && block * 8 + 8 <= range.offset + range.length;
+        });
+    };
+    REQUIRE(metadata(xattr_block));
+    REQUIRE(metadata(reused_block));
+    REQUIRE_FALSE(metadata(payload)); // Two paths to one inode are not duplicate block owners.
+    REQUIRE(file_sha256(path) == before);
+    std::vector<uint8_t> final_raw(raw.size());
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    REQUIRE(fd >= 0);
+    const auto got = ::pread(fd, final_raw.data(), final_raw.size(), 0);
+    REQUIRE(::close(fd) == 0);
+    REQUIRE(got == static_cast<ssize_t>(final_raw.size()));
+    const auto packed_path = dir / "classified.lsmt";
+    {
+        struct Input {
+            int fd;
+            ~Input() { if (fd >= 0) ::close(fd); }
+        } source{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+        REQUIRE(source.fd >= 0);
+        format::LsmtWriteOptions options;
+        options.uuid = "00000000-0000-0000-0000-000000000160";
+        options.tail_ranges = layout.metadata;
+        format::write_lsmt_single_layer(source.fd, final_raw.size(), packed_path, options);
+    }
+    REQUIRE(read_layer_raw(packed_path) == final_raw);
+    Ext2View finalized(std::move(final_raw));
+    REQUIRE(finalized.lookup({"tool-alias"}) == ino);
+    REQUIRE(finalized.user_xattrs(ino).at("layout") == value);
+    REQUIRE(finalized.read_file(ino) == test::pattern_bytes(kIndirectToolSize, 77));
+    REQUIRE(finalized.list_dir(EXT2_ROOT_INO).count("zero-file") == 0);
+    REQUIRE(finalized.lookup({"reused-directory"}) == reused_ino);
+    REQUIRE(finalized.inode(reused_ino).blocks[0] == reused_block);
+    const auto reused_entries = finalized.list_dir(reused_ino);
+    REQUIRE(reused_entries.size() == 2);
+    REQUIRE(reused_entries.at(".") == reused_ino);
+    REQUIRE(reused_entries.at("..") == EXT2_ROOT_INO);
+#ifdef OBD_TEST_E2FSCK_BIN
+    // Independent read-only filesystem validation of this ordinary test file.
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        ::execl(OBD_TEST_E2FSCK_BIN, OBD_TEST_E2FSCK_BIN, "-fn", path.c_str(), nullptr);
+        ::_exit(127);
+    }
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0) REQUIRE(errno == EINTR);
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == 0);
+#else
+    WARN("e2fsck unavailable: independent filesystem validation was not performed");
+#endif
+    const auto repeated = convert::classify_ext2_layout(path, raw.size());
+    REQUIRE(repeated.supported);
+    REQUIRE(repeated.metadata.size() == layout.metadata.size());
+    for (size_t i = 0; i < layout.metadata.size(); ++i) {
+        REQUIRE(repeated.metadata[i].offset == layout.metadata[i].offset);
+        REQUIRE(repeated.metadata[i].length == layout.metadata[i].length);
+    }
+    REQUIRE(file_sha256(path) == before);
+    const auto wrong_size = convert::classify_ext2_layout(path, raw.size() + 4096);
+    REQUIRE_FALSE(wrong_size.supported);
+    REQUIRE(wrong_size.metadata.empty());
+    REQUIRE(file_sha256(path) == before);
+    // Advertise a feature outside this classifier's supported scope. The
+    // fallback must return no partial plan and must not rewrite the image.
+    const int feature_fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    REQUIRE(feature_fd >= 0);
+    std::array<uint8_t, 4> features{};
+    const auto feature_read = ::pread(feature_fd, features.data(), features.size(), 1024 + 96);
+    if (feature_read == static_cast<ssize_t>(features.size())) {
+        bytes::store_u32_le(features.data(), bytes::load_u32_le(features.data()) | 0x40U);
+    }
+    const auto feature_written = feature_read == static_cast<ssize_t>(features.size())
+        ? ::pwrite(feature_fd, features.data(), features.size(), 1024 + 96) : -1;
+    REQUIRE(::close(feature_fd) == 0);
+    REQUIRE(feature_read == static_cast<ssize_t>(features.size()));
+    REQUIRE(feature_written == static_cast<ssize_t>(features.size()));
+    const auto unsupported_hash = file_sha256(path);
+    const auto unsupported = convert::classify_ext2_layout(path, raw.size());
+    REQUIRE_FALSE(unsupported.supported);
+    REQUIRE(unsupported.metadata.empty());
+    REQUIRE_FALSE(unsupported.reason.empty());
+    REQUIRE(file_sha256(path) == unsupported_hash);
+#else
+    const auto result = convert::classify_ext2_layout("unused", 4096);
+    REQUIRE_FALSE(result.supported);
+    REQUIRE(result.metadata.empty());
+    REQUIRE(result.reason == "libe2fs classification unavailable in this build");
+#endif
+}
+
+TEST_CASE("cli: obd-convert rejects invalid and nonnative layout selections",
+          "[cli]") {
+    TempDir dir;
+    const auto input = test::write_file(dir / "input.tar", make_rootfs_tar());
+    const std::vector<std::vector<std::string>> invalid{
+        {"--lsmt-layout", "unknown"}, {"--lsmt-layout"},
+        {"--lsmt-layout", "metadata-tail", "--turboOCI"},
+        {"--lsmt-layout", "logical", "--import-turboOCI", "unused-package"}};
+    size_t index = 0;
+    for (const auto& extra : invalid) {
+        const auto output = dir / ("output-" + std::to_string(index++));
+        std::vector<std::string> arguments{"--input", input, "--out-dir", output};
+        arguments.insert(arguments.end(), extra.begin(), extra.end());
+        const auto result = run_convert(arguments, nullptr, false);
+        REQUIRE(result.exit_code == 2);
+        REQUIRE(result.err.find("--lsmt-layout") != std::string::npos);
+        REQUIRE_FALSE(std::filesystem::exists(output));
+    }
 }

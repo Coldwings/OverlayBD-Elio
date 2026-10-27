@@ -5,6 +5,7 @@
 #include "common/errors.hpp"
 #include "format/lsmt_rw.hpp"
 #include "format/hybrid_rw.hpp"
+#include "format/sparse_rw.hpp"
 #include "image/config.hpp"
 #include "supervisor/child.hpp"
 #include "supervisor/protocol.hpp"
@@ -400,6 +401,9 @@ class Daemon {
         std::string upper_path;   // Writable data artifact captured at create.
         std::string upper_index_path; // Hybrid companion captured with data path.
         std::string upper_type;   // "" = no writable upper recorded
+        // Guarded by mu_; first valid ready captures parent association.
+        std::optional<std::string> upper_parent_uuid;
+        bool upper_parent_conflict = false;
         /// True once the entry's writable upper is KNOWN — from the image
         /// config parsed at create time, or (blank devices, ADR-0014) from
         /// the workspace layout. Named for what commit actually needs; the
@@ -854,11 +858,24 @@ private:
                         continue;
                     }
                     co_await maybe_grant_startup(entry, channel);
-                    Child::Status cur = entry->child->status();
-                    cur.state = st->state;
-                    if (!st->device.empty()) cur.device = st->device;
-                    if (!st->error.empty()) cur.error = st->error;
-                    entry->child->update_status(cur);
+                    {
+                        co_await mu_.lock();
+                        SyncMutexGuard registry_guard{mu_};
+                        // Do not suspend between reading and publishing status:
+                        // identity and ready state belong to the same child.
+                        Child::Status cur = entry->child->status();
+                        cur.state = st->state;
+                        if (!st->device.empty()) cur.device = st->device;
+                        if (!st->error.empty()) cur.error = st->error;
+                        if (st->state == "ready" && st->upper_parent_uuid) {
+                            cur.upper_parent_uuid = st->upper_parent_uuid;
+                            if (!entry->upper_parent_uuid)
+                                entry->upper_parent_uuid = st->upper_parent_uuid;
+                            else if (*entry->upper_parent_uuid != *st->upper_parent_uuid)
+                                entry->upper_parent_conflict = true;
+                        }
+                        entry->child->update_status(cur);
+                    }
                     while (!entry->child->try_notify_waiters()) {
                         co_await elio::time::yield();
                     }
@@ -1902,14 +1919,15 @@ private:
     /// ADR-0014 offline commit: stop the device (when live), then seal its
     /// LSMT-RW upper in this process and reply with the sealed file's path,
     /// sha256 and size. The upper path/kind recorded at create time is the
-    /// provenance (docs/supervisor.md). Sparse uppers and upper-less
-    /// devices are clear errors (upstream #216 parity). Concurrent commits
+    /// provenance (docs/supervisor.md). Sparse uppers export a separate
+    /// LSMT delta after the same stop/reap boundary; upper-less devices fail. Concurrent commits
     /// of the same device are rejected (`committing`); the stop-and-seal
     /// itself is serialized against recovery respawns by the entry's
     /// op_mu, so a seal never runs while a device child is alive.
     elio::coro::task<std::string> cmd_commit(const nlohmann::json& j) {
         const std::string id = j["id"].get<std::string>();
         const std::string user_tag = j.value("user_tag", "");
+        const std::string output = j.value("output", "");
         // D3 commit re-baseline: optional virtual_size override (bytes)
         // written into the sealed header (0 = keep the layer's declared
         // size). parse_command validated the type; alignment/positivity
@@ -1959,7 +1977,7 @@ private:
         std::string reply;
         try {
             reply = co_await commit_stop_and_seal(entry, id, user_tag,
-                                                  virtual_size);
+                                                  virtual_size, output);
         } catch (const std::exception& e) {
             reply = reply_error(std::string("commit failed for ") + id +
                                 ": " + e.what());
@@ -1977,7 +1995,7 @@ private:
     /// re-baseline override (0 = keep the layer's declared size).
     elio::coro::task<std::string> commit_stop_and_seal(
         const std::shared_ptr<DeviceEntry>& entry, const std::string& id,
-        const std::string& user_tag, uint64_t virtual_size) {
+        const std::string& user_tag, uint64_t virtual_size, const std::string& output) {
         if (!entry->upper_known) {
             co_return reply_error(
                 "image config unreadable at create; upper unknown: " + id);
@@ -1985,9 +2003,11 @@ private:
         if (entry->upper_type.empty()) {
             co_return reply_error("device has no writable upper: " + id);
         }
-        if (entry->upper_type != "lsmt" && entry->upper_type != "hybrid") {
-            co_return reply_error("sparse uppers cannot be sealed: " + id);
-        }
+        if (entry->upper_type != "lsmt" && entry->upper_type != "sparse" &&
+            entry->upper_type != "hybrid")
+            co_return reply_error("unsupported writable upper type: " + entry->upper_type);
+        if (!output.empty() && entry->upper_type != "sparse")
+            co_return reply_error("commit output is supported only for sparse uppers");
         // ADR-0014 mode 3 boundary: a blank device the supervisor itself
         // was asked to format with host mkfs is never sealed. Host mkfs
         // output is non-deterministic (UUIDs, hash seeds, timestamps) and
@@ -2004,6 +2024,7 @@ private:
                 "non-deterministic upper cannot be sealed: " + id);
         }
         const std::string& upper = entry->upper_path;
+        std::string parent_uuid;
 
         co_await entry->op_mu.lock();
         SyncMutexGuard op_guard{entry->op_mu};
@@ -2012,6 +2033,15 @@ private:
             SyncMutexGuard registry_guard{mu_};
             if (entry->child->startup_protected())
                 co_return reply_error("startup owner retained; upper not sealed: " + id);
+            if (entry->upper_type == "sparse") {
+                const auto current = entry->child->status();
+                if (!entry->upper_parent_uuid || !current.upper_parent_uuid)
+                    co_return reply_error("sparse parent identity unavailable; upper not exported: " + id);
+                if (entry->upper_parent_conflict ||
+                    *entry->upper_parent_uuid != *current.upper_parent_uuid)
+                    co_return reply_error("sparse parent identity changed; upper not exported: " + id);
+                parent_uuid = *entry->upper_parent_uuid;
+            }
             // From this point commit is intentionally stopping the live
             // device. Pre-stop refusals above must leave crash recovery
             // enabled for the still-running child.
@@ -2040,6 +2070,15 @@ private:
                 co_return reply_error(
                     "device did not stop in time; upper not sealed: " + id);
             }
+        }
+
+        if (entry->upper_type == "sparse") {
+            const auto destination = output.empty() ? upper + ".lsmt" : output;
+            const auto exported = co_await format::SparseRwLayer::export_file(
+                upper, destination, parent_uuid, user_tag, virtual_size);
+            co_return reply_ok({{"id", id}, {"path", destination},
+                {"sha256", exported.sha256}, {"size", exported.size},
+                {"uuid", exported.uuid}, {"parent_uuid", parent_uuid}});
         }
 
         std::string sha256;

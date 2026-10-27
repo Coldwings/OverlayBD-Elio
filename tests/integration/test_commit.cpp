@@ -15,6 +15,8 @@
 // the real device.) No ublk/kernel facility is needed.
 #include "format/lsmt.hpp"
 #include "format/lsmt_rw.hpp"
+#include "format/sparse_rw.hpp"
+#include "format/writer.hpp"
 #include "supervisor/daemon.hpp"
 #include "supervisor/daemon_test_hooks.hpp"
 #include "supervisor/protocol.hpp"
@@ -39,6 +41,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -317,8 +320,7 @@ TEST_CASE("supervisor: commit stops the device and seals its upper offline",
             check(rpc_json({{"cmd", "hello"}}).value("ok", false) == true,
                   "daemon unusable after malformed commit commands");
 
-            // Three devices: lsmt upper (committable), sparse upper (never
-            // seals, upstream parity), no upper.
+            // LSMT seals in place; Sparse exports separately; no upper refuses.
             check(rpc_json({{"cmd", "create"},
                             {"id", "d1"},
                             {"config", cfg_lsmt}})
@@ -335,13 +337,26 @@ TEST_CASE("supervisor: commit stops the device and seals its upper offline",
                       .value("ok", false),
                   "create d3 failed");
 
+            // Commit uses captured source metadata, even after config edits.
+            test::write_file(cfg_sparse, std::vector<uint8_t>{'{', '}'});
             const auto sparse = rpc_json({{"cmd", "commit"}, {"id", "d2"}});
-            check(sparse.value("ok", true) == false,
-                  "commit on sparse upper not an error");
-            check(sparse.contains("error") &&
-                      sparse["error"].get<std::string>().find("sparse") !=
-                          std::string::npos,
-                  "sparse error text mismatch");
+            check(sparse.value("ok", false), "sparse export failed");
+            check(sparse.value("path", "") == upper_dir + "/overlaybd.sparse.lsmt",
+                  "sparse default output mismatch");
+            check(sparse.value("parent_uuid", "missing").empty(),
+                  "bottom sparse parent identity mismatch");
+            check(std::filesystem::file_size(upper_dir + "/overlaybd.sparse") ==
+                      kFakeVsize, "sparse source size changed");
+            const auto repeated = rpc_json({{"cmd", "commit"}, {"id", "d2"}});
+            check(repeated.value("ok", false) &&
+                      repeated.value("sha256", "") == sparse.value("sha256", "missing"),
+                  "identical sparse export retry failed");
+            const auto alternate = rpc_json({{"cmd", "commit"}, {"id", "d2"},
+                {"output", upper_dir + "/separate.lsmt"}});
+            check(alternate.value("ok", false) &&
+                      alternate.value("path", "") == upper_dir + "/separate.lsmt" &&
+                      alternate.value("sha256", "") == sparse.value("sha256", "missing"),
+                  "explicit sparse output changed bytes");
             const auto no_upper = rpc_json({{"cmd", "commit"}, {"id", "d3"}});
             check(no_upper.value("ok", true) == false,
                   "commit without upper not an error");
@@ -1134,6 +1149,9 @@ TEST_CASE("supervisor: rejected commits preserve crash recovery",
     const std::string cfg_plain = test::write_file(
         dir / "config-plain.json", std::vector<uint8_t>{'{', '}'});
 
+    // An old child cannot establish the parent identity required for export.
+    test::write_file(cfg_sparse + ".omit-parent-uuid", std::vector<uint8_t>{});
+
     auto mock = std::make_shared<MockMkfs>();
     auto guard = block_daemon_signals();
 
@@ -1244,7 +1262,7 @@ TEST_CASE("supervisor: rejected commits preserve crash recovery",
                           "destroy after recovery failed");
                 };
 
-            expect_refusal_keeps_recovery("sparse", "sparse");
+            expect_refusal_keeps_recovery("sparse", "parent identity unavailable");
             expect_refusal_keeps_recovery("plain", "no writable upper");
             expect_refusal_keeps_recovery("mode3", "host mkfs");
         });
@@ -1818,4 +1836,149 @@ TEST_CASE("supervisor: the reaper collects helpers a runner had to abandon",
                   "abandoned helper was not reaped by the daemon");
         });
     REQUIRE(failures == 0);
+}
+
+TEST_CASE("supervisor: sparse export preserves the opened parent and reusable source",
+          "[supervisor][sparse-export]") {
+    int recovery = 0;
+    SECTION("graceful stop") {}
+    SECTION("recovery with unchanged parent") { recovery = 1; }
+    SECTION("recovery with changed parent refuses before stop") { recovery = 2; }
+    test::TempDir dir;
+    const auto sock = dir / "supervisor.sock";
+    const auto upper_dir = dir / "upper";
+    const auto output = dir / "delta.lsmt";
+    const auto parent_path = dir / "parent.lsmt";
+    const std::string parent_uuid = "01234567-89ab-cdef-0123-456789abcdef";
+    const auto parent_bytes = test::pattern_bytes(kFakeVsize, 1615);
+    const auto raw_path = test::write_file(dir / "parent.raw", parent_bytes);
+    const auto alternate_parent = dir / "alternate.lsmt";
+    const int fd = ::open(raw_path.c_str(), O_RDONLY | O_CLOEXEC);
+    REQUIRE(fd >= 0);
+    format::LsmtWriteOptions options;
+    options.uuid = parent_uuid;
+    try {
+        format::write_lsmt_single_layer(fd, parent_bytes.size(), parent_path, options);
+        if (recovery == 2) {
+            options.uuid = "fedcba98-7654-3210-fedc-ba9876543210";
+            format::write_lsmt_single_layer(fd, parent_bytes.size(), alternate_parent, options);
+        }
+    }
+    catch (...) { ::close(fd); throw; }
+    REQUIRE(::close(fd) == 0);
+    const auto config = write_config(dir, "image.json", {
+        {"lowers", nlohmann::json::array({{{"file", parent_path}}})},
+        {"upper", {{"dir", upper_dir}, {"type", "sparse"}}}});
+    auto guard = block_daemon_signals();
+    auto daemon_config = commit_test_cfg(sock);
+    daemon_config.max_recovery_attempts = 1;
+    const int failures = run_daemon_case(daemon_config,
+        [&](const std::string& socket, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(socket); ++i)
+                std::this_thread::sleep_for(20ms);
+            if (!std::filesystem::exists(socket)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc = [&](const nlohmann::json& command) {
+                return nlohmann::json::parse(uds_rpc(socket, command.dump() + "\n"));
+            };
+            const auto created = rpc({{"cmd", "create"}, {"id", "sparse-parent"},
+                                      {"config", config}});
+            check(created.value("ok", false), "parent-backed sparse create failed");
+            if (!created.value("ok", false)) return;
+            if (recovery != 0) {
+                if (recovery == 2) {
+                    write_config(dir, "image.json", {
+                        {"lowers", nlohmann::json::array({{{"file", alternate_parent}}})},
+                        {"upper", {{"dir", upper_dir}, {"type", "sparse"}}}});
+                }
+                const auto before = rpc({{"cmd", "status"}, {"id", "sparse-parent"}});
+                const auto pid = before.value("pid", -1);
+                check(pid > 0 && before.value("state", "") == "ready",
+                      "fixture child not ready before recovery");
+                if (pid <= 0 || before.value("state", "") != "ready") return;
+                // This PID comes from the still-running test-owned daemon child.
+                if (::kill(pid, SIGKILL) != 0) {
+                    check(false, "cannot terminate fixture child for recovery");
+                    return;
+                }
+                nlohmann::json recovered;
+                bool ready = false;
+                for (int i = 0; i < 250; ++i) {
+                    recovered = rpc({{"cmd", "status"}, {"id", "sparse-parent"}});
+                    if (recovered.value("recoveries", 0) == 1 &&
+                        recovered.value("pid", pid) != pid &&
+                        recovered.value("state", "") == "ready") {
+                        ready = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(20ms);
+                }
+                check(ready, "sparse fixture did not recover");
+                if (!ready) return;
+                if (recovery == 2) {
+                    const auto refused = rpc({{"cmd", "commit"}, {"id", "sparse-parent"},
+                                               {"output", output}});
+                    check(!refused.value("ok", true) &&
+                          refused.value("error", "").find("parent identity changed") != std::string::npos,
+                          "changed parent was not refused");
+                    const auto after = rpc({{"cmd", "status"}, {"id", "sparse-parent"}});
+                    check(after.value("state", "") == "ready" &&
+                          after.value("pid", -1) == recovered.value("pid", -2) &&
+                          after.value("recoveries", 0) == 1,
+                          "parent refusal stopped or replaced recovered device");
+                    check(!std::filesystem::exists(output), "refused export published output");
+                    check(rpc({{"cmd", "destroy"}, {"id", "sparse-parent"}}).value("ok", false),
+                          "cannot clean up recovered fixture");
+                    return;
+                }
+            }
+            // A changed config cannot rewrite the already opened parent identity.
+            test::write_file(config, std::vector<uint8_t>{'{', '}'});
+            const auto exported = rpc({{"cmd", "commit"}, {"id", "sparse-parent"},
+                {"output", output}, {"virtual_size", kFakeVsize * 2}});
+            check(exported.value("ok", false), "parent-backed sparse export failed");
+            check(exported.value("parent_uuid", "") == parent_uuid,
+                  "export parent did not match opened image");
+            const auto status = rpc({{"cmd", "status"}, {"id", "sparse-parent"}});
+            check(status.value("state", "") == "exited", "export left source child alive");
+        });
+    REQUIRE(failures == 0);
+    if (recovery == 2) {
+        REQUIRE_FALSE(std::filesystem::exists(output));
+        return;
+    }
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto blob = co_await source::LocalFileSource::open(output);
+        auto delta = co_await format::LsmtLayer::open(std::move(blob));
+        REQUIRE(delta->header().parent_uuid == parent_uuid);
+        REQUIRE(delta->virtual_size() == kFakeVsize * 2);
+        // Expanded capacity must not acquire ownership of inherited sectors.
+        for (const auto& segment : delta->segments())
+            REQUIRE(segment.end() <= (kFakePayloadBytes + 512) / 512);
+        auto parent_blob = co_await source::LocalFileSource::open(parent_path);
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(co_await format::LsmtLayer::open(std::move(parent_blob)));
+        layers.push_back(std::move(delta));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        auto expected = parent_bytes;
+        const auto payload = test::pattern_bytes(kFakePayloadBytes, kFakePayloadSeed);
+        std::copy(payload.begin(), payload.end(), expected.begin());
+        std::fill_n(expected.begin() + kFakePayloadBytes, 512, 0);
+        expected.resize(kFakeVsize * 2, 0);
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        auto source = co_await format::SparseRwLayer::open_existing(
+            upper_dir + "/overlaybd.sparse");
+        REQUIRE(source->virtual_size() == kFakeVsize);
+        const auto written = co_await source->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(written == static_cast<ssize_t>(payload.size()));
+        const int flushed = co_await source->flush();
+        REQUIRE(flushed == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
 }

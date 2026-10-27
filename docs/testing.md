@@ -1425,6 +1425,26 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   forwarded, not refused. The test server's accept is bounded, so a CLI
   that wrongly rejects an argument fails the assertion instead of hanging
   the job (#11).
+- `cli: obd-convert metadata tail preserves the complete filesystem` — compares
+  actual logical-order and metadata-tail conversion, complete logical bytes and
+  repeat determinism. It wraps the actual reordered LSMT artifact in LZ4 and
+  ZSTD ZFiles with 64 KiB blocks and verifies complete decompressed logical
+  readback with checksum verification. Enabled libe2fs builds check structural block placement,
+  including an external symlink block; dependency-free builds check fallback.
+- `cli: obd-convert metadata tail preserves an empty filesystem` — converts
+  a root-directory-only tar with both layouts, checks complete logical-byte equality and the
+  empty root directory, and exercises either metadata placement or the
+  dependency-free fallback when no ordinary file payload exists.
+- `convert: finalized ext2 classification preserves hardlinks and external xattrs`
+  — modifies a converter-produced ordinary filesystem file through libe2fs,
+  closes it, and checks classification, packed logical bytes, inode sharing,
+  external xattrs, repeat determinism and read-only classification. It also
+  deletes a regular file and explicitly reallocates its former DATA block as
+  directory storage, checking the classification changes to metadata. Runs
+  `e2fsck -fn` when available and emits a warning when that independent check is
+  unavailable. Wrong geometry and unsupported features must return an empty
+  fallback plan without changing the input. These correctness checks do not
+  establish startup performance improvements.
 - `cli: obd-convert builds a deterministic ext2 layer from tar` — the REAL
   converter binary consumes the same rootfs tar from a file and from stdin with
   `--backend builtin-ext2`, emits byte-identical sealed LSMT layers, reports
@@ -1583,8 +1603,9 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   (`tests/fake_device_main.cpp`) that, like the real device, checkpoints
   its LSMT-RW upper only on SIGTERM — so a commit that sealed without
   stopping the device first could not succeed (stop-then-seal is pinned,
-  not just narrated): commit on unknown id, sparse upper, and upper-less
-  devices fails with precise errors; malformed field types (non-string
+  not just narrated): commit on unknown id and upper-less devices fails with
+  precise errors; Sparse commit exports a separate artifact with deterministic
+  retry and explicit-output coverage. Malformed field types (non-string
   `id`/`user_tag`) are answered as protocol errors and the daemon keeps
   serving; editing the config file after create
   does not redirect commit (upper path provenance); commit on a live
@@ -1592,6 +1613,14 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   upper, replying `path`/`sha256`/`size`; a second commit fails with
   "already sealed"; the sealed file re-opens as a valid LSMT RO layer
   with the fake's payload (ADR-0014). Runs without privileges.
+- `supervisor: sparse export preserves the opened parent and reusable source` —
+  real parent-backed image assembly and a simulated device child exercise
+  graceful stop, recovery with the same parent, and rejection after a changed
+  parent. Checks refusal before stop, full nonzero-parent DATA/ZERO/INHERIT
+  readback, output-only growth and source reuse. No ublk device is required.
+- `cli: obdctl commit forwards sparse export destination and geometry` —
+  executes the CLI against a test-owned socket and validates the JSON fields,
+  path containing spaces, default omission and failure exit codes.
 - `supervisor: successful commit disables recovery respawn` — with
   `max_recovery_attempts` positive, a successful commit leaves the stopped
   child exited with the original PID and zero recoveries instead of

@@ -93,15 +93,16 @@ command (`src/supervisor/daemon.cpp`):
 
 - **hello**: `{"ok":true,"protocol":<int>,"version":"<project version>",
   "features":[...]}` — the handshake. `protocol` is the control-protocol
-  revision (`kProtocolVersion`, currently 5; 1 = initial command set,
+  revision (`kProtocolVersion`, currently 6; 1 = initial command set,
   2 = added `commit`, 3 = added `trace_start`/`trace_stop` and the
   additive `trace` status field, 4 = added `resize` and the
   `virtual_size` create/commit fields (D3) and the `blank` create mode
-  (ADR-0014), 5 = retained startup ownership (ADR-0022)); `version` is the
+  (ADR-0014), 5 = retained startup ownership (ADR-0022),
+  6 = Sparse export and parent identity (ADR-0027)); `version` is the
   project version string wired from CMake
   (`kProjectVersion`); `features` is a JSON array of strings — the
   capability gate for optional commands, currently
-  `["commit","trace","resize","blank","startup_owner","hybrid_upper"]`.
+  `["commit","trace","resize","blank","startup_owner","hybrid_upper","sparse_export"]`.
 - **create**: `{"ok":true,"id","pid","device"}` — `device` is the child's
   reported `/dev/ublkb<N>`. With an optional `virtual_size` (bytes > 0)
   the device is created with that capacity instead of the image's
@@ -173,7 +174,9 @@ is being sealed. Contract:
   create time** — provenance. A later edit of the config file does not
   redirect commit; if the config could not be parsed at create, commit
   reports "image config unreadable at create; upper unknown". The
-  device-status protocol is unchanged.
+  ready status additionally reports `upper_parent_uuid`: empty means no parent,
+  while an omitted field means unknown. Sparse export requires the current
+  child and all observed ready generations to agree on this identity.
 - **The shutdown checkpoint.** An unsealed LSMT-RW file's segment index is
   memory-only (docs/format.md); a graceful obd-device shutdown therefore
   **checkpoints** the index into the file (unsealed trailer) before
@@ -205,13 +208,29 @@ is being sealed. Contract:
   compaction, so the upper stays committable at its declared size.
 - **Errors** (via the `{"ok":false,"error"}` envelope, precise reasons):
   unknown id ("no such device"), a config without `upper` ("no writable
-  upper"), a sparse upper ("sparse uppers cannot be sealed" — upstream
-  parity, ADR-0014), a concurrent commit ("commit already in progress"),
+  upper"), unavailable or changed Sparse parent identity, a concurrent commit ("commit already in progress"),
   a destroy already in progress ("device is being destroyed"), a config
   unreadable at create time, a missing upper file, an already-sealed
   upper, a missing or invalid shutdown checkpoint (device crashed), a
   rejected `virtual_size` re-baseline (grow-only or misaligned), and
   stop-timeout.
+
+The integration case `supervisor: sparse export preserves the opened parent and reusable source`
+uses the real image assembly and a simulated device child, a nonzero parent,
+DATA/ZERO/INHERIT readback, changed config, and output-only capacity expansion.
+It exercises the control socket and stop/reap path without a kernel ublk device.
+
+Sparse uppers use the separate export path described by ADR-0027.
+After stopping and reaping the child, commit recovers exact ownership and writes
+an ordinary sealed LSMT delta to `<upper.dir>/overlaybd.sparse.lsmt`, or to the
+explicit `output` path (`obdctl commit ID --output PATH`). DATA is copied, ZERO
+is encoded, and INHERIT is omitted. The source remains reusable. Identical
+retries succeed; conflicting existing output fails without replacement.
+`virtual_size` grows only the exported geometry, leaving source capacity intact.
+Sparse parent identity comes from the child's actual opened top data layer,
+not a later reread of the config. Missing or inconsistent identity refuses
+commit before stopping the device. Protocol version 6 advertises `sparse_export`.
+LSMT in-place commit does not accept `output`.
 
 ### Online resize (D3, ADR-0014 dev_size model)
 
@@ -671,7 +690,7 @@ exception behavior are specified under "Daemon shutdown" below.
 - `std::string reply_hello()` — the `hello` handshake reply via the
   `reply_ok` envelope: `protocol` (`kProtocolVersion`), `version`
   (`kProjectVersion`), and `features` (a JSON array of capability strings,
-  currently `["commit","trace","resize","blank","startup_owner","hybrid_upper"]`).
+  currently `["commit","trace","resize","blank","startup_owner","hybrid_upper","sparse_export"]`).
 - `inline constexpr int kStartupOwnerVersion = 1` — private startup capability.
 - `struct StartupOwnerStatus` — the generation, revision, phase, device ID,
   reason, control/raw-debt and release fields specified above.
@@ -813,8 +832,8 @@ additionally validates the blank spec (size + optional mkfs, see
 `parse_blank_spec`) and, when mode 3 is requested, runs the mkfs runner
 against the ready device's block path before replying;
 `destroy`/`status`/`commit` reject unknown ids with `{"ok":false,"error":"no such
-device: <id>"}`; `commit` additionally rejects upper-less and sparse-upper
-devices and stops a live device before sealing (see "Offline commit").
+device: <id>"}`; `commit` additionally rejects upper-less devices and stops a live device
+before sealing or exporting (see "Offline commit").
 Blank-born devices commit exactly like image-born ones: their upper path
 and kind are recorded at create time (from the workspace layout, no config
 pre-parse needed).
@@ -1286,7 +1305,8 @@ the normal lifecycle, then invokes `HybridRwLayer::seal_file`. The success reply
 reports the data artifact path, full SHA-256 and sealed byte size. An optional
 virtual-size override is grow-only; missing artifacts, an owned pair, invalid
 metadata and already-sealed output report errors without creating a new pair.
-The existing sparse refusal and host-mkfs provenance restriction still apply.
+Sparse commit continues to export a separate LSMT delta (ADR-0027). The
+host-mkfs provenance restriction still applies to both LSMT and Hybrid blanks.
 Blank-device Hybrid selection uses `blank.upper_type = "hybrid"`; the CLI
 requires the advertised `hybrid_upper` capability before sending that request.
 

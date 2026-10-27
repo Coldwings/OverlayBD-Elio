@@ -199,8 +199,8 @@ is checked. For LSMT/Hybrid, the sealed output is then reopened through the
 ordinary LSMT reader and checked across every populated byte plus sampled writes
 outside that region. This additional readback is outside seal timing and reported
 separately; process CPU/RSS include verification. Uncheckpointed LSMT has no equivalent resumable writable reopen, so
-that field is null, with an explanation. Sparse seal remains null until its
-separate export feature is implemented; it is not reported as a zero-cost seal.
+that field is null, with an explanation. This driver does not time the separate
+sparse export API (ADR-0027), so its seal field is null rather than zero.
 
 The report includes per-file logical/allocated sizes after each random phase,
 reopen time, live-seal time, and peak allocated space sampled every 10 ms during
@@ -224,7 +224,9 @@ were 78–102 ms; the copying LSMT seal grew from approximately 6.4 seconds at
 durability contracts, not portable performance guarantees. Sparse export was
 not implemented in this frozen comparison. QD16 does not establish multicore
 scaling, and these ordinary-file measurements do not validate kernel or
-supervisor crash recovery.
+supervisor crash recovery. This frozen matrix predates the managed terminal
+seal marker and its additional synchronization; its seal timings are historical
+evidence, not measurements of the current implementation.
 
 ## Hybrid log scaling and compaction cadence
 
@@ -246,3 +248,10 @@ directly; its heavily observed wall time is not a throughput benchmark.
 Fixture construction happens outside replay timing. Output files are retained,
 and existing directories are refused. Build and run serially with the other
 benchmarks and preserve source/binary hashes with the resulting report.
+
+## Native converter metadata placement
+
+See [metadata layout measurements](metadata-layout.md) for the controlled
+conversion/startup study and its [numeric results](metadata-layout-results.json).
+These use production image assembly and inline structural warm-up, unlike the
+local-source fio controls above. They do not change the default layout.

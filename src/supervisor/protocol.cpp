@@ -127,6 +127,12 @@ std::optional<nlohmann::json> parse_command(std::string_view line,
             error = "commit 'user_tag' must be a string";
             return std::nullopt;
         }
+        if (j.contains("output") && (!j["output"].is_string() ||
+            j["output"].get<std::string>().empty() ||
+            j["output"].get<std::string>().find('\0') != std::string::npos)) {
+            error = "commit output must be a nonempty pathname";
+            return std::nullopt;
+        }
         // D3 commit re-baseline: optional 'virtual_size' override in
         // bytes (0 = absent). Semantic rules (positive, 512-aligned,
         // grow-only vs the layer's declared size and content extent)
@@ -274,7 +280,7 @@ std::string reply_hello() {
     // grow-only online resize command is served; "blank" = create
     // accepts the ADR-0014 blank (raw) device modes 2/3.
     fields["features"] =
-        nlohmann::json::array({"commit", "trace", "resize", "blank", "startup_owner", "hybrid_upper"});
+        nlohmann::json::array({"commit", "trace", "resize", "blank", "startup_owner", "hybrid_upper", "sparse_export"});
     return reply_ok(fields);
 }
 
@@ -400,6 +406,12 @@ std::optional<DeviceStatus> parse_device_status(std::string_view line) {
         st.state = j["state"].get<std::string>();
         st.device = j.value("device", "");
         st.error = j.value("error", "");
+        if (j.contains("upper_parent_uuid")) {
+            if (!j["upper_parent_uuid"].is_string()) return std::nullopt;
+            st.upper_parent_uuid = j["upper_parent_uuid"].get<std::string>();
+            if (st.upper_parent_uuid->size() > 36 ||
+                st.upper_parent_uuid->find('\0') != std::string::npos) return std::nullopt;
+        }
         if (j.contains("startup_owner")) {
             st.startup_owner = parse_startup_owner(j["startup_owner"]);
             if (!st.startup_owner) return std::nullopt;
@@ -416,6 +428,7 @@ std::string make_device_status(const DeviceStatus& st) {
     if (!st.device.empty()) j["device"] = st.device;
     if (!st.error.empty()) j["error"] = st.error;
     if (st.startup_owner) j["startup_owner"] = startup_owner_json(*st.startup_owner);
+    if (st.upper_parent_uuid) j["upper_parent_uuid"] = *st.upper_parent_uuid;
     return j.dump() + "\n";
 }
 

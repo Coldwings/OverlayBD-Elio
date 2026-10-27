@@ -57,7 +57,8 @@ inline constexpr size_t kMaxMessageBytes = 64 * 1024;
 ///   5 — retained startup owners and explicit release (ADR-0022; feature
 ///       "startup_owner"). The private child channel requires a start grant
 ///       before the child may acquire ublk command obligations.
-inline constexpr int kProtocolVersion = 5;
+///   6 — sparse delta commit, optional commit output, and child upper parent UUID.
+inline constexpr int kProtocolVersion = 6;
 
 /// Project version string, wired from CMake `project(... VERSION ...)` so
 /// it cannot drift; "dev" is the fallback for non-CMake builds.
@@ -135,6 +136,7 @@ struct CommitCommand {  // commit (ADR-0014: offline seal of the upper)
     /// layer's declared size and its content extent (validated in the
     /// seal path).
     uint64_t virtual_size = 0;
+    std::string output;  // optional separate sparse delta destination
 };
 
 // Trace recording (ADR-0013 record path): wire shapes.
@@ -241,6 +243,7 @@ struct DeviceStatus {
     std::string device;  // /dev/ublkb<N> when ready
     std::string error;   // when failed
     std::optional<StartupOwnerStatus> startup_owner = std::nullopt;
+    std::optional<std::string> upper_parent_uuid = std::nullopt; // ready: empty means no parent
 };
 
 /// Parses a status line from a device child; nullopt on malformed input.

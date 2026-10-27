@@ -524,7 +524,8 @@ elio::coro::task<int> device_main(Args args) {
 
         serving.store(true);
         report(channel, DeviceStatus{"ready", dev->bdev_path(), "",
-                                     startup_status(startup.snapshot())});
+                                     startup_status(startup.snapshot()),
+                                     opened.writable ? std::optional{opened.upper_parent_uuid} : std::nullopt});
         while (!shutdown_requested.load()) {
             co_await elio::time::sleep_for(std::chrono::milliseconds(50));
         }

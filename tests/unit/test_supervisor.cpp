@@ -141,6 +141,8 @@ TEST_CASE("supervisor: hello handshake replies with protocol version and feature
     REQUIRE(reply["features"].is_array());
     REQUIRE(std::find(reply["features"].begin(), reply["features"].end(),
                       nlohmann::json("hybrid_upper")) != reply["features"].end());
+    REQUIRE(std::find(reply["features"].begin(), reply["features"].end(),
+                      nlohmann::json("sparse_export")) != reply["features"].end());
 
     // Bad input is still answered, never dropped: unknown cmd and malformed
     // JSON are rejected with a reason the daemon can reply with.
@@ -224,6 +226,16 @@ TEST_CASE("supervisor: commit command parses and validates its fields",
                 R"({"cmd":"commit","id":"a","user_tag":42})", err)
                  .has_value());
     REQUIRE(err.find("user_tag") != std::string::npos);
+
+    REQUIRE(supervisor::parse_command(
+        R"({"cmd":"commit","id":"a","output":"delta.lsmt"})", err));
+    for (const auto* invalid : {
+        R"({"cmd":"commit","id":"a","output":42})",
+        R"({"cmd":"commit","id":"a","output":""})",
+        R"({"cmd":"commit","id":"a","output":"bad\u0000path"})"}) {
+        REQUIRE_FALSE(supervisor::parse_command(invalid, err));
+        REQUIRE(err.find("output") != std::string::npos);
+    }
 
     // The hello handshake advertises the capability gate for commit —
     // including the protocol version field itself (clients gate on both).
@@ -962,4 +974,25 @@ TEST_CASE("supervisor: blank upper type is explicit and validated", "[supervisor
             nlohmann::json{{"size", 32768}, {"upper_type", invalid}}, error));
         REQUIRE(error.find("upper_type") != std::string::npos);
     }
+}
+
+TEST_CASE("supervisor: ready parent identity distinguishes missing and bottom layers",
+          "[supervisor]") {
+    const auto legacy = supervisor::parse_device_status(R"({"state":"ready"})");
+    REQUIRE(legacy);
+    REQUIRE_FALSE(legacy->upper_parent_uuid);
+    supervisor::DeviceStatus bottom{"ready", "/dev/ublkb70", ""};
+    bottom.upper_parent_uuid = "";
+    const auto restored = supervisor::parse_device_status(supervisor::make_device_status(bottom));
+    REQUIRE(restored);
+    REQUIRE(restored->upper_parent_uuid);
+    REQUIRE(restored->upper_parent_uuid->empty());
+    bottom.upper_parent_uuid = "01234567-89ab-cdef-0123-456789abcdef";
+    const auto parent = supervisor::parse_device_status(supervisor::make_device_status(bottom));
+    REQUIRE(parent);
+    REQUIRE(parent->upper_parent_uuid == bottom.upper_parent_uuid);
+    REQUIRE_FALSE(supervisor::parse_device_status(
+        R"({"state":"ready","upper_parent_uuid":42})"));
+    REQUIRE_FALSE(supervisor::parse_device_status(
+        R"({"state":"ready","upper_parent_uuid":"bad\u0000parent"})"));
 }

@@ -74,6 +74,7 @@ struct OpenedImage {
     size_t layer_count = 0;      // data layers (trace layer excluded)
     bool writable = false;       // root is a WritableBlobSource (ADR-0008)
     std::string upper_path;      // the writable layer file, when writable
+    std::string upper_parent_uuid; // UUID of actual immediate data lower when writable
     TraceReplayStats trace;      // ADR-0013 replay outcome (all zero when
                                  // no acceleration layer was configured)
     StructuralWarmupStats warmup;  // ADR-0012 structural warm-up outcome

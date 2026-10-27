@@ -31,7 +31,7 @@ void usage(const char* argv0) {
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
-                 "  %s [--socket PATH] commit <id> [--tag TAG] [--virtual-size BYTES]\n"
+                 "  %s [--socket PATH] commit <id> [--tag TAG] [--virtual-size BYTES] [--output PATH]\n"
                  "  %s [--socket PATH] trace_start <id> <output.trace> [--duration SEC]\n"
                  "  %s [--socket PATH] trace_stop <id>\n"
                  "  %s [--socket PATH] resize <id> <size-bytes>\n",
@@ -215,6 +215,7 @@ int main(int argc, char** argv) {
         while (i < argc) {
             const std::string a = argv[i++];
             if (a == "--tag" && i < argc) req["user_tag"] = argv[i++];
+            else if (a == "--output" && i < argc) req["output"] = argv[i++];
             else if (a == "--virtual-size" && i < argc) {
                 // D3 commit re-baseline override (bytes): full strtoull
                 // validation; grow-only/alignment semantics are decided

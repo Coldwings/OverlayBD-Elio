@@ -5,6 +5,7 @@
 #include "common/errors.hpp"
 #include "common/sha256.hpp"
 #include "format/writer.hpp"
+#include "ext2_layout.hpp"
 #include "turbo_import.hpp"
 #include "turbo_layered.hpp"
 #include "format/lsmt_format.hpp"
@@ -321,6 +322,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --input <rootfs.tar|-> --out-dir <dir> [--name base]\n"
                  "          [--backend builtin-ext2|libe2fs] [--size bytes] [--keep-raw]\n"
+                 "          [--lsmt-layout logical|metadata-tail] (native conversion only)\n"
                  "          [--turboOCI] (local tar or gzip, libe2fs required)\n"
                  "          [--import-turboOCI package --descriptor descriptor.json [--parent-config config.json]]\n"
                  "          [--max-import-metadata-size bytes (default 1073741824)]\n"
@@ -1693,6 +1695,8 @@ struct Options {
 #endif
     uint64_t size = 0;
     bool keep_raw = false;
+    bool metadata_tail = false;
+    bool layout_explicit = false;
     bool turbo_oci = false;
 };
 
@@ -1723,6 +1727,13 @@ Options parse_args(int argc, char** argv) {
             else if (value == "libe2fs") opts.backend = ConverterBackend::LibE2fs;
             else throw UsageError("--backend must be builtin-ext2 or libe2fs");
         }
+        else if (a == "--lsmt-layout") {
+            const auto value = next("--lsmt-layout");
+            if (value != "logical" && value != "metadata-tail")
+                throw UsageError("--lsmt-layout must be logical or metadata-tail");
+            opts.metadata_tail = value == "metadata-tail";
+            opts.layout_explicit = true;
+        }
         else if (a == "--size") opts.size = parse_size_arg(next("--size"), "--size");
         else if (a == "--keep-raw") opts.keep_raw = true;
         else if (a == "--turboOCI") opts.turbo_oci = true;
@@ -1738,6 +1749,8 @@ Options parse_args(int argc, char** argv) {
         std::exit(2);
     }
     validate_output_name(opts.name);
+    if (opts.layout_explicit && (opts.turbo_oci || !opts.import_package.empty()))
+        throw UsageError("--lsmt-layout applies only to native conversion");
     if (opts.inputs.size() > 1 && (!opts.turbo_oci || !opts.import_package.empty()))
         throw UsageError("repeated --input requires --turboOCI conversion");
     if (!opts.import_package.empty()) {
@@ -1809,6 +1822,19 @@ int main(int argc, char** argv) {
         obd::format::LsmtWriteOptions lopts;
         lopts.uuid = uuid_from_digest(raw_digest);
         lopts.user_tag = std::string("obd-convert ") + std::string(backend_name(opts.backend));
+        if (opts.metadata_tail) {
+            auto layout = obd::convert::classify_ext2_layout(raw_path, raw_size);
+            if (layout.supported) {
+                std::fprintf(stderr,
+                    "LSMT metadata-tail: data_blocks=%llu metadata_blocks=%llu free_blocks=%llu\n",
+                    static_cast<unsigned long long>(layout.data_blocks),
+                    static_cast<unsigned long long>(layout.metadata_blocks),
+                    static_cast<unsigned long long>(layout.free_blocks));
+                lopts.tail_ranges = std::move(layout.metadata);
+            } else {
+                std::fprintf(stderr, "LSMT logical layout fallback: %s\n", layout.reason.c_str());
+            }
+        }
         obd::format::write_lsmt_single_layer(raw_fd, raw_size, lsmt_tmp_path, lopts);
         raw.reset();
         fsync_file(lsmt_tmp_path, "LSMT layer");

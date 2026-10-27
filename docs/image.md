@@ -303,7 +303,10 @@ mode:
   virtual sizes); writes land in the upper, reads fall through (copy-on-write
   — the lowers are never modified);
 - the root then implements `WritableBlobSource`, and `OpenedImage` reports
-  `writable = true` plus the `upper_path`;
+  `writable = true` plus the `upper_path` and `upper_parent_uuid`. The UUID
+  comes from the actual top data lower before moving layers into the merged
+  root; an acceleration layer is excluded. Empty means no data parent. The
+  device reports this identity for Sparse export admission (ADR-0027);
 - `"hybrid"` → `<dir>/overlaybd.hybrid/{data,index}` (ADR-0026). Assembly
   creates an absent pair directory atomically or reopens the persisted pair;
   it never recreates individual missing files. A larger persisted capacity is
@@ -482,6 +485,7 @@ struct OpenedImage {
     size_t layer_count = 0;       // data layers (trace layer excluded)
     bool writable = false;
     std::string upper_path;
+    std::string upper_parent_uuid; // actual immediate data lower (ADR-0027)
     TraceReplayStats trace;       // ADR-0013 replay outcome
     StructuralWarmupStats warmup; // ADR-0012 structural warm-up outcome
     std::vector<source::LayerStore*> layer_stores;  // non-owning
