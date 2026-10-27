@@ -10,6 +10,13 @@
 
 namespace obd::format::hybrid {
 
+#ifdef OBD_TEST_HOOKS
+// 1=data header synced, 2=index header synced, 3=staging directory synced,
+// 4=log state activated, 5=pair renamed, 6=parent directory synced.
+// Inject EIO or immediate process exit (90 + stage); reset with -1.
+void creation_fault_for_test(int stage, bool exit_process = false);
+#endif
+
 class FilePair {
 public:
     ~FilePair();
@@ -25,7 +32,9 @@ public:
         std::string data_path, std::string index_path, bool writable = false);
 
     /// Atomically publishes a new directory containing data and index. The
-    /// parent directory must exist; an existing destination is never replaced.
+    /// parent directory and its ancestor names must already be durable; an
+    /// existing destination is never replaced. Image assembly establishes
+    /// that workspace durability before calling this API.
     static elio::coro::task<std::unique_ptr<FilePair>> create(
         std::string directory, uint64_t virtual_size);
 

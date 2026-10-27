@@ -368,6 +368,90 @@ TEST_CASE("image: TurboOCI assembly retains original tar byte offsets", "[image]
     REQUIRE(rc == 0);
 }
 
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("image: hybrid workspace ancestor sync failures are retried before publication",
+          "[image][hybrid]") {
+    for (bool blank : {false, true}) {
+        DYNAMIC_SECTION("blank=" << blank) {
+            TempDir temporary;
+            const std::string workspace = temporary / "new/upper";
+            struct Probe {
+                std::string ancestor;
+                bool fail = true;
+                unsigned visits = 0;
+            } probe{temporary / "new"};
+            image::test_hooks::WorkspaceSyncHook hook{
+                [](int fd, void* context) -> int {
+                    auto& p = *static_cast<Probe*>(context);
+                    struct stat actual{}, target{};
+                    if (::fstat(fd, &actual) != 0 || ::stat(p.ancestor.c_str(), &target) != 0)
+                        return errno;
+                    if (actual.st_dev != target.st_dev || actual.st_ino != target.st_ino)
+                        return 0;
+                    ++p.visits;
+                    return p.fail ? EIO : 0;
+                }, &probe};
+            struct ResetHook {
+                ~ResetHook() { image::test_hooks::set_workspace_sync_hook_for_test(nullptr); }
+            } reset;
+            image::test_hooks::set_workspace_sync_hook_for_test(&hook);
+            const auto fixture = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                                 "fixtures/hybrid/overlaybd/sealed.data";
+            const auto cfg = image::ImageConfig::from_json_text(nlohmann::json{
+                {"lowers", {{{"file", fixture.string()}}}},
+                {"upper", {{"dir", workspace}, {"type", "hybrid"}}}}.dump(), {});
+            image::GlobalConfig global;
+            global.prefetch_enable = false;
+            image::BlankDeviceSpec spec;
+            spec.upper_type = "hybrid";
+            spec.dir = workspace;
+            spec.size = 32768;
+            auto open = [&]() -> elio::coro::task<image::OpenedImage> {
+                if (blank) co_return co_await image::open_blank_device(spec);
+                co_return co_await image::open_image(cfg, global);
+            };
+            const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+                // The first failure leaves the directories behind. Existing
+                // names on retry must not bypass the unsatisfied durability.
+                for (unsigned attempt = 1; attempt <= 2; ++attempt) {
+                    int failure = 0;
+                    try { (void)co_await open(); }
+                    catch (const error& e) { failure = e.errno_value(); }
+                    REQUIRE(failure == EIO);
+                    REQUIRE(probe.visits == attempt);
+                    REQUIRE(std::filesystem::is_directory(workspace));
+                    REQUIRE_FALSE(std::filesystem::exists(workspace + "/overlaybd.hybrid"));
+                }
+                probe.fail = false;
+                auto opened = co_await open();
+                REQUIRE(probe.visits == 3);
+                auto* writable = dynamic_cast<format::MergedWritable*>(opened.root.get());
+                REQUIRE(writable != nullptr);
+                std::vector<uint8_t> payload(512, 0x79), actual(512);
+                const auto written = co_await writable->pwrite(payload.data(), payload.size(), 0);
+                REQUIRE(written == 512);
+                const int flushed = co_await writable->flush();
+                REQUIRE(flushed == 0);
+                opened.root.reset();
+                probe.fail = true;
+                int failure = 0;
+                try { (void)co_await open(); }
+                catch (const error& e) { failure = e.errno_value(); }
+                REQUIRE(failure == EIO);
+                REQUIRE(probe.visits == 4);
+                probe.fail = false;
+                opened = co_await open();
+                const auto read = co_await opened.root->pread(actual.data(), actual.size(), 0);
+                REQUIRE(read == 512);
+                REQUIRE(actual == payload);
+                co_return 0;
+            });
+            REQUIRE(rc == 0);
+        }
+    }
+}
+#endif
+
 TEST_CASE("image: hybrid assembly reopens durable upper and refuses incomplete pairs",
           "[image][hybrid]") {
     TempDir temporary;

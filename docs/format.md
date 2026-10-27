@@ -419,11 +419,21 @@ owned staging directory; after publication, a parent-sync error retains the
 complete pair and reports failure. Recovery after process exit and publication
 faults must be tested separately from successful creation.
 
+Deterministic creation tests inject returned errors and separate-process exits
+after each header sync, staging-directory sync, log-state activation, publication
+rename and parent-directory sync. Before rename, returned errors clean up only
+the owned staging directory; an abrupt exit can leave an unreferenced
+`.hybrid-init-*` directory. Retry creates a new pair without adopting or deleting
+that abandoned private directory. After rename, retry reopens the complete pair
+and settles its parent-directory sync. These tests exercise publication and
+retry control flow, not physical power-loss behavior.
+
 `hybrid::Writer` owns an exclusively opened pair. Its asynchronous operation
 mutex serializes direct reads, writes, discard and FLUSH. DATA rewrites reuse
 current-upper physical ranges without appending mapping records. New ownership
 and ZERO-to-DATA transitions prepare the replacement in-memory index first,
-write payload, sync the data file and then append the mapping record. The
+complete payload writes and then append the mapping record without a per-request
+data sync. The
 replacement becomes visible only after the complete record write. Discard
 retains existing exclusive backing or writes a fresh zero allocation for an
 unbacked range. Repeated discard/rewrite reuses that allocation. FLUSH syncs
@@ -487,9 +497,24 @@ integrity uses separate local `user.overlaybd.hybrid.log` extended attributes
 on both files. Each fixed 128-byte version-1 record has a CRC32C and bounded log
 stamps (random generation, byte length and CRC32C of the mapping-record prefix).
 The index attribute records completed append progress; the data attribute
-anchors the last durable prefix. A new mapping writes payload and syncs it,
+anchors the last durable prefix. A new mapping completes ordinary payload I/O,
 appends the complete upstream record, then updates index progress before
 reporting success. In-place DATA rewrites do not change either log stamp.
+
+Completed writes and discards, including their mapping transitions, survive a
+process crash without FLUSH when the OS and filesystem continue running. Each
+operation completes payload I/O, complete index-record writes and progress
+publication before returning. This is not a guarantee that those bytes have
+reached persistent storage. A process interrupted during an operation may leave
+an absent or partial operation; in-place writes may leave mixed bytes.
+
+After a host crash or power loss, operations not covered by successful FLUSH may
+be absent, partial, or recovered with incomplete payload. A valid mapping CRC
+checks index integrity, not payload durability. Recovery does not promise an
+exact last-FLUSH image because subsequent in-place writes may already have
+modified its physical blocks. Lower files remain immutable; a flushed ZERO mask
+remains protective unless a later operation modifies that range. An unflushed
+ZERO-to-DATA rewrite can lose that zero guarantee after host failure.
 
 FLUSH syncs payload, the index including its xattr, and the index directory,
 then publishes and syncs the data anchor. Reopen verifies the committed prefix
@@ -527,7 +552,7 @@ leaves the writer nonterminal so another write and checkpoint retry can succeed.
 These injected errors model interruption at the boundary, not an actual torn
 xattr or a filesystem's power-loss persistence behavior.
 
-Native writer error tests also stop after half/full payload writes, data sync,
+Native writer error tests also stop after half/full payload writes, before index publication,
 and half/full index-record appends. Unpublished mappings remain invisible after
 recovery; a half-record tail fails closed without truncation. A partial in-place
 payload overwrite can survive reopen as mixed old/new bytes, as the documented
@@ -1754,12 +1779,15 @@ Data-before-zero-mask and zero-mask-before-reclamation ordering stays explicit.
 Atomic sidecar publication, directory sync, locked trace-start truncation and blocking grow/seal
 utilities remain synchronous transactions on their existing execution paths.
 
-Managed Hybrid pairs use `user.overlaybd.hybrid.sealed` as terminal state,
-published and synced before retiring the recoverable seal intent. A managed
-log without that marker stays writable even when guest DATA or discarded
-backing resembles a trailer. Invalid markers fail closed. Preserve both local
-log and seal attributes when copying managed pairs; see ADR-0026 for encoding
-and ordering. Unmanaged upstream imports use identity, geometry, DATA ownership
-and equivalent sidecar/appended mappings to recognize sealing. Imported ZERO
-markers are normalized against the original payload EOF, excluding appended
-metadata from reusable backing. All metadata IO runs off scheduler workers.
+Hybrid seal state comes from a complete trailer and self-contained compact index,
+for both native and imported artifacts. Header identity, geometry, logical order and
+payload bounds must validate; local log attributes cannot override a valid seal.
+No terminal-seal xattr is created or required, and old terminal attributes are
+ignored for classification. Seal synchronizes its appended metadata before
+retiring the recoverable intent. See ADR-0026 for ordering.
+
+Without a complete trailer, an artifact cannot be loaded as a sealed lower,
+regardless of xattrs. Reading an unsealed writable pair through its independent
+index is a separate API. Complete trailer-shaped payload is classified by its
+bytes; matching magic alone is insufficient. Trailer removal to resume writing
+is not performed implicitly. All metadata IO runs off scheduler workers.

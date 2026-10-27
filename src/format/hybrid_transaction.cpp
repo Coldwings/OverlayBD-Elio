@@ -24,9 +24,6 @@ constexpr size_t kChecksum = 88;
 using Header = std::array<uint8_t, lsmt::kSpace>;
 using Record = std::array<uint8_t, kRecordSize>;
 constexpr uint8_t kMagic[8] = {'O','B','D','H','Y','T','X','1'};
-constexpr char kSealAttribute[] = "user.overlaybd.hybrid.sealed";
-constexpr uint8_t kSealMagic[8] = {'O','B','D','H','Y','S','L','1'};
-using SealMarker = std::array<uint8_t, 24>;
 struct Fd {
     explicit Fd(int fd) : value(fd) {}
     ~Fd() { if (value >= 0) ::close(value); }
@@ -258,18 +255,6 @@ void finish(const Intent& intent, int data_fd, int index_fd, int directory_fd,
         write_exact(data_fd, intent.target.data(), intent.target.size(), trailer);
         observe(5);
         sync(data_fd);
-        // The terminal state is metadata, never inferred from guest bytes.
-        // Keep the recoverable intent until both payload and marker are durable.
-        SealMarker marker{};
-        std::copy(std::begin(kSealMagic), std::end(kSealMagic), marker.begin());
-        bytes::store_u64_le(marker.data() + 8, trailer + lsmt::kSpace);
-        bytes::store_u32_le(marker.data() + 16,
-                            crc32::crc32c(intent.target.data(), intent.target.size()));
-        bytes::store_u32_le(marker.data() + 20, crc32::crc32c(marker.data(), 20));
-        if (::fsetxattr(data_fd, kSealAttribute, marker.data(), marker.size(), 0) != 0)
-            throw_errno(errno, "hybrid: publish terminal seal state");
-        observe(8);
-        sync(data_fd);
         observe(6);
     }
     if (::unlinkat(directory_fd, name.c_str(), 0) != 0)
@@ -325,29 +310,8 @@ bool is_sealed_pair(int data_fd, int index_fd) {
     struct stat data{}, index{};
     if (::fstat(data_fd, &data) != 0 || ::fstat(index_fd, &index) != 0)
         throw_errno(errno, "hybrid: inspect sealed pair");
-    SealMarker marker{};
-    const auto marker_size = ::fgetxattr(data_fd, kSealAttribute, marker.data(), marker.size());
-    if (marker_size >= 0) {
-        if (marker_size != static_cast<ssize_t>(marker.size()) ||
-            std::memcmp(marker.data(), kSealMagic, sizeof(kSealMagic)) != 0 ||
-            bytes::load_u32_le(marker.data() + 20) != crc32::crc32c(marker.data(), 20) ||
-            data.st_size < 2 * lsmt::kSpace ||
-            bytes::load_u64_le(marker.data() + 8) != static_cast<uint64_t>(data.st_size))
-            throw format_error("hybrid: invalid terminal seal state");
-        Header tail{};
-        read_exact(data_fd, tail.data(), tail.size(), static_cast<uint64_t>(data.st_size) - tail.size());
-        if (bytes::load_u32_le(marker.data() + 16) != crc32::crc32c(tail.data(), tail.size()))
-            throw format_error("hybrid: terminal seal trailer changed");
-        return true;
-    }
-    if (errno != ENODATA && errno != EOPNOTSUPP)
-        throw_errno(errno, "hybrid: inspect terminal seal state");
-    const auto managed = ::fgetxattr(data_fd, kLogStateAttribute, nullptr, 0);
-    if (managed >= 0) return false;
-    if (errno != ENODATA && errno != EOPNOTSUPP)
-        throw_errno(errno, "hybrid: inspect managed pair state");
-    // Only unmanaged upstream imports need structural seal detection. Their
-    // EOF ZERO markers have no managed backing guarantee.
+    // Complete appended metadata determines seal state. Local log attributes
+    // neither establish a sealed lower nor override a valid sealed trailer.
     if (data.st_size < 2 * lsmt::kSpace) return false;
     const auto data_bytes = static_cast<uint64_t>(data.st_size);
     const auto index_bytes = static_cast<uint64_t>(index.st_size);
@@ -364,64 +328,41 @@ bool is_sealed_pair(int data_fd, int index_fd) {
     read_exact(index_fd, sidecar.data(), sidecar.size(), 0);
     const auto header = lsmt::HeaderTrailer::parse(first.data());
     (void)validate_pair(header, lsmt::HeaderTrailer::parse(sidecar.data()), data_bytes, index_bytes);
-    auto replay = [&](int fd, uint64_t offset, uint64_t size, uint64_t payload_bytes) {
-        Replay records(header.virtual_size, payload_bytes);
-        std::array<uint8_t, 64 * 1024> chunk{};
-        while (size) {
-            const auto count = static_cast<size_t>(std::min<uint64_t>(size, chunk.size()));
-            read_exact(fd, chunk.data(), count, offset);
-            records.append(std::span(chunk).first(count));
-            offset += count;
-            size -= count;
-        }
-        return records.finish();
-    };
-    auto live = replay(index_fd, lsmt::kSpace, index_bytes - lsmt::kSpace, data_bytes);
-    // Guest DATA remains payload even when it contains a fully valid trailer,
-    // including this pair's UUID. Imported ZERO needs the original EOF below.
-    for (const auto& mapping : live) {
-        if (!mapping.zeroed &&
-            (mapping.moffset + mapping.length) * 512 > tail_offset)
-            return false;
-    }
-    if (trailer.uuid != header.uuid || trailer.parent_uuid != header.parent_uuid ||
-        trailer.virtual_size != header.virtual_size || trailer.version != header.version ||
-        trailer.sub_version != header.sub_version || trailer.reserved != header.reserved ||
-        trailer.index_offset < lsmt::kSpace || trailer.index_offset % 512 != 0 ||
+    // Match the sealed reader: trailer fields are authoritative, and extra
+    // padding before the EOF trailer does not make a sealed layer writable.
+    if (trailer.version != 1 || trailer.sub_version != 1 ||
+        trailer.index_offset < lsmt::kSpace ||
         trailer.index_offset > tail_offset || trailer.index_size > lsmt::kMaxRoIndexSize ||
         trailer.index_size * 16 > tail_offset - trailer.index_offset)
         return false;
-    const auto index_end = trailer.index_offset + trailer.index_size * 16;
-    if ((index_end + lsmt::kSpace - 1) / lsmt::kSpace * lsmt::kSpace != tail_offset)
-        return false;
-    for (const auto& mapping : live) {
-        if (!mapping.zeroed &&
-            (mapping.moffset + mapping.length) * 512 > trailer.index_offset)
-            return false;
+    // Validate the self-contained read-only index. A stale or misleading
+    // writable sidecar must never turn complete sealed metadata into payload.
+    uint64_t previous_end = 0;
+    uint64_t remaining = trailer.index_size * 16;
+    uint64_t offset = trailer.index_offset;
+    const auto payload_sectors = trailer.index_offset / lsmt::kAlignment;
+    std::array<uint8_t, 64 * 1024> chunk{};
+    while (remaining) {
+        const auto count = static_cast<size_t>(std::min<uint64_t>(remaining, chunk.size()));
+        read_exact(data_fd, chunk.data(), count, offset);
+        for (size_t pos = 0; pos < count; pos += 16) {
+            const auto m = bytes::load_segment_le(chunk.data() + pos);
+            if (m.offset == bytes::segment_mapping::kInvalidOffset) continue;
+            if (m.length == 0 || trailer.virtual_size % lsmt::kAlignment != 0 ||
+                m.offset < previous_end ||
+                m.end() > trailer.virtual_size / lsmt::kAlignment)
+                return false;
+            const bool valid_physical = m.zeroed
+                ? (m.moffset == kNoPhysicalOffset ||
+                   (m.moffset >= lsmt::kDataStartSector && m.moffset <= payload_sectors))
+                : (m.moffset >= lsmt::kDataStartSector && m.moffset < payload_sectors &&
+                   m.length <= payload_sectors - m.moffset);
+            if (!valid_physical) return false;
+            previous_end = m.end();
+        }
+        offset += count;
+        remaining -= count;
     }
-    // Appended metadata must not turn an upstream EOF ZERO marker into
-    // writable backing. Normalize both views against the original payload EOF.
-    live = replay(index_fd, lsmt::kSpace, index_bytes - lsmt::kSpace, trailer.index_offset);
-    const auto sealed = replay(data_fd, trailer.index_offset, trailer.index_size * 16,
-                               trailer.index_offset);
-    // Compare semantic ranges, allowing upstream compaction to split/coalesce
-    // equivalent records and to normalize ZERO's physical backing marker.
-    size_t a = 0, b = 0;
-    uint64_t used_a = 0, used_b = 0;
-    while (a < live.size() && b < sealed.size()) {
-        const auto& left = live[a];
-        const auto& right = sealed[b];
-        if (left.offset + used_a != right.offset + used_b || left.zeroed != right.zeroed ||
-            (!left.zeroed && left.moffset + used_a != right.moffset + used_b))
-            throw format_error("hybrid: sealed index differs from paired log");
-        const auto count = std::min(left.length - used_a, right.length - used_b);
-        used_a += count;
-        used_b += count;
-        if (used_a == left.length) { ++a; used_a = 0; }
-        if (used_b == right.length) { ++b; used_b = 0; }
-    }
-    if (a != live.size() || b != sealed.size())
-        throw format_error("hybrid: sealed index coverage differs from paired log");
     return true;
 }
 

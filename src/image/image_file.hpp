@@ -143,6 +143,13 @@ uint64_t device_capacity_bytes(uint64_t image_bytes, uint64_t override_bytes,
 namespace test_hooks {
 std::chrono::milliseconds trace_blob_load_budget_for_test();
 void set_trace_blob_load_budget_for_test(std::chrono::milliseconds budget);
+// Called on the blocking pool before each Hybrid workspace-directory fsync.
+// The owner must keep this hook and its context alive until assembly drains.
+struct WorkspaceSyncHook {
+    int (*before_sync)(int fd, void* context);
+    void* context;
+};
+void set_workspace_sync_hook_for_test(WorkspaceSyncHook* hook);
 }  // namespace test_hooks
 #endif
 

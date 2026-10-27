@@ -24,6 +24,8 @@
 #include <elio/time/timer.hpp>
 
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -39,13 +41,49 @@ namespace obd::image {
 
 namespace {
 
-elio::coro::task<void> ensure_upper_directory(const std::string& directory) {
+#ifdef OBD_TEST_HOOKS
+std::atomic<test_hooks::WorkspaceSyncHook*> g_workspace_sync_hook{nullptr};
+#endif
+
+void sync_workspace_ancestors(const std::string& directory) {
+    struct DirectoryFd {
+        int value;
+        ~DirectoryFd() { if (value >= 0) ::close(value); }
+    } current{::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    if (current.value < 0) throw_errno(errno, "cannot open Hybrid workspace directory");
+    // Walk actual directory parents, including already existing names. A
+    // previous attempt can have created a name and failed before syncing it.
+    for (;;) {
+#ifdef OBD_TEST_HOOKS
+        if (auto* hook = g_workspace_sync_hook.load(std::memory_order_acquire)) {
+            const int failure = hook->before_sync(current.value, hook->context);
+            if (failure != 0) throw_errno(failure, "injected Hybrid workspace sync failure");
+        }
+#endif
+        int rc;
+        do { rc = ::fsync(current.value); } while (rc != 0 && errno == EINTR);
+        if (rc != 0) throw_errno(errno, "cannot sync Hybrid workspace ancestor");
+        DirectoryFd parent{::openat(current.value, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+        if (parent.value < 0) throw_errno(errno, "cannot open Hybrid workspace ancestor");
+        struct stat child_stat{}, parent_stat{};
+        if (::fstat(current.value, &child_stat) != 0 || ::fstat(parent.value, &parent_stat) != 0)
+            throw_errno(errno, "cannot stat Hybrid workspace ancestor");
+        if (child_stat.st_dev == parent_stat.st_dev && child_stat.st_ino == parent_stat.st_ino)
+            break;
+        std::swap(current.value, parent.value);
+    }
+}
+
+elio::coro::task<void> ensure_upper_directory(const std::string& directory, bool durable) {
     auto* request = new std::string(directory);
     std::exception_ptr failure;
     try {
-        failure = co_await elio::spawn_blocking([request]() noexcept -> std::exception_ptr {
+        failure = co_await elio::spawn_blocking([request, durable]() noexcept -> std::exception_ptr {
             std::unique_ptr<std::string> owned(request);
-            try { std::filesystem::create_directories(*owned); }
+            try {
+                std::filesystem::create_directories(*owned);
+                if (durable) sync_workspace_ancestors(*owned);
+            }
             catch (...) { return std::current_exception(); }
             return {};
         });
@@ -713,7 +751,7 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         if (cap == 0) throw error(EINVAL, cap_error);
         vsize = cap;
     }
-    co_await ensure_upper_directory(cfg.upper.dir);
+    co_await ensure_upper_directory(cfg.upper.dir, cfg.upper.type == "hybrid");
     std::unique_ptr<format::WritableLayer> top;
     std::string upper_path;
     if (cfg.upper.type == "sparse") {
@@ -772,7 +810,7 @@ elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
     }
     if (spec.upper_type != "lsmt" && spec.upper_type != "hybrid")
         throw error(EINVAL, "blank upper type must be lsmt or hybrid");
-    try { co_await ensure_upper_directory(spec.dir); }
+    try { co_await ensure_upper_directory(spec.dir, spec.upper_type == "hybrid"); }
     catch (const std::filesystem::filesystem_error& e) {
         throw error(e.code().value(), "cannot create blank device workspace " + spec.dir + ": " + e.what());
     }
@@ -853,6 +891,10 @@ uint64_t device_capacity_bytes(uint64_t image_bytes, uint64_t override_bytes,
 
 #ifdef OBD_TEST_HOOKS
 namespace test_hooks {
+
+void set_workspace_sync_hook_for_test(WorkspaceSyncHook* hook) {
+    g_workspace_sync_hook.store(hook, std::memory_order_release);
+}
 
 std::chrono::milliseconds trace_blob_load_budget_for_test() {
     return configured_trace_blob_load_budget();

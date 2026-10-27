@@ -195,10 +195,10 @@ elio::coro::task<ssize_t> Writer::modify(
                 rc = co_await write_exact(pair_->data_fd(), bytes, write_size, physical * 512);
                 if (rc == 0 && (io_fault(1) || io_fault(2))) rc = -EIO;
             }
-            if (rc == 0 && transition) {
-                rc = co_await sync(pair_->data_fd());
-                if (rc == 0 && io_fault(3)) rc = -EIO;
-            }
+            // Completed payload IO precedes mapping publication. Ordinary writes
+            // survive process death through the kernel cache; FLUSH establishes
+            // host-storage durability without a barrier for every transition.
+            if (rc == 0 && transition && io_fault(3)) rc = -EIO;
             if (rc == 0 && transition) {
                 std::array<uint8_t, 16> raw{};
                 bytes::store_segment_le(raw.data(), mapping);

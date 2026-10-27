@@ -210,8 +210,9 @@ and sampled tail of its sealed output.
 The report includes per-file logical/allocated sizes after each random phase,
 reopen time, live-seal time, and peak allocated space sampled every 10 ms during
 seal. The sampled peak is a lower bound: short-lived temporary files between
-samples may be missed. Seal includes the format's required synchronization,
-without a separate external digest pass. OS caches are warm; this tool does not
+samples may be missed. Publication includes the format's required synchronization;
+LSMT/Hybrid do not add an external digest pass, while Sparse includes its API
+digest. OS caches are warm; this tool does not
 drop global caches. RSS includes the driver, seeded permutation and readback
 buffers. Keep raw JSON, exact build/source provenance, CPU/filesystem details,
 and repetition counts alongside any performance summary. Small smoke runs
@@ -229,9 +230,48 @@ were 78–102 ms; the copying LSMT seal grew from approximately 6.4 seconds at
 durability contracts, not portable performance guarantees. Sparse export was
 not implemented in this frozen comparison. QD16 does not establish multicore
 scaling, and these ordinary-file measurements do not validate kernel or
-supervisor crash recovery. This frozen matrix predates the managed terminal
-seal marker and its additional synchronization; its seal timings are historical
-evidence, not measurements of the current implementation.
+supervisor crash recovery. This frozen matrix predates the final trailer-based seal classification; its
+seal timings are historical evidence, not measurements of the final implementation.
+
+## Small Hybrid process-crash comparison
+
+The [numeric results](hybrid-writable-results.json) record the basic development
+comparison: 32 MiB fully populated before seal, 256 sampled 4 KiB offsets per
+random phase, one discard/rewrite cycle, seed 146, two workers, QD1/QD16,
+and one trial per cell. All eight trials passed full sealed-output readback.
+These measurements replace further large benchmark runs for this change;
+the later 1/10/32 GiB rerun was stopped at the user's request and is incomplete.
+The older completed matrix above remains historical evidence only.
+
+| Build / format | QD | First write ops/s | Rewrite ops/s | Discard + rewrite ops/s | First FLUSH ms | Seal ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline-hybrid-qd1 | 1 | 409 | 30574 | 409 | 6.0 | 40.0 |
+| optimized-hybrid-qd1 | 1 | 7136 | 29201 | 4446 | 14.5 | 27.4 |
+| baseline-hybrid-qd16 | 16 | 368 | 27831 | 386 | 6.4 | 29.0 |
+| optimized-hybrid-qd16 | 16 | 7953 | 29129 | 4465 | 31.1 | 27.5 |
+| optimized-lsmt-qd1 | 1 | 29016 | 28900 | 22590 | 15.9 | 246.4 |
+| optimized-lsmt-qd16 | 16 | 29006 | 28731 | 23568 | 7.2 | 241.6 |
+| optimized-sparse-qd1 | 1 | 8396 | 37233 | 51 | 45.3 | 225.8 |
+| optimized-sparse-qd16 | 16 | 9540 | 36266 | 81 | 34.0 | 248.8 |
+
+Baseline Hybrid synchronizes payload on every ownership transition. Optimized
+Hybrid completes payload, mapping, and recovery-progress writes before returning,
+without that per-transition sync; explicit FLUSH retains persistence ordering.
+This comparison measures that selected process-crash contract, not a speedup
+under identical power-loss guarantees. Request timings exclude the separately
+reported FLUSH. Remaining first-write cost includes index/progress updates;
+these measurements do not attribute the remaining gap to a specific operation.
+
+The shared host and warm caches, small sample, and single trials do not support
+a statistical format ranking or multicore scaling claim. Sparse export includes
+its API digest; LSMT and Hybrid live seal do not. Identical benchmark payloads
+cannot independently detect skipped rewrites; separate semantic regression tests
+cover those transitions. The local LSMT writable-reopen gap is tracked in
+[issue 164](https://github.com/Coldwings/OverlayBD-Elio/issues/164); it is not an
+upstream LSMT format restriction. Source archive, dirty-patch, binary, and original
+report hashes are recorded in the JSON for this development snapshot. It predates
+the later removal of terminal-seal xattr publication and its extra sync, so seal
+timings are not measurements of that final seal path.
 
 ## Hybrid log scaling and compaction cadence
 

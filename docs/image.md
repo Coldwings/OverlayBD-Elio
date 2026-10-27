@@ -312,6 +312,12 @@ mode:
   it never recreates individual missing files. A larger persisted capacity is
   retained; a larger requested capacity uses the durable grow transaction.
   An explicit override below the persisted capacity fails as a shrink.
+  Before opening the pair, assembly creates the requested workspace and syncs
+  it and its actual directory ancestors through the namespace root on the
+  blocking pool. Existing directories are synced too: a previous failed
+  attempt may have left their names unsynced. An open/sync failure aborts
+  assembly before pair creation and may be retried without deleting the
+  workspace. The directory namespace must remain stable during setup.
 - an **unknown** `upper.type` is rejected at parse time with
   `obd::error(EINVAL)`; an absent or empty `upper` object keeps the
   read-only behavior exactly.

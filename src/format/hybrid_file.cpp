@@ -23,6 +23,21 @@
 
 namespace obd::format::hybrid {
 namespace {
+#ifdef OBD_TEST_HOOKS
+std::atomic<int> creation_fault_stage{-1};
+std::atomic<bool> creation_fault_exits{false};
+#endif
+void creation_boundary(int stage) {
+#ifdef OBD_TEST_HOOKS
+    if (creation_fault_stage.load() == stage) {
+        if (creation_fault_exits.load()) ::_exit(90 + stage);
+        throw error(EIO, "hybrid: injected creation failure");
+    }
+#else
+    (void)stage;
+#endif
+}
+
 elio::coro::task<void> read_exact(int fd, std::span<uint8_t> bytes, uint64_t offset) {
     const auto result = co_await elio::io::pread_exactly(
         fd, std::as_writable_bytes(bytes), offset);
@@ -111,6 +126,10 @@ struct OpenResult {
 
 #ifdef OBD_TEST_HOOKS
 std::atomic<int> FilePair::replace_fail_stage_{-1};
+void creation_fault_for_test(int stage, bool exit_process) {
+    creation_fault_exits.store(exit_process);
+    creation_fault_stage.store(stage);
+}
 #endif
 
 FilePair::~FilePair() {
@@ -205,12 +224,15 @@ std::unique_ptr<FilePair> FilePair::create_sync(
     header.uuid = generate_uuid();
     header.parent_uuid = "00000000-0000-0000-0000-000000000000";
     write_header_sync(data.value, header);
+    creation_boundary(1);
     auto index_header = header;
     index_header.flags = kHybridFlag | 1u;
     index_header.index_offset = lsmt::kSpace;
     write_header_sync(index.value, index_header);
+    creation_boundary(2);
     if (::fsync(pending.directory.value) != 0)
         throw_errno(errno, "hybrid: sync initialized directory");
+    creation_boundary(3);
     // Allocate and initialize the return value before the publication boundary.
     auto pair = std::unique_ptr<FilePair>(new FilePair);
     pair->writable_ = true;
@@ -223,12 +245,15 @@ std::unique_ptr<FilePair> FilePair::create_sync(
     pair->index_fd_ = index.release();
     pair->log_stamp_ = activate_log_state(pair->data_fd_, pair->index_fd_,
                                          pair->index_directory_fd_, std::nullopt);
+    creation_boundary(4);
     if (::syscall(SYS_renameat2, parent.value, pending.name.c_str(),
                   parent.value, filename.c_str(), RENAME_NOREPLACE) != 0)
         throw_errno(errno, "hybrid: publish initialized directory");
     pending.published = true;
+    creation_boundary(5);
     if (::fsync(parent.value) != 0)
         throw_errno(errno, "hybrid: sync pair parent directory");
+    creation_boundary(6);
     return pair;
 }
 

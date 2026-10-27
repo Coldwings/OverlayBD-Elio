@@ -1,7 +1,7 @@
 # ADR-0026: Persist interoperable Hybrid uppers without payload-copy sealing
 
-- Status: proposed
-- Date: 2026-10-26
+- Status: accepted
+- Date: 2026-10-27
 - Supersedes: none
 - Binds: src/format/hybrid_format.hpp, src/format/hybrid_format.cpp,
   src/format/lsmt.cpp, src/format/writable.hpp,
@@ -64,6 +64,12 @@ Sealed ZERO records remain in-range markers accepted by both reference readers;
 sealing never copies live payload solely to change ZERO encoding.
 
 New owned pairs live in a dedicated directory with `data` and `index` files.
+Image assembly first creates and syncs the requested workspace and its actual
+directory ancestors through the namespace root on the blocking pool. Retry
+syncs existing names too, since an earlier failed attempt may have created
+them without completing durability. Directory open/sync errors abort assembly
+before pair publication. Standalone pair-creation callers must supply an
+already durable parent namespace, stable throughout setup.
 Prepare both artifacts in a same-parent staging directory, sync the artifacts
 and staging directory, publish with a no-replace directory rename, then sync
 the parent. Existing destinations are never replaced by initialization. This
@@ -80,8 +86,8 @@ operation with upper mutation and merged-index replacement. A raw file-view
 lock alone cannot repair an already stale merged snapshot. Lower files are
 immutable throughout these operations.
 
-For new mappings, complete payload writes and the required backing-file sync
-before appending the mapping record. A returned request must not publish a
+For new mappings, complete ordinary payload writes before appending the mapping
+record; do not synchronize the data file for every mapping transition. A returned request must not publish a
 mapping whose required payload write failed. A successful guest FLUSH covers
 preceding payload changes, all pending mapping records, and required namespace
 publication, in that order. In-place rewrites do not add mapping records when
@@ -93,6 +99,22 @@ atomicity is promised. Errors and interrupted multi-fragment operations may
 expose a completed prefix and must preserve explicit ZERO masks and lower
 isolation. Process-exit recovery, partial-operation recovery and power-loss
 recovery are distinct test cases.
+
+Completed writes and discards, including their mapping transitions, survive a
+process crash without FLUSH when the OS and filesystem continue running. Each
+operation completes payload I/O, complete index-record writes and progress
+publication before returning. This is not a guarantee that those bytes have
+reached persistent storage. A process interrupted during an operation may leave
+an absent or partial operation; in-place writes may leave mixed bytes.
+
+After a host crash or power loss, operations not covered by successful FLUSH may
+be absent, partial, or recovered with incomplete payload. A valid mapping CRC
+checks index integrity, not payload durability. Recovery does not promise an
+exact last-FLUSH image because subsequent in-place writes may already have
+modified its physical blocks. Lower files remain immutable; a flushed ZERO mask
+remains protective unless a later operation modifies that range. An unflushed
+ZERO-to-DATA rewrite can lose that zero guarantee after host failure.
+
 
 Reject partial mapping records and invalid complete records before using them.
 The upstream log has no per-record checksum: arbitrary corruption or a torn
@@ -173,9 +195,13 @@ both subsequent writes and reads against the pinned reference implementations.
 
 Additional metadata ordering has a measurable latency cost. Compare current
 `lsmt`, `sparse` and Hybrid first-write/rewrite workloads at QD1/QD16, log growth
-and reopen time, and seal latency/peak temporary storage. Include 1 GiB, 10 GiB
-and larger practical cases and state the environment and limitations. Successful
-small-file tests do not substitute for these measurements or the fault matrix.
+and reopen time, and seal latency/peak temporary storage. The selected local
+validation scope is a basic 32 MiB comparison at QD1/QD16, with one trial per
+cell, explicit build provenance, and full sealed-output readback. Further large
+matrix runs were withdrawn to limit load on the development node. Retain older
+large-run evidence as historical measurements, not current implementation
+results. Small performance samples establish neither a statistical ranking nor
+large-image scaling and do not replace the deterministic fault matrix.
 
 Before acceptance, finish all integrations and fault/performance validation, update current module
 contracts, and pass deterministic fault/concurrency tests, bidirectional fixture
@@ -205,20 +231,26 @@ Read-only or unknown uppers omit the object. This reports configured artifact
 provenance, not a fresh filesystem existence or integrity check; failures remain
 in the existing `error` field and operation replies.
 
-### Managed terminal seal state
+### Trailer-based seal state
 
-Managed pairs persist `user.overlaybd.hybrid.sealed` on the data inode before
-retiring the seal transaction intent. Its 24 bytes contain `OBDHYSL1`, the
-little-endian final data length, CRC32C of the 4096-byte trailer, and CRC32C of
-the preceding 20 marker bytes. Payload/trailer synchronization precedes marker
-publication; marker synchronization precedes intent retirement. Recovery of an
-existing intent completes the same sequence. Invalid marker contents fail
-closed. This local state must be preserved together with the log attributes;
-it does not change upstream data/index bytes.
+A complete sealed trailer and its self-contained compact index determine sealed
+state for both native and imported files. Validate header identity and trailer/index geometry, logical
+ordering and payload bounds, using authoritative trailer fields as the sealed reader does; accept OverlayBD's 512-byte compact-index padding
+and AgentENV's 4096-byte trailer alignment, as well as extra padding accepted
+by the sealed reader. A valid sealed artifact is refused
+by writable-pair open even when local log attributes remain present or the
+sidecar describes older writable history. Attributes cannot override that state.
 
-A managed log without a terminal marker remains writable regardless of guest
-payload content, including trailer-shaped DATA that was subsequently discarded.
-Unmanaged upstream imports instead require structural seal recognition: identity,
-geometry, DATA ownership boundaries, and equivalent sidecar/appended mappings.
-Imported ZERO is normalized against the candidate original payload EOF so the
-appended index/trailer cannot become writable backing.
+Do not create or require a terminal-seal xattr. Seal appends the index/trailer,
+synchronizes data, then retires the recoverable intent and synchronizes its
+directory. Existing local terminal attributes are ignored for classification.
+Local log attributes still protect writable recovery progress; they do not make
+a missing or incomplete trailer into a sealed lower. Read-only inspection of a
+writable pair is separate from loading a sealed lower, which requires complete
+trailer/index validation.
+
+An arbitrary payload deliberately constructed to be a complete sealed artifact
+is classified by that structure, regardless of whether the caller invoked
+seal(). Merely matching trailer magic or flags is insufficient. No verified
+external xattr convention currently authorizes removing a trailer to resume
+writing, so this implementation never performs that conversion implicitly.
