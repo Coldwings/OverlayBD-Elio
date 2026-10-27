@@ -564,3 +564,28 @@ nodes outside Linux's 12-bit major and 20-bit minor encoding are rejected.
 Import applies the same tar-prefix check to every original target, including
 parent targets: a USTAR/GNU prefix or two complete zero terminator blocks for an
 empty archive. This check does not replace full tar parsing during conversion.
+
+### Native LSMT payload layout (proposed ADR-0028)
+
+`obd-convert --lsmt-layout logical|metadata-tail` selects native final packing.
+The current default is `logical`. `metadata-tail` analyzes the closed, finalized
+ext2 image using the pinned libe2fs reader and places classified structural blocks
+immediately before the ordinary index. This changes physical offsets only;
+logical filesystem bytes, layer tags and format flags keep their meaning.
+It does not create a classification sidecar or require a new reader.
+
+Unsupported filesystem features/geometry, excessive classification/index budgets
+or builds without libe2fs retain logical order and print a fallback diagnostic.
+Supported classification is limited to 4 KiB ext2 with FILETYPE, LARGE_FILE,
+SPARSE_SUPER and EXT_ATTR features, 2^26 blocks and 2^20 inodes. Directories,
+symlinks, indirect blocks and xattrs remain metadata. Free blocks are preserved,
+not promoted to live metadata. The option applies only to native conversion;
+explicit use with TurboOCI conversion/import is rejected.
+
+`cli: obd-convert metadata tail preserves the complete filesystem` compares
+complete logical images, deterministic repeated output, filesystem contents and
+physical placement of superblock, inode table, directory and indirect blocks.
+`cli: obd-convert rejects invalid and nonnative layout selections` checks
+unknown/missing values and TurboOCI/import combinations fail before creating
+output directories. Actual independent-reader/filesystem and four-way performance validation remain
+required before accepting the proposed optimization/default policy.

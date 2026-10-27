@@ -20,10 +20,21 @@ namespace obd::format {
 /// Generates a random lowercase 8-4-4-4-12 UUID string (36 chars).
 std::string generate_uuid();
 
+/// Transient logical-sector range to pack at the payload tail. Classification
+/// is not serialized; the ordinary LSMT index preserves logical addressing.
+struct LsmtPayloadRange {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+
 struct LsmtWriteOptions {
     std::string uuid;         // generated when empty
     std::string parent_uuid;  // may be empty (bottom layer)
     std::string user_tag;     // commit message, may be empty
+    // Sorted, disjoint, nonempty sector ranges; adjacent ranges normalize.
+    // Empty preserves the original sequential layout. Both placement classes
+    // retain logical order internally; all logical bytes remain represented.
+    std::vector<LsmtPayloadRange> tail_ranges = {};
 };
 
 /// Builds a sealed single-layer LSMT file at `out_path` from the raw image

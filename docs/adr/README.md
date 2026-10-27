@@ -147,3 +147,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | accepted |
 | [0024](./0024-exact-sparse-upper-coverage.md) | Persist exact sector coverage for sparse uppers | accepted |
 | [0025](./0025-configure-device-queue-and-worker-topology.md) | Resolve device queues and workers together before startup | accepted |
+| [0028](./0028-cluster-converted-filesystem-metadata.md) | Cluster finalized filesystem metadata in ordinary LSMT payloads | proposed |

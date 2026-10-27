@@ -1425,6 +1425,22 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   forwarded, not refused. The test server's accept is bounded, so a CLI
   that wrongly rejects an argument fails the assertion instead of hanging
   the job (#11).
+- `cli: obd-convert metadata tail preserves the complete filesystem` — compares
+  actual logical-order and metadata-tail conversion, complete logical bytes and
+  repeat determinism. It wraps the actual reordered LSMT artifact in LZ4 and
+  ZSTD ZFiles with 64 KiB blocks and verifies complete decompressed logical
+  readback with checksum verification. Enabled libe2fs builds check structural block placement,
+  including an external symlink block; dependency-free builds check fallback.
+- `convert: finalized ext2 classification preserves hardlinks and external xattrs`
+  — modifies a converter-produced ordinary filesystem file through libe2fs,
+  closes it, and checks classification, packed logical bytes, inode sharing,
+  external xattrs, repeat determinism and read-only classification. It also
+  deletes a regular file and explicitly reallocates its former DATA block as
+  directory storage, checking the classification changes to metadata. Runs
+  `e2fsck -fn` when available and emits a warning when that independent check is
+  unavailable. Wrong geometry and unsupported features must return an empty
+  fallback plan without changing the input. These correctness checks do not
+  establish startup performance improvements.
 - `cli: obd-convert builds a deterministic ext2 layer from tar` — the REAL
   converter binary consumes the same rootfs tar from a file and from stdin with
   `--backend builtin-ext2`, emits byte-identical sealed LSMT layers, reports
