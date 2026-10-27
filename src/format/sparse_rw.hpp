@@ -26,6 +26,12 @@ struct ZeroMaskPersistResult {
     bool namespace_committed = false;
 };
 
+struct SparseExportResult {
+    std::string uuid;
+    std::string sha256;
+    uint64_t size = 0;
+};
+
 class SparseRwLayer final : public WritableLayer {
 public:
     ~SparseRwLayer() override;
@@ -37,6 +43,21 @@ public:
     static elio::coro::task<std::unique_ptr<SparseRwLayer>> open(
         const std::string& path, uint64_t vsize);
 
+    /// Recover an existing regular file at its persisted size without creating
+    /// or growing it. All opens hold a nonblocking exclusive inode lock until
+    /// destruction; another cooperating writer is rejected with EBUSY.
+    static elio::coro::task<std::unique_ptr<SparseRwLayer>> open_existing(
+        std::string path);
+
+    /// Offline delta export to a separate immutable LSMT artifact. Source must
+    /// have no other cooperating owner; it remains reusable after this returns.
+    /// Existing output is accepted only if byte-identical; never overwritten.
+    /// Throws on failure, including directory sync after visible publication.
+    static elio::coro::task<SparseExportResult> export_file(
+        std::string source, std::string destination,
+        std::string parent_uuid = {}, std::string user_tag = {},
+        uint64_t virtual_size = 0);
+
     elio::coro::task<ssize_t> pwrite(const void* buf, size_t count,
                                      uint64_t offset) override;
     elio::coro::task<ssize_t> pread(void* buf, size_t count,
@@ -44,8 +65,9 @@ public:
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
     /// Persists dirty zero-mask metadata through the ordered data-file and
-    /// sidecar durability path shared with flush(). Sparse uppers never seal
-    /// (ADR-0014 upstream parity).
+    /// sidecar durability path shared with flush(). Ends writes on this instance
+    /// but retains its exclusive lock until destruction. Offline export_file()
+    /// creates a separate sealed LSMT artifact after the current owner closes.
     elio::coro::task<int> checkpoint() override;
 
     /// D3 grow-only vsize extension (see WritableLayer::grow): extends
@@ -105,7 +127,8 @@ private:
     int sync_data_file() const;
     void load_zero_masks();
     static std::unique_ptr<SparseRwLayer> open_sync(std::string path,
-                                                    uint64_t vsize);
+                                                    uint64_t vsize,
+                                                    bool existing_only = false);
     void create_coverage_snapshot(bool legacy_import);
     void load_coverage(const std::string& artifact_path,
                        uint64_t data_size,

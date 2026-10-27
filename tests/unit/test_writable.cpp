@@ -8,6 +8,8 @@
 #include "format/lsmt_rw.hpp"
 #include "format/merged_writable.hpp"
 #include "format/sparse_rw.hpp"
+#include "format/sparse_export_plan.hpp"
+#include "format/sparse_export_fault.hpp"
 #include "format/writer.hpp"
 #include "image/image_file.hpp"
 
@@ -26,6 +28,7 @@
 #include <utility>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
@@ -2967,6 +2970,8 @@ TEST_CASE("format: sparse layer checkpoint persists a dirty zero mask",
         REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
         REQUIRE(sparse_zero_mask_vsize(path) == 512 * 64);
 
+        // Checkpoint preserves ownership until this drained instance closes.
+        layer.reset();
         auto reopened = co_await format::SparseRwLayer::open(path, 512 * 32);
         REQUIRE(reopened->virtual_size() == 512 * 64);
         REQUIRE(reopened->segments().size() == 1);
@@ -4051,8 +4056,8 @@ TEST_CASE("format: empty sealed lsmt layer is a zero base of its virtual size",
 
 TEST_CASE("format: sparse layer grow extends the write window", "[format]") {
     // D3 data-plane grow for the sparse upper: ftruncate extends the
-    // sparse file; pwrite/pread accept the new range (sparse uppers never
-    // seal, so the size lives in the file's extent).
+    // sparse file; pwrite/pread accept the new range. Offline export preserves
+    // this source capacity in the separate sealed artifact.
     TempDir dir;
     const std::string path = dir / "upper.sparse";
     const auto a = sectors_pattern(0, 16, 712);
@@ -4806,6 +4811,840 @@ TEST_CASE("format: writable mapped reads reject early file EOF", "[format]") {
             const auto read = co_await layer->pread(buffer.data(), buffer.size(), 0);
             REQUIRE(read == -EIO);
         }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+
+TEST_CASE("format: sparse existing open refuses a missing source without creation",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "missing";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        bool rejected = false;
+        try { auto layer = co_await format::SparseRwLayer::open_existing(path); }
+        catch (const error& e) { rejected = true; REQUIRE(e.errno_value() == ENOENT); }
+        REQUIRE(rejected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(std::filesystem::is_empty(dir.path()));
+}
+
+TEST_CASE("format: sparse ownership excludes ordinary and existing opens through aliases",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const auto alias = dir / "alias";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto owner = co_await format::SparseRwLayer::open(path, 4096);
+        co_await elio::spawn_blocking([&] { std::filesystem::create_hard_link(path, alias); });
+        for (const auto& candidate : {path, alias}) {
+            for (bool existing : {false, true}) {
+                bool rejected = false;
+                try {
+                    std::unique_ptr<format::SparseRwLayer> other;
+                    if (existing)
+                        other = co_await format::SparseRwLayer::open_existing(candidate);
+                    else
+                        other = co_await format::SparseRwLayer::open(candidate, 8192);
+                } catch (const error& e) {
+                    rejected = true;
+                    REQUIRE(e.errno_value() == EBUSY);
+                }
+                REQUIRE(rejected);
+            }
+        }
+        const int checkpointed = co_await owner->checkpoint();
+        REQUIRE(checkpointed == 0);
+        bool rejected = false;
+        try { auto other = co_await format::SparseRwLayer::open_existing(path); }
+        catch (const error& e) { rejected = true; REQUIRE(e.errno_value() == EBUSY); }
+        REQUIRE(rejected);
+        owner.reset();
+        auto reopened = co_await format::SparseRwLayer::open_existing(path);
+        REQUIRE(reopened->virtual_size() == 4096);
+        std::vector<uint8_t> payload(512, 0x5a);
+        const auto written = co_await reopened->pwrite(payload.data(), payload.size(), 512);
+        REQUIRE(written == 512);
+        const int flushed = co_await reopened->flush();
+        REQUIRE(flushed == 0);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE(std::filesystem::file_size(path) == 4096);
+    REQUIRE_FALSE(std::filesystem::exists(alias + ".coverage"));
+    REQUIRE_FALSE(std::filesystem::exists(alias + ".zeroes"));
+}
+
+TEST_CASE("format: sparse existing open preserves persisted growth and exact ownership",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::vector<uint8_t> payload(512, 0xa7);
+        {
+            auto source = co_await format::SparseRwLayer::open(path, 4096);
+            auto* active = source.get();
+            const int grown = co_await elio::spawn_blocking([active] { return active->grow(8192); });
+            REQUIRE(grown == 0);
+            const auto written = co_await source->pwrite(payload.data(), payload.size(), 7680);
+            REQUIRE(written == 512);
+            const int discarded = co_await source->discard(512, 512);
+            REQUIRE(discarded == 0);
+            const int flushed = co_await source->checkpoint();
+            REQUIRE(flushed == 0);
+        }
+        auto recovered = co_await format::SparseRwLayer::open_existing(path);
+        REQUIRE(recovered->virtual_size() == 8192);
+        const auto mappings = recovered->segments_snapshot();
+        REQUIRE(mappings.size() == 2);
+        REQUIRE(mappings[0].offset == 1);
+        REQUIRE(mappings[0].length == 1);
+        REQUIRE(mappings[0].zeroed);
+        REQUIRE(mappings[1].offset == 15);
+        REQUIRE(mappings[1].length == 1);
+        REQUIRE_FALSE(mappings[1].zeroed);
+        std::vector<uint8_t> actual(512);
+        const auto read = co_await recovered->pread(actual.data(), actual.size(), 7680);
+        REQUIRE(read == 512);
+        REQUIRE(actual == payload);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+
+TEST_CASE("format: sparse export layout preserves gaps and explicit zero masks",
+          "[format][sparse-export]") {
+    using format::sparse_export_detail::make_plan;
+    const auto empty = make_plan(uint64_t{1} << 40, {});
+    REQUIRE(empty.mappings.empty());
+    REQUIRE(empty.payload_bytes == 0);
+    REQUIRE(empty.file_bytes == 8192);
+    const auto plan = make_plan(512 * 64, {
+        {1, 1, 1, false, 0}, {3, 2, 0, true, 0}, {63, 1, 63, false, 0}});
+    REQUIRE(plan.mappings.size() == 3);
+    REQUIRE(plan.payload_bytes == 1024);
+    REQUIRE(plan.index_offset == 8192);
+    REQUIRE(plan.trailer_offset == 12288);
+    REQUIRE(plan.file_bytes == 16384);
+    REQUIRE(plan.mappings[0].offset == 1);
+    REQUIRE(plan.mappings[0].moffset == 8);
+    REQUIRE(plan.mappings[1].offset == 3);
+    REQUIRE(plan.mappings[1].length == 2);
+    REQUIRE(plan.mappings[1].zeroed);
+    REQUIRE(plan.mappings[2].offset == 63);
+    REQUIRE(plan.mappings[2].moffset == 9);
+    const auto zero = make_plan(4096, {{0, 8, 0, true, 0}});
+    REQUIRE(zero.payload_bytes == 0);
+    REQUIRE(zero.mappings.size() == 1);
+    REQUIRE(zero.mappings[0].moffset == 8);
+    REQUIRE(zero.index_offset == 4096);
+}
+
+TEST_CASE("format: sparse export layout is independent of ownership fragmentation",
+          "[format][sparse-export]") {
+    using Mapping = bytes::segment_mapping;
+    const uint64_t length = 2 * Mapping::kMaxLength + 3;
+    auto history = [length](uint32_t step) {
+        std::vector<Mapping> result;
+        for (uint64_t first = 5; first < 5 + length;) {
+            const auto count = static_cast<uint32_t>(std::min<uint64_t>(step, 5 + length - first));
+            result.push_back({first, count, first, false, 0});
+            first += count;
+        }
+        // Different ZERO physical markers carry no payload ownership.
+        result.push_back({5 + length, 1, 123, true, 0});
+        result.push_back({6 + length, 1, 0, true, 0});
+        return result;
+    };
+    const auto a = format::sparse_export_detail::make_plan((length + 16) * 512,
+                                                         history(Mapping::kMaxLength));
+    const auto b = format::sparse_export_detail::make_plan((length + 16) * 512,
+                                                         history(257));
+    REQUIRE(a.mappings.size() == 4);
+    REQUIRE(a.mappings[0].length == Mapping::kMaxLength);
+    REQUIRE(a.mappings[1].length == Mapping::kMaxLength);
+    REQUIRE(a.mappings[2].length == 3);
+    REQUIRE(a.mappings[3].length == 2);
+    REQUIRE(a.mappings[3].zeroed);
+    REQUIRE(a.payload_bytes == length * 512);
+    REQUIRE(a.file_bytes == b.file_bytes);
+    auto encode = [](const std::vector<Mapping>& mappings) {
+        std::vector<uint8_t> raw(mappings.size() * 16);
+        for (size_t i = 0; i < mappings.size(); ++i)
+            bytes::store_segment_le(raw.data() + i * 16, mappings[i]);
+        return raw;
+    };
+    REQUIRE(encode(a.mappings) == encode(b.mappings));
+}
+
+TEST_CASE("format: sparse export layout rejects invalid ownership before output",
+          "[format][sparse-export]") {
+    using format::sparse_export_detail::make_plan;
+    REQUIRE_THROWS_AS(make_plan(0, {}), error);
+    REQUIRE_THROWS_AS(make_plan(513, {}), error);
+    REQUIRE_THROWS_AS(make_plan(4096, {{1, 0, 1, false, 0}}), error);
+    REQUIRE_THROWS_AS(make_plan(4096, {{7, 2, 7, false, 0}}), error);
+    REQUIRE_THROWS_AS(make_plan(4096, {{1, 1, 2, false, 0}}), error);
+    REQUIRE_THROWS_AS(make_plan(4096, {{1, 1, 1, false, 1}}), error);
+    REQUIRE_THROWS_AS(make_plan(4096, {{1, 2, 1, false, 0}, {2, 1, 0, true, 0}}), error);
+}
+
+
+TEST_CASE("format: sparse delta writer preserves parent bytes and deterministic output",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto parent_bytes = test::pattern_bytes(512 * 32, 1610);
+    const auto source_bytes = test::pattern_bytes(512 * 32, 1611);
+    const auto source_path = dir / "source";
+    test::write_file(source_path, source_bytes);
+    std::string parent_path;
+    make_lsmt_lower(dir.str(), "parent", parent_bytes, &parent_path);
+    using Mapping = bytes::segment_mapping;
+    const std::vector<std::vector<Mapping>> cases = {
+        {}, {{1, 3, 1, false, 0}}, {{5, 2, 0, true, 0}},
+        {{1, 3, 1, false, 0}, {5, 2, 0, true, 0}, {31, 1, 31, false, 0}},
+        {{1, 1, 1, false, 0}, {2, 2, 2, false, 0},
+         {5, 1, 50, true, 0}, {6, 1, 0, true, 0}, {31, 1, 31, false, 0}}
+    };
+    std::vector<uint8_t> canonical;
+    for (size_t index = 0; index < cases.size(); ++index) {
+        const auto output = dir / ("output-" + std::to_string(index));
+        const int fd = ::open(output.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        REQUIRE(fd >= 0);
+        struct Close { int fd; ~Close() { ::close(fd); } } close{fd};
+        const auto& ownership = cases[index];
+        auto expected = parent_bytes;
+        for (const auto& m : ownership) {
+            if (m.zeroed)
+                std::fill_n(expected.begin() + m.offset * 512, m.length * 512, 0);
+            else
+                std::copy_n(source_bytes.begin() + m.offset * 512, m.length * 512,
+                            expected.begin() + m.offset * 512);
+        }
+        const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+            std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+            auto parent_source = co_await source::LocalFileSource::open(parent_path);
+            layers.push_back(co_await format::LsmtLayer::open(std::move(parent_source)));
+            const auto parent_uuid = layers.front()->header().uuid;
+            auto input = co_await source::LocalFileSource::open(source_path);
+            const auto result = co_await format::sparse_export_detail::write_delta(
+                *input, fd, source_bytes.size(), ownership, parent_uuid, "delta-test");
+            REQUIRE(result.file_bytes >= 8192);
+            auto delta_source = co_await source::LocalFileSource::open(output);
+            REQUIRE(delta_source->size() == result.file_bytes);
+            auto delta = co_await format::LsmtLayer::open(std::move(delta_source));
+            REQUIRE(delta->header().uuid == result.uuid);
+            REQUIRE(delta->header().parent_uuid == parent_uuid);
+            REQUIRE(delta->header().user_tag == "delta-test");
+            REQUIRE(delta->header().flags == 6); // Reader uses the sealed trailer.
+            layers.push_back(std::move(delta));
+            auto merged = co_await format::MergedLsmt::open(std::move(layers));
+            std::vector<uint8_t> actual(expected.size());
+            const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+            REQUIRE(read == static_cast<ssize_t>(actual.size()));
+            REQUIRE(actual == expected);
+            co_return 0;
+        });
+        REQUIRE(rc == 0);
+        if (index >= 3) {
+            std::vector<uint8_t> bytes(static_cast<size_t>(std::filesystem::file_size(output)));
+            REQUIRE(::pread(fd, bytes.data(), bytes.size(), 0) == static_cast<ssize_t>(bytes.size()));
+            if (index == 3) canonical = bytes;
+            else REQUIRE(bytes == canonical);
+        }
+    }
+}
+
+
+TEST_CASE("format: sparse exports match across independent recovered write histories",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto payload = test::pattern_bytes(3 * 512, 1621);
+    const auto stale = test::pattern_bytes(3 * 512, 1622);
+    const std::string parent_uuid = "12345678-1234-5678-9abc-123456789abc";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::vector<format::SparseExportResult> results;
+        std::vector<std::vector<uint8_t>> artifacts;
+        for (int history = 0; history != 2; ++history) {
+            const auto path = dir / ("upper-" + std::to_string(history));
+            const auto output = dir / ("delta-" + std::to_string(history));
+            {
+                auto upper = co_await format::SparseRwLayer::open(path, 32 * 512);
+                if (history == 1) {
+                    const auto written = co_await upper->pwrite(stale.data(), stale.size(), 512);
+                    REQUIRE(written == static_cast<ssize_t>(stale.size()));
+                    const auto discarded = co_await upper->discard(512, payload.size());
+                    REQUIRE(discarded == 0);
+                    const auto old_zero = co_await upper->pwrite(stale.data(), 512, 8 * 512);
+                    REQUIRE(old_zero == 512);
+                    const auto flushed = co_await upper->flush();
+                    REQUIRE(flushed == 0);
+                }
+            }
+            {
+                auto upper = co_await format::SparseRwLayer::open_existing(path);
+                if (history == 0) {
+                    const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
+                    REQUIRE(written == static_cast<ssize_t>(payload.size()));
+                } else {
+                    for (int sector = 2; sector >= 0; --sector) {
+                        const auto written = co_await upper->pwrite(
+                            payload.data() + sector * 512, 512, (sector + 1) * 512);
+                        REQUIRE(written == 512);
+                    }
+                }
+                const auto discarded = co_await upper->discard(8 * 512, 512);
+                REQUIRE(discarded == 0);
+                const auto flushed = co_await upper->flush();
+                REQUIRE(flushed == 0);
+            }
+            // export_file performs another existing-source recovery itself.
+            results.push_back(co_await format::SparseRwLayer::export_file(
+                path, output, parent_uuid, "equivalent-state"));
+            auto blob = co_await source::LocalFileSource::open(output);
+            std::vector<uint8_t> bytes(blob->size());
+            const auto read = co_await blob->pread(bytes.data(), bytes.size(), 0);
+            REQUIRE(read == static_cast<ssize_t>(bytes.size()));
+            artifacts.push_back(std::move(bytes));
+        }
+        REQUIRE(results[0].uuid == results[1].uuid);
+        REQUIRE(results[0].sha256 == results[1].sha256);
+        REQUIRE(results[0].size == results[1].size);
+        REQUIRE(artifacts[0] == artifacts[1]);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse export transaction retains a reusable independent source",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const auto output = dir / "sealed";
+    const auto parent_bytes = test::pattern_bytes(512 * 32, 1612);
+    const auto payload = test::pattern_bytes(512, 1613);
+    std::string parent_path;
+    make_lsmt_lower(dir.str(), "parent", parent_bytes, &parent_path);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::string parent_uuid;
+        {
+            auto parent_source = co_await source::LocalFileSource::open(parent_path);
+            auto parent = co_await format::LsmtLayer::open(std::move(parent_source));
+            parent_uuid = parent->header().uuid;
+            auto upper = co_await format::SparseRwLayer::open(path, parent_bytes.size());
+            const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
+            REQUIRE(written == 512);
+            const auto discarded = co_await upper->discard(3 * 512, 512);
+            REQUIRE(discarded == 0);
+            const int flushed = co_await upper->flush();
+            REQUIRE(flushed == 0);
+        }
+        const auto first = co_await format::SparseRwLayer::export_file(path, output, parent_uuid, "snapshot");
+        const auto second = co_await format::SparseRwLayer::export_file(path, output, parent_uuid, "snapshot");
+        REQUIRE(first.uuid == second.uuid);
+        REQUIRE(first.sha256 == second.sha256);
+        REQUIRE(first.size == second.size);
+        REQUIRE(first.sha256.size() == 64);
+        {
+            auto upper = co_await format::SparseRwLayer::open_existing(path);
+            std::vector<uint8_t> changed(512, 0x19);
+            const auto written = co_await upper->pwrite(changed.data(), changed.size(), 512);
+            REQUIRE(written == 512);
+            const int flushed = co_await upper->flush();
+            REQUIRE(flushed == 0);
+        }
+        bool refused = false;
+        try { auto result = co_await format::SparseRwLayer::export_file(path, output, parent_uuid, "snapshot"); }
+        catch (const error& e) { refused = true; REQUIRE(e.errno_value() == EEXIST); }
+        REQUIRE(refused);
+        // The first immutable artifact retains the original bytes despite both
+        // later source writes and a conflicting retry to its destination.
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        auto parent_source = co_await source::LocalFileSource::open(parent_path);
+        layers.push_back(co_await format::LsmtLayer::open(std::move(parent_source)));
+        auto sealed_source = co_await source::LocalFileSource::open(output);
+        std::vector<uint8_t> sealed_bytes(static_cast<size_t>(first.size));
+        const auto raw_read = co_await sealed_source->pread(sealed_bytes.data(), sealed_bytes.size(), 0);
+        REQUIRE(raw_read == static_cast<ssize_t>(sealed_bytes.size()));
+        REQUIRE(common::Sha256::hex(sealed_bytes.data(), sealed_bytes.size()) == first.sha256);
+        layers.push_back(co_await format::LsmtLayer::open(std::move(sealed_source)));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        auto expected = parent_bytes;
+        std::copy(payload.begin(), payload.end(), expected.begin() + 512);
+        std::fill_n(expected.begin() + 3 * 512, 512, 0);
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        auto reopened = co_await format::SparseRwLayer::open_existing(path);
+        const auto source_read = co_await reopened->pread(actual.data(), 512, 512);
+        REQUIRE(source_read == 512);
+        REQUIRE(std::all_of(actual.begin(), actual.begin() + 512, [](uint8_t b) { return b == 0x19; }));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    for (const auto& entry : std::filesystem::directory_iterator(dir.path()))
+        REQUIRE_FALSE(entry.path().filename().string().starts_with(".obd-sparse-export-"));
+}
+
+TEST_CASE("format: sparse export transaction rejects source aliases and active owners",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const auto data_alias = dir / "data-alias";
+    const auto coverage_alias = dir / "coverage-alias";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto owner = co_await format::SparseRwLayer::open(path, 4096);
+            bool rejected = false;
+            try { auto result = co_await format::SparseRwLayer::export_file(path, dir / "output"); }
+            catch (const error& e) { rejected = true; REQUIRE(e.errno_value() == EBUSY); }
+            REQUIRE(rejected);
+        }
+        co_await elio::spawn_blocking([&] {
+            std::filesystem::create_hard_link(path, data_alias);
+            std::filesystem::create_hard_link(path + ".coverage", coverage_alias);
+        });
+        for (const auto& target : {path, path + ".coverage", path + ".zeroes",
+                                   path + ".coverage.tmp", path + ".zeroes.tmp", data_alias, coverage_alias}) {
+            bool rejected = false;
+            try { auto result = co_await format::SparseRwLayer::export_file(path, target); }
+            catch (const error& e) { rejected = true; REQUIRE(e.errno_value() == EINVAL); }
+            REQUIRE(rejected);
+        }
+        auto reopened = co_await format::SparseRwLayer::open_existing(path);
+        REQUIRE(reopened->segments_snapshot().empty());
+        REQUIRE(reopened->virtual_size() == 4096);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    REQUIRE_FALSE(std::filesystem::exists(dir / "output"));
+    REQUIRE_FALSE(std::filesystem::exists(path + ".zeroes"));
+    for (const auto& entry : std::filesystem::directory_iterator(dir.path()))
+        REQUIRE_FALSE(entry.path().filename().string().starts_with(".obd-sparse-export-"));
+}
+
+
+TEST_CASE("format: sparse export failures preserve source and retry publication",
+          "[format][sparse-export]") {
+    using namespace format::sparse_export_detail;
+    for (const auto fault : {Fault::payload, Fault::index, Fault::header, Fault::trailer,
+                             Fault::file_sync, Fault::publish, Fault::directory_sync}) {
+        DYNAMIC_SECTION("failure boundary " << static_cast<int>(fault)) {
+            struct Reset { ~Reset() { fail_export_for_test(Fault::none); } } reset;
+            test::TempDir dir;
+            const auto path = dir / "upper";
+            const auto output = dir / "sealed";
+            const auto payload = test::pattern_bytes(512, 1614);
+            const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+                {
+                    auto upper = co_await format::SparseRwLayer::open(path, 4096);
+                    const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
+                    REQUIRE(written == 512);
+                    const int zeroed = co_await upper->discard(3 * 512, 512);
+                    REQUIRE(zeroed == 0);
+                    const int flushed = co_await upper->flush();
+                    REQUIRE(flushed == 0);
+                }
+                fail_export_for_test(fault);
+                bool failed = false;
+                try { auto result = co_await format::SparseRwLayer::export_file(path, output); }
+                catch (const error& e) { failed = true; REQUIRE(e.errno_value() == EIO); }
+                REQUIRE(failed);
+                fail_export_for_test(Fault::none);
+                const bool published = co_await elio::spawn_blocking([&] {
+                    return std::filesystem::exists(output);
+                });
+                REQUIRE(published == (fault == Fault::directory_sync));
+                {
+                    auto source = co_await format::SparseRwLayer::open_existing(path);
+                    const auto mappings = source->segments_snapshot();
+                    REQUIRE(mappings.size() == 2);
+                    REQUIRE(mappings[0].offset == 1);
+                    REQUIRE_FALSE(mappings[0].zeroed);
+                    REQUIRE(mappings[1].offset == 3);
+                    REQUIRE(mappings[1].zeroed);
+                    std::vector<uint8_t> actual(512);
+                    const auto read = co_await source->pread(actual.data(), actual.size(), 512);
+                    REQUIRE(read == 512);
+                    REQUIRE(actual == payload);
+                }
+                const auto retried = co_await format::SparseRwLayer::export_file(path, output);
+                auto file = co_await source::LocalFileSource::open(output);
+                std::vector<uint8_t> raw(static_cast<size_t>(retried.size));
+                const auto read = co_await file->pread(raw.data(), raw.size(), 0);
+                REQUIRE(read == static_cast<ssize_t>(raw.size()));
+                REQUIRE(common::Sha256::hex(raw.data(), raw.size()) == retried.sha256);
+                std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+                layers.push_back(co_await format::LsmtLayer::open(std::move(file)));
+                auto sealed = co_await format::MergedLsmt::open(std::move(layers));
+                std::vector<uint8_t> expected(4096, 0), actual(4096, 0xff);
+                std::copy(payload.begin(), payload.end(), expected.begin() + 512);
+                const auto verified = co_await sealed->pread(actual.data(), actual.size(), 0);
+                REQUIRE(verified == 4096);
+                REQUIRE(actual == expected);
+                co_return 0;
+            });
+            REQUIRE(rc == 0);
+            for (const auto& entry : std::filesystem::directory_iterator(dir.path()))
+                REQUIRE_FALSE(entry.path().filename().string().starts_with(".obd-sparse-export-"));
+        }
+    }
+}
+
+
+TEST_CASE("cli: sparse export writes an independent delta and reports its digest",
+          "[cli][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const auto output = dir / "sealed";
+    const auto payload = test::pattern_bytes(512, 1615);
+    const int prepared = test::run_coro([&]() -> elio::coro::task<int> {
+        auto upper = co_await format::SparseRwLayer::open(path, 4096);
+        const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
+        REQUIRE(written == 512);
+        const int flushed = co_await upper->checkpoint();
+        REQUIRE(flushed == 0);
+        co_return 0;
+    });
+    REQUIRE(prepared == 0);
+    unsigned invocation = 0;
+    auto command = [&](std::vector<std::string> args, std::string* captured) {
+        const auto out = dir / ("stdout-" + std::to_string(invocation));
+        const auto err = dir / ("stderr-" + std::to_string(invocation++));
+        CoverageTestFd stdout_fd(::open(out.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+        CoverageTestFd stderr_fd(::open(err.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+        REQUIRE(stdout_fd.value >= 0);
+        REQUIRE(stderr_fd.value >= 0);
+        args.insert(args.begin(), OBD_TEST_SPARSE_EXPORT_BIN);
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        argv.push_back(nullptr);
+        const pid_t child = ::fork();
+        REQUIRE(child >= 0);
+        if (child == 0) {
+            if (::dup2(stdout_fd.value, STDOUT_FILENO) < 0 ||
+                ::dup2(stderr_fd.value, STDERR_FILENO) < 0) ::_exit(126);
+            ::execv(argv[0], argv.data());
+            ::_exit(127);
+        }
+        int status = 0;
+        bool done = false;
+        bool still_owned = true;
+        for (int wait = 0; wait < 3000; ++wait) {
+            const auto pid = ::waitpid(child, &status, WNOHANG);
+            if (pid == child) { done = true; break; }
+            if (pid < 0 && errno != EINTR) { still_owned = false; break; }
+            ::usleep(10000);
+        }
+        if (!done && still_owned) {
+            ::kill(child, SIGKILL); // Only this invocation's unreaped test child.
+            while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        }
+        REQUIRE(done);
+        REQUIRE(WIFEXITED(status));
+        struct stat st{};
+        REQUIRE(::fstat(stdout_fd.value, &st) == 0);
+        REQUIRE(st.st_size >= 0);
+        REQUIRE(st.st_size < 65536);
+        captured->resize(static_cast<size_t>(st.st_size));
+        REQUIRE(::pread(stdout_fd.value, captured->data(), captured->size(), 0) ==
+                static_cast<ssize_t>(captured->size()));
+        return WEXITSTATUS(status);
+    };
+    std::string response;
+    const std::string parent = "16100000-0000-4000-8000-000000000001";
+    REQUIRE(command({path, output, "--parent", parent, "--tag", "cli-export"}, &response) == 0);
+    const auto first = nlohmann::json::parse(response);
+    REQUIRE(first.at("path") == output);
+    REQUIRE(first.at("parent_uuid") == parent);
+    REQUIRE(command({path, output, "--parent", parent, "--tag", "cli-export"}, &response) == 0);
+    REQUIRE(nlohmann::json::parse(response) == first);
+    REQUIRE(command({dir / "missing", dir / "absent-output"}, &response) == 1);
+    REQUIRE(response.empty());
+    REQUIRE_FALSE(std::filesystem::exists(dir / "missing"));
+    REQUIRE_FALSE(std::filesystem::exists(dir / "absent-output"));
+    REQUIRE(command({path, path}, &response) == 1);
+    REQUIRE(response.empty());
+    REQUIRE(command({path, output, "--unknown", "x"}, &response) == 2);
+    const int verified = test::run_coro([&]() -> elio::coro::task<int> {
+        auto file = co_await source::LocalFileSource::open(output);
+        REQUIRE(file->size() == first.at("size").get<uint64_t>());
+        std::vector<uint8_t> raw(static_cast<size_t>(file->size()));
+        const auto read = co_await file->pread(raw.data(), raw.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(raw.size()));
+        REQUIRE(common::Sha256::hex(raw.data(), raw.size()) ==
+                first.at("sha256").get<std::string>());
+        auto layer = co_await format::LsmtLayer::open(std::move(file));
+        REQUIRE(layer->header().parent_uuid == parent);
+        REQUIRE(layer->header().user_tag == "cli-export");
+        auto source = co_await format::SparseRwLayer::open_existing(path);
+        const auto written = co_await source->pwrite(payload.data(), payload.size(), 1024);
+        REQUIRE(written == 512);
+        co_return 0;
+    });
+    REQUIRE(verified == 0);
+}
+
+TEST_CASE("format: sparse export size override grows only the independent delta",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const auto output = dir / "grown.lsmt";
+    const auto payload = test::pattern_bytes(512, 1614);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto upper = co_await format::SparseRwLayer::open(path, 4096);
+            const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
+            REQUIRE(written == 512);
+            const int flushed = co_await upper->flush();
+            REQUIRE(flushed == 0);
+        }
+        for (const uint64_t invalid : {uint64_t{512}, uint64_t{4097}}) {
+            bool refused = false;
+            try {
+                auto result = co_await format::SparseRwLayer::export_file(
+                    path, output, "", "", invalid);
+            } catch (const error& e) {
+                refused = true;
+                REQUIRE(e.errno_value() == EINVAL);
+            }
+            REQUIRE(refused);
+            REQUIRE_FALSE(std::filesystem::exists(output));
+        }
+        const auto result = co_await format::SparseRwLayer::export_file(
+            path, output, "", "", 8192);
+        REQUIRE(result.size > 0);
+        auto blob = co_await source::LocalFileSource::open(output);
+        auto layer = co_await format::LsmtLayer::open(std::move(blob));
+        REQUIRE(layer->header().virtual_size == 8192);
+        auto upper = co_await format::SparseRwLayer::open_existing(path);
+        REQUIRE(upper->virtual_size() == 4096);
+        std::vector<uint8_t> actual(512);
+        const auto read = co_await upper->pread(actual.data(), actual.size(), 512);
+        REQUIRE(read == 512);
+        REQUIRE(actual == payload);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse export imports legacy zero masks without flattening parents",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "legacy.sparse";
+    const auto output = dir / "delta.lsmt";
+    const auto parent_bytes = test::pattern_bytes(512 * 32, 1616);
+    const auto payload = test::pattern_bytes(4096, 1617);
+    std::string parent_path;
+    make_lsmt_lower(dir.str(), "parent", parent_bytes, &parent_path);
+    {
+        CoverageTestFd fd(::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+        REQUIRE(fd.value >= 0);
+        REQUIRE(::ftruncate(fd.value, parent_bytes.size()) == 0);
+        REQUIRE(::pwrite(fd.value, payload.data(), payload.size(), 4096) == 4096);
+        REQUIRE(::fsync(fd.value) == 0);
+    }
+    write_sparse_zero_mask(path, parent_bytes.size(), {{10, 4}});
+    REQUIRE_FALSE(std::filesystem::exists(path + ".coverage"));
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto parent_source = co_await source::LocalFileSource::open(parent_path);
+        auto parent = co_await format::LsmtLayer::open(std::move(parent_source));
+        const auto uuid = parent->header().uuid;
+        const auto first = co_await format::SparseRwLayer::export_file(path, output, uuid);
+        REQUIRE(std::filesystem::exists(path + ".coverage"));
+        const auto again = co_await format::SparseRwLayer::export_file(path, output, uuid);
+        REQUIRE(first.sha256 == again.sha256);
+        auto blob = co_await source::LocalFileSource::open(output);
+        auto delta = co_await format::LsmtLayer::open(std::move(blob));
+        REQUIRE(delta->segments().size() == 3);
+        REQUIRE(delta->segments()[0].offset == 8);
+        REQUIRE(delta->segments()[0].length == 2);
+        REQUIRE_FALSE(delta->segments()[0].zeroed);
+        REQUIRE(delta->segments()[1].offset == 10);
+        REQUIRE(delta->segments()[1].length == 4);
+        REQUIRE(delta->segments()[1].zeroed);
+        REQUIRE(delta->segments()[2].offset == 14);
+        REQUIRE(delta->segments()[2].length == 2);
+        REQUIRE_FALSE(delta->segments()[2].zeroed);
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(std::move(parent));
+        layers.push_back(std::move(delta));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        auto expected = parent_bytes;
+        std::copy(payload.begin(), payload.end(), expected.begin() + 4096);
+        std::fill_n(expected.begin() + 10 * 512, 4 * 512, 0);
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        auto reopened = co_await format::SparseRwLayer::open_existing(path);
+        REQUIRE(reopened->segments().size() == 3);
+        REQUIRE(reopened->segments()[1].zeroed);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse export rejects damaged recovery metadata before publication",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const auto output = dir / "delta.lsmt";
+    enum class Damage { coverage_header, zero_mask, data_identity, data_truncation };
+    auto damage = Damage::coverage_header;
+    SECTION("coverage header corruption") {}
+    SECTION("truncated compatibility zero mask") { damage = Damage::zero_mask; }
+    SECTION("replacement data inode") { damage = Damage::data_identity; }
+    SECTION("truncated data inode") { damage = Damage::data_truncation; }
+    const int prepared = test::run_coro([&]() -> elio::coro::task<int> {
+        auto upper = co_await format::SparseRwLayer::open(path, 8192);
+        const auto payload = test::pattern_bytes(512, 1618);
+        const auto written = co_await upper->pwrite(payload.data(), payload.size(), 4096);
+        REQUIRE(written == 512);
+        const int flushed = co_await upper->flush();
+        REQUIRE(flushed == 0);
+        co_return 0;
+    });
+    REQUIRE(prepared == 0);
+    if (damage == Damage::coverage_header) {
+        CoverageTestFd fd(::open((path + ".coverage").c_str(), O_RDWR | O_CLOEXEC));
+        REQUIRE(fd.value >= 0);
+        const uint8_t bad = 0;
+        REQUIRE(::pwrite(fd.value, &bad, 1, 0) == 1);
+    } else if (damage == Damage::zero_mask) {
+        test::write_file(path + ".zeroes", std::vector<uint8_t>{1, 2, 3});
+    } else if (damage == Damage::data_identity) {
+        std::filesystem::rename(path, path + ".original");
+        CoverageTestFd fd(::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+        REQUIRE(fd.value >= 0);
+        REQUIRE(::ftruncate(fd.value, 8192) == 0);
+    } else {
+        REQUIRE(::truncate(path.c_str(), 4096) == 0);
+    }
+    auto read_artifact = [](const std::string& name) {
+        CoverageTestFd fd(::open(name.c_str(), O_RDONLY | O_CLOEXEC));
+        REQUIRE(fd.value >= 0);
+        std::vector<uint8_t> bytes(static_cast<size_t>(std::filesystem::file_size(name)));
+        REQUIRE(::pread(fd.value, bytes.data(), bytes.size(), 0) ==
+                static_cast<ssize_t>(bytes.size()));
+        return bytes;
+    };
+    const auto coverage_before = read_artifact(path + ".coverage");
+    const auto data_before = read_artifact(path);
+    const auto zero_before = damage == Damage::zero_mask
+        ? read_artifact(path + ".zeroes") : std::vector<uint8_t>{};
+    const int rejected = test::run_coro([&]() -> elio::coro::task<int> {
+        bool refused = false;
+        try { auto result = co_await format::SparseRwLayer::export_file(path, output); }
+        catch (const std::exception&) { refused = true; }
+        REQUIRE(refused);
+        co_return 0;
+    });
+    REQUIRE(rejected == 0);
+    REQUIRE_FALSE(std::filesystem::exists(output));
+    REQUIRE(std::filesystem::exists(path));
+    REQUIRE(read_artifact(path + ".coverage") == coverage_before);
+    REQUIRE(read_artifact(path) == data_before);
+    if (damage == Damage::zero_mask)
+        REQUIRE(read_artifact(path + ".zeroes") == zero_before);
+    for (const auto& entry : std::filesystem::directory_iterator(dir.str()))
+        REQUIRE_FALSE(entry.path().filename().string().starts_with(".obd-sparse-export-"));
+}
+
+TEST_CASE("format: sparse export resolves directory symlinks before parent traversal",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const auto local = dir / "local";
+    const auto target = dir / "target";
+    std::filesystem::create_directory(local);
+    std::filesystem::create_directories(target + "/nested");
+    std::filesystem::create_directory_symlink(target + "/nested", local + "/link");
+    const auto requested = local + "/link/../delta.lsmt";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto source = co_await format::SparseRwLayer::open(path, 4096);
+            const int flushed = co_await source->checkpoint();
+            REQUIRE(flushed == 0);
+        }
+        const auto result = co_await format::SparseRwLayer::export_file(path, requested);
+        REQUIRE(std::filesystem::exists(requested));
+        REQUIRE(std::filesystem::exists(target + "/delta.lsmt"));
+        REQUIRE_FALSE(std::filesystem::exists(local + "/delta.lsmt"));
+        auto blob = co_await source::LocalFileSource::open(requested);
+        REQUIRE(blob->size() == result.size);
+        auto layer = co_await format::LsmtLayer::open(std::move(blob));
+        REQUIRE(layer->virtual_size() == 4096);
+        REQUIRE(layer->segments().empty());
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: sparse export recovers completed child operations and grown tails",
+          "[format][sparse-export]") {
+    test::TempDir dir;
+    const auto path = dir / "upper";
+    const auto output = dir / "delta.lsmt";
+    const auto parent_bytes = test::pattern_bytes(512 * 64, 1619);
+    std::string parent_path;
+    make_lsmt_lower(dir.str(), "parent", parent_bytes, &parent_path);
+    auto completed = [&](const std::string& operation, uint64_t capacity,
+                         uint64_t sector) {
+        const int status = run_sparse_crash_writer(path, operation, capacity,
+                                                   sector * 512, 512);
+        REQUIRE(WIFEXITED(status));
+        REQUIRE(WEXITSTATUS(status) == 0);
+    };
+    // Each helper exits via _exit immediately after a completed operation:
+    // no flush, checkpoint or layer/runtime destructor publishes the state.
+    completed("write", 512 * 32, 9);
+    completed("discard", 512 * 32, 9);
+    completed("write-zero", 512 * 32, 10);
+    completed("write", 512 * 64, 63);
+    // A surviving v1 compatibility mask overlays authoritative v2 coverage.
+    write_sparse_zero_mask(path, 512 * 64, {{9, 1}, {20, 1}});
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto parent_source = co_await source::LocalFileSource::open(parent_path);
+        auto parent = co_await format::LsmtLayer::open(std::move(parent_source));
+        const auto uuid = parent->header().uuid;
+        const auto result = co_await format::SparseRwLayer::export_file(path, output, uuid);
+        const auto retry = co_await format::SparseRwLayer::export_file(path, output, uuid);
+        REQUIRE(result.sha256 == retry.sha256);
+        auto blob = co_await source::LocalFileSource::open(output);
+        auto delta = co_await format::LsmtLayer::open(std::move(blob));
+        REQUIRE(delta->virtual_size() == parent_bytes.size());
+        REQUIRE(delta->header().parent_uuid == uuid);
+        REQUIRE(delta->segments().size() == 4);
+        REQUIRE(delta->segments()[0].offset == 9);
+        REQUIRE(delta->segments()[0].zeroed);
+        REQUIRE(delta->segments()[1].offset == 10);
+        REQUIRE_FALSE(delta->segments()[1].zeroed);
+        REQUIRE(delta->segments()[2].offset == 20);
+        REQUIRE(delta->segments()[2].zeroed);
+        REQUIRE(delta->segments()[3].offset == 63);
+        REQUIRE_FALSE(delta->segments()[3].zeroed);
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(std::move(parent));
+        layers.push_back(std::move(delta));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        auto expected = parent_bytes;
+        for (const size_t sector : {size_t{9}, size_t{10}, size_t{20}})
+            std::fill_n(expected.begin() + sector * 512, 512, 0);
+        std::fill_n(expected.begin() + 63 * 512, 512, 0xa5);
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        auto source = co_await format::SparseRwLayer::open_existing(path);
+        REQUIRE(source->virtual_size() == parent_bytes.size());
+        const int flushed = co_await source->flush();
+        REQUIRE(flushed == 0);
         co_return 0;
     });
     REQUIRE(rc == 0);

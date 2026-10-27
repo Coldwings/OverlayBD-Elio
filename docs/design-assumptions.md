@@ -88,8 +88,10 @@ sector coverage, ADR-0024) and
 Writes are copy-on-write into the upper; unsealed LSMT-RW data is durable
 only at flush level and is not recoverable across restarts until sealed.
 A graceful device shutdown checkpoints the LSMT-RW index into the file so
-the supervisor can seal the upper offline (`commit`, ADR-0014); sparse
-uppers never seal.
+the supervisor can seal the upper offline (`commit`, ADR-0027). Sparse
+commit instead exports a separate sealed LSMT delta after stop/reap and
+source checkpoint, preserving DATA/ZERO/INHERIT and the opened parent identity.
+The sparse source remains reusable; its raw file is never overwritten with LSMT.
 Discard's intended device contract is mask-with-zeroes semantics
 (ADR-0009): a discarded range should read back as zeroes rather than fall
 through to the lowers. LSMT-RW satisfies this by recording zeroed segments;

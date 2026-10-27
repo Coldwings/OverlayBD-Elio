@@ -264,3 +264,31 @@ TEST_CASE("cli: obdctl create-blank sends a create command with the blank object
                 absent, {"create-blank", "d15", "--size",
                          "18014398509481984"})) == 2);
 }
+
+TEST_CASE("cli: obdctl commit forwards sparse export destination and geometry",
+          "[cli][sparse-export]") {
+    test::TempDir dir;
+    const auto sock = dir / "ctl.sock";
+    const auto output = dir / "exported delta.lsmt";
+    {
+        OneShotServer server(sock);
+        const auto pid = spawn_obdctl(sock, {"commit", "sparse", "--output", output,
+            "--tag", "snapshot", "--virtual-size", "65536"});
+        const auto line = server.receive_and_reply("{\"ok\":true}\n");
+        REQUIRE(wait_obdctl(pid) == 0);
+        const auto request = nlohmann::json::parse(line);
+        const nlohmann::json expected = {{"cmd", "commit"}, {"id", "sparse"},
+            {"output", output}, {"user_tag", "snapshot"}, {"virtual_size", 65536}};
+        REQUIRE(request == expected);
+    }
+    {
+        OneShotServer server(sock);
+        const auto pid = spawn_obdctl(sock, {"commit", "sparse"});
+        const auto line = server.receive_and_reply("{\"ok\":false,\"error\":\"test refusal\"}\n");
+        REQUIRE(wait_obdctl(pid) == 1);
+        const auto request = nlohmann::json::parse(line);
+        REQUIRE_FALSE(request.contains("output"));
+    }
+    REQUIRE(wait_obdctl(spawn_obdctl(dir / "absent.sock",
+        {"commit", "sparse", "--output"})) == 2);
+}

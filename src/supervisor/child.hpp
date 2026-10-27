@@ -91,6 +91,7 @@ public:
         std::string device;
         std::string error;
         int exit_code = -1;  // >= 0 once reaped
+        std::optional<std::string> upper_parent_uuid = std::nullopt;
     };
 
     Status status() const;

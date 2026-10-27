@@ -6,6 +6,10 @@ add_executable(obd-mkimage obd_mkimage_main.cpp)
 obd_target_warnings(obd-mkimage)
 target_link_libraries(obd-mkimage PRIVATE obd_core)
 
+add_executable(obd-export-sparse obd_export_sparse_main.cpp)
+obd_target_warnings(obd-export-sparse)
+target_link_libraries(obd-export-sparse PRIVATE obd_core)
+
 add_executable(obd-convert obd_convert_main.cpp ext2_layout.cpp gzip_index_builder.cpp turbo_package.cpp turbo_import.cpp oci_layer_plan.cpp oci_ext2_builder.cpp turbo_layered.cpp)
 obd_target_warnings(obd-convert)
 target_link_libraries(obd-convert PRIVATE obd_core)
@@ -24,4 +28,4 @@ else()
     target_compile_definitions(obd-convert PRIVATE OBD_HAVE_LIBE2FS=0)
 endif()
 
-install(TARGETS obdctl obd-mkimage obd-convert RUNTIME DESTINATION bin)
+install(TARGETS obdctl obd-mkimage obd-convert obd-export-sparse RUNTIME DESTINATION bin)

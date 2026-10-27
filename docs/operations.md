@@ -291,12 +291,28 @@ A per-image config may add a writable upper:
   teardown.
 - `type: "sparse"` → a sparse file (`<dir>/overlaybd.sparse`); after an
   unclean shutdown exact 512-byte DATA/ZERO ownership is recovered from
-  `<dir>/overlaybd.sparse.coverage` (ADR-0024). Sparse uppers never seal
-  (ADR-0014 upstream parity).
+  `<dir>/overlaybd.sparse.coverage` (ADR-0024). Offline export produces a
+  separate sealed LSMT delta while preserving the Sparse source (ADR-0027).
 
 With an upper present the device is created read-write; without one it is
 read-only and write attempts fail with `EROFS`. See ADR-0008 for the
 decision and its durability contract.
+
+### Exporting a stopped sparse upper (ADR-0027)
+
+Use `obd-export-sparse SOURCE OUTPUT [--parent UUID] [--tag TAG]` after stopping
+and reaping the source device. The destination is a new independent LSMT upper
+delta; retain its original parent chain when loading it. The sparse source is
+not consumed and can be reopened read-write. Exact DATA/ZERO/INHERIT semantics
+are preserved, so this is not a flattened disk image. The source must exist,
+and an active cooperating Sparse owner causes an error.
+
+A successful command prints the artifact path, SHA-256, size and UUID. Keep the
+source data/metadata paths and output directory stable during the operation.
+Source aliases and conflicting existing outputs are rejected. If publication
+succeeds but its directory sync fails, retry the same command: identical output
+is verified and synchronized without replacement. See
+[binaries.md](./binaries.md#obd-export-sparse) for arguments and exit codes.
 
 ## Committing a writable device (ADR-0014)
 
@@ -316,7 +332,7 @@ Contract and runbook notes:
   reaped (bounded; SIGKILL on timeout) before any byte is sealed — there
   is no live seal. The device entry remains afterwards (`obdctl status`
   still works, state `exited`); `destroy` removes it as usual.
-- **Graceful shutdown checkpoint is required.** The seal consumes the
+- **LSMT-RW requires a graceful shutdown checkpoint.** Its seal consumes the
   index checkpoint obd-device writes on graceful shutdown. If the device
   crashes or is SIGKILLed before that checkpoint succeeds, commit fails
   with "no valid shutdown checkpoint" and the unsealed upper's writes are
@@ -327,10 +343,14 @@ Contract and runbook notes:
   upper's content plus the `--tag` string: identical content and tag seal
   to identical bytes, so the reply's `sha256` is suitable for
   content-addressed layer reuse. See docs/format.md for the invariant.
-- **Sparse uppers never seal** (upstream parity): commit fails with
-  "sparse uppers cannot be sealed". Upper-less (read-only) devices fail
-  with "no writable upper".
-- A second commit of the same upper fails with "already sealed" — commit
+- **Sparse commit exports separately.** After stop/reap, it recovers exact
+  ownership and exports to `<upper.dir>/overlaybd.sparse.lsmt`, or `--output PATH`.
+  The child's reported parent identity must be available and unchanged across
+  observed recovery generations. Refusal at that check leaves the live device
+  running. Identical-output retries succeed; different existing output is kept
+  and rejected. The source remains reopenable read-write. Upper-less devices
+  still fail with "no writable upper".
+- A second LSMT-RW commit fails with "already sealed" — LSMT-RW commit
   seals in place (atomic rename over `overlaybd.rw`); copy the file
   beforehand if you need the unsealed form. A commit issued while another
   commit of the same device is still running fails with "commit already
@@ -598,7 +618,7 @@ correlate by device id and by the supervisor's spawn logs.
 | Slow first reads, DART warnings in the log | DART proxy configured but unreachable. This is handled: the source logs a warning and falls back to direct registry reads (guarded by `integration: enabled-but-unreachable DART falls back to direct reads`). Fix the `p2pConfig` address or disable P2P. |
 | A device child crashed | Siblings and the supervisor are isolated (ADR-0004). For an ordinary ready-device crash, the supervisor attempts bounded recovery and respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection. A retained startup generation blocks further replacement; inspect ownership status and use explicit `destroy` before recreating. Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008); offline `commit` only has input if graceful shutdown already wrote a valid checkpoint before the child died. |
 | `commit` fails with "no valid shutdown checkpoint" | No graceful-shutdown checkpoint reached disk before the child died, for example a crash or SIGKILL before `checkpoint()` completed. The unsealed upper is unsealable (ADR-0014); start over from the lowers. |
-| `commit` fails with "sparse uppers cannot be sealed" | Sparse uppers never seal (upstream parity, ADR-0014). Use `type: "lsmt"` uppers for content you intend to commit. |
+| Sparse `commit` reports unavailable or changed parent identity | Use a device child supporting the `sparse_export` protocol batch. Keep its parent chain stable across recovery. The refusal occurs before stopping; do not substitute an unrelated parent merely to make export succeed. See ADR-0027. |
 | `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard reaches only writable devices; writable uppers satisfy ADR-0009 zero-mask semantics. LSMT-RW records zeroed segments, while sparse uppers publish exact ZERO coverage plus the compatibility zero-mask before punching holes. |
 | `resize` fails with a "grow-only" error | The requested size is at or below the device's current capacity; shrink is unsupported (ADR-0014). Grow to a larger size, or create with `--virtual-size` headroom if you need to plan ahead. |
 | `resize` fails with an `UPDATE_SIZE`-related error (`ENOTSUPP` 524 or `EOPNOTSUPP` 95) | The kernel driver predates `UBLK_U_CMD_UPDATE_SIZE` (needs the 6.16 cycle; pre-6.15 drivers answer `ENOTSUPP` 524, 6.15+ answer `EOPNOTSUPP` 95); the kernel capacity is unchanged and a retry succeeds once the driver accepts the command. `create --virtual-size` and `commit --virtual-size` do not need kernel support. |

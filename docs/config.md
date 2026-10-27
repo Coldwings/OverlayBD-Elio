@@ -261,7 +261,8 @@ Durability note: the `lsmt` upper keeps its segment index in memory
 until `checkpoint()`/`seal()`; unsealed data is not crash-durable (see
 *Limitations & TODO* in `docs/architecture.md`). A graceful device
 shutdown writes the checkpoint that the offline `commit` seal consumes
-(ADR-0014); a `"sparse"` upper never seals.
+(ADR-0014). Sparse commit instead exports a separate sealed LSMT delta after
+stop/reap and exact-coverage recovery, retaining the reusable source (ADR-0027).
 
 ### `download` (per-image overrides)
 

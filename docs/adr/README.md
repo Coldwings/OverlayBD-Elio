@@ -135,7 +135,7 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0011](./0011-sparse-layer-store.md) | Unify layer persistence into a sparse-file LayerStore with sidecar bitmap and per-extent CRC | accepted |
 | [0012](./0012-read-admission-funnel.md) | Admit all remote reads through one priority funnel with scavenger-class prefetch | accepted |
 | [0013](./0013-trace-prefetch.md) | Record and replay prefetch traces in upstream-compatible format without a photon dependency | accepted |
-| [0014](./0014-offline-commit-and-cli-boundary.md) | Commit offline with deterministic seal, grow-only resize, and an external CLI boundary | accepted |
+| [0014](./0014-offline-commit-and-cli-boundary.md) | Commit offline with deterministic seal, grow-only resize, and an external CLI boundary | superseded by ADR-0027 |
 | [0015](./0015-registry-token-singleflight-and-expiry.md) | Single-flight registry token re-auth with expires_in-honoring cache lifetimes | superseded by ADR-0017 |
 | [0016](./0016-persistence-never-gates-boot.md) | Layer persistence is best-effort — an unusable layer dir degrades to remote-only, never fails assembly | accepted |
 | [0017](./0017-self-mode-bearer-url-info-expiry.md) | Cap Self-mode Bearer URL-info cache by token expiry | accepted |
@@ -147,4 +147,5 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | accepted |
 | [0024](./0024-exact-sparse-upper-coverage.md) | Persist exact sector coverage for sparse uppers | accepted |
 | [0025](./0025-configure-device-queue-and-worker-topology.md) | Resolve device queues and workers together before startup | accepted |
+| [0027](./0027-export-stable-sparse-deltas.md) | Export stable sparse ownership as an independent LSMT delta | accepted |
 | [0028](./0028-cluster-converted-filesystem-metadata.md) | Cluster finalized filesystem metadata in ordinary LSMT payloads | proposed |
