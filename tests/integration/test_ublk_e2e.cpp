@@ -5,6 +5,7 @@
 #include "ublk/device.hpp"
 #include "ublk/request_counts.hpp"
 #include "format/hybrid_rw.hpp"
+#include "format/lsmt_rw.hpp"
 #include "format/merged_writable.hpp"
 
 #include "../support.hpp"
@@ -464,9 +465,10 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
 
 namespace {
 
-void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = false) {
+void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = false, bool lsmt = false) {
+    const bool writable = hybrid || lsmt;
     test::TempDir temporary;
-    const auto pair_directory = temporary / "recovery.hybrid";
+    const auto pair_directory = temporary / "recovery-upper";
     // A child process creates and serves the device; the parent kills it
     // and attaches a replacement server (the real kernel handshake,
     // ADR-0010). The block device must survive and keep serving reads.
@@ -482,16 +484,20 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
         ::close(server.pipefd[0]);
         int rc = 1;
         try {
-            rc = elio::run([](int out, bool requested, uint16_t queue_count, bool use_hybrid, const char* directory)
+            rc = elio::run([](int out, bool requested, uint16_t queue_count, int upper_type, const char* directory)
                 -> elio::coro::task<int> {
                 auto data = test::pattern_bytes(512 * 64, 84);
                 source::BlobSourcePtr src;
-                if (use_hybrid) {
-                    auto top = co_await format::HybridRwLayer::create(directory, data.size());
+                if (upper_type != 0) {
+                    std::unique_ptr<format::WritableLayer> top;
+                    if (upper_type == 1)
+                        top = co_await format::HybridRwLayer::create(directory, data.size());
+                    else
+                        top = co_await format::LsmtRwLayer::create(directory, data.size());
                     src = co_await format::MergedWritable::open({}, std::move(top));
                 } else src = std::make_unique<test::VectorSource>(data);
                 ublk::DeviceParams params;
-                params.read_only = !use_hybrid;
+                params.read_only = upper_type == 0;
                 params.dev_sectors = data.size() / 512;
                 params.enable_recovery = requested;
                 params.nr_queues = queue_count;
@@ -520,7 +526,7 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
                         co_await elio::time::sleep_for(std::chrono::hours(1));
                     }
                 });
-            }, server.pipefd[1], request_recovery, nr_queues, hybrid, pair_directory.c_str());
+            }, server.pipefd[1], request_recovery, nr_queues, hybrid ? 1 : lsmt ? 2 : 0, pair_directory.c_str());
         } catch (const std::exception& e) {
             std::fprintf(stderr, "recovery child failed: %s\n", e.what());
         } catch (...) {
@@ -559,9 +565,9 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
 
     // The device answers reads while the first server is alive.
     auto expected = test::pattern_bytes(512 * 64, 84);
-    server.client_fd = ::open(bdev.c_str(), hybrid ? O_RDWR : O_RDONLY);
+    server.client_fd = ::open(bdev.c_str(), writable ? O_RDWR : O_RDONLY);
     REQUIRE(server.client_fd >= 0);
-    if (hybrid) {
+    if (writable) {
         REQUIRE(::pwrite(server.client_fd, expected.data(), expected.size(), 0) ==
                 static_cast<ssize_t>(expected.size()));
         REQUIRE(::fsync(server.client_fd) == 0);
@@ -575,7 +581,7 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
     REQUIRE(::pread(server.client_fd, buf.data(), buf.size(), 2048) == 4096);
     REQUIRE(buf == std::vector<uint8_t>(expected.begin() + 2048,
                                         expected.begin() + 2048 + 4096));
-    if (hybrid) REQUIRE(::ioctl(server.client_fd, BLKFLSBUF) == 0);
+    if (writable) REQUIRE(::ioctl(server.client_fd, BLKFLSBUF) == 0);
     ::close(server.client_fd);
     server.client_fd = -1;
 
@@ -610,9 +616,13 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
         rc = test::run_coro([&]() -> elio::coro::task<int> {
             auto data = test::pattern_bytes(512 * 64, 84);
             source::BlobSourcePtr src;
-            if (hybrid) {
-                auto top = co_await format::HybridRwLayer::open_existing(
-                    pair_directory + "/data", pair_directory + "/index");
+            if (writable) {
+                std::unique_ptr<format::WritableLayer> top;
+                if (hybrid)
+                    top = co_await format::HybridRwLayer::open_existing(
+                        pair_directory + "/data", pair_directory + "/index");
+                else
+                    top = co_await format::LsmtRwLayer::open_or_create(pair_directory, 32768, true);
                 std::vector<uint8_t> recovered(expected.size());
                 const auto bytes = co_await top->pread(recovered.data(), recovered.size(), 0);
                 REQUIRE(bytes == static_cast<ssize_t>(recovered.size()));
@@ -620,7 +630,7 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
                 src = co_await format::MergedWritable::open({}, std::move(top));
             } else src = std::make_unique<test::VectorSource>(data);
             ublk::DeviceParams params;
-            params.read_only = !hybrid;
+            params.read_only = !writable;
             params.dev_sectors = data.size() / 512;
             params.nr_queues = nr_queues;
             auto dev = co_await ublk::Device::attach(
@@ -630,7 +640,7 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
             co_return co_await with_device_cleanup(dev, fd2, [&]()
                 -> elio::coro::task<int> {
                 fd2 = co_await bdev_io([&] {
-                    return ::open(dev->bdev_path().c_str(), hybrid ? O_RDWR : O_RDONLY);
+                    return ::open(dev->bdev_path().c_str(), writable ? O_RDWR : O_RDONLY);
                 });
                 REQUIRE(fd2 >= 0);
                 std::vector<uint8_t> buf2(4096);
@@ -640,7 +650,7 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
                 REQUIRE(nread2 == 4096);
                 REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
                                                      expected.begin() + 2048 + 4096));
-                if (hybrid) {
+                if (writable) {
                     const auto patch = test::pattern_bytes(4096, 1461);
                     const auto written = co_await bdev_io([&] {
                         return ::pwrite(fd2, patch.data(), patch.size(), 16384);
@@ -673,10 +683,14 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
     release_observer.join();
     REQUIRE(rc == 0);
     REQUIRE(kernel_device_absent(dev_id));
-    if (hybrid) {
+    if (writable) {
         const int reopened = test::run_coro([&]() -> elio::coro::task<int> {
-            auto top = co_await format::HybridRwLayer::open_existing(
-                pair_directory + "/data", pair_directory + "/index");
+            std::unique_ptr<format::WritableLayer> top;
+            if (hybrid)
+                top = co_await format::HybridRwLayer::open_existing(
+                    pair_directory + "/data", pair_directory + "/index");
+            else
+                top = co_await format::LsmtRwLayer::open_or_create(pair_directory, 32768, true);
             std::vector<uint8_t> actual(expected.size());
             const auto read = co_await top->pread(actual.data(), actual.size(), 0);
             REQUIRE(read == static_cast<ssize_t>(actual.size()));
@@ -684,7 +698,7 @@ void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = fal
             co_return 0;
         });
         REQUIRE(reopened == 0);
-        std::fprintf(stderr, "HYBRID_RECOVERY queues=%u flags=%llu passed\n", nr_queues,
+        std::fprintf(stderr, "%s_RECOVERY queues=%u flags=%llu passed\n", hybrid ? "HYBRID" : "LSMT", nr_queues,
             static_cast<unsigned long long>(report[1]));
     }
 }
@@ -777,4 +791,13 @@ TEST_CASE("integration: hybrid ublk recovers persisted writes after server death
     const uint16_t queues = GENERATE(1, 2);
     INFO("queues=" << queues);
     check_recovery(true, queues, true);
+}
+
+TEST_CASE("integration: LSMT ublk recovers persisted writes after server death",
+          "[ublk][lsmt]") {
+    if (const auto reason = test::ublk_prerequisite_skip_reason(); !reason.empty())
+        SKIP(reason);
+    const uint16_t queues = GENERATE(1, 2);
+    INFO("queues=" << queues);
+    check_recovery(true, queues, false, true);
 }

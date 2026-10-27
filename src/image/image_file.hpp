@@ -105,7 +105,7 @@ struct OpenedImage {
 /// (grow-only vs the image's declared size, validated here with the
 /// single-source rule device_capacity_bytes); a read-only image ignores
 /// it (headroom is dev-size-only at the ublk layer, set by the caller).
-/// For Hybrid USER_RECOVERY, recover_existing_upper requires the persisted
+/// For LSMT/Hybrid USER_RECOVERY, recover_existing_upper requires the persisted
 /// pair and uses its capacity instead of the original create-time override.
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                          const GlobalConfig& global,

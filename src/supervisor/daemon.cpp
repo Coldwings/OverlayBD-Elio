@@ -399,7 +399,7 @@ class Daemon {
         int recoveries = 0;   // completed respawns
         bool destroying = false;  // intentional teardown: never respawn
         std::string upper_path;   // Writable data artifact captured at create.
-        std::string upper_index_path; // Hybrid companion captured with data path.
+        std::string upper_index_path; // Writable companion captured with data path.
         std::string upper_type;   // "" = no writable upper recorded
         // Guarded by mu_; first valid ready captures parent association.
         std::optional<std::string> upper_parent_uuid;
@@ -1238,6 +1238,7 @@ private:
                 entry->upper_index_path = workspace + "/overlaybd.hybrid/index";
             } else {
                 entry->upper_path = workspace + "/overlaybd.rw";
+                entry->upper_index_path = entry->upper_path + ".index";
             }
             entry->blank = true;
             // Recorded NOW (before the entry is published and before mkfs
@@ -1269,6 +1270,7 @@ private:
                     entry->upper_type = img.upper.type;
                     if (img.upper.type == "lsmt") {
                         entry->upper_path = img.upper.dir + "/overlaybd.rw";
+                        entry->upper_index_path = entry->upper_path + ".index";
                     } else if (img.upper.type == "sparse") {
                         entry->upper_path = img.upper.dir + "/overlaybd.sparse";
                     } else if (img.upper.type == "hybrid") {
@@ -2052,8 +2054,8 @@ private:
         // first (SIGTERM + bounded reap — the destroy mechanics without
         // removing the entry) and only then seals; a device that will not
         // stop is never sealed underneath. The graceful shutdown makes the
-        // device checkpoint its upper's index (obd-device), which the
-        // offline seal below requires. The loop re-reads entry->child: a
+        // device checkpoint its upper (obd-device). Persistent pairs also
+        // permit offline seal after process-crash recovery. The loop re-reads entry->child: a
         // recovery respawn that completed just before op_mu was taken
         // installed a fresh child, which is stopped here too; while op_mu
         // is held no further respawn can install another.

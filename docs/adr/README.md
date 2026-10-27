@@ -141,7 +141,7 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0017](./0017-self-mode-bearer-url-info-expiry.md) | Cap Self-mode Bearer URL-info cache by token expiry | accepted |
 | [0018](./0018-download-trycnt-structural-boundary.md) | Treat invalid download tryCnt as a structural configuration error | proposed |
 | [0019](./0019-streaming-tar-converter.md) | Build tar streams into deterministic device-free LSMT layers | accepted |
-| [0020](./0020-native-turbooci.md) | Read TurboOCI natively and build its metadata locally | accepted |
+| [0020](./0020-native-turbooci.md) | Read TurboOCI natively and build its metadata locally | superseded by ADR-0029 |
 | [0021](./0021-reuse-tag-handlers-on-the-bridge-worker.md) | Reuse tag handlers on their bridge worker | accepted |
 | [0022](./0022-retain-failed-startup-owners.md) | Retain failed startup owners until positive retirement | proposed |
 | [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | accepted |
@@ -150,3 +150,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0026](./0026-persist-interoperable-hybrid-uppers.md) | Persist interoperable Hybrid uppers without payload-copy sealing | accepted |
 | [0027](./0027-export-stable-sparse-deltas.md) | Export stable sparse ownership as an independent LSMT delta | accepted |
 | [0028](./0028-cluster-converted-filesystem-metadata.md) | Cluster finalized filesystem metadata in ordinary LSMT payloads | accepted |
+| [0029](./0029-persistent-lsmt-writable-pairs.md) | Resume LSMT writable data/index pairs after process exit | accepted |

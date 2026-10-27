@@ -1149,13 +1149,11 @@ single Range-capable blob. No external golden files.
   `AdmissionSource` wrapper.
 - **`lower.size` is not cross-checked** against the probed/local blob size;
   the authoritative size comes from the source at open time.
-- **Writable uppers are per-device and not sealed automatically** — a
-  sparse upper can recover exact DATA/ZERO ownership from its coverage
-  sidecar across reopen, while an unsealed LSMT-RW upper is not recovered by a later
-  image open even after graceful shutdown writes its checkpoint; that
-  checkpoint is consumed only by the supervisor's offline `commit`, and a
-  fresh open truncates the unsealed file. Committing/sealing an upper into
-  a new lower is an explicit, offline operation (ADR-0014);
+- **Writable uppers are per-device and not sealed automatically.** LSMT
+  data/index pairs recover completed ownership and grown capacity on reopen
+  (ADR-0029); Sparse uses its exact-coverage sidecar. Recovery never silently
+  creates a missing LSMT pair. Valid legacy checkpoints migrate; memory-only
+  legacy uppers cannot recover. Commit remains an explicit offline operation;
   registry write-back remains out of scope (ADR-0007).
 - **Legacy sparse uppers are imported once.** An upper without v2 coverage is
   scanned with `SEEK_DATA`/`SEEK_HOLE`, overlaid with `.zeroes`, and frozen as

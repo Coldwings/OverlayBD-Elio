@@ -429,6 +429,73 @@ Every test, grouped by area, with the property it guards.
 - `format: lsmt rw overwrites covered data in place` — rewriting a
   range already covered by the RW layer edits it in place; uncovering
   writes append.
+- `integration: LSMT ublk recovers persisted writes after server death` —
+  single/two-queue kernel recovery preserves writes, discard and write-zeroes,
+  permits replacement writes, and validates a final ordinary-file reopen.
+- `integration: real supervisor recovers LSMT completed unflushed writes` —
+  the real supervisor replaces its killed two-queue child after direct writes
+  and discard without FLUSH; full byte and ownership checks follow recovery
+  and final stop/reopen. Requires isolated privileged ublk validation.
+- `format: LSMT process exit between payload and index preserves only published ownership` —
+  an independent child exits after new payload completion but before mapping
+  publication; completed earlier overwrite survives, orphan payload gains no
+  ownership, and resumed writes append beyond it.
+- `image: LSMT assembly preserves uncheckpointed ownership and grown capacity on reopen` —
+  ordinary and recovery assembly preserve DATA, ZERO masks over a nonzero lower,
+  and grown-tail contents for image and blank devices, including explicit
+  write/discard/FLUSH/reopen cycles; a missing index fails
+  without replacing the upper.
+- `format: LSMT rejected later write piece preserves readable published prefix` —
+  after a later piece hits the admission limit, live merged, direct and reopened
+  reads agree on the completed prefix while the unpublished suffix inherits
+  the nonzero lower.
+- `format: failed LSMT discard preserves masked lower bytes in the live merged view` —
+  failed journal publication preserves both prior DATA and ZERO over a nonzero
+  lower immediately and after reopen.
+- `format: LSMT partial admission requires reopen before further mutation` —
+  a rejected multi-record discard retains its completed prefix on disk and
+  refuses new mutations until reopen reconciles the staged visible map.
+- `format: LSMT admission counts replay splits and uncoalesced records before publication` —
+  a small test-only admission cap rejects both splitting and append growth
+  without publishing an unrecoverable record; rejection permits later writes.
+- `format: LSMT partial mapping append poisons writer until validated recovery` —
+  an incomplete index record prevents later acknowledgements, is trimmed only
+  by reopen, and does not fabricate ownership.
+- `format: LSMT checkpoint retries each synchronization failure before becoming terminal` —
+  failures at payload, index and directory synchronization permit retry; only
+  successful checkpoint terminates the instance and reopen remains writable.
+- `format: LSMT compaction retains the authoritative index after publication failures` —
+  before/after-rename failures retain exclusive ownership and the correct index
+  descriptor; subsequent appends and another compaction survive reopen.
+- `format: LSMT writable replay matches upstream append and buffered fixtures` —
+  pinned upstream pair logs reproduce exact bytes and ownership states; pair
+  identity, capacity and incomplete-record mismatches are rejected.
+- `format: LSMT writable replay preserves ZERO splits and rejects DATA aliasing` —
+  ordered overlap replay retains ZERO masks and rejects physical DATA aliases.
+- `format: LSMT pair replays completed appends without FLUSH and compacts under stable ownership` —
+  index replacement retains exclusive ownership and can be reopened and flushed.
+- `format: LSMT pair repairs only incomplete suffix after validating completed records` —
+  a partial EOF record is retired only after full-record validation succeeds.
+- `format: LSMT pair refuses complete sealed data before opening its stale index` —
+  sealed data is rejected even when its index sidecar is absent.
+- `format: LSMT imported pair resumes writes after unflushed process death` —
+  an independent child exits without cleanup after overwrite, new DATA,
+  discard and ZERO-to-DATA; a fresh owner verifies all bytes and keeps writing.
+- `format: LSMT paired grow recovers every publication boundary and permits retry` —
+  injected errors and independent process exits at five grow boundaries roll
+  forward consistently; retry and writes in the grown tail survive reopening.
+- `format: LSMT grow intent repairs torn capacity but rejects changed identity` —
+  torn capacity fields recover from the published intent; unrelated identity
+  changes fail without rewriting the data artifact.
+- `format: LSMT pair creation resumes only its complete staged artifacts` —
+  six creation boundaries exercise ordinary errors and process exit; recovery
+  publishes the staged pair and supports subsequent writes and discard.
+- `format: LSMT creation never replaces an existing header-only upper or foreign destination` —
+  a missing index never becomes fabricated empty ownership; creation recovery
+  validates both candidates before publishing either destination.
+- `format: LSMT legacy checkpoint migration survives publication faults without retiring old metadata` —
+  four migration boundaries exercise errors and process exit; retry preserves
+  original bytes, publishes the index and appends beyond the retained checkpoint.
 - `format: lsmt rw seal compacts into a standard sealed layer` —
   `seal()` turns the unsealed RW file into a byte-standard sealed LSMT
   RO layer that the normal reader opens.

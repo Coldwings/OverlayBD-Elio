@@ -23,6 +23,8 @@ add_library(obd_core STATIC
     format/sparse_export_plan.cpp
     format/sparse_export_output.cpp
     format/lsmt_rw.cpp
+    format/lsmt_rw_index.cpp
+    format/lsmt_rw_file.cpp
     format/merged_writable.cpp
     source/gzip_index_source.cpp
     source/local_file.cpp

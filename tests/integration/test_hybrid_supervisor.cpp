@@ -1,6 +1,7 @@
 // Real supervisor/device recovery; admitted only with kernel ublk prerequisites.
 #include "startup_kernel_support.hpp"
 #include "format/hybrid_rw.hpp"
+#include "format/lsmt_rw.hpp"
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #include <cstdlib>
@@ -9,10 +10,10 @@
 namespace {
 using namespace obd::test::startup_kernel;
 
-class HybridSupervisorFixture {
+class WritableSupervisorFixture {
 public:
-    HybridSupervisorFixture() {
-        auto pattern = (std::filesystem::temp_directory_path() / "obd-hybrid-supervisor-XXXXXX").string();
+    explicit WritableSupervisorFixture(bool lsmt = false) : lsmt_(lsmt) {
+        auto pattern = (std::filesystem::temp_directory_path() / "obd-writable-supervisor-XXXXXX").string();
         std::vector<char> name(pattern.begin(), pattern.end());
         name.push_back('\0');
         const auto made = ::mkdtemp(name.data());
@@ -22,10 +23,10 @@ public:
         write_text(directory_ + "/global.json",
                    R"({"ublkConfig":{"enableRecovery":true,"queues":2,"workers":3}})");
     }
-    ~HybridSupervisorFixture() {
+    ~WritableSupervisorFixture() {
         if (fd_ >= 0) ::close(fd_);
         // Preserve unresolved ownership and evidence; no forced teardown.
-        if (!complete_) std::fprintf(stderr, "retained Hybrid fixture: supervisor=%ld directory=%s\n",
+        if (!complete_) std::fprintf(stderr, "retained writable fixture: supervisor=%ld directory=%s\n",
                                     static_cast<long>(pid_), directory_.c_str());
     }
     void run() {
@@ -34,10 +35,10 @@ public:
             try { return call({{"cmd", "hello"}}).value("ok", false); }
             catch (...) { return false; }
         }, 5s, "supervisor did not listen");
-        const auto created = call({{"cmd", "create"}, {"id", "hybrid"},
-            {"blank", {{"size", capacity}, {"upper_type", "hybrid"}}}});
-        require_fixture(created.value("ok", false), "Hybrid blank create failed: " + created.dump());
-        const auto original = call({{"cmd", "status"}, {"id", "hybrid"}});
+        const auto created = call({{"cmd", "create"}, {"id", "writable"},
+            {"blank", {{"size", capacity}, {"upper_type", lsmt_ ? "lsmt" : "hybrid"}}}});
+        require_fixture(created.value("ok", false), "writable blank create failed: " + created.dump());
+        const auto original = call({{"cmd", "status"}, {"id", "writable"}});
         require_fixture(original.at("state") == "ready", "original not ready");
         const auto original_pid = original.at("pid").get<pid_t>();
         PinnedProcess child(original_pid, process_start_ticks(original_pid));
@@ -60,15 +61,17 @@ public:
         std::fill_n(expected.begin(), 4096, uint8_t{0x61});
         uint64_t discard[2] = {4096, 4096};
         require_fixture(::ioctl(fd_, BLKDISCARD, discard) == 0, "block discard");
-        require_fixture(::fsync(fd_) == 0, "durable pre-crash flush");
+        // The LSMT variant proves completed direct IO survives process death
+        // without an explicit FLUSH or graceful checkpoint.
+        if (!lsmt_) require_fixture(::fsync(fd_) == 0, "durable pre-crash flush");
         child.signal(SIGKILL); // Only the pinned child created above is targeted.
         Json recovered;
         wait_for([&] {
-            recovered = call({{"cmd", "status"}, {"id", "hybrid"}});
+            recovered = call({{"cmd", "status"}, {"id", "writable"}});
             return recovered.value("ok", false) && recovered.value("state", "") == "ready" &&
                    recovered.value("pid", pid_t{-1}) != original_pid &&
                    recovered.value("recoveries", 0) == 1;
-        }, 40s, "supervisor did not recover its Hybrid child");
+        }, 40s, "supervisor did not recover its writable child");
         require_fixture(child.reaped(), "replacement became ready before original reap");
         require_fixture(recovered.at("startup_owner").at("device_id") == id,
                         "recovery replaced the kernel device");
@@ -86,7 +89,7 @@ public:
         require_fixture(::fsync(fd_) == 0, "replacement flush");
         require_fixture(::close(fd_) == 0, "close block device");
         fd_ = -1;
-        require_fixture(call({{"cmd", "destroy"}, {"id", "hybrid"}}).value("ok", false),
+        require_fixture(call({{"cmd", "destroy"}, {"id", "writable"}}).value("ok", false),
                         "destroy recovered device");
         require_fixture(call({{"cmd", "list"}}).at("devices").empty(), "device remains registered");
         require_fixture(replacement.reaped(), "destroy returned before replacement reap");
@@ -105,13 +108,19 @@ public:
             return result == pid_;
         }, 10s, "supervisor did not exit");
         require_fixture(WIFEXITED(status) && WEXITSTATUS(status) == 0, "supervisor exit failed");
-        const auto pair = directory_ + "/devices/hybrid/overlaybd.hybrid/";
+        const auto workspace = directory_ + "/devices/writable/";
         const int rc = obd::test::run_coro([&]() -> elio::coro::task<int> {
-            auto upper = co_await obd::format::HybridRwLayer::open_existing(pair + "data", pair + "index");
+            std::unique_ptr<obd::format::WritableLayer> upper;
+            if (lsmt_)
+                upper = co_await obd::format::LsmtRwLayer::open_or_create(
+                    workspace + "overlaybd.rw", capacity, true);
+            else
+                upper = co_await obd::format::HybridRwLayer::open_existing(
+                    workspace + "overlaybd.hybrid/data", workspace + "overlaybd.hybrid/index");
             std::vector<uint8_t> actual(capacity);
             const auto count = co_await upper->pread(actual.data(), actual.size(), 0);
             require_fixture(count == static_cast<ssize_t>(capacity) && actual == expected,
-                            "final reopened Hybrid bytes differ");
+                            "final reopened writable bytes differ");
             const auto mappings = upper->segments_snapshot();
             for (uint64_t sector = 0; sector != capacity / 512; ++sector) {
                 int state = 0; // INHERIT=0, DATA=1, ZERO=2.
@@ -129,8 +138,8 @@ public:
         require_fixture(rc == 0, "final reopen failed");
         write_text(directory_ + "/result.json", Json{{"passed", true}, {"original", original},
             {"recovered", recovered}, {"verified_bytes", capacity}}.dump(2));
-        std::fprintf(stderr, "HYBRID_SUPERVISOR verified_bytes=%zu recoveries=1 directory=%s\n",
-                     capacity, directory_.c_str());
+        std::fprintf(stderr, "%s_SUPERVISOR verified_bytes=%zu recoveries=1 directory=%s\n",
+                     lsmt_ ? "LSMT" : "HYBRID", capacity, directory_.c_str());
         complete_ = true;
     }
 private:
@@ -181,6 +190,7 @@ private:
     pid_t pid_ = -1;
     int fd_ = -1;
     bool complete_ = false;
+    bool lsmt_ = false;
     std::unique_ptr<PinnedProcess> supervisor_;
 };
 } // namespace
@@ -189,6 +199,14 @@ TEST_CASE("integration: real supervisor recovers a Hybrid device and durable byt
           "[ublk][hybrid][supervisor]") {
     const auto skip = obd::test::ublk_prerequisite_skip_reason();
     if (!skip.empty()) SKIP(skip);
-    HybridSupervisorFixture fixture;
+    WritableSupervisorFixture fixture;
+    REQUIRE_NOTHROW(fixture.run());
+}
+
+TEST_CASE("integration: real supervisor recovers LSMT completed unflushed writes",
+          "[ublk][lsmt][supervisor]") {
+    const auto skip = obd::test::ublk_prerequisite_skip_reason();
+    if (!skip.empty()) SKIP(skip);
+    WritableSupervisorFixture fixture(true);
     REQUIRE_NOTHROW(fixture.run());
 }

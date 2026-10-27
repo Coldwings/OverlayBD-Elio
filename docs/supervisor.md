@@ -177,14 +177,11 @@ is being sealed. Contract:
   ready status additionally reports `upper_parent_uuid`: empty means no parent,
   while an omitted field means unknown. Sparse export requires the current
   child and all observed ready generations to agree on this identity.
-- **The shutdown checkpoint.** An unsealed LSMT-RW file's segment index is
-  memory-only (docs/format.md); a graceful obd-device shutdown therefore
-  **checkpoints** the index into the file (unsealed trailer) before
-  exiting, which is what the supervisor's offline seal consumes. A device
-  that crashes or is SIGKILLed before that checkpoint completes has no
-  checkpoint and its upper is lost; if the kill races after the checkpoint
-  has already been written, offline `commit` can still consume it. Missing
-  checkpoints fail with a precise error.
+- **The shutdown checkpoint.** Graceful shutdown flushes and terminates the
+  current LSMT writer. Offline seal also accepts an uncheckpointed persistent
+  pair after its owner exits (ADR-0029). Legacy single-file uppers require a
+  valid shutdown checkpoint for migration. Completed current-pair operations
+  survive process exit; interrupted operations may be partial.
 - **Sealing** runs in the supervisor process via
   `src/format/lsmt_rw.hpp::LsmtRwLayer::seal_file` over the async IO
   backend (no blocking work on the Elio workers). The sealed uuid is
@@ -284,10 +281,9 @@ Contract:
   replacement obd-device therefore seeds its grow-only baseline from the
   KERNEL's real capacity (`Ctrl::get_params`, not the create-time
   params) so a post-recovery resize can never silently shrink the
-  gendisk; an unsealed LSMT-RW upper is truncated on recovery
-  (ADR-0008), so the fresh upper and data plane start at the image's
-  declared size — resize (grow) is how the operator restores the larger
-  window.
+  gendisk. LSMT pair recovery also preserves the persisted grown capacity
+  and completed tail ownership; it does not reset the upper to create-time
+  capacity (ADR-0029).
 - **Headroom at create.** `create --virtual-size <bytes>` sizes the
   device to the override (sanctioned headroom); for a WRITABLE image
   the writable upper — and hence the merged data plane — is assembled
@@ -369,13 +365,12 @@ three creation modes of ADR-0014 are:
 Two workspace caveats for blank devices (both inherited from the
 writable-upper model, documented in docs/operations.md):
 
-- **Respawn truncates the upper.** ADR-0010 crash recovery re-assembles
-  the blank stack, and assembly recreates `overlaybd.rw` with `O_TRUNC`:
-  unsealed writes do not survive a device crash. Commit (or a graceful
-  stop) first.
+- **Respawn preserves the pair.** Recovery reopens both artifacts and retains
+  grown capacity. Missing or invalid metadata fails without creating empty
+  ownership (ADR-0029).
 - **The committed artifact lives in the workspace.** `commit` seals
-  `<blank_dir>/<id>/overlaybd.rw` in place; `destroy` + re-create of the
-  same id truncates it. Copy the sealed layer out first.
+  `<blank_dir>/<id>/overlaybd.rw` in place. That sealed artifact cannot reopen
+  as a writable upper; use a fresh workspace for another blank device.
 
 Size rules (enforced at parse/handler time): positive, multiple of 512
 bytes, at most `kMaxBlankSizeBytes` (16 TiB sanity bound — the zero base

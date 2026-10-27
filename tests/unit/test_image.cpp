@@ -579,3 +579,95 @@ TEST_CASE("image: hybrid blank recovery preserves writes and grown size", "[imag
     REQUIRE(missing == ENOENT);
     REQUIRE_FALSE(std::filesystem::exists(pair));
 }
+
+TEST_CASE("image: LSMT assembly preserves uncheckpointed ownership and grown capacity on reopen",
+          "[image][lsmt-recovery]") {
+    for (bool blank : {false, true}) {
+        DYNAMIC_SECTION("blank=" << blank) {
+            TempDir temporary;
+            const auto fixtures = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                                  "fixtures/lsmt/overlaybd";
+            const std::string workspace = temporary / "upper";
+            const auto cfg = image::ImageConfig::from_json_text(nlohmann::json{
+                {"lowers", {{{"file", (fixtures / "sealed.data").string()}}}},
+                {"upper", {{"dir", workspace}, {"type", "lsmt"}}}}.dump(), {});
+            image::GlobalConfig global; global.prefetch_enable = false;
+            image::BlankDeviceSpec spec;
+            spec.size = 32768; spec.dir = workspace; spec.upper_type = "lsmt";
+            auto open = [&](bool recover) -> elio::coro::task<image::OpenedImage> {
+                if (blank) {
+                    spec.recover = recover;
+                    co_return co_await image::open_blank_device(spec);
+                }
+                co_return co_await image::open_image(cfg, global, recover ? 32768 : 0, recover);
+            };
+            std::vector<uint8_t> expected(32768, 0);
+            if (!blank) {
+                std::ifstream oracle(fixtures / "expected.raw", std::ios::binary);
+                oracle.read(reinterpret_cast<char*>(expected.data()), expected.size());
+                REQUIRE(oracle.good());
+            }
+            elio::run_config runtime; runtime.num_threads = 2; runtime.blocking_threads = 1;
+            const int rc = elio::run([&]() -> elio::coro::task<int> {
+                auto opened = co_await open(false);
+                REQUIRE(opened.upper_path == workspace + "/overlaybd.rw");
+                auto* merged = dynamic_cast<format::MergedWritable*>(opened.root.get());
+                REQUIRE(merged != nullptr);
+                std::vector<uint8_t> actual(expected.size());
+                const auto initial = co_await merged->pread(actual.data(), actual.size(), 0);
+                REQUIRE(initial == 32768); REQUIRE(actual == expected);
+                const int discarded = co_await merged->discard(512, 512);
+                REQUIRE(discarded == 0);
+                std::fill_n(expected.begin() + 512, 512, 0);
+                std::array<uint8_t, 512> payload{}; payload.fill(0x5b);
+                const auto written = co_await merged->pwrite(payload.data(), payload.size(), 1024);
+                REQUIRE(written == 512);
+                std::fill_n(expected.begin() + 1024, 512, 0x5b);
+                const int grown = co_await elio::spawn_blocking([merged] { return merged->grow(65536); });
+                REQUIRE(grown == 0);
+                expected.resize(65536, 0);
+                const auto tail = co_await merged->pwrite(payload.data(), payload.size(), 65024);
+                REQUIRE(tail == 512);
+                std::fill_n(expected.begin() + 65024, 512, 0x5b);
+                opened.root.reset(); // No FLUSH or checkpoint before reopen.
+                for (bool recover : {false, true}) {
+                    opened = co_await open(recover);
+                    REQUIRE(opened.virtual_size == 65536);
+                    actual.resize(65536);
+                    const auto read = co_await opened.root->pread(actual.data(), actual.size(), 0);
+                    REQUIRE(read == 65536); REQUIRE(actual == expected);
+                    // Also exercise explicit FLUSH followed by another reopen
+                    // over the same nonzero lower and grown blank/image view.
+                    auto* resumed = dynamic_cast<format::MergedWritable*>(opened.root.get());
+                    REQUIRE(resumed != nullptr);
+                    const int zero = co_await resumed->discard(8 * 512, 512);
+                    REQUIRE(zero == 0);
+                    std::fill_n(expected.begin() + 8 * 512, 512, 0);
+                    const auto rewrite = co_await resumed->pwrite(payload.data(), payload.size(), 9 * 512);
+                    REQUIRE(rewrite == 512);
+                    std::fill_n(expected.begin() + 9 * 512, 512, 0x5b);
+                    const int flushed = co_await resumed->flush();
+                    REQUIRE(flushed == 0);
+                    opened.root.reset();
+                    opened = co_await open(recover);
+                    const auto reread = co_await opened.root->pread(actual.data(), actual.size(), 0);
+                    REQUIRE(reread == 65536); REQUIRE(actual == expected);
+                    opened.root.reset();
+                }
+                co_return 0;
+            }, runtime);
+            REQUIRE(rc == 0);
+            const auto data = workspace + "/overlaybd.rw", index = data + ".index";
+            const auto size = std::filesystem::file_size(data);
+            std::filesystem::rename(index, index + ".saved");
+            const int failed = elio::run([&]() -> elio::coro::task<int> {
+                try { (void)co_await open(true); }
+                catch (const error& e) { co_return e.errno_value(); }
+                co_return 0;
+            }, runtime);
+            REQUIRE(failed != 0);
+            REQUIRE_FALSE(std::filesystem::exists(index));
+            REQUIRE(std::filesystem::file_size(data) == size);
+        }
+    }
+}

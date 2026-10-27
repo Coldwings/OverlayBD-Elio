@@ -1,0 +1,17 @@
+{
+  "source_commit": "1fe0ea1b87989a616f21105a13455b79c8512ffb",
+  "photon_commit": "dd236e97866fd3d4cbff64b7ada7b69ef9464695",
+  "producer_sha256": "c03c96c0375bab471b22bf9f0d13086f6035589199d9477ed77cbdd6dd9a44a3",
+  "fixtures": {
+    "writable.data": "e2752148f0432a700d91ec61ec71f436ec9e203cf633ae8079803da8b274b9a8",
+    "writable.index": "8503b3735657294e2f2c46e2cb3dafe7e7d5466bde5f30177d2eff3c47968156",
+    "buffered.data": "e2752148f0432a700d91ec61ec71f436ec9e203cf633ae8079803da8b274b9a8",
+    "buffered.index": "1a0ac466f453473f02f93455ddf58901778861852b76f9855d5707e19639c549",
+    "sealed.data": "1ab692818e5b282cb39a90b2af51fb290156a0ed423bb15d00f42b384c12fdce",
+    "sealed.index": "8503b3735657294e2f2c46e2cb3dafe7e7d5466bde5f30177d2eff3c47968156",
+    "expected.raw": "b5e8ff8d7d1b84216364471ffa81a5c5acd1e5f7246ca9c47ecd815185692f19",
+    "expected.states": "b16b884f4525c498a6614ad80c2a656d58f0534498d2694ac7094cf0f2bf8a60"
+  },
+  "generator": "producers/overlaybd.cpp: produce DIR, linked against pinned upstream lsmt_lib and Photon",
+  "format": "RWType::Append (data flags=3, index flags=1); ordinary and 4096-byte buffered logs; sealed reference and independent byte/ownership oracles"
+}

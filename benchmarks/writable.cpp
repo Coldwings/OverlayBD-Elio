@@ -154,18 +154,17 @@ elio::coro::task<int> exercise(const Settings* s, json* report, Peak* peak) {
     require(flushed == 0, "population flush failed");
     (*report)["populate_ms_including_flush"] = milliseconds(fill_start);
     (*report)["before_reopen"] = co_await snapshot(s);
-    if (s->mode != "lsmt") {
-        root.reset();
-        const auto start = Clock::now();
-        if (s->mode == "sparse") top = co_await format::SparseRwLayer::open(data_path, s->size);
-        else top = co_await format::HybridRwLayer::open_existing(data_path + "/data", data_path + "/index");
-        (*report)["reopen_ms"] = milliseconds(start);
-        layer = top.get();
-        root = co_await format::MergedWritable::open({}, std::move(top));
-    } else {
-        (*report)["reopen_ms"] = nullptr;
-        (*report)["reopen_note"] = "Uncheckpointed LSMT is not restart-recoverable; no equivalent writable reopen API.";
-    }
+    root.reset();
+    const auto reopen_start = Clock::now();
+    if (s->mode == "lsmt")
+        top = co_await format::LsmtRwLayer::open_existing(data_path, data_path + ".index");
+    else if (s->mode == "sparse")
+        top = co_await format::SparseRwLayer::open(data_path, s->size);
+    else
+        top = co_await format::HybridRwLayer::open_existing(data_path + "/data", data_path + "/index");
+    (*report)["reopen_ms"] = milliseconds(reopen_start);
+    layer = top.get();
+    root = co_await format::MergedWritable::open({}, std::move(top));
     // Verify the populated region after recovery, including its tail.
     std::vector<uint8_t> actual(fill.size());
     for (uint64_t offset = 0; offset < s->populate; offset += fill.size()) {
