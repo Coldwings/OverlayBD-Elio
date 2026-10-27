@@ -1,5 +1,6 @@
 // LSMT writable layer. See lsmt_rw.hpp.
 #include "format/lsmt_rw.hpp"
+#include "format/lsmt_rw_file.hpp"
 
 #include "common/errors.hpp"
 #include "common/sha256.hpp"
@@ -8,12 +9,14 @@
 #include <elio/io/file_transfer.hpp>
 #include <elio/io/file_operations.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <utility>
 
@@ -137,6 +140,18 @@ elio::coro::task<int> read_all(int fd, void* buf, size_t count,
     co_return result.end == elio::io::transfer_end::complete ? 0 : -EIO;
 }
 
+elio::coro::task<int> sync_parent(const std::string& path) {
+    auto parent = std::filesystem::path(path).parent_path();
+    auto request = std::make_shared<std::string>(parent.empty() ? "." : parent.string());
+    auto operation = [request] {
+        const int fd = ::open(request->c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0) return -errno;
+        FdGuard owned(fd);
+        return ::fsync(fd) == 0 ? 0 : -errno;
+    };
+    co_return co_await elio::spawn_blocking(std::move(operation));
+}
+
 lsmt::HeaderTrailer make_ht(bool header, bool sealed, uint64_t index_offset,
                             uint64_t index_size, uint64_t vsize,
                             const std::string& uuid,
@@ -232,7 +247,86 @@ void LsmtRwLayer::end_terminal_op() {
     terminal_op_in_progress_ = false;
 }
 
+elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::open_existing(
+    const std::string& data_path, const std::string& index_path) {
+    auto pair = co_await lsmt_rw::FilePair::open_existing(data_path, index_path);
+    co_return from_pair(std::move(pair), data_path);
+}
+
+elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create_persistent(
+    const std::string& data_path, const std::string& index_path, uint64_t vsize) {
+    auto pair = co_await lsmt_rw::FilePair::create(data_path, index_path, vsize);
+    co_return from_pair(std::move(pair), data_path);
+}
+
+std::unique_ptr<LsmtRwLayer> LsmtRwLayer::from_pair(
+    std::unique_ptr<lsmt_rw::FilePair> pair, const std::string& data_path) {
+    auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer);
+    const int fd = ::fcntl(pair->data_fd(), F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) throw error(errno, "lsmt rw: duplicate payload descriptor");
+    FdGuard opened(fd);
+    auto handle = std::make_shared<FdHandle>(fd);
+    opened.release();
+    layer->fd_.store(std::move(handle), std::memory_order_release);
+    layer->vsize_.store(pair->header().virtual_size, std::memory_order_release);
+    layer->data_bytes_.store(pair->data_bytes(), std::memory_order_release);
+    layer->data_end_sector_ = pair->data_bytes() / kSector;
+    layer->uuid_ = pair->header().uuid;
+    layer->path_ = data_path;
+    layer->segments_ = pair->mappings();
+    layer->pair_ = std::move(pair);
+    layer->view_ = std::make_unique<View>(&layer->fd_, &layer->data_bytes_, "lsmt-rw:" + data_path);
+    return layer;
+}
+
+elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::migrate_checkpoint(
+    const std::string& data_path, const std::string& index_path) {
+    auto pair = co_await lsmt_rw::FilePair::migrate_checkpoint(data_path, index_path);
+    co_return from_pair(std::move(pair), data_path);
+}
+
+elio::coro::task<int> LsmtRwLayer::prepare_mutation() {
+    if (journal_failed_) co_return -EIO;
+    if (pair_ && (pair_->index_bytes() - lsmt::kSpace) / 16 >=
+        std::max<uint64_t>(4096, 4 * segments_.size())) {
+        co_return co_await pair_->compact(segments_);
+    }
+    co_return 0;
+}
+
 elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
+    const std::string& path, uint64_t vsize) {
+    co_return co_await create_persistent(path, path + ".index", vsize);
+}
+
+elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::open_or_create(
+    const std::string& path, uint64_t minimum_size, bool existing_only) {
+    std::unique_ptr<LsmtRwLayer> layer;
+    int failure = 0;
+    try { layer = co_await migrate_checkpoint(path, path + ".index"); }
+    catch (const error& e) { failure = e.errno_value(); }
+    if (!layer) {
+        if (existing_only || failure != ENOENT)
+            throw error(failure, "lsmt rw: cannot recover existing upper " + path);
+        try { layer = co_await create(path, minimum_size); }
+        catch (const error& e) {
+            if (e.errno_value() != EEXIST) throw;
+        }
+        // Another cooperating creator may have published between attempts.
+        if (!layer) layer = co_await migrate_checkpoint(path, path + ".index");
+    }
+    if (layer->virtual_size() < minimum_size) {
+        if (existing_only)
+            throw error(EINVAL, "lsmt rw: recovered upper is smaller than required capacity");
+        auto grow = [active = layer.get(), minimum_size] { return active->grow(minimum_size); };
+        const int rc = co_await elio::spawn_blocking(std::move(grow));
+        if (rc != 0) throw error(-rc, "lsmt rw: cannot grow reopened upper");
+    }
+    co_return layer;
+}
+
+#ifdef OBD_TEST_HOOKS
+elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create_legacy_for_test(
     const std::string& path, uint64_t vsize) {
     if (vsize == 0 || vsize % kSector != 0) {
         throw error(EINVAL, "lsmt rw vsize must be sector aligned");
@@ -266,6 +360,8 @@ elio::coro::task<std::unique_ptr<LsmtRwLayer>> LsmtRwLayer::create(
     co_return layer;
 }
 
+#endif
+
 int LsmtRwLayer::grow(uint64_t vsize) {
     // D3 grow-only vsize extension. BLOCKING (a 4096B header rewrite plus
     // fsync on fd_): callers must run this off an Elio worker via
@@ -276,6 +372,17 @@ int LsmtRwLayer::grow(uint64_t vsize) {
     const int gate = begin_grow_op();
     if (gate != 0) return gate;
     auto gate_guard = make_scope_exit([this] { end_grow_op(); });
+    if (pair_) {
+        if (journal_failed_ && !pair_->growth_pending()) return -EIO;
+        const int rc = pair_->grow(vsize);
+        if (pair_->healthy()) {
+            vsize_.store(pair_->header().virtual_size, std::memory_order_release);
+            journal_failed_ = false;
+        } else if (pair_->growth_pending()) {
+            journal_failed_ = true;
+        }
+        return rc;
+    }
     if (vsize == 0 || vsize % kSector != 0) return -EINVAL;
     const uint64_t cur = vsize_.load(std::memory_order_acquire);
     if (vsize < cur) return -EINVAL;  // grow-only (equal = no-op)
@@ -350,7 +457,9 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
         co_return -EINVAL;
     }
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
-    if (offset + count > cur_vsize) co_return -EINVAL;
+    if (offset > cur_vsize || count > cur_vsize - offset) co_return -EINVAL;
+    const int prepared = co_await prepare_mutation();
+    if (prepared != 0) co_return prepared;
     auto handle = fd_.load(std::memory_order_acquire);
     if (!handle) co_return -EBADF;
     const int fd = handle->get();
@@ -404,6 +513,18 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
             }
         }
 
+        // Publish new ownership only after payload completion. In-place DATA
+        // overwrites retain their mapping and need no additional log record.
+        if (pair_) {
+            for (const auto& op : ops) {
+                if (op.inplace) continue;
+                bytes::segment_mapping m;
+                m.offset = op.voff; m.length = static_cast<uint32_t>(op.nsector);
+                m.moffset = op.moff; m.zeroed = false; m.tag = 0;
+                const int published = co_await pair_->append(m);
+                if (published != 0) { journal_failed_ = true; co_return published; }
+            }
+        }
         // Update the in-memory index: drop coverage of [lo,hi) from old
         // segments (split/trim), then insert the new subrange segments.
         std::vector<bytes::segment_mapping> next;
@@ -446,6 +567,7 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
 
 elio::coro::task<ssize_t> LsmtRwLayer::pread(void* buf, size_t count,
                                              uint64_t offset) {
+    if (journal_failed_) co_return -EIO;
     if (offset % kSector != 0 || count % kSector != 0) co_return -EINVAL;
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
     if (offset >= cur_vsize) co_return 0;
@@ -500,7 +622,9 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
         co_return -EINVAL;
     }
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
-    if (offset + len > cur_vsize) co_return -EINVAL;
+    if (offset > cur_vsize || len > cur_vsize - offset) co_return -EINVAL;
+    const int prepared = co_await prepare_mutation();
+    if (prepared != 0) co_return prepared;
     const uint64_t lo = offset / kSector;
     const uint64_t hi = lo + len / kSector;
 
@@ -542,6 +666,10 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
         m.moffset = kHeaderSectors;
         m.zeroed = true;
         m.tag = 0;
+        if (pair_) {
+            const int published = co_await pair_->append(m);
+            if (published != 0) { journal_failed_ = true; co_return published; }
+        }
         insert_sorted(segments_, m);
         cur += n;
     }
@@ -549,6 +677,8 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
 }
 
 elio::coro::task<int> LsmtRwLayer::flush() {
+    if (journal_failed_) co_return -EIO;
+    if (pair_ && !sealed_.load(std::memory_order_acquire)) co_return co_await pair_->flush();
     auto handle = fd_.load(std::memory_order_acquire);
     if (!handle) co_return -EBADF;
     const auto status = co_await elio::io::sync_file(
@@ -560,6 +690,12 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
     const int gate = begin_terminal_op(false);
     if (gate != 0) co_return gate;
     auto gate_guard = make_scope_exit([this] { end_terminal_op(); });
+    if (journal_failed_) co_return -EIO;
+    if (pair_) {
+        const int rc = co_await pair_->flush();
+        if (rc == 0) checkpointed_.store(true, std::memory_order_release);
+        co_return rc;
+    }
     auto handle = fd_.load(std::memory_order_acquire);
     if (!handle) co_return -EBADF;
     const int fd = handle->get();
@@ -604,6 +740,7 @@ elio::coro::task<int> LsmtRwLayer::checkpoint() {
 }
 
 elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
+    if (journal_failed_) co_return -EIO;
     const int gate = begin_terminal_op(true);
     if (gate != 0) co_return gate;
     auto gate_guard = make_scope_exit([this] { end_terminal_op(); });
@@ -741,154 +878,11 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
     fd_.store(std::move(sealed_handle), std::memory_order_release);
     output.unlink_path = nullptr;  // rename published the output
     sealed_.store(true, std::memory_order_release);
+    if (pair_) pair_->retire_payload();
+    rc = co_await sync_parent(path_);
 
 out:
     co_return rc;
-}
-
-elio::coro::task<std::unique_ptr<LsmtRwLayer>>
-LsmtRwLayer::open_checkpointed(const std::string& path, int* error) {
-    auto layer = std::unique_ptr<LsmtRwLayer>(new LsmtRwLayer);
-    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        *error = -errno;
-        co_return nullptr;
-    }
-    FdGuard opened(fd);
-
-    struct stat st {};
-    if (::fstat(fd, &st) != 0) {
-        *error = -errno;
-        co_return nullptr;
-    }
-    if (st.st_size < static_cast<off_t>(2 * lsmt::kSpace)) {
-        *error = -EINVAL;
-        co_return nullptr;
-    }
-
-    // The checkpoint trailer is the file's last 4096 bytes.
-    const uint64_t trailer_offset =
-        static_cast<uint64_t>(st.st_size) - lsmt::kSpace;
-    uint8_t region[lsmt::kSpace];
-    int rc = co_await read_all(fd, region, sizeof(region), trailer_offset);
-    if (rc != 0) {
-        *error = rc;
-        co_return nullptr;
-    }
-    lsmt::HeaderTrailer tht;
-    try {
-        tht = lsmt::HeaderTrailer::parse(region);
-    } catch (const std::exception&) {
-        *error = -EINVAL;
-        co_return nullptr;
-    }
-    if (!tht.is_trailer() || !tht.is_data_file()) {
-        *error = -EINVAL;
-        co_return nullptr;
-    }
-    if (tht.is_sealed()) {
-        *error = -EALREADY;
-        co_return nullptr;
-    }
-    if (tht.virtual_size == 0 || tht.virtual_size % kSector != 0 ||
-        tht.index_size > lsmt::kMaxRoIndexSize) {
-        *error = -EINVAL;
-        co_return nullptr;
-    }
-
-    // Cross-check the on-disk header (offset 0) against the trailer. A
-    // trailer torn mid-write can otherwise parse as a valid but EMPTY
-    // checkpoint — silently sealing an empty layer — and a trailer alone
-    // is forgeable by the block-device guest. The header is written at
-    // create() with a random uuid the guest never sees, so agreement of
-    // uuid and virtual_size authenticates the checkpoint.
-    rc = co_await read_all(fd, region, sizeof(region), 0);
-    if (rc != 0) {
-        *error = rc;
-        co_return nullptr;
-    }
-    lsmt::HeaderTrailer hht;
-    try {
-        hht = lsmt::HeaderTrailer::parse(region);
-    } catch (const std::exception&) {
-        *error = -EINVAL;
-        co_return nullptr;
-    }
-    if (!hht.is_header() || !hht.is_data_file() || hht.is_sealed() ||
-        hht.uuid != tht.uuid || hht.virtual_size != tht.virtual_size) {
-        *error = -EINVAL;
-        co_return nullptr;
-    }
-
-    const uint64_t index_bytes =
-        tht.index_size * bytes::segment_mapping::kEncodedSize;
-    // Bounds: index_offset must lie inside [kSpace, trailer_offset] BEFORE
-    // any subtraction — with index_size == 0 an out-of-range index_offset
-    // would otherwise underflow the check below and seal an empty layer
-    // instead of rejecting the malformed checkpoint.
-    if (tht.index_offset < lsmt::kSpace ||
-        tht.index_offset > trailer_offset ||
-        index_bytes > trailer_offset - tht.index_offset) {
-        *error = -EINVAL;
-        co_return nullptr;
-    }
-
-    // Load and validate the checkpointed index (LsmtLayer::open rules:
-    // drop invalid entries, clear tags, strict ordering, moffset range).
-    std::vector<uint8_t> raw(index_bytes);
-    if (index_bytes > 0) {
-        rc = co_await read_all(fd, raw.data(), index_bytes, tht.index_offset);
-        if (rc != 0) {
-            *error = rc;
-            co_return nullptr;
-        }
-    }
-    std::vector<bytes::segment_mapping> segments;
-    segments.reserve(tht.index_size);
-    for (uint64_t i = 0; i < tht.index_size; ++i) {
-        auto s = bytes::load_segment_le(
-            raw.data() + i * bytes::segment_mapping::kEncodedSize);
-        if (s.offset == bytes::segment_mapping::kInvalidOffset) continue;
-        s.tag = 0;
-        segments.push_back(s);
-    }
-    for (size_t i = 1; i < segments.size(); ++i) {
-        if (segments[i - 1].end() > segments[i].offset) {
-            *error = -EINVAL;
-            co_return nullptr;
-        }
-    }
-    const uint64_t moffset_end = tht.index_offset / kSector;
-    for (const auto& m : segments) {
-        const bool ok = m.zeroed
-                            ? (kHeaderSectors <= m.moffset &&
-                               m.moffset <= moffset_end)
-                            : (kHeaderSectors <= m.moffset &&
-                               m.moffset < moffset_end &&
-                               kHeaderSectors < m.mend() &&
-                               m.mend() <= moffset_end);
-        if (!ok) {
-            *error = -EINVAL;
-            co_return nullptr;
-        }
-    }
-
-    layer->vsize_.store(tht.virtual_size,
-                             std::memory_order_release);
-    layer->data_end_sector_ = tht.index_offset / kSector;
-    layer->uuid_ = tht.uuid;
-    layer->path_ = path;
-    // terminal: no more pwrite/discard
-    layer->checkpointed_.store(true, std::memory_order_release);
-    layer->segments_ = std::move(segments);
-    layer->data_bytes_.store(static_cast<uint64_t>(st.st_size),
-                             std::memory_order_release);
-    auto handle = std::make_shared<FdHandle>(fd);
-    opened.release();
-    layer->fd_.store(std::move(handle), std::memory_order_release);
-    layer->view_ = std::make_unique<LsmtRwLayer::View>(
-        &layer->fd_, &layer->data_bytes_, "lsmt-rw:" + path);
-    co_return layer;
 }
 
 elio::coro::task<int> LsmtRwLayer::seal_file(const std::string& path,
@@ -897,13 +891,16 @@ elio::coro::task<int> LsmtRwLayer::seal_file(const std::string& path,
                                              uint64_t* size,
                                              uint64_t virtual_size,
                                              std::string* reject) {
-    int err = 0;
-    auto layer = co_await open_checkpointed(path, &err);
-    if (!layer) co_return err;
+    std::unique_ptr<LsmtRwLayer> layer;
+    try { layer = co_await migrate_checkpoint(path, path + ".index"); }
+    catch (const error& e) {
+        if (reject != nullptr) *reject = e.what();
+        co_return -e.errno_value();
+    }
     if (virtual_size > 0) {
         // D3 commit re-baseline: grow-only vs the layer's declared size
         // AND its content extent (the highest covered sector end — the
-        // checkpoint index is loaded by open_checkpointed). An override
+        // validated index is loaded by migrate_checkpoint). An override
         // smaller than either would re-baseline below existing content
         // or below what the layer already declares (shrink), which is
         // rejected here with a precise reason BEFORE any compaction, so

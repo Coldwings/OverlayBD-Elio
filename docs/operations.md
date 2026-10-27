@@ -225,17 +225,14 @@ created with `obdctl create-blank` (or the equivalent `create` with a
 
    Two workspace caveats (both inherited from the writable-upper model):
 
-   - **A crash-respawn truncates the upper.** ADR-0010 recovery re-assembles
-     the blank stack when a device process dies, and assembly recreates
-     `overlaybd.rw` with `O_TRUNC`. Unsealed writes do **not** survive a
-     device crash: `obdctl commit` (or a graceful `destroy`, which
-     checkpoints) before letting a valuable device crash-recover. This is
-     the same behavior image-mode writable devices have always had.
+   - **Recovery reopens the pair.** Completed data and ZERO ownership survive
+     process exit; grown capacity is retained (ADR-0029). Preserve both
+     `overlaybd.rw` and `overlaybd.rw.index`. Missing metadata fails without
+     replacing the upper; interrupted operations may be partial.
    - **The sealed layer lives inside the workspace.** `commit` seals
-     `<blank-dir>/<id>/overlaybd.rw` in place, so `destroy` followed by
-     re-creating the same id truncates the previously committed sealed
-     layer. Copy the sealed file out (its `path` comes back in the commit
-     reply) before re-creating that id.
+     `<blank-dir>/<id>/overlaybd.rw` in place. A sealed artifact cannot be
+     reopened as a writable upper. Preserve it and use a fresh workspace for
+     the next blank device.
 
 3. **Blank + mkfs convenience** (host tooling; runtime only):
 
@@ -274,21 +271,18 @@ A per-image config may add a writable upper:
 "upper": { "dir": "/var/lib/overlaybd-elio/upper/myimg", "type": "lsmt" }
 ```
 
-- `type: "lsmt"` (default) → an in-place-edit LSMT-RW file
-  (`<dir>/overlaybd.rw`). **Durability rule: LSMT-RW data is not durable as
-  a standard layer until it is sealed.** `seal()` compacts the writable
-  layer into a standard sealed LSMT that ordinary OverlayBD tooling can
-  consume; before sealing, the file is an intermediate format for the live
-  device plus the offline `commit` path, not a normal reopen target. A
-  later `create`/recovery open truncates a fresh unsealed LSMT-RW upper.
-  On a **graceful shutdown** (SIGTERM, e.g. via `destroy` or `commit`)
-  obd-device checkpoints the upper's in-memory index into the file; that
-  checkpoint is what the offline `commit` seal consumes. A crash or
-  SIGKILL before a successful graceful-shutdown checkpoint leaves no
-  checkpoint and its unsealed upper is unsealable; if the kill races after
-  that checkpoint has already been written, offline `commit` can still
-  consume it. Use `commit` before relying on LSMT-RW writes after device
-  teardown.
+- `type: "lsmt"` (default) → an upstream-compatible writable pair:
+  `<dir>/overlaybd.rw` and `<dir>/overlaybd.rw.index` (ADR-0029). Preserve both
+  artifacts when copying an unsealed upper, with its owner stopped. Completed
+  writes and discard ownership recover after process exit without a prior
+  FLUSH; interrupted operations may be partial, including in-place overwrites.
+  Explicit FLUSH synchronizes data, index and directory metadata for storage
+  durability. Graceful shutdown flushes and terminates the current writer;
+  reopening the unsealed pair permits further writes. Only sealed output is
+  usable as a read-only lower. Offline commit compacts the pair into a standard
+  sealed LSMT. A valid legacy shutdown checkpoint can migrate to the pair;
+  a legacy memory-only upper without a checkpoint cannot recover its mappings.
+  Recovery never replaces a missing index with empty ownership.
 - `type: "sparse"` → a sparse file (`<dir>/overlaybd.sparse`); after an
   unclean shutdown exact 512-byte DATA/ZERO ownership is recovered from
   `<dir>/overlaybd.sparse.coverage` (ADR-0024). Offline export produces a
@@ -332,13 +326,10 @@ Contract and runbook notes:
   reaped (bounded; SIGKILL on timeout) before any byte is sealed — there
   is no live seal. The device entry remains afterwards (`obdctl status`
   still works, state `exited`); `destroy` removes it as usual.
-- **LSMT-RW requires a graceful shutdown checkpoint.** Its seal consumes the
-  index checkpoint obd-device writes on graceful shutdown. If the device
-  crashes or is SIGKILLed before that checkpoint succeeds, commit fails
-  with "no valid shutdown checkpoint" and the unsealed upper's writes are
-  lost (the ADR-0008 durability rule). If a kill races after the
-  checkpoint has already been written, offline `commit` can still consume
-  that checkpoint.
+- **LSMT-RW seal reads its persistent index.** A current data/index pair needs
+  no prior graceful-shutdown checkpoint. The owner must first stop and release
+  its locks. A legacy single-file upper requires a valid shutdown checkpoint
+  for migration; invalid mappings fail before an index sidecar is published.
 - **Deterministic output.** The sealed file is a pure function of the
   upper's content plus the `--tag` string: identical content and tag seal
   to identical bytes, so the reply's `sha256` is suitable for
@@ -488,11 +479,9 @@ Contract and runbook notes:
   never resets it and the replacement re-attaches without SET_PARAMS.
   The replacement baselines its grow-only check against that real kernel
   capacity (read via GET_PARAMS), so a post-recovery resize can never
-  silently shrink the gendisk. The unsealed LSMT-RW upper itself is
-  truncated on recovery (ADR-0008 — its pre-crash writes are gone), and
-  the fresh upper starts at the image's declared size; a grow resize
-  restores the larger window for new writes. Do not rely on a
-  resized-but-uncommitted device surviving a crash.
+  silently shrink the gendisk. LSMT pair recovery preserves the grown upper
+  capacity and completed tail writes (ADR-0029); interrupted growth rolls
+  forward only after its intent and pair are validated.
 - **Create-time headroom (optional).** `obdctl create myimg config.json
   --virtual-size 17179869184` creates the device directly at the larger
   size (sanctioned headroom) instead of the image's declared size — for
@@ -616,7 +605,7 @@ correlate by device id and by the supervisor's spawn logs.
 | `create` fails with "virtual size not sector aligned" | The merged image size is zero or not a multiple of 512 bytes; the image is malformed for block serving. |
 | No `/dev/ublkb<N>` after a successful `create` | `ublk_drv` not loaded or missing udev; check `/dev/ublk-control` and `lsmod`. |
 | Slow first reads, DART warnings in the log | DART proxy configured but unreachable. This is handled: the source logs a warning and falls back to direct registry reads (guarded by `integration: enabled-but-unreachable DART falls back to direct reads`). Fix the `p2pConfig` address or disable P2P. |
-| A device child crashed | Siblings and the supervisor are isolated (ADR-0004). For an ordinary ready-device crash, the supervisor attempts bounded recovery and respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection. A retained startup generation blocks further replacement; inspect ownership status and use explicit `destroy` before recreating. Note the data boundary: an unsealed LSMT-RW upper loses its unsealed writes on recovery (ADR-0008); offline `commit` only has input if graceful shutdown already wrote a valid checkpoint before the child died. |
+| A device child crashed | Siblings and the supervisor are isolated (ADR-0004). For an ordinary ready-device crash, the supervisor attempts bounded recovery and respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection. A retained startup generation blocks further replacement; inspect ownership status and use explicit `destroy` before recreating. Current LSMT data/index pairs recover completed operations without a shutdown checkpoint (ADR-0029); legacy memory-only uppers still require a valid checkpoint for migration. Interrupted operations may be partial. |
 | `commit` fails with "no valid shutdown checkpoint" | No graceful-shutdown checkpoint reached disk before the child died, for example a crash or SIGKILL before `checkpoint()` completed. The unsealed upper is unsealable (ADR-0014); start over from the lowers. |
 | Sparse `commit` reports unavailable or changed parent identity | Use a device child supporting the `sparse_export` protocol batch. Keep its parent chain stable across recovery. The refusal occurs before stopping; do not substitute an unrelated parent merely to make export succeed. See ADR-0027. |
 | `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard reaches only writable devices; writable uppers satisfy ADR-0009 zero-mask semantics. LSMT-RW records zeroed segments, while sparse uppers publish exact ZERO coverage plus the compatibility zero-mask before punching holes. |
@@ -628,11 +617,11 @@ correlate by device id and by the supervisor's spawn logs.
 
 ## Known operational limitations
 
-- **Recovery loses unsealed LSMT-RW writes.** Crash recovery re-opens the
-  image from disk; a sparse upper recovers exact completed DATA/ZERO coverage
-  from its sidecar, while an unsealed LSMT-RW upper does not (ADR-0008,
-  ADR-0010, ADR-0024). Choose the sparse upper when process-crash recovery
-  matters.
+- **Legacy memory-only LSMT uppers need a valid checkpoint to migrate.**
+  Current writable pairs recover completed operations after process exit;
+  retain both data and index artifacts. This does not promise rollback of an
+  interrupted overwrite or power-loss durability before explicit FLUSH
+  (ADR-0029).
 - **Sparse v2 uppers cannot be opened safely by an older binary.** Older
   versions ignore `.coverage` and can widen a 512-byte DATA write to a
   filesystem allocation extent. Recreate or export the upper through a

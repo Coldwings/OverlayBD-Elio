@@ -38,6 +38,8 @@ add_executable(obd_unit_tests
     unit/test_format.cpp
     unit/test_hybrid.cpp
     unit/test_hybrid_replay.cpp
+    unit/test_lsmt_rw_index.cpp
+    unit/test_lsmt_rw_file.cpp
     unit/test_hybrid_log_state.cpp
     unit/test_hybrid_file.cpp
     unit/test_hybrid_rw.cpp
@@ -95,6 +97,9 @@ target_link_libraries(obd-test-hybrid-fixture-writer PRIVATE obd_core)
 add_executable(obd-test-sparse-crash-writer sparse_crash_writer.cpp)
 obd_target_warnings(obd-test-sparse-crash-writer)
 target_link_libraries(obd-test-sparse-crash-writer PRIVATE obd_core)
+add_executable(obd-test-lsmt-crash-writer lsmt_crash_writer.cpp)
+obd_target_warnings(obd-test-lsmt-crash-writer)
+target_link_libraries(obd-test-lsmt-crash-writer PRIVATE obd_core)
 # The CLI test EXECUTES the real obdctl binary (argv → wire translation),
 # so the test target depends on it and is told its path.
 target_compile_definitions(obd_unit_tests
@@ -104,13 +109,14 @@ target_compile_definitions(obd_unit_tests
             OBD_TEST_HYBRID_WRITER_BIN="$<TARGET_FILE:obd-test-hybrid-fixture-writer>"
             OBD_TEST_SPARSE_EXPORT_BIN="$<TARGET_FILE:obd-export-sparse>"
             OBD_TEST_SPARSE_CRASH_WRITER_BIN="$<TARGET_FILE:obd-test-sparse-crash-writer>"
+            OBD_TEST_LSMT_CRASH_WRITER_BIN="$<TARGET_FILE:obd-test-lsmt-crash-writer>"
             OBD_TEST_HAVE_LIBE2FS=$<BOOL:${OBD_ENABLE_LIBE2FS_BACKEND}>)
 find_program(OBD_E2FSCK_EXECUTABLE e2fsck PATHS /usr/sbin /sbin)
 if(OBD_E2FSCK_EXECUTABLE)
     target_compile_definitions(obd_unit_tests PRIVATE
         OBD_TEST_E2FSCK_BIN="${OBD_E2FSCK_EXECUTABLE}")
 endif()
-add_dependencies(obd_unit_tests obdctl obd-convert obd-export-sparse obd-test-sparse-crash-writer obd-test-hybrid-fixture-writer)
+add_dependencies(obd_unit_tests obdctl obd-convert obd-export-sparse obd-test-sparse-crash-writer obd-test-hybrid-fixture-writer obd-test-lsmt-crash-writer)
 catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
     PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
                TIMEOUT 60)

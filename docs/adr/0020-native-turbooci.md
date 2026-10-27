@@ -1,6 +1,6 @@
 # ADR-0020: Read TurboOCI natively and build its metadata locally
 
-- Status: accepted
+- Status: superseded by ADR-0029
 - Date: 2026-09-12
 - Supersedes: ADR-0008
 - Binds: docs/design-assumptions.md, docs/format.md, docs/config.md,

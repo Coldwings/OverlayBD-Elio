@@ -85,10 +85,12 @@ A writable upper engages only when the per-image config names it
 sanctioned types exist: `sparse` (sparse data file with exact persisted
 sector coverage, ADR-0024) and
 `lsmt` (in-place-edit LSMT-RW that seals into a standard LSMT lower).
-Writes are copy-on-write into the upper; unsealed LSMT-RW data is durable
-only at flush level and is not recoverable across restarts until sealed.
-A graceful device shutdown checkpoints the LSMT-RW index into the file so
-the supervisor can seal the upper offline (`commit`, ADR-0027). Sparse
+Writes modify only the upper. LSMT-RW persists ownership in an upstream
+compatible data/index pair (ADR-0029), recovering completed operations after
+process exit without a prior FLUSH. Interrupted operations may be partial;
+explicit FLUSH synchronizes storage. Graceful shutdown flushes and terminates
+the current writer; offline seal can also consume an uncheckpointed pair.
+Legacy single-file uppers require a valid checkpoint for migration. Sparse
 commit instead exports a separate sealed LSMT delta after stop/reap and
 source checkpoint, preserving DATA/ZERO/INHERIT and the opened parent identity.
 The sparse source remains reusable; its raw file is never overwritten with LSMT.

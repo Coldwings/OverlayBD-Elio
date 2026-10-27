@@ -738,7 +738,8 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
     // (a read-only device's headroom is dev-size-only at the ublk layer).
     uint64_t vsize = 0;
     for (const auto& l : layers) vsize = std::max(vsize, l->virtual_size());
-    const uint64_t upper_override = recover_existing_upper && cfg.upper.type == "hybrid"
+    const uint64_t upper_override = recover_existing_upper &&
+        (cfg.upper.type == "hybrid" || cfg.upper.type == "lsmt")
         ? 0 : writable_override_bytes;
     if (upper_override > 0) {
         if (upper_override % 512 != 0) {
@@ -751,7 +752,8 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         if (cap == 0) throw error(EINVAL, cap_error);
         vsize = cap;
     }
-    co_await ensure_upper_directory(cfg.upper.dir, cfg.upper.type == "hybrid");
+    co_await ensure_upper_directory(cfg.upper.dir,
+        cfg.upper.type == "hybrid" || cfg.upper.type == "lsmt");
     std::unique_ptr<format::WritableLayer> top;
     std::string upper_path;
     if (cfg.upper.type == "sparse") {
@@ -771,7 +773,9 @@ elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
         upper_path = directory + "/data";
     } else {
         upper_path = cfg.upper.dir + "/overlaybd.rw";
-        top = co_await format::LsmtRwLayer::create(upper_path, vsize);
+        top = co_await format::LsmtRwLayer::open_or_create(upper_path, vsize, recover_existing_upper);
+        if (upper_override != 0 && upper_override < top->virtual_size())
+            throw error(EINVAL, "create virtual_size is smaller than the recovered LSMT upper (grow-only)");
     }
     const std::string upper_parent_uuid = layers.empty() ? "" : layers.back()->header().uuid;
     auto merged = co_await format::MergedWritable::open(std::move(layers),
@@ -810,7 +814,7 @@ elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
     }
     if (spec.upper_type != "lsmt" && spec.upper_type != "hybrid")
         throw error(EINVAL, "blank upper type must be lsmt or hybrid");
-    try { co_await ensure_upper_directory(spec.dir, spec.upper_type == "hybrid"); }
+    try { co_await ensure_upper_directory(spec.dir, true); }
     catch (const std::filesystem::filesystem_error& e) {
         throw error(e.code().value(), "cannot create blank device workspace " + spec.dir + ": " + e.what());
     }
@@ -830,7 +834,8 @@ elio::coro::task<OpenedImage> open_blank_device(const BlankDeviceSpec& spec) {
         upper_path = directory + "/data";
     } else {
         upper_path = spec.dir + "/overlaybd.rw";
-        top = co_await format::LsmtRwLayer::create(upper_path, spec.size);
+        top = co_await format::LsmtRwLayer::open_or_create(upper_path, spec.size, spec.recover);
+        virtual_size = top->virtual_size();
     }
 
     // The zero base: a sealed EMPTY LSMT RO layer (ADR-0014). Byte

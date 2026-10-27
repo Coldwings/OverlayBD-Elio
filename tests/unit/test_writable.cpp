@@ -6,6 +6,7 @@
 #include "common/sha256.hpp"
 #include "format/lsmt.hpp"
 #include "format/lsmt_rw.hpp"
+#include "format/lsmt_rw_file.hpp"
 #include "format/merged_writable.hpp"
 #include "format/sparse_rw.hpp"
 #include "format/sparse_export_plan.hpp"
@@ -2168,7 +2169,7 @@ TEST_CASE("format: lsmt rw failed live seal keeps original backing",
         REQUIRE_FALSE(std::filesystem::exists(tmp));
         REQUIRE_FALSE(layer->sealed());
         REQUIRE(file_sha256(path) == before);
-        REQUIRE(original.descriptors() == 1);
+        REQUIRE(original.descriptors() == 2);
 
         std::vector<uint8_t> buf(payload.size());
         const ssize_t got = co_await layer->pread(buf.data(), buf.size(), 0);
@@ -2380,7 +2381,7 @@ TEST_CASE("format: lsmt rw checkpoint persists the index for offline seal",
         REQUIRE(src == -ENOENT);
         // A crashed device (no checkpoint) leaves an unsealable file.
         const std::string raw = dir / "crashed.rw";
-        auto l2 = co_await format::LsmtRwLayer::create(raw, 512 * 64);
+        auto l2 = co_await format::LsmtRwLayer::create_legacy_for_test(raw, 512 * 64);
         r = co_await l2->pwrite(a.data(), a.size(), 0);
         REQUIRE(r > 0);
         l2.reset();
@@ -2394,7 +2395,7 @@ TEST_CASE("format: lsmt rw checkpoint persists the index for offline seal",
     // outside the data region must fail validation (-EINVAL), not seal.
     const std::string tampered = dir / "tampered.rw";
     int crc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::LsmtRwLayer::create(tampered,
+        auto layer = co_await format::LsmtRwLayer::create_legacy_for_test(tampered,
                                                           512 * 64);
         ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
         REQUIRE(r > 0);
@@ -2454,7 +2455,7 @@ TEST_CASE("format: lsmt rw offline seal rejects a torn checkpoint trailer",
     const auto a = sectors_pattern(0, 16, 700);
 
     int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+        auto layer = co_await format::LsmtRwLayer::create_legacy_for_test(path, 512 * 64);
         ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
         REQUIRE(r > 0);
         int crc = co_await layer->checkpoint();
@@ -2513,7 +2514,7 @@ TEST_CASE("format: lsmt rw offline seal rejects a torn checkpoint trailer",
     // pass — the index_offset bounds guard is what rejects it.
     const std::string path2 = dir / "upper2.rw";
     rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::LsmtRwLayer::create(path2, 512 * 64);
+        auto layer = co_await format::LsmtRwLayer::create_legacy_for_test(path2, 512 * 64);
         ssize_t r = co_await layer->pwrite(a.data(), a.size(), 0);
         REQUIRE(r > 0);
         int crc = co_await layer->checkpoint();
@@ -4460,14 +4461,9 @@ TEST_CASE("image: writable assembly grows to the virtual_size headroom override"
 
 TEST_CASE("format: offline seal rejects a virtual_size below the content extent",
           "[format]") {
-    // D3 commit re-baseline: the content-extent guard is defense against
-    // a checkpoint whose declared virtual size lies BELOW what its index
-    // actually covers (real writers keep extent <= declared, so the guard
-    // needs a synthetic fixture). Build a checkpointed layer, patch BOTH
-    // the on-disk header and the trailer to a smaller virtual size
-    // (keeping uuid/flags, exactly what the cross-check authenticates),
-    // then seal with an override >= the patched declared size but < the
-    // real content extent: the guard must reject with the precise reason.
+    // A legacy checkpoint with mappings beyond its declared capacity is
+    // invalid before any commit override is considered. Migration must reject
+    // it without publishing a sidecar or changing the original bytes.
     TempDir dir;
     const std::string path = dir / "upper.rw";
     const auto payload = sectors_pattern(0, 16, 718);  // extent = 16 sectors
@@ -4476,7 +4472,7 @@ TEST_CASE("format: offline seal rejects a virtual_size below the content extent"
     uint64_t size = 0;
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+            auto layer = co_await format::LsmtRwLayer::create_legacy_for_test(path, 512 * 64);
             const ssize_t r =
                 co_await layer->pwrite(payload.data(), payload.size(), 0);
             REQUIRE(r == static_cast<ssize_t>(payload.size()));
@@ -4506,13 +4502,27 @@ TEST_CASE("format: offline seal rejects a virtual_size below the content extent"
         };
         patch_region(0);          // header
         patch_region(trailer_off);  // checkpoint trailer
-        // Override between the patched declared size and the content
-        // extent: >= declared passes, < extent trips the guard.
+        auto read_bytes = [](const std::string& filename) {
+            const int fd = ::open(filename.c_str(), O_RDONLY | O_CLOEXEC);
+            REQUIRE(fd >= 0);
+            struct stat info {};
+            const int stated = ::fstat(fd, &info);
+            if (stated != 0) ::close(fd);
+            REQUIRE(stated == 0);
+            std::vector<uint8_t> bytes(static_cast<size_t>(info.st_size));
+            const auto count = ::pread(fd, bytes.data(), bytes.size(), 0);
+            ::close(fd);
+            REQUIRE(count == static_cast<ssize_t>(bytes.size()));
+            return bytes;
+        };
+        const auto before = read_bytes(path);
+        // An override cannot rescue invalid source mappings.
         const int src = co_await format::LsmtRwLayer::seal_file(
             path, "", &sha, &size, 512 * 12, &reject);
         REQUIRE(src == -EINVAL);
-        REQUIRE(reject.find("content extent") != std::string::npos);
-        REQUIRE(reject.find("grow-only") != std::string::npos);
+        REQUIRE(reject.find("invalid logical mapping") != std::string::npos);
+        REQUIRE(read_bytes(path) == before);
+        REQUIRE_FALSE(std::filesystem::exists(path + ".index"));
         co_return 0;
     });
     REQUIRE(rc == 0);
@@ -4706,9 +4716,9 @@ TEST_CASE("format: lsmt rw destruction releases its backing descriptor", "[forma
     const std::string path = dir / "upper.rw";
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         for (int i = 0; i < 8; ++i) {
-            auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
+            auto layer = co_await format::LsmtRwLayer::open_or_create(path, 512 * 64);
             const BackingInode backing(path);
-            REQUIRE(backing.descriptors() == 1);
+            REQUIRE(backing.descriptors() == 2);
             // All operations, including reads through the borrowing View, finish
             // before destruction. The layer does not drain work for its caller.
             std::vector<uint8_t> header(4096);
@@ -4734,9 +4744,13 @@ TEST_CASE("format: lsmt rw offline seal releases replaced inode descriptors", "[
         REQUIRE(wrote == static_cast<ssize_t>(data.size()));
         const int checkpoint_rc = co_await layer->checkpoint();
         REQUIRE(checkpoint_rc == 0);
-        // Keep the creator alive to distinguish the temporary reopened owner
-        // from the creator's descriptor, even on the leaking baseline.
-        REQUIRE(original.descriptors() == 1);
+        // The checkpointed owner keeps its lock until destruction.
+        REQUIRE(original.descriptors() == 2);
+        const int busy = co_await format::LsmtRwLayer::seal_file(path, "", nullptr, nullptr);
+        REQUIRE(busy == -EWOULDBLOCK);
+        REQUIRE(original.descriptors() == 2);
+        layer.reset();
+        REQUIRE(original.descriptors() == 0);
         std::string digest;
         uint64_t size = 0;
         const int seal_rc = co_await format::LsmtRwLayer::seal_file(
@@ -4744,7 +4758,7 @@ TEST_CASE("format: lsmt rw offline seal releases replaced inode descriptors", "[
         REQUIRE(seal_rc == 0);
         const BackingInode sealed(path);
         REQUIRE(sealed.inode != original.inode);
-        REQUIRE(original.descriptors() == 1);
+        REQUIRE(original.descriptors() == 0);
         REQUIRE(sealed.descriptors() == 0);
         REQUIRE(digest == file_sha256(path));
         REQUIRE(size == file_bytes(path));
@@ -4772,6 +4786,7 @@ TEST_CASE("format: lsmt rw rejected seal releases its reopened descriptor", "[fo
         auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
         const int checkpoint_rc = co_await layer->checkpoint();
         REQUIRE(checkpoint_rc == 0);
+        layer.reset();
         const BackingInode backing(path);
         const std::string before = file_sha256(path);
         for (const uint64_t vsize : {uint64_t{513}, uint64_t{512 * 32}}) {
@@ -4781,7 +4796,7 @@ TEST_CASE("format: lsmt rw rejected seal releases its reopened descriptor", "[fo
             REQUIRE(seal_rc == -EINVAL);
             REQUIRE_FALSE(reject.empty());
             REQUIRE(file_sha256(path) == before);
-            REQUIRE(backing.descriptors() == 1);
+            REQUIRE(backing.descriptors() == 0);
         }
         // An ordinary output-open error must also release the reopened owner.
         const std::string tmp = path + ".sealing." + std::to_string(::getpid());
@@ -4790,7 +4805,7 @@ TEST_CASE("format: lsmt rw rejected seal releases its reopened descriptor", "[fo
             path, "", nullptr, nullptr);
         REQUIRE(seal_rc == -EISDIR);
         REQUIRE(file_sha256(path) == before);
-        REQUIRE(backing.descriptors() == 1);
+        REQUIRE(backing.descriptors() == 0);
         layer.reset();
         REQUIRE(backing.descriptors() == 0);
         co_return 0;
@@ -4805,6 +4820,7 @@ TEST_CASE("format: lsmt rw seal exceptions release temporary descriptors", "[for
         auto layer = co_await format::LsmtRwLayer::create(path, 512 * 64);
         const int checkpoint_rc = co_await layer->checkpoint();
         REQUIRE(checkpoint_rc == 0);
+        layer.reset();
         const BackingInode backing(path);
         const std::string before = file_sha256(path);
         const std::string tmp = path + ".sealing." + std::to_string(::getpid());
@@ -4824,7 +4840,7 @@ TEST_CASE("format: lsmt rw seal exceptions release temporary descriptors", "[for
         REQUIRE(threw);
         REQUIRE(output.descriptors() == 0);
         REQUIRE_FALSE(std::filesystem::exists(tmp));
-        REQUIRE(backing.descriptors() == 1);
+        REQUIRE(backing.descriptors() == 0);
         REQUIRE(file_sha256(path) == before);
         layer.reset();
         REQUIRE(backing.descriptors() == 0);
@@ -4869,26 +4885,27 @@ TEST_CASE("format: lsmt rw setup failures release their descriptors", "[format][
                 REQUIRE(file_sha256(path) == before);
             }
         }
-        // /dev/full accepts open but deterministically fails the header write.
-        // A separate live layer must remain usable through exception cleanup.
+        // A staged creation failure must close its files without disturbing
+        // a separately owned live layer. All artifacts stay in this workspace.
         auto live = co_await format::LsmtRwLayer::create(dir / "live.rw", 512 * 64);
         const BackingInode live_inode(dir / "live.rw");
-        const BackingInode full("/dev/full");
-        const size_t full_before = full.descriptors();
+        REQUIRE(live_inode.descriptors() == 2);
+        struct Reset { ~Reset() { format::lsmt_rw::create_fault_for_test(-1); } } reset;
         for (int i = 0; i < 4; ++i) {
+            format::lsmt_rw::create_fault_for_test(1);
+            const auto failed_path = dir / ("failed-" + std::to_string(i));
             bool threw = false;
-            try {
-                auto failed = co_await format::LsmtRwLayer::create("/dev/full", 512 * 64);
-            } catch (const std::system_error& e) {
-                REQUIRE(e.code().value() == ENOSPC);
+            try { (void)co_await format::LsmtRwLayer::create(failed_path, 512 * 64); }
+            catch (const std::system_error& e) {
+                REQUIRE(e.code().value() == EIO);
                 threw = true;
             }
+            format::lsmt_rw::create_fault_for_test(-1);
             REQUIRE(threw);
-            REQUIRE(full.descriptors() == full_before);
-            REQUIRE(live_inode.descriptors() == 1);
+            REQUIRE_FALSE(std::filesystem::exists(failed_path));
+            REQUIRE(live_inode.descriptors() == 2);
             std::vector<uint8_t> header(4096);
-            const ssize_t got = co_await live->data_source().pread(
-                header.data(), header.size(), 0);
+            const ssize_t got = co_await live->data_source().pread(header.data(), header.size(), 0);
             REQUIRE(got == static_cast<ssize_t>(header.size()));
         }
         live.reset();

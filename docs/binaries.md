@@ -311,11 +311,10 @@ running on arbitrary threads.
 - obd-device: after reporting `ready`, it waits on the signal fd; the first
   SIGTERM or SIGINT breaks the loop, stops and destroys the ublk device,
   reports `stopped`, and returns exit code 0. When the image has a writable
-  upper, the shutdown **checkpoints** the upper's in-memory segment index
-  into its file after the queues drain (ADR-0014) — this is what the
-  supervisor's offline `commit` seal consumes; a checkpoint failure is
-  logged and shutdown continues (commit will then report the missing
-  checkpoint).
+  upper, shutdown checkpoints after queues drain (ADR-0014). For an LSMT
+  pair this flushes storage and terminates the writer; offline commit does not
+  require that checkpoint to recover completed mappings (ADR-0029). A checkpoint
+  failure is logged and shutdown continues; it does not promise FLUSH durability.
 - obd-device during protected startup: TERM/INT does not authorize release.
   The startup observer and private command reader remain available; explicit
   destroy uses the generation-bound release protocol.

@@ -22,7 +22,7 @@ images built by upstream `overlaybd-*` tools load identically here:
   `merged_writable.hpp`) — the ADR-0008 writable top of an image stack:
   `SparseRwLayer` (sparse data plus exact persisted coverage, ADR-0024),
   `LsmtRwLayer` (unsealed
-  single-file LSMT with in-place edit and seal compaction),
+  data/index LSMT pair with in-place edit and seal compaction),
   `HybridRwLayer` (persisted mapping log and metadata-only seal, ADR-0026), and
   `MergedWritable` (copy-on-write merged view implementing
   `source::WritableBlobSource`).
@@ -129,7 +129,7 @@ A writable image has one writable top layer above zero or more sealed RO
 lowers. Writes always land in the top (copy-on-write — lowers are never
 modified); reads walk a merged index rebuilt after every write. Two top-layer
 implementations exist: a sparse file with identity mapping
-(`SparseRwLayer`), and an unsealed single-file LSMT with in-place edit
+(`SparseRwLayer`), and an unsealed data/index LSMT pair with in-place edit
 (`LsmtRwLayer`), which `seal()` compacts into a standard sealed LSMT RO
 file.
 
@@ -1062,114 +1062,96 @@ public:
     static elio::coro::task<std::unique_ptr<LsmtRwLayer>> create(
         const std::string& path, uint64_t vsize);
 
-    // + WritableLayer overrides (grow() rewrites the declared-size header)
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> open_or_create(
+        const std::string& path, uint64_t minimum_size, bool existing_only = false);
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> open_existing(
+        const std::string& data_path, const std::string& index_path);
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> create_persistent(
+        const std::string& data_path, const std::string& index_path, uint64_t vsize);
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> migrate_checkpoint(
+        const std::string& data_path, const std::string& index_path);
+
+    // + WritableLayer overrides (grow() updates both persistent headers)
 
     bool sealed() const noexcept;
     elio::coro::task<int> seal(const std::string& user_tag = "");
     static elio::coro::task<int> seal_file(const std::string& path,
                                            const std::string& user_tag,
                                            std::string* sha256_hex,
-                                           uint64_t* size);
+                                           uint64_t* size,
+                                           uint64_t virtual_size = 0,
+                                           std::string* reject = nullptr);
 };
 ```
 
-Threading: `grow()` is blocking and may run on a spawn_blocking pool
-thread while `checkpoint()`/`seal()` (Elio workers) run — hence the
-declared size (`vsize_`) and the terminal `sealed_`/`checkpointed_`
-flags are `std::atomic` (the device's shutdown path also drains the
-resize gate before checkpointing, so the two never actually overlap;
-this build has no TSAN option to prove it mechanically). A failed grow
-restores the previous 4096-byte header before returning, so the header
-never disagrees with the size the checkpoint trailer will carry.
+The writable layout is an upstream append-type LSMT data/index pair
+(ADR-0029): a 4096-byte data header with flags 3 and a 4096-byte index header
+with flags 1 followed by standard 16-byte mappings. Pair UUID, parent identity,
+capacity, versions and mapping bounds are validated before recovery changes
+anything. The latest mapping owns each logical range. Invalid-offset upstream
+padding is ignored, runtime tags are cleared, and final live DATA extents must
+not physically alias because writes can update payload in place.
 
-D3 `grow()`: besides widening the in-memory window, an LSMT grow rewrites
-the file's 4096B declared-size header at offset 0 (uuid preserved) —
-which is what keeps the checkpoint-vs-header cross-check and the offline
-seal consistent after a live grow: the graceful-shutdown checkpoint then
-writes its trailer at the grown size and a plain `seal_file` seals that
-declared size (no `--virtual_size` override needed).
-
-An unsealed single-file LSMT with **in-place edit** (ADR-0008):
-
-- `create` requires a non-zero sector-aligned `vsize` (throws
-  `obd::error(EINVAL)` otherwise) and creates `path` with
-  `O_RDWR | O_CREAT | O_TRUNC` — **any existing file is truncated** (v0.2
-  limitation, see below). It writes an unsealed header and generates a fresh
-  layer UUID.
-- `pwrite`: for each ≤ 16383-sector piece of the request, subranges covered
-  by **live** segments **overwrite their data blocks in place**;
-  previously-uncovered subranges **append** at the data end. A subrange
-  whose only coverage is a discarded (zeroed) segment owns no data blocks
-  in the file, so it also appends: a pwrite over a discarded range never
-  reuses the zeroed segment's placeholder `moffset` (which would land on
-  whatever live data occupies those physical sectors, corrupting it — see
-  issue #13). The in-memory index is updated accordingly (old coverage
-  split/trimmed, new subranges inserted and coalesced with contiguous
-  neighbors). Trimming zeroed coverage preserves its placeholder physical
-  offset: a virtual trim distance cannot advance it into unrelated data
-  or beyond the checkpoint's data region. Returns `count`, `-EINVAL` on
-  unaligned/empty/out-of-`vsize` requests, `-EROFS` once checkpointed or
-  sealed, or a propagated -errno.
-- `pread`: sector-aligned; holes and zeroed segments read as zeroes; clamped
-  at `virtual_size()`.
-- `flush()`: `fdatasync`; 0 or `-errno`.
-- `discard` (ADR-0009): inserts **zeroed segments** covering the range
-  (split/trimming overlapped segments exactly like `pwrite`); no data is
-  written and superseded blocks become garbage that `seal()` drops. Zeroed
-  segments carry a valid in-data-region `moffset` (never read, but the
-  read-only loader validates the range). Splitting an existing zeroed
-  segment preserves that placeholder, so repeated discards followed by
-  checkpoint/offline seal stay valid. `-EINVAL` on unaligned/out-of-`vsize`
-  ranges, `-EROFS` once checkpointed or sealed.
-- `data_source()`: an fd-backed `BlobSource` view whose size **tracks
-  appends and a successful live seal** (an `std::atomic<uint64_t>` upper
-  bound), unlike a `LocalFileSource` which pins `st_size` at open.
-- Descriptor lifetime: the layer owns a shared handle for the backing
-  descriptor from successful open through destruction, including setup
-  exceptions. `data_source()` borrows that handle slot and the layer's size
-  state; callers must finish all operations and stop using the view before
-  destroying the layer. A successful live `seal()` atomically publishes the
-  compacted inode and swaps the handle so the layer and existing view use it;
-  the replaced descriptor closes after any in-flight users release their
-  handle. Destruction closes whichever descriptor handle is current.
-  `seal_file()` destroys its reopened layer after sealing (also on rejection or
-  failure), releasing the replaced inode. Compaction and digest descriptors
-  have scoped ownership so exceptions also close them.
-- `checkpoint()` (ADR-0014): appends the in-memory segment index plus an
-  **unsealed trailer** at the data end (index region padded to 4096B,
-  trailer in the file's last 4096 bytes) and fdatasyncs. Called by
-  obd-device on graceful shutdown; it is terminal — `pwrite`/`discard`
-  afterwards return `-EROFS`, as does a second `checkpoint()`. This is the
-  only on-disk persistence of the RW index; a crash before it loses the
-  unsealed writes. Direct concurrent `grow()`/`checkpoint()`/`seal()` calls
-  return `-EBUSY`.
-- `seal(user_tag)`: compacts the file into a **standard sealed LSMT RO
-  file**: live segments are copied out packed sequentially into
-  `<path>.sealing.<pid>` (a per-process tmp name — two seals never
-  interleave writes; garbage left behind by in-place edits and discards is
-  dropped; zeroed segments consume no data space),
-  followed by the padded index, a sealed header and trailer, `fdatasync`,
-  and an **atomic rename** over `path`. Afterwards `sealed()` is true and
-  `pwrite`/`discard`/`grow` and repeat `seal()` return `-EROFS`; serialized
-  reads through the original layer and its existing `data_source()` use the
-  compacted published file. Returns 0 or a negative -errno; on failure the temp
-  file is unlinked and the original file is untouched. Direct concurrent
-  `grow()`/`checkpoint()`/`seal()` calls return `-EBUSY`.
-- `seal_file(path, user_tag, sha256_hex, size)` (ADR-0014 offline commit):
-  opens a **checkpointed** RW file without truncating (index loaded from
-  the on-disk unsealed trailer, validated with the `LsmtLayer::open`
-  rules, and the trailer's uuid/virtual_size cross-checked against the
-  on-disk header at offset 0 — a trailer torn mid-write or forged cannot
-  seal an empty or wrong layer), seals it in place, and reports the
-  sealed file's sha256 hex digest and byte size. Used by the supervisor's `commit` command after
-  the device process has exited. Error channels: `-ENOENT` (missing
-  file), `-EALREADY` (already sealed), `-EINVAL` (not a valid checkpointed
-  LSMT-RW file — e.g. the device crashed before checkpointing), other
-  -errno propagated.
-- **v0.2 limitation**: the segment index is memory-only until
-  `checkpoint()` or `seal()`; an unsealed RW file is **not recoverable
-  across process restarts** (`create()` truncates). Checkpoint on graceful
-  shutdown and seal (possibly offline, via `seal_file`) to persist.
+- `create(path, vsize)` creates `path` and `path + ".index"` exclusively;
+  existing artifacts are never truncated. Capacity must be positive and
+  sector-aligned. Creation stages complete headers before publishing a
+  restartable intent and links the final names without replacing them.
+- `open_existing(data, index)` opens a valid pair; `open_or_create(path, size,
+  existing_only)` also migrates valid legacy checkpoints and, unless recovery
+  is requested, creates when both artifacts are absent. Recovery never creates
+  an empty substitute. Existing larger capacity is preserved; ordinary open
+  can grow to a larger minimum. A complete sealed artifact refuses writable
+  reopening even when a stale index sidecar remains.
+- `pwrite` overwrites live DATA in place and appends payload for uncovered or
+  ZERO-covered subranges. New payload completes before its mapping record,
+  which completes before success is returned. Mapping insertion splits/trims
+  previous coverage. A failed mapping append poisons the writer until reopen.
+- `discard` publishes ZERO mappings before reporting success; ZERO owns no
+  physical payload. Splits preserve the placeholder offset. Holes inherit the
+  lower in a merged view, while ZERO masks it. Direct upper reads return zero
+  for both holes and ZERO; reads and writes remain sector-aligned.
+- Completed operations recover after process exit without a prior FLUSH while
+  the OS continues running. Interrupted operations may be absent or partial,
+  including mixed bytes for an interrupted in-place overwrite. This is not
+  rollback to the last FLUSH. `flush()` synchronizes payload, index and directory
+  metadata in order, propagating errors. Power loss before FLUSH has weaker
+  guarantees. There is no per-record data synchronization barrier.
+- Replay validates all complete records before trimming an incomplete EOF
+  record. Malformed full records fail without resetting data. Index history is
+  bounded through compact replacement; payload and the new index are synced
+  before rename. Once published, the new descriptor remains authoritative even
+  if directory sync fails. Stable pathname and inode locks exclude cooperating
+  owners through replacement. Do not modify a pair with external tools while
+  it is owned.
+- `grow()` runs on the blocking pool. It publishes a checksummed intent with
+  both target headers before rewriting either; recovery validates identity and
+  mappings, then rolls forward and retires the intent. Failed growth blocks
+  ordinary mutations until recovery. Direct overlapping grow/checkpoint/seal
+  operations return `-EBUSY`; production IO is serialized by `MergedWritable`.
+- `checkpoint()` flushes and terminates the current instance: subsequent
+  mutations and another checkpoint return `-EROFS`. The unsealed pair can reopen
+  for further writes. It does not append a legacy checkpoint trailer.
+- `seal()` copies live payload in logical order into a temporary, appends the
+  compact index and sealed metadata, syncs it, atomically replaces the data
+  pathname, and syncs its parent directory. Existing reads rebind to the new
+  inode. Before publication, failure preserves the original; after publication,
+  a directory-sync error leaves the sealed artifact terminal. Mutations and
+  repeat seal return `-EROFS`. Stable ownership remains until destruction.
+- `seal_file` exclusively opens the pair or migrates a validated legacy
+  checkpoint, seals it and returns the digest and size. A pair needs no prior
+  checkpoint. Optional capacity override is grow-only and sector-aligned.
+  Sealed input returns `-EALREADY`; invalid mappings fail before migration;
+  setup diagnostics are returned through the optional rejection string.
+- A legacy checkpoint migrates by publishing its index sidecar before any old
+  metadata can be retired. Old checkpoint bytes remain unreferenced payload
+  until seal compacts them away. A legacy memory-only upper without a valid
+  checkpoint has no recoverable ownership; a header-only file is not proof of
+  empty ownership because discard may have written only to the missing index.
+- `data_source()` borrows the layer's descriptor handle and tracked size.
+  Callers must drain operations before destruction. The pair owns its data and
+  index descriptors; the read view has a duplicate data descriptor. Successful
+  seal releases old payload ownership and rebinds the view to the sealed inode.
+  Offline seal releases all descriptors on return, including error paths.
 
 `src/format/lsmt_rw.hpp` — `create_empty_lsmt_layer`
 
@@ -1658,15 +1640,15 @@ writers and readers agree on the same bytes.
 - `format: lsmt rw seal exceptions release temporary descriptors` — a header
   serialization exception closes both temporary descriptors and removes the
   compaction file while preserving the original checkpoint.
-- `format: lsmt rw setup failures release their descriptors` — short files,
-  invalid trailers/index entries, and `/dev/full` header-write errors release
-  their descriptors while a separate live layer remains readable.
+- `format: lsmt rw setup failures release their descriptors` — staged creation
+  failures in owned temporary directories release their descriptors without
+  publishing a final data file while a separate live layer remains readable.
 - `format: lsmt rw checkpoint persists the index for offline seal` — the
   ADR-0014 offline-commit machinery: `checkpoint()` persists the index
   (writes afterwards get `-EROFS`), `seal_file()` seals the file from a
   fresh open with digest/size reported, the sealed output loads as a valid
   RO layer, and the error channels are precise (`-EALREADY` sealed,
-  `-ENOENT` missing, `-EINVAL` never checkpointed).
+  `-ENOENT` missing, `-EINVAL` legacy upper without a valid checkpoint).
 - `format: empty sealed lsmt layer is a zero base of its virtual size` —
   a sealed empty LSMT layer opens as a valid RO layer with the requested
   `virtual_size`, zero segments, minimal 8192-byte geometry
@@ -1727,11 +1709,10 @@ writers and readers agree on the same bytes.
   are not supported. Ordinary LSMT `gc_layer` / `sparse_rw` flags are
   parsed but not acted on, and read-only `parent_uuid` chains are not validated.
   Hybrid rejects conflicting layout flags and recognizes unbacked ZERO markers.
-- **`LsmtRwLayer` v0.2:** the segment index is memory-only until
-  `checkpoint()` or `seal()`; an unsealed RW file is not recoverable as a
-  writable layer across restarts (`create()` truncates any existing file),
-  and a crash before the graceful-shutdown checkpoint loses the unsealed
-  writes. Full RW restart recovery is future work.
+- **Legacy LSMT migration requires a checkpoint.** Current pairs recover
+  completed writes and ZERO mappings; old memory-only uppers without a valid
+  checkpoint cannot reconstruct ownership. Preserve both artifacts when
+  copying a stopped writable pair (ADR-0029).
 - **Legacy sparse migration freezes the v1 view.** A v1 file did not record
   exact DATA intent, so its one-time extent import can retain an already
   over-wide filesystem-block extent. All writes after v2 publication and all

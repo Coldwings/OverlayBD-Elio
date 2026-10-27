@@ -351,10 +351,8 @@ contracts above:
   ADR-0009 mask contract with zeroed segments. Sparse uppers satisfy the
   same merged-view mask by publishing sidecar zero-mask metadata before
   punching top-file holes.
-- **LSMT-RW durability:** an unsealed `overlaybd.rw` upper keeps its
-  segment index in memory only; unsealed data is **not restart-recoverable**
-  as a writable upper. A graceful obd-device shutdown checkpoint is the
-  input to the supervisor's offline `commit` (ADR-0014), not a reopen path;
-  a later image open creates/truncates a fresh unsealed LSMT-RW file. Only
-  `seal()` / offline commit compacts the data into a standard sealed LSMT
-  layer.
+- **LSMT-RW durability:** the upstream-compatible data/index pair recovers
+  completed operations after process exit without a prior checkpoint
+  (ADR-0029). Explicit FLUSH synchronizes storage; interrupted in-place writes
+  may contain mixed bytes. Legacy memory-only uppers require a valid checkpoint
+  for migration. Only sealed output is usable as a read-only lower.

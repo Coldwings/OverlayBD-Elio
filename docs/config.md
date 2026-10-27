@@ -255,14 +255,16 @@ empty `dir` keeps the device read-only.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `dir` | string | `""` | Directory holding the upper layer file; created if missing. Non-empty engages writable mode (`src/image/config.hpp::UpperConfig`). |
-| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` (unsealed in-place-edit LSMT); `"sparse"` → `<dir>/overlaybd.sparse` plus exact `<dir>/overlaybd.sparse.coverage` metadata; `"hybrid"` → `<dir>/overlaybd.hybrid/{data,index}` (persisted mapping log and metadata-only seal, ADR-0026). **Any other value is rejected** with `EINVAL`. |
+| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` plus `<dir>/overlaybd.rw.index` (unsealed in-place-edit LSMT pair); `"sparse"` → `<dir>/overlaybd.sparse` plus exact `<dir>/overlaybd.sparse.coverage` metadata; `"hybrid"` → `<dir>/overlaybd.hybrid/{data,index}` (persisted mapping log and metadata-only seal, ADR-0026). **Any other value is rejected** with `EINVAL`. |
 
-Durability note: the `lsmt` upper keeps its segment index in memory
-until `checkpoint()`/`seal()`; unsealed data is not crash-durable (see
-*Limitations & TODO* in `docs/architecture.md`). A graceful device
-shutdown writes the checkpoint that the offline `commit` seal consumes
-(ADR-0014). Sparse commit instead exports a separate sealed LSMT delta after
-stop/reap and exact-coverage recovery, retaining the reusable source (ADR-0027).
+Durability note: the `lsmt` upper recovers completed operations from its
+upstream-compatible data/index pair after process exit (ADR-0029). Explicit
+FLUSH synchronizes storage; interrupted writes may be partial. Both files must
+be retained. Missing or invalid metadata fails without recreating the upper.
+A valid legacy shutdown checkpoint is migrated before writable use; old
+memory-only uppers without a checkpoint cannot recover. Sparse commit exports
+a separate sealed LSMT delta after stop/reap and exact-coverage recovery,
+retaining the reusable source (ADR-0027).
 
 Hybrid is opt-in. Image assembly atomically creates an absent pair directory or
 reopens both existing files; an incomplete pair fails without recreating either

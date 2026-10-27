@@ -1,16 +1,11 @@
-// LSMT writable layer (ADR-0008): an unsealed single-file LSMT supporting
-// in-place edit. Write ranges covered by live segments overwrite their
-// data blocks in place; uncovered or discarded (zeroed) subranges append
-// new data at the data end. Zeroed segments own no physical blocks. seal()
-// compacts the file into a standard sealed LSMT RO file (garbage from
-// superseded in-place regions is dropped), readable by LsmtLayer.
-//
-// v0.2 limitation: the segment index is memory-only until checkpoint() or
-// seal(); an unsealed RW file is NOT recoverable across process restarts
-// (create() truncates). checkpoint() (called by the device process on
-// graceful shutdown, ADR-0014) persists the index as an unsealed trailer so
-// seal_file() can seal the file offline, from another process, after the
-// device is gone.
+// LSMT writable data/index pair (ADR-0029), with in-place DATA overwrite.
+// Uncovered or discarded (zeroed) subranges append new payload. ZERO mappings
+// own no physical blocks. Completed ownership changes publish upstream index
+// records before success, allowing recovery after process exit without FLUSH.
+// Explicit FLUSH provides storage synchronization; interrupted operations may
+// be partial. checkpoint() flushes and terminates the current instance only;
+// reopening the unsealed pair permits further writes.
+// seal() compacts into a standard sealed LSMT RO file readable by LsmtLayer.
 //
 // Seal determinism (ADR-0014): the sealed file's uuid is derived from the
 // content digest (sha256 of virtual_size || packed data || packed index,
@@ -28,6 +23,7 @@
 #include <string>
 
 namespace obd::format {
+namespace lsmt_rw { class FilePair; }
 
 /// ADR-0014 blank (raw) device zero base: writes a sealed EMPTY LSMT RO
 /// layer at `path` — virtual_size = `vsize`, index_size = 0 (no segments,
@@ -58,10 +54,29 @@ class LsmtRwLayer final : public WritableLayer {
 public:
     ~LsmtRwLayer() override;  // out-of-line: View is an incomplete type here
 
-    /// Creates a fresh unsealed LSMT RW file at `path` (any existing file
-    /// is truncated) with the given virtual size in bytes (sector aligned).
+    /// Creates a new upstream pair at path and path + ".index". Existing
+    /// artifacts are never truncated or replaced.
     static elio::coro::task<std::unique_ptr<LsmtRwLayer>> create(
         const std::string& path, uint64_t vsize);
+    /// Reopen a valid pair, migrate a complete legacy checkpoint, or create
+    /// only when neither artifact exists. Recovery callers set existing_only.
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> open_or_create(
+        const std::string& path, uint64_t minimum_size, bool existing_only = false);
+#ifdef OBD_TEST_HOOKS
+    // Produces the retired memory-only layout for migration fixtures only.
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> create_legacy_for_test(
+        const std::string& path, uint64_t vsize);
+#endif
+
+    /// Opens an upstream append-type data/index pair without truncation.
+    /// Completed mutations publish index records before returning. The caller
+    /// serializes reads/mutations, as for the existing MergedWritable path.
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> open_existing(
+        const std::string& data_path, const std::string& index_path);
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> create_persistent(
+        const std::string& data_path, const std::string& index_path, uint64_t vsize);
+    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> migrate_checkpoint(
+        const std::string& data_path, const std::string& index_path);
 
     elio::coro::task<ssize_t> pwrite(const void* buf, size_t count,
                                      uint64_t offset) override;
@@ -70,10 +85,9 @@ public:
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
 
-    /// Persists the in-memory segment index into the file as an unsealed
-    /// trailer (index region + trailer appended at the data end), so the
-    /// file can later be sealed offline by seal_file() (ADR-0014). Called
-    /// by the device process on graceful shutdown after IO has drained.
+    /// Flushes the persistent pair and terminates this writable instance.
+    /// The unsealed pair can subsequently reopen for writes or offline seal.
+    /// Called by the device process on graceful shutdown after IO has drained.
     /// Terminal: pwrite/discard after a checkpoint return -EROFS. Returns 0
     /// or a negative -errno; -EROFS when already sealed or checkpointed,
     /// -EBUSY when a direct grow/checkpoint/seal call is already in flight.
@@ -109,16 +123,15 @@ public:
     /// when a direct grow/checkpoint/seal call is already in flight.
     elio::coro::task<int> seal(const std::string& user_tag = "");
 
-    /// Offline seal (ADR-0014): opens a checkpointed unsealed RW file at
-    /// `path` (one written by checkpoint(), e.g. by a device process that
-    /// has since exited), seals it in place, and reports the sealed file's
-    /// sha256 hex digest and byte size. Returns 0 or a negative -errno:
-    /// -ENOENT when the file is missing, -EALREADY when it is already
-    /// sealed, -EINVAL when it is not a valid checkpointed LSMT-RW file
-    /// (e.g. the device crashed before checkpointing).
+    /// Offline seal (ADR-0014/0029): exclusively opens the persistent pair
+    /// at `path` and `path + ".index"`, or migrates a valid legacy checkpoint,
+    /// then seals it in place and reports its sha256 hex digest and byte size.
+    /// A persistent pair needs no prior checkpoint. Returns 0 or -errno;
+    /// sealed input returns -EALREADY, malformed input returns -EINVAL, and
+    /// another cooperating owner prevents opening the pair.
     ///
     /// D3 commit re-baseline: `virtual_size` (bytes, 0 = keep the
-    /// checkpointed size) overrides the virtual size written into the
+    /// recovered size) overrides the virtual size written into the
     /// sealed header/trailer (and hashed into the content digest), so a
     /// commit can declare a larger device. Grow-only, validated here
     /// before any compaction: the override must be 512-aligned and at
@@ -134,13 +147,9 @@ public:
 
 private:
     LsmtRwLayer() = default;
+    static std::unique_ptr<LsmtRwLayer> from_pair(
+        std::unique_ptr<lsmt_rw::FilePair>, const std::string& data_path);
     friend struct LsmtRwLayerTestAccess;
-
-    /// Opens an existing checkpointed RW file (no truncation) with its
-    /// index loaded from the on-disk unsealed trailer. Returns a negative
-    /// -errno via `error` (-EINVAL/-EALREADY/-ENOENT/...) on failure.
-    static elio::coro::task<std::unique_ptr<LsmtRwLayer>> open_checkpointed(
-        const std::string& path, int* error);
 
     int begin_grow_op();
     void end_grow_op();
@@ -159,6 +168,9 @@ private:
     uint64_t data_end_sector_ = 0;  // append position, sectors
     std::string uuid_;
     std::string path_;
+    std::unique_ptr<lsmt_rw::FilePair> pair_;
+    bool journal_failed_ = false;
+    elio::coro::task<int> prepare_mutation();
     /// Terminal-state flags. ATOMIC on purpose: grow() runs on a
     /// spawn_blocking pool thread (the device resize executor) while
     /// checkpoint()/seal() — which set them — run on Elio workers, the
