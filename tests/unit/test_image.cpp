@@ -636,6 +636,22 @@ TEST_CASE("image: LSMT assembly preserves uncheckpointed ownership and grown cap
                     actual.resize(65536);
                     const auto read = co_await opened.root->pread(actual.data(), actual.size(), 0);
                     REQUIRE(read == 65536); REQUIRE(actual == expected);
+                    // Also exercise explicit FLUSH followed by another reopen
+                    // over the same nonzero lower and grown blank/image view.
+                    auto* resumed = dynamic_cast<format::MergedWritable*>(opened.root.get());
+                    REQUIRE(resumed != nullptr);
+                    const int zero = co_await resumed->discard(8 * 512, 512);
+                    REQUIRE(zero == 0);
+                    std::fill_n(expected.begin() + 8 * 512, 512, 0);
+                    const auto rewrite = co_await resumed->pwrite(payload.data(), payload.size(), 9 * 512);
+                    REQUIRE(rewrite == 512);
+                    std::fill_n(expected.begin() + 9 * 512, 512, 0x5b);
+                    const int flushed = co_await resumed->flush();
+                    REQUIRE(flushed == 0);
+                    opened.root.reset();
+                    opened = co_await open(recover);
+                    const auto reread = co_await opened.root->pread(actual.data(), actual.size(), 0);
+                    REQUIRE(reread == 65536); REQUIRE(actual == expected);
                     opened.root.reset();
                 }
                 co_return 0;

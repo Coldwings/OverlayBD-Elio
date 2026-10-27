@@ -498,6 +498,8 @@ elio::coro::task<int> FilePair::append(bytes::segment_mapping mapping) {
     if (live_ranges_.size() - removed + replacement.size() > limit) co_return -EFBIG;
     std::array<uint8_t, 16> raw{};
     bytes::store_segment_le(raw.data(), mapping);
+    // Test boundary after the caller completed payload, before any index byte.
+    if (io_failure(8)) { poisoned_ = true; co_return -EIO; }
     const bool partial = io_failure(1);
     const auto encoded = std::as_bytes(std::span(raw));
     const auto result = co_await elio::io::pwrite_exactly(

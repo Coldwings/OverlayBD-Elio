@@ -13,7 +13,8 @@ namespace obd::format::lsmt_rw {
 void live_limit_for_test(uint64_t limit);
 // 1=partial append; 2/3/4=fail data/index/directory FLUSH;
 // 5/6/7=compact after data sync/new index sync/descriptor adoption.
-// Process-exit injection is supported for compact stages; reset with -1.
+// 8=payload completed, before index publication. Process-exit injection is
+// supported for stages 5..8; reset with -1.
 void io_fault_for_test(int stage, bool exit_process = false);
 // 1=intent published, 2=data header written, 3=index header written,
 // 4=both headers synced, 5=intent retired. Reset with -1.

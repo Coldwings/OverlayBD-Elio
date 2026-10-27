@@ -58,6 +58,10 @@ int main(int argc, char** argv) {
             co_return 5;
         }
 #endif
+#ifdef OBD_TEST_HOOKS
+        if (argc == 4 && std::string(argv[3]) == "payload-crash")
+            obd::format::lsmt_rw::io_fault_for_test(8, true);
+#endif
         std::array<uint8_t, 512> bytes{};
         bytes.fill(0xa1);
         if (co_await upper->pwrite(bytes.data(), bytes.size(), 512) != 512) co_return 1;

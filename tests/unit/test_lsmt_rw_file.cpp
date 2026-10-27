@@ -657,3 +657,48 @@ TEST_CASE("format: LSMT partial admission requires reopen before further mutatio
     REQUIRE(rc == 0);
 }
 #endif
+
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("format: LSMT process exit between payload and index preserves only published ownership",
+          "[format][lsmt-rw-file]") {
+    test::TempDir directory;
+    copy_pair(directory);
+    const auto data = directory / "data", index = directory / "index";
+    const auto old_data_size = std::filesystem::file_size(data);
+    const auto old_index_size = std::filesystem::file_size(index);
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        ::execl(OBD_TEST_LSMT_CRASH_WRITER_BIN, OBD_TEST_LSMT_CRASH_WRITER_BIN,
+                data.c_str(), index.c_str(), "payload-crash", nullptr);
+        ::_exit(127);
+    }
+    int status = 0; pid_t waited;
+    do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    REQUIRE(waited == child); REQUIRE(WIFEXITED(status)); REQUIRE(WEXITSTATUS(status) == 128);
+    REQUIRE(std::filesystem::file_size(data) == old_data_size + 512);
+    REQUIRE(std::filesystem::file_size(index) == old_index_size);
+    const int rc = run_pair([&]() -> elio::coro::task<int> {
+        auto upper = co_await format::LsmtRwLayer::open_existing(data, index);
+        std::array<uint8_t, 512> bytes{};
+        const auto prior = co_await upper->pread(bytes.data(), bytes.size(), 512);
+        REQUIRE(prior == 512);
+        for (auto byte : bytes) REQUIRE(byte == 0xa1); // Completed overwrite survives.
+        const auto unpublished = co_await upper->pread(bytes.data(), bytes.size(), 30 * 512);
+        REQUIRE(unpublished == 512);
+        for (auto byte : bytes) REQUIRE(byte == 0);
+        for (const auto& m : upper->segments()) REQUIRE_FALSE((m.offset <= 30 && m.end() > 30));
+        bytes.fill(0xd4);
+        const auto resumed = co_await upper->pwrite(bytes.data(), bytes.size(), 30 * 512);
+        REQUIRE(resumed == 512);
+        REQUIRE(std::filesystem::file_size(data) == old_data_size + 1024);
+        upper.reset();
+        upper = co_await format::LsmtRwLayer::open_existing(data, index);
+        const auto read = co_await upper->pread(bytes.data(), bytes.size(), 30 * 512);
+        REQUIRE(read == 512);
+        for (auto byte : bytes) REQUIRE(byte == 0xd4);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+#endif

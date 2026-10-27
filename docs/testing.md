@@ -436,9 +436,14 @@ Every test, grouped by area, with the property it guards.
   the real supervisor replaces its killed two-queue child after direct writes
   and discard without FLUSH; full byte and ownership checks follow recovery
   and final stop/reopen. Requires isolated privileged ublk validation.
+- `format: LSMT process exit between payload and index preserves only published ownership` —
+  an independent child exits after new payload completion but before mapping
+  publication; completed earlier overwrite survives, orphan payload gains no
+  ownership, and resumed writes append beyond it.
 - `image: LSMT assembly preserves uncheckpointed ownership and grown capacity on reopen` —
   ordinary and recovery assembly preserve DATA, ZERO masks over a nonzero lower,
-  and grown-tail contents for image and blank devices; a missing index fails
+  and grown-tail contents for image and blank devices, including explicit
+  write/discard/FLUSH/reopen cycles; a missing index fails
   without replacing the upper.
 - `format: failed LSMT discard preserves masked lower bytes in the live merged view` —
   failed journal publication preserves both prior DATA and ZERO over a nonzero
