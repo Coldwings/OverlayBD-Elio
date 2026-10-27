@@ -88,22 +88,46 @@ void write_lsmt_single_layer(int in_fd, uint64_t in_size,
     const uint64_t n_sectors = in_size / lsmt::kAlignment;
     constexpr uint64_t kMaxSegSectors = bytes::segment_mapping::kMaxLength;
 
-    // Build the index: full coverage, one segment per <= 16383-sector chunk,
-    // data region starts at sector 8 (byte 4096).
-    std::vector<bytes::segment_mapping> segs;
-    uint64_t off = 0, moff = lsmt::kDataStartSector;
-    while (off < n_sectors) {
-        const uint64_t len = std::min(kMaxSegSectors, n_sectors - off);
-        bytes::segment_mapping s;
-        s.offset = off;
-        s.length = static_cast<uint32_t>(len);
-        s.moffset = moff;
-        s.zeroed = false;
-        s.tag = 0;
-        segs.push_back(s);
-        off += len;
-        moff += len;
+    if (n_sectors > bytes::segment_mapping::kMaxOffset)
+        throw error(EFBIG, "lsmt input exceeds logical sector range");
+    if (opts.tail_ranges.size() > lsmt::kMaxRoIndexSize)
+        throw error(EFBIG, "lsmt placement has too many ranges");
+    std::vector<LsmtPayloadRange> tail;
+    uint64_t tail_sectors = 0;
+    for (const auto& range : opts.tail_ranges) {
+        if (range.length == 0 || range.offset >= n_sectors ||
+            range.length > n_sectors - range.offset ||
+            (!tail.empty() && range.offset < tail.back().offset + tail.back().length))
+            throw error(EINVAL, "lsmt placement ranges must be sorted, disjoint and in bounds");
+        tail_sectors += range.length;
+        if (!tail.empty() && range.offset == tail.back().offset + tail.back().length)
+            tail.back().length += range.length;
+        else
+            tail.push_back(range);
     }
+    // Index stays in logical order. Ordinary payload precedes the classified
+    // tail, with stable logical order inside each class. No new flags or tags.
+    const uint64_t tail_start = lsmt::kDataStartSector + n_sectors - tail_sectors;
+    uint64_t data_physical = lsmt::kDataStartSector, tail_physical = tail_start;
+    std::vector<bytes::segment_mapping> segs;
+    auto append = [&](uint64_t first, uint64_t length, uint64_t& physical) {
+        while (length != 0) {
+            if (segs.size() == lsmt::kMaxRoIndexSize)
+                throw error(EFBIG, "lsmt placement exceeds index limit");
+            const auto count = static_cast<uint32_t>(std::min(kMaxSegSectors, length));
+            segs.push_back({first, count, physical, false, 0});
+            first += count;
+            physical += count;
+            length -= count;
+        }
+    };
+    uint64_t logical = 0;
+    for (const auto& range : tail) {
+        append(logical, range.offset - logical, data_physical);
+        append(range.offset, range.length, tail_physical);
+        logical = range.offset + range.length;
+    }
+    append(logical, n_sectors - logical, data_physical);
 
     const uint64_t index_offset = lsmt::kSpace + in_size;
     const uint64_t index_bytes =
@@ -133,12 +157,20 @@ void write_lsmt_single_layer(int in_fd, uint64_t in_size,
     uint8_t zeros[lsmt::kSpace] = {};
     full_pwrite(out_fd, zeros, sizeof(zeros), 0);
     std::vector<uint8_t> buf(1 << 20);
-    for (uint64_t done = 0; done < in_size;) {
-        const size_t chunk =
-            static_cast<size_t>(std::min<uint64_t>(buf.size(), in_size - done));
-        full_pread(in_fd, buf.data(), chunk, done);
-        full_pwrite(out_fd, buf.data(), chunk, lsmt::kSpace + done);
-        done += chunk;
+    for (const bool at_tail : {false, true}) {
+        for (const auto& segment : segs) {
+            if ((segment.moffset >= tail_start) != at_tail) continue;
+            const uint64_t length = uint64_t{segment.length} * lsmt::kAlignment;
+            for (uint64_t done = 0; done < length;) {
+                const auto chunk = static_cast<size_t>(
+                    std::min<uint64_t>(buf.size(), length - done));
+                full_pread(in_fd, buf.data(), chunk,
+                           segment.offset * lsmt::kAlignment + done);
+                full_pwrite(out_fd, buf.data(), chunk,
+                            segment.moffset * lsmt::kAlignment + done);
+                done += chunk;
+            }
+        }
     }
 
     // Index region.

@@ -1,0 +1,6777 @@
+{
+  "status": "reported controlled and application startup matrices complete",
+  "date": "2026-10-27",
+  "implementation_commit": "ed4adc4fc6578d9072881b7cdcc3090d53df51ea",
+  "integrated_application_commit": "69eb59529aea34fa17daaca4c95063f0b6953855",
+  "controls": {
+    "workers": 2,
+    "queues": 2,
+    "guest_vcpus": 2,
+    "guest_memory_mib": 3072,
+    "origin_response_delay_ms": 2,
+    "aggregate_bandwidth_cap_bytes_per_second": 16777216,
+    "prefetch_head_kib": 256,
+    "prefetch_tail_kib": 256,
+    "background_fill": false,
+    "repetitions": 3,
+    "zfile_block_bytes": 4096,
+    "cache_extent_bytes": 65536
+  },
+  "controlled_matrices": {
+    "single": {
+      "complete_single_layer_matrix": true,
+      "completed_trials": 72,
+      "planned_trials": 72,
+      "cells": [
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "lz4",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 37.677082,
+              "min": 36.644443,
+              "max": 37.797943
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 92.329168,
+              "min": 91.497909,
+              "max": 103.991768
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 7.886248,
+              "min": 7.103717,
+              "max": 9.005691
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 6.523194,
+              "min": 5.507565,
+              "max": 7.462193
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 3.862361,
+              "min": 3.723375,
+              "max": 4.135338
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 6,
+              "min": 6,
+              "max": 6
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 153294,
+              "min": 153294,
+              "max": 153294
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44676,
+              "min": 44588,
+              "max": 44728
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.05824,
+              "min": 0.057165999999999995,
+              "max": 0.07016700000000001
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.007254,
+              "min": 0.006562,
+              "max": 0.008396
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "lz4",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 36.696851,
+              "min": 36.147184,
+              "max": 37.188702
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 92.534784,
+              "min": 89.122398,
+              "max": 92.922589
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.014898,
+              "min": 7.296495,
+              "max": 9.499021
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 6.525252,
+              "min": 5.714816,
+              "max": 7.885632
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 3.937783,
+              "min": 3.934975,
+              "max": 4.136684
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 6,
+              "min": 6,
+              "max": 6
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 153294,
+              "min": 153294,
+              "max": 153294
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44716,
+              "min": 44512,
+              "max": 44732
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.059031,
+              "min": 0.055635,
+              "max": 0.059798000000000004
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.007315,
+              "min": 0.006811,
+              "max": 0.009076
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "raw",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 33.189563,
+              "min": 31.35232,
+              "max": 35.583357
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 147.958467,
+              "min": 129.343735,
+              "max": 175.481617
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 56.652235,
+              "min": 55.882639,
+              "max": 77.094061
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 54.73213,
+              "min": 54.118522,
+              "max": 75.060952
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.520032,
+              "min": 4.261391,
+              "max": 7.469381
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 17,
+              "min": 16,
+              "max": 18
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 868418,
+              "min": 802882,
+              "max": 933954
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 720896,
+              "min": 655360,
+              "max": 786432
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 1.0158730158730158,
+              "min": 0.9235209235209235,
+              "max": 1.1082251082251082
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45020,
+              "min": 44952,
+              "max": 45188
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.079296,
+              "min": 0.05653999999999999,
+              "max": 0.10658899999999999
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.010148,
+              "min": 0.009859,
+              "max": 0.013794
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "raw",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 116.081729,
+              "min": 115.333617,
+              "max": 120.883443
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 202.164529,
+              "min": 192.197241,
+              "max": 206.843393
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 35.467331,
+              "min": 35.133324,
+              "max": 35.808082
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 33.689482,
+              "min": 33.600537,
+              "max": 34.11485
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.328291,
+              "min": 4.244972,
+              "max": 5.029812
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 23,
+              "min": 23,
+              "max": 23
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 1261634,
+              "min": 1261634,
+              "max": 1261634
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 458752,
+              "min": 458752,
+              "max": 458752
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.6464646464646465,
+              "min": 0.6464646464646465,
+              "max": 0.6464646464646465
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45136,
+              "min": 45036,
+              "max": 45180
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.079763,
+              "min": 0.070618,
+              "max": 0.086632
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.007586000000000001,
+              "min": 0.007202,
+              "max": 0.007638
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "zstd",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 26.666886,
+              "min": 26.052121,
+              "max": 27.550325
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 83.334339,
+              "min": 81.740502,
+              "max": 84.179904
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.720123,
+              "min": 7.486191,
+              "max": 8.960587
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.036047,
+              "min": 5.945704,
+              "max": 7.450202
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.134929,
+              "min": 3.703335,
+              "max": 4.685934
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 4,
+              "min": 4,
+              "max": 4
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 120810,
+              "min": 120810,
+              "max": 120810
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44808,
+              "min": 44656,
+              "max": 45028
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.057109999999999994,
+              "min": 0.055383,
+              "max": 0.06032
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008104,
+              "min": 0.0066240000000000005,
+              "max": 0.00831
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "zstd",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 26.168392,
+              "min": 24.628459,
+              "max": 26.552988
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 79.204784,
+              "min": 75.793637,
+              "max": 85.848472
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.96478,
+              "min": 8.59785,
+              "max": 10.883341
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.4454,
+              "min": 6.93113,
+              "max": 9.028605
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 5.853587,
+              "min": 4.074371,
+              "max": 6.053015
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 4,
+              "min": 4,
+              "max": 4
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 120810,
+              "min": 120810,
+              "max": 120810
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44796,
+              "min": 44708,
+              "max": 44916
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.04923100000000001,
+              "min": 0.048836000000000004,
+              "max": 0.059605
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008253,
+              "min": 0.008045,
+              "max": 0.010145
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "lz4",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 34.915466,
+              "min": 31.836416,
+              "max": 41.643314
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 92.077043,
+              "min": 76.46438,
+              "max": 96.054762
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 9.053591,
+              "min": 8.21619,
+              "max": 9.118515
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.254812,
+              "min": 6.299795,
+              "max": 7.701713
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 5.171661,
+              "min": 4.328052,
+              "max": 31.526473
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 6,
+              "min": 6,
+              "max": 6
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 153294,
+              "min": 153294,
+              "max": 153294
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44784,
+              "min": 44784,
+              "max": 44804
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.057031,
+              "min": 0.042043000000000004,
+              "max": 0.062362
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.007455,
+              "min": 0.007309,
+              "max": 0.008473999999999999
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "lz4",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 36.289096,
+              "min": 36.170155,
+              "max": 36.305943
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 89.277963,
+              "min": 88.1206,
+              "max": 115.224641
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.904007,
+              "min": 8.139271,
+              "max": 9.148987
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.215211,
+              "min": 6.657304,
+              "max": 7.600749
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.079104,
+              "min": 3.75657,
+              "max": 4.269437
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 6,
+              "min": 6,
+              "max": 6
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 153294,
+              "min": 153294,
+              "max": 153294
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44620,
+              "min": 44616,
+              "max": 44764
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.056757999999999996,
+              "min": 0.055851,
+              "max": 0.08173000000000001
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008149,
+              "min": 0.007755,
+              "max": 0.008382
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "raw",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 33.054415,
+              "min": 32.397065,
+              "max": 35.415448
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 149.108479,
+              "min": 136.954828,
+              "max": 195.416392
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 74.008535,
+              "min": 64.945289,
+              "max": 74.080804
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 59.375445,
+              "min": 50.185072,
+              "max": 59.584467
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 5.344086,
+              "min": 5.225573,
+              "max": 5.525903
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 17,
+              "min": 17,
+              "max": 17
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 868418,
+              "min": 868418,
+              "max": 868418
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 720896,
+              "min": 720896,
+              "max": 720896
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 1.0158730158730158,
+              "min": 1.0158730158730158,
+              "max": 1.0158730158730158
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45408,
+              "min": 45176,
+              "max": 45616
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.076885,
+              "min": 0.058568999999999996,
+              "max": 0.11411099999999999
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.012578,
+              "min": 0.010657,
+              "max": 0.014074
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "raw",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 118.802026,
+              "min": 118.627742,
+              "max": 122.357802
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 217.99751,
+              "min": 211.295622,
+              "max": 225.9701
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 50.190608,
+              "min": 40.70656,
+              "max": 59.410795
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 43.544613,
+              "min": 32.895787,
+              "max": 45.358567
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.626253,
+              "min": 4.170775,
+              "max": 4.843777
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 21,
+              "min": 21,
+              "max": 23
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 1130562,
+              "min": 1130562,
+              "max": 1261634
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 327680,
+              "min": 327680,
+              "max": 458752
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.46176046176046176,
+              "min": 0.46176046176046176,
+              "max": 0.6464646464646465
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 46616,
+              "min": 45580,
+              "max": 47276
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.08979599999999999,
+              "min": 0.08840100000000001,
+              "max": 0.09507600000000001
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.011484,
+              "min": 0.009801,
+              "max": 0.012070999999999998
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "zstd",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 28.235554,
+              "min": 26.448218,
+              "max": 28.834851
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 83.022769,
+              "min": 82.505057,
+              "max": 87.784089
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 9.303503,
+              "min": 9.09121,
+              "max": 10.733727
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.66226,
+              "min": 7.437672,
+              "max": 8.055148
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.243335,
+              "min": 4.042832,
+              "max": 4.670623
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 4,
+              "min": 4,
+              "max": 4
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 120812,
+              "min": 120812,
+              "max": 120812
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44912,
+              "min": 44684,
+              "max": 44916
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.056432,
+              "min": 0.054418,
+              "max": 0.061593
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008614,
+              "min": 0.008464,
+              "max": 0.009715999999999999
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "zstd",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 26.65083,
+              "min": 26.319461,
+              "max": 28.307936
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 79.5688,
+              "min": 77.693264,
+              "max": 82.037084
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.640031,
+              "min": 7.968242,
+              "max": 8.75619
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 6.41439,
+              "min": 6.400436,
+              "max": 7.120132
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.083596,
+              "min": 3.959964,
+              "max": 4.106334
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 4,
+              "min": 4,
+              "max": 4
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 120812,
+              "min": 120812,
+              "max": 120812
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44812,
+              "min": 44704,
+              "max": 44928
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.051990999999999996,
+              "min": 0.049437999999999996,
+              "max": 0.054286999999999995
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.00779,
+              "min": 0.007012999999999999,
+              "max": 0.007951
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "lz4",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 33.982913,
+              "min": 33.662905,
+              "max": 34.029173
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 93.682377,
+              "min": 89.94281,
+              "max": 100.868949
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 15.083057,
+              "min": 13.379699,
+              "max": 16.198514
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 13.514848,
+              "min": 11.658212,
+              "max": 14.974101
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 10.32881,
+              "min": 9.787235,
+              "max": 10.751556
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 5,
+              "min": 5,
+              "max": 6
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 137741,
+              "min": 137741,
+              "max": 144408
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44668,
+              "min": 44568,
+              "max": 44772
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.055268,
+              "min": 0.050841,
+              "max": 0.061207
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.013205,
+              "min": 0.011665,
+              "max": 0.01483
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "lz4",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 33.518483,
+              "min": 33.199653,
+              "max": 36.926328
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 89.105028,
+              "min": 81.766477,
+              "max": 97.297302
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 14.088798,
+              "min": 13.575441,
+              "max": 14.883035
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 12.722084,
+              "min": 11.802361,
+              "max": 13.37525
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 9.484584,
+              "min": 9.292488,
+              "max": 9.759493
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 5,
+              "min": 5,
+              "max": 6
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 137741,
+              "min": 137741,
+              "max": 144408
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44696,
+              "min": 44612,
+              "max": 44748
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.052398,
+              "min": 0.041279,
+              "max": 0.062667
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.012626,
+              "min": 0.01176,
+              "max": 0.013079
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "raw",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 33.391799,
+              "min": 31.824029,
+              "max": 36.438689
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 189.805027,
+              "min": 177.609662,
+              "max": 204.053576
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 102.524817,
+              "min": 100.606066,
+              "max": 114.08344
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 100.844955,
+              "min": 98.960878,
+              "max": 112.063744
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 13.952595,
+              "min": 13.30065,
+              "max": 15.244308
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 15,
+              "min": 15,
+              "max": 16
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 737346,
+              "min": 737346,
+              "max": 802882
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 589824,
+              "min": 589824,
+              "max": 655360
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.964824120603015,
+              "min": 0.964824120603015,
+              "max": 1.0720268006700167
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44788,
+              "min": 44752,
+              "max": 44896
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.083295,
+              "min": 0.066354,
+              "max": 0.08423900000000001
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.025471,
+              "min": 0.023459,
+              "max": 0.027385
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "raw",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 118.781229,
+              "min": 115.537745,
+              "max": 120.894009
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 234.585497,
+              "min": 226.106749,
+              "max": 270.751296
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 67.954409,
+              "min": 67.334854,
+              "max": 89.120523
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 65.843911,
+              "min": 65.502161,
+              "max": 86.351966
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 14.903163,
+              "min": 14.051483,
+              "max": 15.49621
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 22,
+              "min": 22,
+              "max": 24
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 1196098,
+              "min": 1196098,
+              "max": 1327170
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 393216,
+              "min": 393216,
+              "max": 524288
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.6432160804020101,
+              "min": 0.6432160804020101,
+              "max": 0.8576214405360134
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44880,
+              "min": 44864,
+              "max": 44888
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.08288200000000001,
+              "min": 0.077228,
+              "max": 0.104136
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.017615,
+              "min": 0.017466,
+              "max": 0.020375
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "zstd",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 28.182187,
+              "min": 27.587137,
+              "max": 30.563752
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 96.521608,
+              "min": 83.805367,
+              "max": 117.024031
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 16.684607,
+              "min": 13.119033,
+              "max": 17.334751
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 14.776582,
+              "min": 11.478112,
+              "max": 15.841691
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 10.267812,
+              "min": 8.86764,
+              "max": 12.264304
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 4,
+              "min": 4,
+              "max": 4
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 114836,
+              "min": 114836,
+              "max": 114836
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44888,
+              "min": 44708,
+              "max": 45016
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.065512,
+              "min": 0.054662,
+              "max": 0.082922
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.014398,
+              "min": 0.011393,
+              "max": 0.015422
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "zstd",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 28.065152,
+              "min": 24.992614,
+              "max": 32.250145
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 90.172742,
+              "min": 83.977934,
+              "max": 104.386738
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 14.398011,
+              "min": 13.142312,
+              "max": 15.943301
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 12.708067,
+              "min": 11.711438,
+              "max": 14.112955
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 10.025551,
+              "min": 9.99745,
+              "max": 10.869136
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 4,
+              "min": 4,
+              "max": 4
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 114836,
+              "min": 114836,
+              "max": 114836
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44900,
+              "min": 44744,
+              "max": 45072
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.058568999999999996,
+              "min": 0.05211,
+              "max": 0.070495
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.012830000000000001,
+              "min": 0.011775,
+              "max": 0.014091
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "lz4",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 34.648603,
+              "min": 30.501674,
+              "max": 37.550355
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 97.37168,
+              "min": 93.497614,
+              "max": 107.943996
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 14.871784,
+              "min": 12.17341,
+              "max": 14.91162
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 12.825838,
+              "min": 10.902375,
+              "max": 13.538438
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 9.920661,
+              "min": 9.883735,
+              "max": 10.411544
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 5,
+              "min": 5,
+              "max": 5
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 137937,
+              "min": 137937,
+              "max": 137937
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44760,
+              "min": 44664,
+              "max": 44840
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.063847,
+              "min": 0.05789,
+              "max": 0.071765
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.013031000000000001,
+              "min": 0.011012,
+              "max": 0.01313
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "lz4",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 36.147691,
+              "min": 33.555236,
+              "max": 37.284986
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 105.637148,
+              "min": 97.662074,
+              "max": 107.746078
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 14.995452,
+              "min": 13.524426,
+              "max": 16.733829
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 13.306947,
+              "min": 11.972296,
+              "max": 14.674529
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 10.212097,
+              "min": 9.112201,
+              "max": 12.58404
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 5,
+              "min": 5,
+              "max": 6
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 137937,
+              "min": 137937,
+              "max": 144800
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44628,
+              "min": 44484,
+              "max": 44796
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.066208,
+              "min": 0.058432,
+              "max": 0.066873
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.013242,
+              "min": 0.012099,
+              "max": 0.015017
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "raw",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 36.569447,
+              "min": 31.809196,
+              "max": 40.401898
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 180.437094,
+              "min": 171.032758,
+              "max": 197.358129
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 97.687562,
+              "min": 91.515777,
+              "max": 109.74597
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 84.899976,
+              "min": 82.908545,
+              "max": 101.529022
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 13.705562,
+              "min": 13.391585,
+              "max": 15.092142
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 16,
+              "min": 15,
+              "max": 16
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 803458,
+              "min": 737922,
+              "max": 803458
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 655360,
+              "min": 589824,
+              "max": 655360
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 1.0720268006700167,
+              "min": 0.964824120603015,
+              "max": 1.0720268006700167
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44736,
+              "min": 44696,
+              "max": 44860
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.069967,
+              "min": 0.06628,
+              "max": 0.078712
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.019823,
+              "min": 0.019639,
+              "max": 0.025804999999999998
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "raw",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 117.392017,
+              "min": 114.923448,
+              "max": 126.38219
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 224.453213,
+              "min": 214.197861,
+              "max": 237.44976
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 50.922884,
+              "min": 48.981133,
+              "max": 51.679207
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 49.316361,
+              "min": 47.445817,
+              "max": 49.940911
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 15.861557,
+              "min": 12.684272,
+              "max": 16.606903
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 20,
+              "min": 20,
+              "max": 20
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 1065602,
+              "min": 1065602,
+              "max": 1065602
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 262144,
+              "min": 262144,
+              "max": 262144
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.4288107202680067,
+              "min": 0.4288107202680067,
+              "max": 0.4288107202680067
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44856,
+              "min": 44840,
+              "max": 44872
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.088434,
+              "min": 0.078569,
+              "max": 0.100038
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.016507,
+              "min": 0.015535,
+              "max": 0.01828
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "zstd",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 30.397176,
+              "min": 26.602295,
+              "max": 37.682324
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 97.063232,
+              "min": 92.320546,
+              "max": 114.873314
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 14.284692,
+              "min": 13.653333,
+              "max": 15.572694
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 12.729618,
+              "min": 12.049595,
+              "max": 13.611089
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 10.704699,
+              "min": 9.792992,
+              "max": 11.333214
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 4,
+              "min": 4,
+              "max": 4
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 115070,
+              "min": 115070,
+              "max": 115070
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44904,
+              "min": 44900,
+              "max": 45008
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.064154,
+              "min": 0.059974,
+              "max": 0.085719
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.012489,
+              "min": 0.011964,
+              "max": 0.013329
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "zstd",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 25.68174,
+              "min": 23.702102,
+              "max": 27.850122
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 82.330206,
+              "min": 80.439338,
+              "max": 98.282664
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 13.314458,
+              "min": 13.140852,
+              "max": 18.726585
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 12.156462,
+              "min": 11.772493,
+              "max": 17.107967
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 9.419766,
+              "min": 8.79981,
+              "max": 10.167229
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 4,
+              "min": 4,
+              "max": 4
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 115070,
+              "min": 115070,
+              "max": 115070
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44904,
+              "min": 44688,
+              "max": 44964
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.053004,
+              "min": 0.049625,
+              "max": 0.061697
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.011500999999999999,
+              "min": 0.011425,
+              "max": 0.01634
+            }
+          }
+        }
+      ],
+      "limits": [
+        "layered DATA/ZERO/INHERIT matrix remains separate",
+        "origin files are read to verify digest before timed assembly",
+        "host cache is uncontrolled and not evicted; loopback service delay and bandwidth fixed",
+        "fixtures are controlled synthetic filesystem trees, not application boot images",
+        "post-assembly amplification includes compression and excludes inline warmup; not internal cache-hit statistics",
+        "kernel readahead may cross phase boundaries; counter snapshots are individually atomic",
+        "warm repeat includes guest filesystem cache",
+        "no layered acceptance claim"
+      ]
+    },
+    "layered": {
+      "complete_layered_matrix": true,
+      "completed_trials": 72,
+      "planned_trials": 72,
+      "cells": [
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "lz4",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 50.290659,
+              "min": 48.846388,
+              "max": 57.070237
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 107.975895,
+              "min": 82.337541,
+              "max": 108.34331
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 7.566682,
+              "min": 6.788163,
+              "max": 7.781273
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 5.860705,
+              "min": 5.41021,
+              "max": 6.050416
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 3.896223,
+              "min": 3.847029,
+              "max": 4.183212
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 10,
+              "min": 9,
+              "max": 10
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 165778,
+              "min": 159435,
+              "max": 165778
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45892,
+              "min": 45736,
+              "max": 45932
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.06493399999999999,
+              "min": 0.036072999999999994,
+              "max": 0.069635
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.006867,
+              "min": 0.006301,
+              "max": 0.007145
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "lz4",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 50.240356,
+              "min": 48.514162,
+              "max": 53.536273
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 103.667324,
+              "min": 96.412077,
+              "max": 108.137435
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.58518,
+              "min": 8.058328,
+              "max": 10.030922
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.146962,
+              "min": 6.350515,
+              "max": 8.273074
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 3.939181,
+              "min": 3.913163,
+              "max": 5.200375
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 9,
+              "min": 9,
+              "max": 9
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 159435,
+              "min": 159435,
+              "max": 159435
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 46004,
+              "min": 45796,
+              "max": 46044
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.064472,
+              "min": 0.056886000000000006,
+              "max": 0.068073
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.007829,
+              "min": 0.0073360000000000005,
+              "max": 0.009363
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "raw",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 75.128586,
+              "min": 70.371166,
+              "max": 114.881445
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 176.939984,
+              "min": 174.194322,
+              "max": 213.126957
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 49.858086,
+              "min": 46.889217,
+              "max": 53.783625
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 47.835904,
+              "min": 45.436059,
+              "max": 50.62526
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 5.536097,
+              "min": 3.993085,
+              "max": 6.059598
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 21,
+              "min": 21,
+              "max": 21
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 991396,
+              "min": 991396,
+              "max": 991396
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 589824,
+              "min": 589824,
+              "max": 589824
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.8311688311688312,
+              "min": 0.8311688311688312,
+              "max": 0.8311688311688312
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 46260,
+              "min": 46108,
+              "max": 46364
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.08445599999999999,
+              "min": 0.07609199999999999,
+              "max": 0.084555
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.010879,
+              "min": 0.007859,
+              "max": 0.011283000000000001
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "raw",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 248.249296,
+              "min": 243.283631,
+              "max": 259.474842
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 316.166298,
+              "min": 286.91397,
+              "max": 318.569663
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 10.933525,
+              "min": 7.866045,
+              "max": 10.962725
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.368242,
+              "min": 6.161154,
+              "max": 9.015297
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.606502,
+              "min": 3.903891,
+              "max": 4.732229
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 34,
+              "min": 34,
+              "max": 34
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 1843364,
+              "min": 1843364,
+              "max": 1843364
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 131072,
+              "min": 131072,
+              "max": 131072
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.1847041847041847,
+              "min": 0.1847041847041847,
+              "max": 0.1847041847041847
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45000,
+              "min": 44952,
+              "max": 45028
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.122214,
+              "min": 0.089843,
+              "max": 0.12513400000000002
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.009813,
+              "min": 0.006999,
+              "max": 0.009968999999999999
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "zstd",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 46.410238,
+              "min": 39.316063,
+              "max": 51.439725
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 99.473137,
+              "min": 92.805537,
+              "max": 107.04668
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.817036,
+              "min": 8.778874,
+              "max": 9.654909
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.246182,
+              "min": 6.654964,
+              "max": 7.871511
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.009326,
+              "min": 3.933074,
+              "max": 4.742149
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 8,
+              "min": 8,
+              "max": 8
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 131230,
+              "min": 131230,
+              "max": 131230
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 46072,
+              "min": 45980,
+              "max": 46180
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.062229,
+              "min": 0.05612099999999999,
+              "max": 0.06937399999999999
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008235,
+              "min": 0.007927,
+              "max": 0.009022
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "logical",
+          "codec": "zstd",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 46.024202,
+              "min": 38.724752,
+              "max": 47.726318
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 104.464219,
+              "min": 93.519927,
+              "max": 132.025338
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 9.239012,
+              "min": 8.307064,
+              "max": 9.570994
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.538835,
+              "min": 6.89266,
+              "max": 7.958456
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.25693,
+              "min": 4.154315,
+              "max": 4.700261
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 8,
+              "min": 8,
+              "max": 8
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 131230,
+              "min": 131230,
+              "max": 131230
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 46052,
+              "min": 45948,
+              "max": 46052
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.070619,
+              "min": 0.057507,
+              "max": 0.09685099999999999
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008472,
+              "min": 0.007717,
+              "max": 0.008957
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "lz4",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 53.419534,
+              "min": 45.839478,
+              "max": 56.423849
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 107.63906,
+              "min": 105.460944,
+              "max": 138.706876
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.524877,
+              "min": 6.990667,
+              "max": 9.355202
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.136089,
+              "min": 5.547525,
+              "max": 7.903994
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 3.905429,
+              "min": 3.896058,
+              "max": 3.927224
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 9,
+              "min": 9,
+              "max": 9
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 159435,
+              "min": 159435,
+              "max": 159435
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45656,
+              "min": 45616,
+              "max": 46024
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.067129,
+              "min": 0.06422900000000001,
+              "max": 0.09736299999999999
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008125,
+              "min": 0.0064139999999999996,
+              "max": 0.008914
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "lz4",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 53.765728,
+              "min": 53.031017,
+              "max": 56.372457
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 106.521375,
+              "min": 87.991695,
+              "max": 115.887753
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 9.466017,
+              "min": 7.417939,
+              "max": 9.558544
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.703317,
+              "min": 5.851777,
+              "max": 7.826603
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.133813,
+              "min": 4.050782,
+              "max": 4.188923
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 9,
+              "min": 9,
+              "max": 10
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 159435,
+              "min": 159435,
+              "max": 165778
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45836,
+              "min": 45648,
+              "max": 45884
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.066827,
+              "min": 0.04057,
+              "max": 0.07007600000000001
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008874,
+              "min": 0.006864,
+              "max": 0.009018
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "raw",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 75.818079,
+              "min": 73.002829,
+              "max": 77.398623
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 178.480443,
+              "min": 174.360324,
+              "max": 185.669462
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 57.288848,
+              "min": 53.935537,
+              "max": 62.579031
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 55.177049,
+              "min": 52.026544,
+              "max": 60.812755
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.629014,
+              "min": 3.881594,
+              "max": 7.442832
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 21,
+              "min": 21,
+              "max": 22
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 991396,
+              "min": 991396,
+              "max": 1056932
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 589824,
+              "min": 589824,
+              "max": 655360
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.8311688311688312,
+              "min": 0.8311688311688312,
+              "max": 0.9235209235209235
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 46200,
+              "min": 46148,
+              "max": 46280
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.07999699999999998,
+              "min": 0.071697,
+              "max": 0.08341699999999999
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.011468,
+              "min": 0.010009,
+              "max": 0.014445
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "raw",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 252.061844,
+              "min": 236.529897,
+              "max": 256.594822
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 315.41155,
+              "min": 314.416129,
+              "max": 320.447284
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 15.213978,
+              "min": 13.613348,
+              "max": 18.876252
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 12.144525,
+              "min": 11.697865,
+              "max": 16.867041
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.611291,
+              "min": 4.349489,
+              "max": 4.654521
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 33,
+              "min": 33,
+              "max": 33
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 1777828,
+              "min": 1777828,
+              "max": 1777828
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 65536,
+              "min": 65536,
+              "max": 65536
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.09235209235209235,
+              "min": 0.09235209235209235,
+              "max": 0.09235209235209235
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45720,
+              "min": 45640,
+              "max": 45896
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.12068999999999999,
+              "min": 0.119419,
+              "max": 0.135036
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008517,
+              "min": 0.0073349999999999995,
+              "max": 0.009113
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "zstd",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 46.101183,
+              "min": 45.824066,
+              "max": 49.773141
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 105.069469,
+              "min": 94.169745,
+              "max": 113.220327
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.928872,
+              "min": 7.425915,
+              "max": 9.815979
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 7.399065,
+              "min": 5.672766,
+              "max": 7.824677
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 3.916259,
+              "min": 3.878181,
+              "max": 3.924993
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 8,
+              "min": 8,
+              "max": 8
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 131232,
+              "min": 131232,
+              "max": 131232
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45936,
+              "min": 45908,
+              "max": 46032
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.067275,
+              "min": 0.057742,
+              "max": 0.07464499999999999
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.008087,
+              "min": 0.006746,
+              "max": 0.009086
+            }
+          }
+        },
+        {
+          "workload": "metadata",
+          "layout": "tail",
+          "codec": "zstd",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 46.382236,
+              "min": 38.208918,
+              "max": 53.96524
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 102.975856,
+              "min": 100.501887,
+              "max": 146.887263
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 8.003739,
+              "min": 7.68219,
+              "max": 9.85626
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 6.375895,
+              "min": 5.942723,
+              "max": 8.06103
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 4.059381,
+              "min": 3.785435,
+              "max": 4.468939
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 8,
+              "min": 8,
+              "max": 8
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 131232,
+              "min": 131232,
+              "max": 131232
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 709632,
+              "min": 709632,
+              "max": 709632
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45960,
+              "min": 45956,
+              "max": 45972
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.06864300000000001,
+              "min": 0.06572700000000001,
+              "max": 0.106026
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.007271,
+              "min": 0.006593,
+              "max": 0.009104
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "lz4",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 45.853414,
+              "min": 44.479043,
+              "max": 47.401072
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 128.269316,
+              "min": 78.077615,
+              "max": 146.093042
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 15.126869,
+              "min": 14.606497,
+              "max": 15.137014
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 13.403031,
+              "min": 13.003937,
+              "max": 13.623505
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 11.020735,
+              "min": 10.168771,
+              "max": 11.962337
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 9,
+              "min": 9,
+              "max": 9
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 143672,
+              "min": 143672,
+              "max": 143672
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45804,
+              "min": 45636,
+              "max": 45876
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.081929,
+              "min": 0.02694,
+              "max": 0.10245599999999999
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.013545000000000001,
+              "min": 0.012805,
+              "max": 0.013592
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "lz4",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 45.619889,
+              "min": 42.228964,
+              "max": 53.761575
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 110.195621,
+              "min": 102.411993,
+              "max": 121.872423
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 15.427011,
+              "min": 13.741272,
+              "max": 15.742841
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 13.978464,
+              "min": 12.193816,
+              "max": 13.989618
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 12.421397,
+              "min": 9.643699,
+              "max": 12.702662
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 9,
+              "min": 9,
+              "max": 9
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 143672,
+              "min": 143672,
+              "max": 143672
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45924,
+              "min": 45564,
+              "max": 45996
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.063631,
+              "min": 0.057088,
+              "max": 0.076319
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.013852000000000001,
+              "min": 0.011904,
+              "max": 0.013859
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "raw",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 80.414846,
+              "min": 72.298221,
+              "max": 83.216143
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 212.306356,
+              "min": 207.827206,
+              "max": 222.568822
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 87.53958,
+              "min": 83.212148,
+              "max": 91.925523
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 85.922632,
+              "min": 81.095378,
+              "max": 90.34433
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 15.919324,
+              "min": 13.71586,
+              "max": 15.971792
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 20,
+              "min": 20,
+              "max": 20
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 901572,
+              "min": 901572,
+              "max": 901572
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 524288,
+              "min": 524288,
+              "max": 524288
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.8576214405360134,
+              "min": 0.8576214405360134,
+              "max": 0.8576214405360134
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44920,
+              "min": 44564,
+              "max": 45032
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.084782,
+              "min": 0.080057,
+              "max": 0.098732
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.022075,
+              "min": 0.019583,
+              "max": 0.024127
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "raw",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 160.500631,
+              "min": 145.222827,
+              "max": 168.948861
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 263.034711,
+              "min": 262.486953,
+              "max": 278.54643
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 56.042538,
+              "min": 55.29507,
+              "max": 66.718757
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 54.317066,
+              "min": 53.646539,
+              "max": 64.832879
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 13.144883,
+              "min": 12.062328,
+              "max": 19.005953
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 27,
+              "min": 27,
+              "max": 27
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 1360324,
+              "min": 1360324,
+              "max": 1360324
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 327680,
+              "min": 327680,
+              "max": 327680
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.5360134003350083,
+              "min": 0.5360134003350083,
+              "max": 0.5360134003350083
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44760,
+              "min": 44736,
+              "max": 44872
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.09076100000000001,
+              "min": 0.08582900000000002,
+              "max": 0.107957
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.015878,
+              "min": 0.015585,
+              "max": 0.020704
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "zstd",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 44.769871,
+              "min": 42.610813,
+              "max": 44.952227
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 115.701164,
+              "min": 102.839407,
+              "max": 131.649557
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 16.200777,
+              "min": 13.438609,
+              "max": 20.788546
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 14.18981,
+              "min": 11.909336,
+              "max": 19.110399
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 10.946768,
+              "min": 10.36667,
+              "max": 11.058363
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 8,
+              "min": 8,
+              "max": 8
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 119194,
+              "min": 119194,
+              "max": 119194
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 46140,
+              "min": 46124,
+              "max": 46316
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.071492,
+              "min": 0.062575,
+              "max": 0.08095
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.014107,
+              "min": 0.01137,
+              "max": 0.01907
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "logical",
+          "codec": "zstd",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 39.291894,
+              "min": 38.105131,
+              "max": 39.656356
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 104.355642,
+              "min": 99.089206,
+              "max": 109.916454
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 14.791543,
+              "min": 14.126367,
+              "max": 18.165705
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 13.282393,
+              "min": 12.506267,
+              "max": 16.30132
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 9.476166,
+              "min": 9.243865,
+              "max": 11.29606
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 8,
+              "min": 8,
+              "max": 8
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 119194,
+              "min": 119194,
+              "max": 119194
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 46152,
+              "min": 46104,
+              "max": 46220
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.060599,
+              "min": 0.056709999999999997,
+              "max": 0.06728
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.012881,
+              "min": 0.012064,
+              "max": 0.016102
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "lz4",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 47.777479,
+              "min": 46.406507,
+              "max": 58.218568
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 116.86547,
+              "min": 114.86175,
+              "max": 125.203099
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 14.446162,
+              "min": 13.094792,
+              "max": 16.300462
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 12.799153,
+              "min": 11.545537,
+              "max": 14.58642
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 9.713774,
+              "min": 9.24056,
+              "max": 10.317386
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 9,
+              "min": 9,
+              "max": 10
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 143892,
+              "min": 143892,
+              "max": 149696
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45820,
+              "min": 45808,
+              "max": 45856
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.068907,
+              "min": 0.064477,
+              "max": 0.079058
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.013009999999999999,
+              "min": 0.011708,
+              "max": 0.014443
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "lz4",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 46.900402,
+              "min": 43.441611,
+              "max": 56.739327
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 113.598939,
+              "min": 109.246776,
+              "max": 127.09562
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 15.528191,
+              "min": 14.535313,
+              "max": 15.821477
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 13.981726,
+              "min": 12.912214,
+              "max": 14.06962
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 9.811841,
+              "min": 9.623818,
+              "max": 11.980067
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 9,
+              "min": 9,
+              "max": 10
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 143892,
+              "min": 143892,
+              "max": 149696
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45784,
+              "min": 45676,
+              "max": 45840
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.065234,
+              "min": 0.061567,
+              "max": 0.0811
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.01379,
+              "min": 0.012891,
+              "max": 0.014087
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "raw",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 75.271054,
+              "min": 71.904477,
+              "max": 78.107967
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 214.560163,
+              "min": 199.265052,
+              "max": 226.086976
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 85.451604,
+              "min": 82.035967,
+              "max": 95.698129
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 81.58165,
+              "min": 80.327364,
+              "max": 93.083416
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 13.565073,
+              "min": 12.116966,
+              "max": 14.718504
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 20,
+              "min": 20,
+              "max": 22
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 902180,
+              "min": 902180,
+              "max": 1033252
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 524288,
+              "min": 524288,
+              "max": 655360
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.8576214405360134,
+              "min": 0.8576214405360134,
+              "max": 1.0720268006700167
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44900,
+              "min": 44876,
+              "max": 45068
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.076072,
+              "min": 0.072829,
+              "max": 0.097995
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.019379,
+              "min": 0.018827,
+              "max": 0.021091000000000002
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "raw",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 161.449973,
+              "min": 159.619897,
+              "max": 165.121097
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 262.813646,
+              "min": 258.451371,
+              "max": 270.392744
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 46.748873,
+              "min": 45.318998,
+              "max": 52.658067
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 45.235328,
+              "min": 43.823684,
+              "max": 51.264209
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 13.336272,
+              "min": 10.922691,
+              "max": 15.046854
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 26,
+              "min": 26,
+              "max": 26
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 1295396,
+              "min": 1295396,
+              "max": 1295396
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 262144,
+              "min": 262144,
+              "max": 262144
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.4288107202680067,
+              "min": 0.4288107202680067,
+              "max": 0.4288107202680067
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 44744,
+              "min": 44736,
+              "max": 44816
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.09601099999999999,
+              "min": 0.09493599999999999,
+              "max": 0.106794
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.014360000000000001,
+              "min": 0.013959,
+              "max": 0.018105
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "zstd",
+          "prefetch": false,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 42.119599,
+              "min": 40.743044,
+              "max": 43.825503
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 109.864321,
+              "min": 105.13801,
+              "max": 139.934604
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 15.596339,
+              "min": 13.356589,
+              "max": 21.631715
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 13.860737,
+              "min": 11.886307,
+              "max": 19.550193
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 9.933382,
+              "min": 8.829623,
+              "max": 10.296893
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 8,
+              "min": 8,
+              "max": 8
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 119438,
+              "min": 119438,
+              "max": 119438
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45884,
+              "min": 45836,
+              "max": 46076
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.066418,
+              "min": 0.06479,
+              "max": 0.09293000000000001
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.013404,
+              "min": 0.01172,
+              "max": 0.019421
+            }
+          }
+        },
+        {
+          "workload": "ordinary",
+          "layout": "tail",
+          "codec": "zstd",
+          "prefetch": true,
+          "trials": 3,
+          "measurements": {
+            "assembly_ms": {
+              "n": 3,
+              "median": 48.666305,
+              "min": 46.057335,
+              "max": 52.06655
+            },
+            "start_to_first_command_ms": {
+              "n": 3,
+              "median": 111.878205,
+              "min": 106.356762,
+              "max": 146.518015
+            },
+            "ready_to_first_command_ms": {
+              "n": 3,
+              "median": 16.098936,
+              "min": 15.118796,
+              "max": 17.140832
+            },
+            "cold_command_ms": {
+              "n": 3,
+              "median": 14.691264,
+              "min": 13.48113,
+              "max": 15.213245
+            },
+            "warm_command_ms": {
+              "n": 3,
+              "median": 9.981708,
+              "min": 9.30192,
+              "max": 10.290179
+            },
+            "first_remote_requests": {
+              "n": 3,
+              "median": 8,
+              "min": 8,
+              "max": 8
+            },
+            "first_remote_bytes": {
+              "n": 3,
+              "median": 119438,
+              "min": 119438,
+              "max": 119438
+            },
+            "post_assembly_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "device_requested_bytes_through_cold": {
+              "n": 3,
+              "median": 611328,
+              "min": 611328,
+              "max": 611328
+            },
+            "post_assembly_remote_over_device_requested": {
+              "n": 3,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0
+            },
+            "warm_remote_requests": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "warm_remote_bytes": {
+              "n": 3,
+              "median": 0,
+              "min": 0,
+              "max": 0
+            },
+            "self_peak_rss_kib": {
+              "n": 3,
+              "median": 45868,
+              "min": 45768,
+              "max": 45908
+            },
+            "self_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.064492,
+              "min": 0.061366,
+              "max": 0.103198
+            },
+            "children_cpu_seconds_through_cold": {
+              "n": 3,
+              "median": 0.013730000000000001,
+              "min": 0.013153,
+              "max": 0.015076
+            }
+          }
+        }
+      ],
+      "limits": [
+        "upper selection derived from actual converter layout; does not add differential converter inputs",
+        "origin files are read to verify digest before timed assembly",
+        "host cache is uncontrolled and not evicted; loopback service delay and bandwidth fixed",
+        "fixtures are controlled synthetic filesystem trees, not application boot images",
+        "post-assembly amplification includes compression and excludes inline warmup; not internal cache-hit statistics",
+        "kernel readahead may cross phase boundaries; counter snapshots are individually atomic",
+        "warm repeat includes guest filesystem cache",
+        "complete merged bytes and ownership verified separately with independent upstream reader; mounted command does not read every device byte"
+      ]
+    }
+  },
+  "conversion": {
+    "status": "passed",
+    "trials": 18,
+    "cells": [
+      {
+        "name": "metadata",
+        "layout": "logical",
+        "trials": 3,
+        "observed_wall_ms": {
+          "median": 165.352624,
+          "min": 165.309392,
+          "max": 165.564391
+        },
+        "index_entries": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "index_bytes": {
+          "median": 32,
+          "min": 32,
+          "max": 32
+        },
+        "lsmt_bytes": {
+          "median": 8396832,
+          "min": 8396832,
+          "max": 8396832
+        },
+        "raw_bytes": {
+          "median": 8388608,
+          "min": 8388608,
+          "max": 8388608
+        },
+        "sampled_peak_logical_bytes_lower_bound": {
+          "median": 16785440,
+          "min": 16785440,
+          "max": 16785440
+        },
+        "sampled_peak_allocated_bytes_lower_bound": {
+          "median": 8970240,
+          "min": 8970240,
+          "max": 8970240
+        },
+        "retained_logical_bytes": {
+          "median": 16785440,
+          "min": 16785440,
+          "max": 16785440
+        },
+        "user_seconds": {
+          "median": 0.02,
+          "min": 0.01,
+          "max": 0.02
+        },
+        "system_seconds": {
+          "median": 0.02,
+          "min": 0.01,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "median": 10168,
+          "min": 10064,
+          "max": 10296
+        },
+        "cpu_seconds": {
+          "median": 0.03,
+          "min": 0.03,
+          "max": 0.04
+        },
+        "retained_allocated_bytes": {
+          "median": 8970240,
+          "min": 8970240,
+          "max": 8970240
+        }
+      },
+      {
+        "name": "metadata",
+        "layout": "tail",
+        "trials": 3,
+        "observed_wall_ms": {
+          "median": 165.312308,
+          "min": 114.887457,
+          "max": 165.618793
+        },
+        "index_entries": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "index_bytes": {
+          "median": 32,
+          "min": 32,
+          "max": 32
+        },
+        "lsmt_bytes": {
+          "median": 8396832,
+          "min": 8396832,
+          "max": 8396832
+        },
+        "raw_bytes": {
+          "median": 8388608,
+          "min": 8388608,
+          "max": 8388608
+        },
+        "sampled_peak_logical_bytes_lower_bound": {
+          "median": 16785440,
+          "min": 16785440,
+          "max": 16785440
+        },
+        "sampled_peak_allocated_bytes_lower_bound": {
+          "median": 8970240,
+          "min": 8970240,
+          "max": 8970240
+        },
+        "retained_logical_bytes": {
+          "median": 16785440,
+          "min": 16785440,
+          "max": 16785440
+        },
+        "user_seconds": {
+          "median": 0.02,
+          "min": 0.01,
+          "max": 0.02
+        },
+        "system_seconds": {
+          "median": 0.01,
+          "min": 0.01,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "median": 9308,
+          "min": 9272,
+          "max": 9588
+        },
+        "cpu_seconds": {
+          "median": 0.03,
+          "min": 0.03,
+          "max": 0.03
+        },
+        "retained_allocated_bytes": {
+          "median": 8970240,
+          "min": 8970240,
+          "max": 8970240
+        }
+      },
+      {
+        "name": "multigroup",
+        "layout": "logical",
+        "trials": 3,
+        "observed_wall_ms": {
+          "median": 1268.576903,
+          "min": 1168.828529,
+          "max": 2423.869704
+        },
+        "index_entries": {
+          "median": 21,
+          "min": 21,
+          "max": 21
+        },
+        "index_bytes": {
+          "median": 336,
+          "min": 336,
+          "max": 336
+        },
+        "lsmt_bytes": {
+          "median": 167780688,
+          "min": 167780688,
+          "max": 167780688
+        },
+        "raw_bytes": {
+          "median": 167772160,
+          "min": 167772160,
+          "max": 167772160
+        },
+        "sampled_peak_logical_bytes_lower_bound": {
+          "median": 335659590,
+          "min": 335659590,
+          "max": 335659590
+        },
+        "sampled_peak_allocated_bytes_lower_bound": {
+          "median": 168099840,
+          "min": 168099840,
+          "max": 168099840
+        },
+        "retained_logical_bytes": {
+          "median": 335552848,
+          "min": 335552848,
+          "max": 335552848
+        },
+        "user_seconds": {
+          "median": 0.15,
+          "min": 0.15,
+          "max": 0.15
+        },
+        "system_seconds": {
+          "median": 0.26,
+          "min": 0.26,
+          "max": 0.31
+        },
+        "max_rss_kib": {
+          "median": 10116,
+          "min": 10104,
+          "max": 10464
+        },
+        "cpu_seconds": {
+          "median": 0.41000000000000003,
+          "min": 0.41000000000000003,
+          "max": 0.45999999999999996
+        },
+        "retained_allocated_bytes": {
+          "median": 167985152,
+          "min": 167985152,
+          "max": 167985152
+        }
+      },
+      {
+        "name": "multigroup",
+        "layout": "tail",
+        "trials": 3,
+        "observed_wall_ms": {
+          "median": 1118.212371,
+          "min": 1068.105247,
+          "max": 1218.736662
+        },
+        "index_entries": {
+          "median": 28,
+          "min": 28,
+          "max": 28
+        },
+        "index_bytes": {
+          "median": 448,
+          "min": 448,
+          "max": 448
+        },
+        "lsmt_bytes": {
+          "median": 167780800,
+          "min": 167780800,
+          "max": 167780800
+        },
+        "raw_bytes": {
+          "median": 167772160,
+          "min": 167772160,
+          "max": 167772160
+        },
+        "sampled_peak_logical_bytes_lower_bound": {
+          "median": 335659702,
+          "min": 335659702,
+          "max": 335659702
+        },
+        "sampled_peak_allocated_bytes_lower_bound": {
+          "median": 168099840,
+          "min": 168099840,
+          "max": 168099840
+        },
+        "retained_logical_bytes": {
+          "median": 335552960,
+          "min": 335552960,
+          "max": 335552960
+        },
+        "user_seconds": {
+          "median": 0.15,
+          "min": 0.15,
+          "max": 0.19
+        },
+        "system_seconds": {
+          "median": 0.23,
+          "min": 0.22,
+          "max": 0.23
+        },
+        "max_rss_kib": {
+          "median": 10160,
+          "min": 10136,
+          "max": 10472
+        },
+        "cpu_seconds": {
+          "median": 0.38,
+          "min": 0.37,
+          "max": 0.42000000000000004
+        },
+        "retained_allocated_bytes": {
+          "median": 167985152,
+          "min": 167985152,
+          "max": 167985152
+        }
+      },
+      {
+        "name": "ordinary",
+        "layout": "logical",
+        "trials": 3,
+        "observed_wall_ms": {
+          "median": 118.983251,
+          "min": 115.514793,
+          "max": 165.316481
+        },
+        "index_entries": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "index_bytes": {
+          "median": 32,
+          "min": 32,
+          "max": 32
+        },
+        "lsmt_bytes": {
+          "median": 8396832,
+          "min": 8396832,
+          "max": 8396832
+        },
+        "raw_bytes": {
+          "median": 8388608,
+          "min": 8388608,
+          "max": 8388608
+        },
+        "sampled_peak_logical_bytes_lower_bound": {
+          "median": 17212408,
+          "min": 17212408,
+          "max": 17212408
+        },
+        "sampled_peak_allocated_bytes_lower_bound": {
+          "median": 9412608,
+          "min": 9412608,
+          "max": 9412608
+        },
+        "retained_logical_bytes": {
+          "median": 16785440,
+          "min": 16785440,
+          "max": 16785440
+        },
+        "user_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.03
+        },
+        "system_seconds": {
+          "median": 0.01,
+          "min": 0.01,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "median": 10272,
+          "min": 10216,
+          "max": 10276
+        },
+        "cpu_seconds": {
+          "median": 0.04,
+          "min": 0.03,
+          "max": 0.04
+        },
+        "retained_allocated_bytes": {
+          "median": 8953856,
+          "min": 8953856,
+          "max": 8953856
+        }
+      },
+      {
+        "name": "ordinary",
+        "layout": "tail",
+        "trials": 3,
+        "observed_wall_ms": {
+          "median": 165.568942,
+          "min": 165.395248,
+          "max": 165.622115
+        },
+        "index_entries": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "index_bytes": {
+          "median": 320,
+          "min": 320,
+          "max": 320
+        },
+        "lsmt_bytes": {
+          "median": 8397120,
+          "min": 8397120,
+          "max": 8397120
+        },
+        "raw_bytes": {
+          "median": 8388608,
+          "min": 8388608,
+          "max": 8388608
+        },
+        "sampled_peak_logical_bytes_lower_bound": {
+          "median": 17212696,
+          "min": 17212696,
+          "max": 17212696
+        },
+        "sampled_peak_allocated_bytes_lower_bound": {
+          "median": 9412608,
+          "min": 9412608,
+          "max": 9412608
+        },
+        "retained_logical_bytes": {
+          "median": 16785728,
+          "min": 16785728,
+          "max": 16785728
+        },
+        "user_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.02
+        },
+        "system_seconds": {
+          "median": 0.02,
+          "min": 0.01,
+          "max": 0.03
+        },
+        "max_rss_kib": {
+          "median": 10412,
+          "min": 10352,
+          "max": 10420
+        },
+        "cpu_seconds": {
+          "median": 0.04,
+          "min": 0.03,
+          "max": 0.05
+        },
+        "retained_allocated_bytes": {
+          "median": 8953856,
+          "min": 8953856,
+          "max": 8953856
+        }
+      }
+    ],
+    "limits": [
+      "shared host, serial trials, no global cache eviction",
+      "same retained raw image policy for both layouts",
+      "sampled temporary sizes are lower bounds; very brief files can escape sampling",
+      "GNU time CPU/wall/RSS describes converter and its waited descendants; observer overhead excluded from CPU but can affect wall time",
+      "three repetitions per cell are descriptive, not a confidence interval"
+    ]
+  },
+  "application_geometry": [
+    {
+      "layout": "logical",
+      "codec": "raw",
+      "index_entries": 33,
+      "metadata_blocks": 184,
+      "windows": [
+        {
+          "window_bytes": 65536,
+          "actual_window_bytes": 65536,
+          "metadata_bytes_covered": 0,
+          "metadata_fraction": 0.0
+        },
+        {
+          "window_bytes": 262144,
+          "actual_window_bytes": 262144,
+          "metadata_bytes_covered": 0,
+          "metadata_fraction": 0.0
+        },
+        {
+          "window_bytes": 1048576,
+          "actual_window_bytes": 1048576,
+          "metadata_bytes_covered": 0,
+          "metadata_fraction": 0.0
+        }
+      ]
+    },
+    {
+      "layout": "logical",
+      "codec": "lz4",
+      "compressed_bytes": 27836400,
+      "windows": [
+        {
+          "window_bytes": 65536,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 0,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.0,
+          "extent_bytes": 114672
+        },
+        {
+          "window_bytes": 262144,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 0,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.0,
+          "extent_bytes": 311280
+        },
+        {
+          "window_bytes": 1048576,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 0,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.0,
+          "extent_bytes": 1097712
+        }
+      ]
+    },
+    {
+      "layout": "logical",
+      "codec": "zstd",
+      "compressed_bytes": 20647993,
+      "windows": [
+        {
+          "window_bytes": 65536,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 0,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.0,
+          "extent_bytes": 69689
+        },
+        {
+          "window_bytes": 262144,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 0,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.0,
+          "extent_bytes": 266297
+        },
+        {
+          "window_bytes": 1048576,
+          "exact_metadata_bytes": 73728,
+          "extent_metadata_bytes": 73728,
+          "exact_metadata_fraction": 0.09782608695652174,
+          "extent_metadata_fraction": 0.09782608695652174,
+          "extent_bytes": 1052729
+        }
+      ]
+    },
+    {
+      "layout": "tail",
+      "codec": "raw",
+      "index_entries": 309,
+      "metadata_blocks": 184,
+      "windows": [
+        {
+          "window_bytes": 65536,
+          "actual_window_bytes": 65536,
+          "metadata_bytes_covered": 56496,
+          "metadata_fraction": 0.07496178668478261
+        },
+        {
+          "window_bytes": 262144,
+          "actual_window_bytes": 262144,
+          "metadata_bytes_covered": 253104,
+          "metadata_fraction": 0.3358313519021739
+        },
+        {
+          "window_bytes": 1048576,
+          "actual_window_bytes": 1048576,
+          "metadata_bytes_covered": 753664,
+          "metadata_fraction": 1.0
+        }
+      ]
+    },
+    {
+      "layout": "tail",
+      "codec": "lz4",
+      "compressed_bytes": 27839442,
+      "windows": [
+        {
+          "window_bytes": 65536,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 0,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.0,
+          "extent_bytes": 117714
+        },
+        {
+          "window_bytes": 262144,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 589824,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.782608695652174,
+          "extent_bytes": 314322
+        },
+        {
+          "window_bytes": 1048576,
+          "exact_metadata_bytes": 753664,
+          "extent_metadata_bytes": 753664,
+          "exact_metadata_fraction": 1.0,
+          "extent_metadata_fraction": 1.0,
+          "extent_bytes": 1100754
+        }
+      ]
+    },
+    {
+      "layout": "tail",
+      "codec": "zstd",
+      "compressed_bytes": 20649366,
+      "windows": [
+        {
+          "window_bytes": 65536,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 0,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.0,
+          "extent_bytes": 71062
+        },
+        {
+          "window_bytes": 262144,
+          "exact_metadata_bytes": 0,
+          "extent_metadata_bytes": 32768,
+          "exact_metadata_fraction": 0.0,
+          "extent_metadata_fraction": 0.043478260869565216,
+          "extent_bytes": 267670
+        },
+        {
+          "window_bytes": 1048576,
+          "exact_metadata_bytes": 753664,
+          "extent_metadata_bytes": 753664,
+          "exact_metadata_fraction": 1.0,
+          "extent_metadata_fraction": 1.0,
+          "extent_bytes": 1054102
+        }
+      ]
+    }
+  ],
+  "application_matrix": {
+    "complete_application_matrix": true,
+    "completed_trials": 36,
+    "planned_trials": 36,
+    "cells": [
+      {
+        "workload": "python",
+        "layout": "logical",
+        "codec": "lz4",
+        "prefetch": false,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 73.536813,
+            "min": 70.815849,
+            "max": 76.339774
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 2040.567278,
+            "min": 2038.897493,
+            "max": 2071.065963
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 1922.440822,
+            "min": 1912.786332,
+            "max": 1942.86551
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 1920.729463,
+            "min": 1910.78516,
+            "max": 1941.481733
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 126.936914,
+            "min": 126.00459,
+            "max": 146.063779
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 201,
+            "min": 199,
+            "max": 203
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 13025266,
+            "min": 12894194,
+            "max": 13156338
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 12582912,
+            "min": 12451840,
+            "max": 12713984
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 0.8395162943226071,
+            "min": 0.8307713329234133,
+            "max": 0.8482612557218009
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45808,
+            "min": 45636,
+            "max": 45836
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.506919,
+            "min": 0.506741,
+            "max": 0.528112
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.303948,
+            "min": 0.28686,
+            "max": 0.306245
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "logical",
+        "codec": "lz4",
+        "prefetch": true,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 96.425029,
+            "min": 95.269737,
+            "max": 98.454941
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 2019.735147,
+            "min": 1976.841929,
+            "max": 2031.178972
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 1879.176071,
+            "min": 1836.103914,
+            "max": 1879.572019
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 1877.38385,
+            "min": 1834.257305,
+            "max": 1877.65016
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 128.619317,
+            "min": 125.633489,
+            "max": 132.783824
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 199,
+            "min": 197,
+            "max": 199
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 12894194,
+            "min": 12763122,
+            "max": 12894194
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 12255232,
+            "min": 12124160,
+            "max": 12255232
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 0.8176538908246226,
+            "min": 0.8089089294254287,
+            "max": 0.8176538908246226
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45968,
+            "min": 45700,
+            "max": 45980
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.503298,
+            "min": 0.475872,
+            "max": 0.527349
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.292806,
+            "min": 0.290225,
+            "max": 0.298429
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "logical",
+        "codec": "raw",
+        "prefetch": false,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 36.784657,
+            "min": 34.714969,
+            "max": 40.762396
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 2846.268564,
+            "min": 2807.558897,
+            "max": 2854.73325
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 2757.841371,
+            "min": 2726.023811,
+            "max": 2759.432535
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 2756.161627,
+            "min": 2721.426554,
+            "max": 2757.856768
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 131.272186,
+            "min": 128.514544,
+            "max": 139.378964
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 301,
+            "min": 300,
+            "max": 301
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 19481634,
+            "min": 19416098,
+            "max": 19481634
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 19333120,
+            "min": 19267584,
+            "max": 19333120
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 1.289881806381089,
+            "min": 1.285509325681492,
+            "max": 1.289881806381089
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45004,
+            "min": 44976,
+            "max": 45384
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.690331,
+            "min": 0.652185,
+            "max": 0.7017450000000001
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.323384,
+            "min": 0.308145,
+            "max": 0.34385699999999997
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "logical",
+        "codec": "raw",
+        "prefetch": true,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 129.094459,
+            "min": 120.127636,
+            "max": 131.278464
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 2855.55375,
+            "min": 2835.143495,
+            "max": 2895.295157
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 2677.53473,
+            "min": 2659.078376,
+            "max": 2709.85267
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 2675.983317,
+            "min": 2657.460053,
+            "max": 2708.194395
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 128.955893,
+            "min": 127.457392,
+            "max": 129.706079
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 306,
+            "min": 305,
+            "max": 307
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 19809314,
+            "min": 19743778,
+            "max": 19874850
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 19005440,
+            "min": 18939904,
+            "max": 19070976
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 1.2680194028831044,
+            "min": 1.2636469221835076,
+            "max": 1.2723918835827013
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45136,
+            "min": 45004,
+            "max": 45188
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.659392,
+            "min": 0.6429360000000001,
+            "max": 0.673033
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.31968799999999997,
+            "min": 0.304083,
+            "max": 0.32642499999999997
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "logical",
+        "codec": "zstd",
+        "prefetch": false,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 66.191874,
+            "min": 58.519212,
+            "max": 66.939708
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 1762.233376,
+            "min": 1749.203517,
+            "max": 1827.790576
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 1653.564193,
+            "min": 1633.415844,
+            "max": 1700.192234
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 1651.482398,
+            "min": 1631.409793,
+            "max": 1698.101656
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 127.975306,
+            "min": 125.594702,
+            "max": 130.872548
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 165,
+            "min": 164,
+            "max": 167
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 10620987,
+            "min": 10555451,
+            "max": 10752059
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 10223616,
+            "min": 10158080,
+            "max": 10354688
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 0.6821069891371183,
+            "min": 0.6777345084375214,
+            "max": 0.6908519505363121
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45916,
+            "min": 45848,
+            "max": 46228
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.4895,
+            "min": 0.4748450000000001,
+            "max": 0.502241
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.282969,
+            "min": 0.26265099999999997,
+            "max": 0.293314
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "logical",
+        "codec": "zstd",
+        "prefetch": true,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 93.436962,
+            "min": 81.964105,
+            "max": 94.600416
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 1812.750052,
+            "min": 1792.118374,
+            "max": 1833.372445
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 1667.180964,
+            "min": 1639.059232,
+            "max": 1693.937024
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 1665.519464,
+            "min": 1637.154028,
+            "max": 1692.082302
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 130.886165,
+            "min": 126.6154,
+            "max": 132.64631
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 166,
+            "min": 164,
+            "max": 167
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 10686523,
+            "min": 10555451,
+            "max": 10752059
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 10092544,
+            "min": 9961472,
+            "max": 10158080
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 0.6733620277379244,
+            "min": 0.6646170663387306,
+            "max": 0.6777345084375214
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45852,
+            "min": 45808,
+            "max": 45908
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.49818799999999996,
+            "min": 0.48609,
+            "max": 0.504176
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.298695,
+            "min": 0.28024,
+            "max": 0.302287
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "tail",
+        "codec": "lz4",
+        "prefetch": false,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 74.806927,
+            "min": 66.002072,
+            "max": 77.847085
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 1954.862924,
+            "min": 1871.914944,
+            "max": 1989.945472
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 1826.405,
+            "min": 1741.472868,
+            "max": 1862.533453
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 1818.974946,
+            "min": 1726.796997,
+            "max": 1846.671092
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 128.658899,
+            "min": 127.427765,
+            "max": 129.084044
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 193,
+            "min": 192,
+            "max": 194
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 12504020,
+            "min": 12438484,
+            "max": 12569556
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 12058624,
+            "min": 11993088,
+            "max": 12124160
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 0.8045364487258317,
+            "min": 0.8001639680262349,
+            "max": 0.8089089294254287
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45928,
+            "min": 45812,
+            "max": 46132
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.49054899999999996,
+            "min": 0.440347,
+            "max": 0.522357
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.277491,
+            "min": 0.259442,
+            "max": 0.31037899999999996
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "tail",
+        "codec": "lz4",
+        "prefetch": true,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 98.093681,
+            "min": 95.580321,
+            "max": 101.302322
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 1943.66956,
+            "min": 1943.237029,
+            "max": 1980.946896
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 1798.691963,
+            "min": 1797.266675,
+            "max": 1815.184845
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 1790.149994,
+            "min": 1784.419464,
+            "max": 1801.077659
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 129.596197,
+            "min": 126.722937,
+            "max": 132.129185
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 193,
+            "min": 192,
+            "max": 194
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 12504020,
+            "min": 12438484,
+            "max": 12569556
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 11862016,
+            "min": 11796480,
+            "max": 11927552
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 0.791419006627041,
+            "min": 0.7870465259274442,
+            "max": 0.795791487326638
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45892,
+            "min": 45668,
+            "max": 46156
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.484342,
+            "min": 0.484259,
+            "max": 0.513512
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.29101299999999997,
+            "min": 0.28335,
+            "max": 0.29144800000000004
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "tail",
+        "codec": "raw",
+        "prefetch": false,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 34.683628,
+            "min": 32.351093,
+            "max": 36.175214
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 2811.833502,
+            "min": 2768.18172,
+            "max": 2812.346391
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 2730.083634,
+            "min": 2688.380347,
+            "max": 2734.853733
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 2720.383401,
+            "min": 2680.881457,
+            "max": 2724.468924
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 130.82489,
+            "min": 126.625789,
+            "max": 142.366985
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 295,
+            "min": 295,
+            "max": 298
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 19097250,
+            "min": 19097250,
+            "max": 19293858
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 18939904,
+            "min": 18939904,
+            "max": 19136512
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 1.2636469221835076,
+            "min": 1.2636469221835076,
+            "max": 1.2767643642822983
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45060,
+            "min": 45012,
+            "max": 45308
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.676056,
+            "min": 0.651162,
+            "max": 0.696761
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.33146200000000003,
+            "min": 0.329508,
+            "max": 0.334273
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "tail",
+        "codec": "raw",
+        "prefetch": true,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 123.648,
+            "min": 121.75194,
+            "max": 130.041103
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 2831.553384,
+            "min": 2828.672809,
+            "max": 2842.271243
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 2644.753738,
+            "min": 2641.607124,
+            "max": 2671.269824
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 2637.319357,
+            "min": 2634.676321,
+            "max": 2653.878615
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 127.986657,
+            "min": 127.072173,
+            "max": 130.562967
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 298,
+            "min": 297,
+            "max": 299
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 19293858,
+            "min": 19228322,
+            "max": 19359394
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 18481152,
+            "min": 18415616,
+            "max": 18546688
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 1.233039557286329,
+            "min": 1.2286670765867322,
+            "max": 1.2374120379859261
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45260,
+            "min": 45208,
+            "max": 45356
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.706161,
+            "min": 0.685888,
+            "max": 0.710091
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.327573,
+            "min": 0.311344,
+            "max": 0.336565
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "tail",
+        "codec": "zstd",
+        "prefetch": false,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 71.070375,
+            "min": 69.43982,
+            "max": 76.02333
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 1708.183846,
+            "min": 1705.675865,
+            "max": 1718.7285
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 1584.597317,
+            "min": 1581.048793,
+            "max": 1587.316174
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 1573.901489,
+            "min": 1570.13622,
+            "max": 1579.725684
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 131.482607,
+            "min": 128.821953,
+            "max": 131.888184
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 151,
+            "min": 151,
+            "max": 152
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 9704856,
+            "min": 9704856,
+            "max": 9770392
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 9306112,
+            "min": 9306112,
+            "max": 9371648
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 0.6208922593427615,
+            "min": 0.6208922593427615,
+            "max": 0.6252647400423584
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45988,
+            "min": 45944,
+            "max": 46080
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.483067,
+            "min": 0.47884899999999997,
+            "max": 0.508772
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.290252,
+            "min": 0.286236,
+            "max": 0.31695
+          }
+        }
+      },
+      {
+        "workload": "python",
+        "layout": "tail",
+        "codec": "zstd",
+        "prefetch": true,
+        "trials": 3,
+        "measurements": {
+          "assembly_ms": {
+            "n": 3,
+            "median": 95.474393,
+            "min": 92.545937,
+            "max": 97.391116
+          },
+          "start_to_first_command_ms": {
+            "n": 3,
+            "median": 1708.978151,
+            "min": 1686.812619,
+            "max": 1716.337246
+          },
+          "ready_to_first_command_ms": {
+            "n": 3,
+            "median": 1559.830161,
+            "min": 1543.052234,
+            "max": 1561.767428
+          },
+          "cold_command_ms": {
+            "n": 3,
+            "median": 1545.171651,
+            "min": 1529.297178,
+            "max": 1554.389003
+          },
+          "warm_command_ms": {
+            "n": 3,
+            "median": 134.339413,
+            "min": 128.281587,
+            "max": 134.356322
+          },
+          "first_remote_requests": {
+            "n": 3,
+            "median": 152,
+            "min": 151,
+            "max": 152
+          },
+          "first_remote_bytes": {
+            "n": 3,
+            "median": 9770392,
+            "min": 9704856,
+            "max": 9770392
+          },
+          "post_assembly_remote_bytes": {
+            "n": 3,
+            "median": 9175040,
+            "min": 9109504,
+            "max": 9175040
+          },
+          "device_requested_bytes_through_cold": {
+            "n": 3,
+            "median": 14988288,
+            "min": 14988288,
+            "max": 14988288
+          },
+          "post_assembly_remote_over_device_requested": {
+            "n": 3,
+            "median": 0.6121472979435677,
+            "min": 0.6077748172439708,
+            "max": 0.6121472979435677
+          },
+          "warm_remote_requests": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "warm_remote_bytes": {
+            "n": 3,
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "self_peak_rss_kib": {
+            "n": 3,
+            "median": 45864,
+            "min": 45860,
+            "max": 45992
+          },
+          "self_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.500618,
+            "min": 0.495158,
+            "max": 0.501244
+          },
+          "children_cpu_seconds_through_cold": {
+            "n": 3,
+            "median": 0.292317,
+            "min": 0.27651,
+            "max": 0.296182
+          }
+        }
+      }
+    ],
+    "limits": [
+      "application is single-layer; controlled single/layered 144-trial evidence is recorded separately",
+      "origin files are read to verify digest before timed assembly",
+      "host cache is uncontrolled and not evicted; loopback service delay and bandwidth fixed",
+      "installed Python runtime with isolated imports, not a distribution boot benchmark",
+      "post-assembly amplification includes compression and excludes inline warmup; not internal cache-hit statistics",
+      "kernel readahead may cross phase boundaries; counter snapshots are individually atomic",
+      "warm repeat includes guest filesystem cache",
+      "full file validation is after timed starts; application scenario is single-layer"
+    ]
+  },
+  "application_conversion": {
+    "status": "passed",
+    "trials": 6,
+    "cells": [
+      {
+        "name": "application",
+        "layout": "logical",
+        "trials": 3,
+        "observed_wall_ms": {
+          "median": 2872.405426,
+          "min": 2571.843537,
+          "max": 4541.421885
+        },
+        "index_entries": {
+          "median": 33,
+          "min": 33,
+          "max": 33
+        },
+        "index_bytes": {
+          "median": 528,
+          "min": 528,
+          "max": 528
+        },
+        "lsmt_bytes": {
+          "median": 268444176,
+          "min": 268444176,
+          "max": 268444176
+        },
+        "raw_bytes": {
+          "median": 268435456,
+          "min": 268435456,
+          "max": 268435456
+        },
+        "sampled_peak_logical_bytes_lower_bound": {
+          "median": 581011939,
+          "min": 581011939,
+          "max": 581011939
+        },
+        "sampled_peak_allocated_bytes_lower_bound": {
+          "median": 360804352,
+          "min": 360804352,
+          "max": 360804352
+        },
+        "retained_logical_bytes": {
+          "median": 536879632,
+          "min": 536879632,
+          "max": 536879632
+        },
+        "retained_allocated_bytes": {
+          "median": 314998784,
+          "min": 314998784,
+          "max": 314998784
+        },
+        "user_seconds": {
+          "median": 0.29,
+          "min": 0.29,
+          "max": 0.37
+        },
+        "system_seconds": {
+          "median": 0.48,
+          "min": 0.43,
+          "max": 0.51
+        },
+        "max_rss_kib": {
+          "median": 10804,
+          "min": 10796,
+          "max": 10936
+        },
+        "cpu_seconds": {
+          "median": 0.8,
+          "min": 0.77,
+          "max": 0.8
+        }
+      },
+      {
+        "name": "application",
+        "layout": "tail",
+        "trials": 3,
+        "observed_wall_ms": {
+          "median": 2871.078166,
+          "min": 2772.262056,
+          "max": 2872.276335
+        },
+        "index_entries": {
+          "median": 309,
+          "min": 309,
+          "max": 309
+        },
+        "index_bytes": {
+          "median": 4944,
+          "min": 4944,
+          "max": 4944
+        },
+        "lsmt_bytes": {
+          "median": 268448592,
+          "min": 268448592,
+          "max": 268448592
+        },
+        "raw_bytes": {
+          "median": 268435456,
+          "min": 268435456,
+          "max": 268435456
+        },
+        "sampled_peak_logical_bytes_lower_bound": {
+          "median": 581016355,
+          "min": 581016355,
+          "max": 581016355
+        },
+        "sampled_peak_allocated_bytes_lower_bound": {
+          "median": 360808448,
+          "min": 360808448,
+          "max": 360808448
+        },
+        "retained_logical_bytes": {
+          "median": 536884048,
+          "min": 536884048,
+          "max": 536884048
+        },
+        "retained_allocated_bytes": {
+          "median": 315002880,
+          "min": 315002880,
+          "max": 315002880
+        },
+        "user_seconds": {
+          "median": 0.33,
+          "min": 0.3,
+          "max": 0.33
+        },
+        "system_seconds": {
+          "median": 0.45,
+          "min": 0.44,
+          "max": 0.48
+        },
+        "max_rss_kib": {
+          "median": 10772,
+          "min": 10736,
+          "max": 10808
+        },
+        "cpu_seconds": {
+          "median": 0.78,
+          "min": 0.77,
+          "max": 0.78
+        }
+      }
+    ],
+    "limits": [
+      "shared host, serial trials, no global cache eviction",
+      "same retained raw image policy for both layouts",
+      "sampled temporary sizes are lower bounds; very brief files can escape sampling",
+      "GNU time CPU/wall/RSS describes converter and its waited descendants; observer overhead excluded from CPU but can affect wall time",
+      "three repetitions per cell are descriptive, not a confidence interval"
+    ]
+  }
+}

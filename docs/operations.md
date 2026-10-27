@@ -689,3 +689,34 @@ kernel/core diagnostics; rerunning successfully does not establish a repair.
 The nonprivileged shutdown unit tests cover normal completion with one worker
 and one blocking thread, while privileged E2E still validates actual kernel
 registration and teardown.
+
+## Native conversion layout selection
+
+`obd-convert --lsmt-layout metadata-tail` opts into the finalized-filesystem
+packing policy in [ADR-0028](adr/0028-cluster-converted-filesystem-metadata.md).
+The default remains `logical`. Converted layers retain ordinary LSMT headers,
+flags and mappings; existing readers require no upgrade or classification files.
+The option applies to native conversion, not TurboOCI/import or online writable
+I/O. It does not repack inherited lower bytes into an upper layer.
+
+Evaluate total start-to-first-command time, including `open_image` and its inline
+structural warm-up, before selecting this option for a workload. Keep worker and
+queue counts, cache budgets, background-fill policy and transport conditions
+identical. Compare cold guests with warm repeats. The
+[measurement report](../benchmarks/metadata-layout.md) includes conversion/index
+costs, HTTP bytes, cache/read amplification and observed regressions; it does not
+establish a universal startup improvement.
+
+Structural head/tail windows address the **stored blob**, including ZFile framing
+and index bytes. A nominal tail window can contain little metadata even after
+reordering, while 64 KiB cache-extent expansion can fetch additional records.
+Do not derive a compressed-image prefetch budget from raw filesystem offsets.
+Keep prefetch selection independent from layout selection: spending more time
+warming the image can outweigh a faster later command.
+
+The converter prints a logical-layout fallback diagnostic for unsupported
+classification features/geometry, classification/index budgets, or builds without
+libe2fs. This preserves logical bytes and format compatibility. Record the
+selected backend, layout diagnostic, final artifact digest/size and converter
+revision when comparing deployments. No format migration or reader-side
+metadata-prefetch protocol is introduced.

@@ -159,3 +159,10 @@ lifecycle diagnostic, not a performance sample or a fake Device model.
 generator and ordinary-child timeout handling without creating a Device. The
 default build-test CI job compiles the optional driver and runs these controls;
 CI does not run this privileged performance matrix.
+
+## Native converter metadata placement
+
+See [metadata layout measurements](metadata-layout.md) for the controlled
+conversion/startup study and its [numeric results](metadata-layout-results.json).
+These use production image assembly and inline structural warm-up, unlike the
+local-source fio controls above. They do not change the default layout.

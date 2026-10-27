@@ -10,7 +10,7 @@ add_executable(obd-export-sparse obd_export_sparse_main.cpp)
 obd_target_warnings(obd-export-sparse)
 target_link_libraries(obd-export-sparse PRIVATE obd_core)
 
-add_executable(obd-convert obd_convert_main.cpp gzip_index_builder.cpp turbo_package.cpp turbo_import.cpp oci_layer_plan.cpp oci_ext2_builder.cpp turbo_layered.cpp)
+add_executable(obd-convert obd_convert_main.cpp ext2_layout.cpp gzip_index_builder.cpp turbo_package.cpp turbo_import.cpp oci_layer_plan.cpp oci_ext2_builder.cpp turbo_layered.cpp)
 obd_target_warnings(obd-convert)
 target_link_libraries(obd-convert PRIVATE obd_core)
 if(OBD_ENABLE_LIBE2FS_BACKEND)

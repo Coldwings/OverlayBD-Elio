@@ -72,6 +72,13 @@ add_executable(obd_unit_tests
 obd_target_warnings(obd_unit_tests)
 target_include_directories(obd_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
+target_sources(obd_unit_tests PRIVATE ../tools/ext2_layout.cpp)
+target_compile_definitions(obd_unit_tests PRIVATE
+    OBD_HAVE_LIBE2FS=$<BOOL:${OBD_ENABLE_LIBE2FS_BACKEND}>)
+if(OBD_ENABLE_LIBE2FS_BACKEND)
+    target_link_libraries(obd_unit_tests PRIVATE obd_pinned_ext2fs obd_libe2fs_build_com_err)
+    add_dependencies(obd_unit_tests obd_libe2fs_build)
+endif()
 
 add_executable(obd-test-sparse-crash-writer sparse_crash_writer.cpp)
 obd_target_warnings(obd-test-sparse-crash-writer)

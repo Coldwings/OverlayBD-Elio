@@ -1019,10 +1019,12 @@ Generates a random lowercase 8-4-4-4-12 UUID string (36 chars) from
 upstream treats the field as an opaque string).
 
 ```cpp
+struct LsmtPayloadRange { uint64_t offset = 0, length = 0; }; // sectors
 struct LsmtWriteOptions {
     std::string uuid;         // generated when empty
     std::string parent_uuid;  // may be empty (bottom layer)
     std::string user_tag;     // commit message, may be empty
+    std::vector<LsmtPayloadRange> tail_ranges = {};
 };
 ```
 
@@ -1040,6 +1042,20 @@ Builds a sealed single-layer LSMT file at `out_path` from the raw image at
 one segment per ≤ 16383-sector chunk, data region starting at sector 8.
 Throws `obd::error` / `obd::format_error` on IO or serialization failure.
 Layout: `header 4096 | data | index | trailer 4096`.
+Optional `tail_ranges` supply sorted, disjoint logical sector ranges for stable
+physical tail packing (ADR-0028). Ordinary payload comes first, then
+selected payload, both in logical order; the index remains logically sorted.
+No classification is serialized and full logical coverage is preserved.
+Adjacent ranges normalize before splitting at the ordinary segment-length bound.
+Invalid geometry, overlaps or excessive index counts fail before output mutation.
+An empty plan keeps the original layout. Classification and converter selection
+are separate responsibilities; this API does not infer filesystem structure.
+The regression cases `format: lsmt tail placement preserves bytes with ordinary logical mappings`
+and `format: lsmt invalid tail placement preserves an existing output` cover
+physical ordering, logical readback, normalized determinism and preflight errors.
+`format: lsmt tail packing splits wire boundaries and normalizes uniform classes`
+checks cross-segment physical offsets, full logical bytes and equality of uniform
+front/tail plans at the 16,383-sector wire boundary.
 
 ```cpp
 struct ZFileWriteOptions {
@@ -1478,9 +1494,9 @@ writers and readers agree on the same bytes.
   trace commands (`trace_record.hpp`, supervisor protocol v3) — but
   packaging the recorded blob as an image layer stays with the external
   CLI (ADR-0014 boundary).
-- **Writers are single-shot fixtures.** `write_lsmt_single_layer` covers the
-  whole input contiguously (no sparse/zero segments); general-purpose image
-  authoring belongs to upstream tools.
+- **The native raw-image writer has full coverage.** `write_lsmt_single_layer`
+  represents every logical input sector (no sparse/zero segments). Transient
+  tail placement changes physical order only; it is not a differential writer.
 
 ### TurboOCI warp mappings (ADR-0020)
 
