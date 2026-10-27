@@ -62,6 +62,8 @@ namespace obd::image {
 ///   <dir>/overlaybd.zero  — sealed EMPTY LSMT layer: the zero base
 ///   <dir>/overlaybd.rw    — LSMT-RW writable upper (ADR-0008), commit-able
 struct BlankDeviceSpec {
+    std::string upper_type = "lsmt";
+    bool recover = false;
     uint64_t size = 0;  // bytes
     std::string dir;    // per-device workspace (created if missing)
 };
@@ -102,9 +104,12 @@ struct OpenedImage {
 /// (grow-only vs the image's declared size, validated here with the
 /// single-source rule device_capacity_bytes); a read-only image ignores
 /// it (headroom is dev-size-only at the ublk layer, set by the caller).
+/// For Hybrid USER_RECOVERY, recover_existing_upper requires the persisted
+/// pair and uses its capacity instead of the original create-time override.
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                          const GlobalConfig& global,
-                                         uint64_t writable_override_bytes = 0);
+                                         uint64_t writable_override_bytes = 0,
+                                         bool recover_existing_upper = false);
 
 /// Assembles the blank (raw) device view for a BlankDeviceSpec: the opened
 /// device is a MergedWritable over the empty LSMT zero base with a fresh

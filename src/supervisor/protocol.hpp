@@ -83,6 +83,7 @@ inline constexpr std::string_view kProjectVersion = "dev";
 /// whose output is never an image-build input (non-deterministic;
 /// ADR-0014, docs/operations.md).
 struct BlankSpec {
+    std::string upper_type = "lsmt";
     uint64_t size = 0;  // bytes; > 0, multiple of 512
     std::string mkfs;   // "" = no mkfs (mode 2); else mkfs.<type> (mode 3)
 };

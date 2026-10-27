@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "purpose": "Unmodified reference-produced Hybrid fixtures; upstream implementations have known ZERO encoding differences.",
+  "producers": {
+    "overlaybd": {
+      "commit": "1fe0ea1b87989a616f21105a13455b79c8512ffb",
+      "repository": "https://github.com/containerd/overlaybd"
+    },
+    "agentenv": {
+      "commit": "bc51e699421fdf67865665f36269b66a1ffac479",
+      "repository": "https://github.com/kvcache-ai/AgentENV"
+    }
+  },
+  "files": {
+    "overlaybd/writable.data": {
+      "bytes": 7680,
+      "sha256": "b5f67dcbd6b6f3e5b44b76322eb660f30d9bce9b438def2f9b6ee9a6ca32b943"
+    },
+    "overlaybd/writable.index": {
+      "bytes": 4208,
+      "sha256": "e397655255446ae593bcabf1e46cad0b5e3904c5d35fc66927c59a9e1c78763f"
+    },
+    "overlaybd/buffered.data": {
+      "bytes": 7680,
+      "sha256": "b5f67dcbd6b6f3e5b44b76322eb660f30d9bce9b438def2f9b6ee9a6ca32b943"
+    },
+    "overlaybd/buffered.index": {
+      "bytes": 8192,
+      "sha256": "3e5080b61520d708d68631119300f95794c5a981e54d23521a410f0e51227ac3"
+    },
+    "overlaybd/sealed.data": {
+      "bytes": 12288,
+      "sha256": "9af6e5c4953ebce0ecf91207382fdbc910db27be64ed96b642fa297539509379"
+    },
+    "overlaybd/expected.raw": {
+      "bytes": 32768,
+      "sha256": "b5e8ff8d7d1b84216364471ffa81a5c5acd1e5f7246ca9c47ecd815185692f19"
+    },
+    "overlaybd/expected.states": {
+      "bytes": 64,
+      "sha256": "b16b884f4525c498a6614ad80c2a656d58f0534498d2694ac7094cf0f2bf8a60"
+    },
+    "agentenv/writable.data": {
+      "bytes": 7168,
+      "sha256": "bad4136926c7916906ccb068f0d9083409ac6e189da40b790c0e24e15312a8c6"
+    },
+    "agentenv/writable.index": {
+      "bytes": 4208,
+      "sha256": "489ccd56d03c8f01279d3b6db21c8e45cfff409f53fdab6a9beb700acb0f9a3e"
+    },
+    "agentenv/buffered.data": {
+      "bytes": 7168,
+      "sha256": "bad4136926c7916906ccb068f0d9083409ac6e189da40b790c0e24e15312a8c6"
+    },
+    "agentenv/buffered.index": {
+      "bytes": 4208,
+      "sha256": "489ccd56d03c8f01279d3b6db21c8e45cfff409f53fdab6a9beb700acb0f9a3e"
+    },
+    "agentenv/sealed.data": {
+      "bytes": 12288,
+      "sha256": "8e074ad14b3ccaca3049b95f4eaeecea39e63b3275e009a195d13d0f2b8c7e56"
+    },
+    "agentenv/expected.raw": {
+      "bytes": 32768,
+      "sha256": "b5e8ff8d7d1b84216364471ffa81a5c5acd1e5f7246ca9c47ecd815185692f19"
+    },
+    "agentenv/expected.states": {
+      "bytes": 64,
+      "sha256": "b16b884f4525c498a6614ad80c2a656d58f0534498d2694ac7094cf0f2bf8a60"
+    },
+    "producers/overlaybd.cpp": {
+      "bytes": 6688,
+      "sha256": "b127aa3a1a56441c9acae1af5bc909c17c02391462c3f6c187838d4a13b15263"
+    },
+    "producers/agentenv.rs": {
+      "bytes": 3906,
+      "sha256": "be7a53eeade84cc84d320f7ccef55697265d500a3ac7128d1c3bca0884e508fc"
+    },
+    "producers/Cargo.lock": {
+      "bytes": 26428,
+      "sha256": "a7445e1963e954aec2554f57ced8e18583a4c08a11bff904a489e7f66a10d448"
+    }
+  },
+  "producer_toolchains": {
+    "overlaybd": "Photon v0.9.6 dd236e97866fd3d4cbff64b7ada7b69ef9464695; CMake RelWithDebInfo",
+    "agentenv": "rustc 1.99.1 (58cf8f9c3 2026-10-13); default-features=false; debug build; Cargo.lock supplied"
+  }
+}

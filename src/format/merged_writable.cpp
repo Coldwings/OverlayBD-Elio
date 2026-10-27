@@ -7,6 +7,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <optional>
 
 namespace obd::format {
 
@@ -156,6 +157,15 @@ elio::coro::task<ssize_t> MergedWritable::pread(void* buf, size_t count,
                                                 uint64_t offset) {
     if ((offset % kSector) != 0 || (count % kSector) != 0) {
         co_return -EINVAL;
+    }
+    std::optional<ActiveOpGuard> active;
+    std::optional<SyncMutexGuard> operation;
+    if (top_->serialize_merged_reads()) {
+        const int gate = begin_flush_op();
+        if (gate != 0) co_return gate;
+        active.emplace(active_ops_, AdoptActiveOp{});
+        co_await op_mu_.lock();
+        operation.emplace(op_mu_);
     }
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
     if (offset >= cur_vsize) co_return 0;

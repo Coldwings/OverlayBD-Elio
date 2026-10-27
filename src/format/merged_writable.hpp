@@ -72,7 +72,8 @@ private:
     std::vector<std::unique_ptr<LsmtLayer>> layers_;  // topmost first (RO)
     std::unique_ptr<WritableLayer> top_;
     /// Serializes top-layer mutations and their merged-index rebuilds so an
-    /// older rebuild cannot publish after a newer write/discard.
+    /// older rebuild cannot publish after a newer write/discard. Opt-in tops
+    /// also hold this across merged snapshot selection and physical reads.
     elio::sync::mutex op_mu_;
     /// Synchronous admission gate shared by grow and coroutine operations.
     /// Operations increment active_ops_ while holding this mutex, so grow

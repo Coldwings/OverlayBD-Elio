@@ -6,6 +6,9 @@
 // kernel. No ublk/kernel facility is needed (the privileged ublk grow is
 // covered by the self-skipping E2E; see tests/integration/test_ublk_e2e.cpp).
 #include "format/lsmt.hpp"
+#include "common/sha256.hpp"
+#include <fstream>
+#include <iterator>
 #include "format/lsmt_rw.hpp"
 #include "source/local_file.hpp"
 #include "supervisor/daemon.hpp"
@@ -586,4 +589,99 @@ TEST_CASE("supervisor: create virtual_size headroom sizes the writable upper",
     // The sealed layer declares the headroom size — no --virtual-size on
     // the commit was needed.
     require_sealed_layer(upper, kFakeVsize * 3);
+}
+
+TEST_CASE("supervisor: hybrid commit uses captured pair and returns sealed artifact",
+          "[supervisor][hybrid]") {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    const std::string upper_dir = dir / "upper";
+    const std::string data = upper_dir + "/overlaybd.hybrid/data";
+    const std::string config = write_config(dir, "hybrid.json",
+        {{"upper", {{"dir", upper_dir}, {"type", "hybrid"}}}});
+    auto guard = block_daemon_signals();
+    std::string digest;
+    uint64_t size = 0;
+    const int failures = run_daemon_case(resize_test_cfg(sock),
+        [&](const std::string& socket, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(socket); ++i)
+                std::this_thread::sleep_for(20ms);
+            if (!std::filesystem::exists(socket)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc = [&](const nlohmann::json& command) {
+                return nlohmann::json::parse(uds_rpc(socket, command.dump() + "\n"));
+            };
+            check(rpc({{"cmd", "create"}, {"id", "hybrid"}, {"config", config}}).value("ok", false),
+                  "create hybrid failed");
+            // Commit provenance belongs to create time, including the index.
+            write_config(dir, "hybrid.json",
+                {{"upper", {{"dir", dir / "redirected"}, {"type", "hybrid"}}}});
+            const nlohmann::json expected_upper = {{"type", "hybrid"}, {"path", data},
+                {"index_path", upper_dir + "/overlaybd.hybrid/index"}};
+            const auto status = rpc({{"cmd", "status"}, {"id", "hybrid"}});
+            check(status.value("upper", nlohmann::json{}) == expected_upper,
+                  "status upper changed after config edit");
+            const auto listed = rpc({{"cmd", "list"}});
+            check(listed.contains("devices") && listed["devices"].size() == 1 &&
+                      listed["devices"][0].value("upper", nlohmann::json{}) == expected_upper,
+                  "list did not capture the same upper provenance");
+            const auto reply = rpc({{"cmd", "commit"}, {"id", "hybrid"},
+                                    {"virtual_size", kFakeVsize * 2}});
+            check(reply.value("ok", false), ("hybrid commit failed: " + reply.dump()).c_str());
+            if (reply.value("ok", false)) {
+                check(reply.value("path", "") == data, "hybrid commit path changed");
+                digest = reply.value("sha256", "");
+                size = reply.value("size", uint64_t{0});
+            }
+            const auto repeated = rpc({{"cmd", "commit"}, {"id", "hybrid"}});
+            check(!repeated.value("ok", true) &&
+                      repeated.value("error", "").find("already sealed") != std::string::npos,
+                  "repeated hybrid commit did not recognize sealed output");
+        });
+    REQUIRE(failures == 0);
+    require_sealed_layer(data, kFakeVsize * 2);
+    std::ifstream input(data, std::ios::binary);
+    const std::vector<uint8_t> bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    REQUIRE(size == bytes.size());
+    REQUIRE(digest == common::Sha256::hex(bytes.data(), bytes.size()));
+    REQUIRE_FALSE(std::filesystem::exists(dir / "redirected"));
+}
+
+TEST_CASE("supervisor: hybrid blank device commits its captured artifact pair",
+          "[supervisor][hybrid]") {
+    test::TempDir dir;
+    const std::string sock = dir / "supervisor.sock";
+    auto cfg = resize_test_cfg(sock);
+    cfg.blank_dir = dir / "devices";
+    const auto data = cfg.blank_dir + "/blank/overlaybd.hybrid/data";
+    auto guard = block_daemon_signals();
+    const int failures = run_daemon_case(cfg,
+        [&](const std::string& socket, const CheckFn& check) {
+            for (int i = 0; i < 250 && !std::filesystem::exists(socket); ++i)
+                std::this_thread::sleep_for(20ms);
+            if (!std::filesystem::exists(socket)) {
+                check(false, "supervisor socket never appeared");
+                return;
+            }
+            auto rpc = [&](const nlohmann::json& command) {
+                return nlohmann::json::parse(uds_rpc(socket, command.dump() + "\n"));
+            };
+            const auto created = rpc({{"cmd", "create"}, {"id", "blank"},
+                {"blank", {{"size", kFakeVsize}, {"upper_type", "hybrid"}}}});
+            check(created.value("ok", false), ("blank create failed: " + created.dump()).c_str());
+            const auto status = rpc({{"cmd", "status"}, {"id", "blank"}});
+            const nlohmann::json expected_upper = {{"type", "hybrid"}, {"path", data},
+                {"index_path", cfg.blank_dir + "/blank/overlaybd.hybrid/index"}};
+            check(status.value("upper", nlohmann::json{}) == expected_upper,
+                  "blank status lacks captured artifact pair");
+            const auto sealed = rpc({{"cmd", "commit"}, {"id", "blank"},
+                                    {"virtual_size", kFakeVsize * 2}});
+            check(sealed.value("ok", false), ("blank commit failed: " + sealed.dump()).c_str());
+            check(sealed.value("path", "") == data, "blank commit used wrong upper");
+        });
+    REQUIRE(failures == 0);
+    require_sealed_layer(data, kFakeVsize * 2);
+    REQUIRE_FALSE(std::filesystem::exists(cfg.blank_dir + "/blank/overlaybd.rw"));
 }

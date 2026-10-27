@@ -1,11 +1,13 @@
 // Writable layer interface (ADR-0008). A writable layer is the topmost
-// layer of an image stack; two implementations exist:
+// layer of an image stack. Implementations:
 //   * SparseRwLayer (sparse_rw.hpp) — a sparse data file with exact persisted
 //     sector coverage and identity segment mapping.
 //   * LsmtRwLayer   (lsmt_rw.hpp)   — an unsealed LSMT file with in-place
 //     edit: subranges covered by live segments overwrite their data blocks
 //     in place; uncovered or discarded (zeroed) subranges are appended.
 //     seal() compacts into a standard sealed LSMT RO file.
+//   * HybridRwLayer (hybrid_rw.hpp) — durable mapping log with in-place
+//     payload reuse and metadata-only sealing.
 #pragma once
 
 #include "common/bytes.hpp"
@@ -84,6 +86,11 @@ public:
     /// grow-capable writable layer may expose a view whose size() tracks
     /// virtual_size() after successful grow() calls.
     virtual source::BlobSource& data_source() = 0;
+
+    /// In-place ownership transitions may invalidate a physical mapping held
+    /// by a concurrent merged reader. Such tops require the merger to serialize
+    /// the entire snapshot-plus-payload read with mutations and grow admission.
+    virtual bool serialize_merged_reads() const noexcept { return false; }
 };
 
 }  // namespace obd::format

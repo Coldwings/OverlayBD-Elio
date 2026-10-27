@@ -92,10 +92,11 @@ struct LowerConfig {
 
 /// Writable upper layer (ADR-0008). `dir` holds the layer file:
 ///   type "lsmt"   → <dir>/overlaybd.rw    (in-place-edit LSMT, default)
-///   type "sparse" → <dir>/overlaybd.sparse (fiemap sparse file)
+///   type "sparse" → <dir>/overlaybd.sparse (exact persisted coverage)
+///   type "hybrid" → <dir>/overlaybd.hybrid/{data,index} (ADR-0026)
 struct UpperConfig {
     std::string dir;
-    std::string type = "lsmt";  // "lsmt" | "sparse"
+    std::string type = "lsmt";  // "lsmt" | "sparse" | "hybrid"
 };
 
 struct ImageConfig {

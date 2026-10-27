@@ -18,11 +18,12 @@ images built by upstream `overlaybd-*` tools load identically here:
   layer format. `LsmtLayer` parses one sealed layer; `MergedLsmt` merges a
   bottom-up stack of layers into the final read-only block view (topmost
   wins, holes read as zeroes).
-- **Writable layers** (`writable.hpp`, `sparse_rw.hpp`, `lsmt_rw.hpp`,
+- **Writable layers** (`writable.hpp`, `sparse_rw.hpp`, `lsmt_rw.hpp`, `hybrid_rw.hpp`,
   `merged_writable.hpp`) — the ADR-0008 writable top of an image stack:
   `SparseRwLayer` (sparse data plus exact persisted coverage, ADR-0024),
   `LsmtRwLayer` (unsealed
-  single-file LSMT with in-place edit and seal compaction), and
+  single-file LSMT with in-place edit and seal compaction),
+  `HybridRwLayer` (persisted mapping log and metadata-only seal, ADR-0026), and
   `MergedWritable` (copy-on-write merged view implementing
   `source::WritableBlobSource`).
 - **Cold-path writers** (`writer.hpp`) — synchronous writers that produce
@@ -94,8 +95,10 @@ Little-endian throughout (upstream `lsmt/file.cpp` and
   `index_size` (entry count), `virtual_size` (bytes), `uuid` (37B),
   `parent_uuid` (37B), `version`/`sub_version` (1/1), `user_tag` (256B).
 - **Flags**: bit0 `is_header`, bit1 `data_file` / `index_file`, bit2
-  `sealed`, bit3 `gc_layer`, bit4 `sparse_rw`, bit5 `info_valid`. Only
-  header/type/sealed are enforced by the reader.
+  `sealed`, bit3 `gc_layer`, bit4 `sparse_rw`, bit5 `hybrid_rw`.
+  Hybrid header/trailer flags must agree, use version 1.1, and contain no
+  unsupported flags. Hybrid cannot be combined with warp or sparse layout.
+  Ordinary LSMT retains header/type/sealed validation.
 - **Sector units**: all index offsets/lengths are in 512-byte sectors. The
   data region begins at **sector 8** (byte 4096); a valid `moffset` lies in
   `[8, index_offset/512)`.
@@ -336,7 +339,7 @@ Constants: `kSpace = 4096` (header/trailer region), `kHeaderSize = 390`,
 (`MAX_LSMT_RO_INDEX_SIZE`), `kMaxStackLayers = 255` (`MAX_STACK_LAYERS`),
 `kDataStartSector = 8`, magics `kMagic0`/`kMagic1`, flag shifts
 `kFlagShiftHeader` (0), `kFlagShiftType` (1), `kFlagShiftSealed` (2),
-`kFlagShiftGcLayer` (3), `kFlagShiftSparseRw` (4), `kFlagShiftInfoValid` (5).
+`kFlagShiftGcLayer` (3), `kFlagShiftSparseRw` (4), `kFlagShiftHybridRw` (5).
 
 `src/format/lsmt_format.hpp::HeaderTrailer`
 
@@ -372,6 +375,220 @@ struct HeaderTrailer {
   37/256-byte fields.
 - `serialize` writes the 390 payload bytes plus zero padding; a string
   longer than its on-disk field throws `obd::format_error`.
+
+### `src/format/hybrid_format.hpp` — bounded writable-log replay
+
+`hybrid::validate_pair` validates the supported writable flags/version,
+data/index UUID and parent identity, matching sector-aligned virtual size,
+artifact sizes and log length before any buffer is allocated from metadata.
+The limit is four million log records and one million live mappings.
+`hybrid::Replay` consumes complete 16-byte records in bounded chunks, applies
+later logical ranges over earlier ones, and clears runtime tags. Abandon the
+replay object after an exception; it is a setup-only parser, not a transactional
+live writer.
+
+`finish()` rejects overlapping live DATA physical extents. ZERO backing is
+retained only when its full physical range fits and is exclusive of all other
+live DATA/ZERO ranges. Other valid ZERO markers become unbacked in memory;
+this prevents treating OverlayBD EOF markers as AgentENV reusable storage.
+Truncated records, invalid ranges, noncanonical padding and unsupported headers
+fail closed. These structural checks cannot detect arbitrary corruption that
+happens to encode another valid unchecksummed record. See ADR-0026.
+
+Sealed Hybrid readers accept the all-ones 55-bit physical offset only for ZERO
+records in a supported Hybrid layout. The marker is never dereferenced; DATA
+still requires an in-file extent. Hybrid logical ranges must be nonempty and
+fit the declared virtual size. Ordinary LSMT keeps its existing ZERO bounds.
+
+### Hybrid artifact recovery and write engine
+
+`hybrid::FilePair::open_existing` opens both existing artifacts without creation
+or truncation. Setup filesystem calls run on the blocking pool; header and log
+contents use native asynchronous reads. Both regular-file descriptors retain
+shared reader or exclusive writer locks. Pair validation precedes bounded
+64 KiB log reads; a sealed artifact is refused with `EALREADY`.
+
+`hybrid::FilePair::create` publishes a new directory containing `data` and
+`index`. Both headers carry the same generated UUID and virtual size. Initialization
+writes and syncs both files, syncs the staging directory, publishes it with a
+no-replace directory rename, then syncs the parent. Existing destinations are
+never overwritten. Before publication, ordinary error cleanup removes only the
+owned staging directory; after publication, a parent-sync error retains the
+complete pair and reports failure. Recovery after process exit and publication
+faults must be tested separately from successful creation.
+
+`hybrid::Writer` owns an exclusively opened pair. Its asynchronous operation
+mutex serializes direct reads, writes, discard and FLUSH. DATA rewrites reuse
+current-upper physical ranges without appending mapping records. New ownership
+and ZERO-to-DATA transitions prepare the replacement in-memory index first,
+write payload, sync the data file and then append the mapping record. The
+replacement becomes visible only after the complete record write. Discard
+retains existing exclusive backing or writes a fresh zero allocation for an
+unbacked range. Repeated discard/rewrite reuses that allocation. FLUSH syncs
+data before index; an uncertain modifying I/O failure closes the engine to
+further reads/writes until recovery, rather than exposing stale ownership.
+
+`Writer::compact()` builds a current-only index. It reserves exclusive backing
+for imported unbacked ZERO in a staged view, syncs payload, writes and syncs a
+replacement index, renames it over the owned index, and syncs its directory.
+Successful publication adopts the replacement descriptor and cursor even when
+the following directory sync fails. A later FLUSH retries directory durability.
+Before rename, failed compaction leaves the original descriptor/cursor active;
+newly reserved, unpublished ZERO space can remain as orphan payload after a
+failed attempt. No live payload is copied just to compact the mapping log.
+The descriptor generation used to notice publication is runtime bookkeeping,
+not an on-disk generation marker or stale-sidecar checksum.
+
+Before a modifying fragment, automatic compaction runs when the log contains at
+least `max(4096, 2 * live_mappings + 16)` records, counting upstream padding.
+Adjacent physically and logically contiguous mappings of the same state are
+coalesced up to the wire length limit. The hard replay and live-index ceilings
+remain independent of this cadence. Compaction's ZERO reservation does not
+append more records to a log already at its hard limit.
+
+`Writer::checkpoint()` serializes with in-flight operations and runs the same
+payload, index and directory durability barrier as FLUSH. Only a successful
+barrier marks this writer instance terminal: subsequent writes, discard, grow,
+compaction, seal and repeated checkpoint return `EROFS`. Reads and FLUSH remain
+available. A failed barrier leaves checkpoint retryable. The terminal flag is
+process-local; a fresh exclusive reopen can resume writes or perform offline
+seal on the durable pair. Device shutdown checkpoints through this primitive before releasing the upper.
+
+`Writer::grow()` runs off scheduler workers, rejects an overlapping operation
+with `EBUSY`, and publishes the larger virtual size only after both headers are
+durable. It does not extend or move payload. `Writer::seal()` serializes with
+other operations, compacts the index, and appends only index metadata, alignment
+padding and a sealed trailer to the existing data file. Successful seal leaves
+direct reads available but makes subsequent mutations read-only; repeat seal
+returns `EALREADY`.
+
+Grow and seal use a local `<index>.txn` publication intent, separate from the
+upstream data/index wire formats. The fixed 16 KiB version-1 record contains a
+CRC32C, operation, both device/inode identities, original lengths, an index-record
+CRC32C, old headers and the target header/trailer. Publication writes and syncs
+an owned temporary intent, renames it without replacing an existing intent, and
+syncs the directory before modifying either artifact. Grow syncs the data header
+then the index header; seal appends the index and trailer then syncs data. Both
+retire the intent and sync its directory after completing the operation.
+
+Exclusive reopen validates a pending intent and rolls it forward before normal
+pair parsing. Read-only open cannot perform this repair (`EBUSY`). Recovery is
+idempotent across interrupted metadata writes and refuses truncated/corrupted
+intents, changed file identities and mismatched index content before modifying
+the artifacts. Copying a pending transaction to different inodes is unsupported;
+recover it on its original files first. A completed seal is recognized as
+`EALREADY`. Writable reopen also syncs the index directory and its parent to
+settle namespace durability after a previous publication error.
+
+The transaction checksum protects pending grow/seal metadata. Ordinary log
+integrity uses separate local `user.overlaybd.hybrid.log` extended attributes
+on both files. Each fixed 128-byte version-1 record has a CRC32C and bounded log
+stamps (random generation, byte length and CRC32C of the mapping-record prefix).
+The index attribute records completed append progress; the data attribute
+anchors the last durable prefix. A new mapping writes payload and syncs it,
+appends the complete upstream record, then updates index progress before
+reporting success. In-place DATA rewrites do not change either log stamp.
+
+FLUSH syncs payload, the index including its xattr, and the index directory,
+then publishes and syncs the data anchor. Reopen verifies the committed prefix
+before accepting a newer complete progress prefix. An incomplete progress update
+or extra unconfirmed complete records may recover to an earlier verified prefix;
+a writable reopen truncates that suffix only after semantic replay succeeds.
+Read-only recovery uses the selected prefix without modifying files. A corrupt
+committed prefix, unrelated generation or missing/corrupt integrity metadata
+fails closed. Partial 16-byte records still fail structural validation.
+
+Compaction gives its new index a fresh generation and progress stamp. Before
+rename, it syncs both candidate logs and publishes a durable data anchor naming
+both generations. After rename and directory sync it keeps only the new stamp.
+A failure after rename adopts the new descriptor, mappings and cursor even if
+an exception propagates. The next FLUSH or writable reopen settles the pending
+anchor; an old generation cannot become authoritative after successful commit.
+
+Writable unmanaged upstream imports are semantically validated before adoption.
+An installing data anchor is synced before creating index progress; interruption
+there can resume only the same verified prefix. Managed writable pairs require
+filesystem support for user xattrs. Read-only unmanaged upstream artifacts do
+not. Backups intended to retain local protection must preserve both attributes.
+For exchange with another writer, stop/drain and copy the two ordinary byte
+artifacts to a fresh destination without local attributes; the receiving writer
+then owns that copy. Upstream writers do not maintain these local attributes.
+Removing both attributes makes a pair indistinguishable from an unmanaged
+upstream import; the metadata is not a record of externally deleted history.
+
+Deterministic error tests interrupt integrity adoption after the installing
+anchor sync, index progress write, and stable anchor write. Both upstream fixture
+families must reopen without changing their ordinary bytes. A failed append
+progress publication requires closing and reopening the writer; a completely
+published failed operation may appear after recovery. A checkpoint anchor error
+leaves the writer nonterminal so another write and checkpoint retry can succeed.
+These injected errors model interruption at the boundary, not an actual torn
+xattr or a filesystem's power-loss persistence behavior.
+
+Native writer error tests also stop after half/full payload writes, data sync,
+and half/full index-record appends. Unpublished mappings remain invisible after
+recovery; a half-record tail fails closed without truncation. A partial in-place
+payload overwrite can survive reopen as mixed old/new bytes, as the documented
+non-atomic overwrite contract permits. Separate FLUSH error tests refuse each
+data/index/directory sync, then verify another write and checkpoint retry.
+The writer submits complete records directly through native asynchronous IO;
+there is no separate userspace buffered-index flush path. These are controlled
+IO boundary/short-write simulations, not a storage power-loss model.
+
+Process-exit tests cover intent publication, each header sync, seal index/trailer
+writes, data sync and intent retirement. They do not simulate storage-cache loss
+or prove power-loss atomicity of in-place payload overwrites. The extended
+attributes do not alter the upstream file byte layout or reader protocol.
+
+`HybridRwLayer` adapts the engine to `WritableLayer`: direct logical reads,
+writes, discard, grow, FLUSH and checkpoint delegate to the serialized engine.
+Its physical `BlobSource` reads the existing payload descriptor and reports the
+current allocated payload boundary. Segment snapshots are owned copies; the
+legacy borrowed `segments()` view requires external exclusion of other calls.
+Creation and existing-pair open remain separate, so recovery cannot accidentally
+create an empty upper when files are missing.
+
+`HybridRwLayer::seal_file(data, index, tag, digest, size, virtual_size, reject)`
+provides the offline operation after the device has stopped. It opens the existing
+pair exclusively, validates an optional grow-only size override, uses the grow
+transaction if needed, then seals and hashes the resulting artifact in bounded
+1 MiB asynchronous reads. Both file locks remain held through digest completion;
+it hashes the same data descriptor used for seal, without reopening a pathname.
+The returned SHA-256 and byte count describe the whole sealed artifact and are
+published to the output arguments only on success. No payload is copied for
+compaction, though computing the digest necessarily reads the complete file.
+
+Invalid alignment/range, shrink and oversized tags return `EINVAL` with a reason;
+missing files return `ENOENT`, another owner prevents the exclusive open, and
+already sealed output returns `EALREADY`. Existing files are never recreated.
+An operational error after publication may leave a complete sealed artifact or a
+recoverable intent; failure does not promise rollback to a writable pair. Reopen
+settles the intent before reporting already sealed. This helper accepts a valid
+recoverable Hybrid log without requiring the terminal LSMT checkpoint format.
+Supervisor commit dispatch records the data/index paths at device creation and
+uses this helper after stopping and reaping the child. Later config edits cannot
+redirect either artifact.
+
+Hybrid requests `serialize_merged_reads()`. `MergedWritable` then registers
+reads with its grow admission gate and holds its operation mutex from snapshot
+selection through completion of every physical read. Mutations and their index
+rebuilds use that same mutex. The lock order is merged operation, upper engine
+operation, then the short snapshot mutex; no lock is held across a reverse call
+into the merger. Existing tops retain their current read scheduling. Once an
+upper belongs to a merger, mutations must use that merged interface; direct
+lifecycle access is for callers that have drained merged IO. Taking a snapshot
+and reading the physical view independently does not establish a read transaction.
+
+Image configuration accepts explicit `upper.type = "hybrid"` and assembles the
+pair under `<upper.dir>/overlaybd.hybrid`. An absent pair directory is atomically
+created; existing incomplete pairs fail closed. Reopen preserves a larger
+persisted size or grows to a larger requested size, while an explicit override
+that would shrink the recovered upper is rejected during ordinary creation.
+USER_RECOVERY instead requires an existing pair and retains its persisted size,
+even when the original create-time override predates online grow. Supervisor commit selects
+the Hybrid offline helper using paths captured at creation. Blank-device type
+selection uses `blank.upper_type`; see ADR-0026 and the test documentation for
+fault and performance validation limits.
 
 ### `src/format/lsmt.hpp` — `namespace obd::format`
 
@@ -1386,8 +1603,9 @@ writers and readers agree on the same bytes.
 - **Dictionary compression is rejected** (`use_dict`/`dict_size` nonzero →
   `format_error` at open).
 - **ZFile index files** (bit1 clear) and the compressed-index flag (bit5)
-  are not supported; LSMT `gc_layer` / `sparse_rw` / `info_valid` flags are
-  parsed but not acted on, and `parent_uuid` chains are not validated.
+  are not supported. Ordinary LSMT `gc_layer` / `sparse_rw` flags are
+  parsed but not acted on, and read-only `parent_uuid` chains are not validated.
+  Hybrid rejects conflicting layout flags and recognizes unbacked ZERO markers.
 - **`LsmtRwLayer` v0.2:** the segment index is memory-only until
   `checkpoint()` or `seal()`; an unsealed RW file is not recoverable as a
   writable layer across restarts (`create()` truncates any existing file),
@@ -1445,3 +1663,13 @@ before the next transfer; this format-specific publication loop is intentional.
 Data-before-zero-mask and zero-mask-before-reclamation ordering stays explicit.
 Atomic sidecar publication, directory sync, locked trace-start truncation and blocking grow/seal
 utilities remain synchronous transactions on their existing execution paths.
+
+Managed Hybrid pairs use `user.overlaybd.hybrid.sealed` as terminal state,
+published and synced before retiring the recoverable seal intent. A managed
+log without that marker stays writable even when guest DATA or discarded
+backing resembles a trailer. Invalid markers fail closed. Preserve both local
+log and seal attributes when copying managed pairs; see ADR-0026 for encoding
+and ordering. Unmanaged upstream imports use identity, geometry, DATA ownership
+and equivalent sidecar/appended mappings to recognize sealing. Imported ZERO
+markers are normalized against the original payload EOF, excluding appended
+metadata from reusable backing. All metadata IO runs off scheduler workers.

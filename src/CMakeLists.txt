@@ -10,6 +10,12 @@ add_library(obd_core STATIC
     format/zfile_format.cpp
     format/zfile.cpp
     format/lsmt_format.cpp
+    format/hybrid_log_state.cpp
+    format/hybrid_format.cpp
+    format/hybrid_file.cpp
+    format/hybrid_rw.cpp
+    format/hybrid_writer.cpp
+    format/hybrid_transaction.cpp
     format/lsmt.cpp
     format/trace.cpp
     format/writer.cpp

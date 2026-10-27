@@ -147,3 +147,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | accepted |
 | [0024](./0024-exact-sparse-upper-coverage.md) | Persist exact sector coverage for sparse uppers | accepted |
 | [0025](./0025-configure-device-queue-and-worker-topology.md) | Resolve device queues and workers together before startup | accepted |
+| [0026](./0026-persist-interoperable-hybrid-uppers.md) | Persist interoperable Hybrid uppers without payload-copy sealing | proposed |

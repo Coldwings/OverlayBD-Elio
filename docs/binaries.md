@@ -55,6 +55,7 @@ owners keep it in maintenance until released (ADR-0022). Options (defaults from
 | `--device-bin PATH` | empty = sibling of the supervisor executable | obd-device binary to exec for each device. |
 | `--ready-timeout SEC` | `60` | How long `create` waits for the child's `ready` status before failing the request. |
 | `--stop-timeout SEC` | `10` | Ready-device TERM/reap grace; protected startup release wait. Timeout does not authorize killing a protected owner. |
+| `--blank-upper-type TYPE` | `lsmt` | Select `lsmt` or opt-in `hybrid`; Hybrid recovery requires its existing data/index pair. |
 | `--blank-dir PATH` | `/var/lib/overlaybd-elio/devices` | ADR-0014: root of the per-device workspaces for blank (raw) devices — each owns `<blank-dir>/<id>/` with `overlaybd.zero` (sealed empty LSMT zero base) and `overlaybd.rw` (writable upper). |
 | `--mkfs-timeout SEC` | `300` | ADR-0014 mode 3: bound for the host `mkfs.<type>` run on a new blank device. |
 | `--help`, `-h` | — | Print usage and exit 0. |
@@ -71,6 +72,7 @@ obd-device (--config PATH | --blank-size BYTES --blank-dir PATH)
 |---|---|---|
 | `--config PATH` | — | Per-image `config.json` (overlaybd-snapshotter format). Mutually exclusive with the blank form. |
 | `--blank-size BYTES` | — | ADR-0014 modes 2/3: create a blank (raw) device of this many bytes (no config) — the empty LSMT zero base + a writable LSMT-RW upper are assembled in `--blank-dir`. Strictly validated here too (positive, 512-aligned, ≤ 16 TiB; a negative or overflowing value is a usage error, exit 2), not only by the supervisor's `parse_blank_spec`. |
+| `--blank-upper-type TYPE` | `lsmt` | Select `lsmt` or opt-in `hybrid`; Hybrid recovery requires its existing data/index pair. |
 | `--blank-dir PATH` | — | ADR-0014: per-device workspace for a blank device (files `overlaybd.zero` / `overlaybd.rw`). |
 | `--global PATH` | empty = built-in defaults | Global `overlaybd.json`, including `ublkConfig.queues` and `.workers` (ADR-0025). When omitted, built-in defaults select up to eight matched pairs from the process CPU budget. |
 | `--control-fd N` | `-1` (standalone socket) | Inherited fd for JSON-lines lifecycle status reports (the socketpair end installed by the supervisor). |
@@ -95,7 +97,7 @@ automatic sizing and recovery rules.
 ```
 obdctl [--socket PATH] hello
 obdctl [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N]
-obdctl [--socket PATH] create-blank <id> --size BYTES [--mkfs TYPE]
+obdctl [--socket PATH] create-blank <id> --size BYTES [--upper-type lsmt|hybrid] [--mkfs TYPE]
                                       [--global PATH] [--dev-id N]
 obdctl [--socket PATH] destroy <id>
 obdctl [--socket PATH] list
@@ -118,7 +120,7 @@ present, must precede the command word. Commands:
   `--dev-id -1` (or omitting the flag) means auto-assign, exactly as the
   protocol defines it — the CLI forwards the range the daemon accepts,
   `[-1, INT32_MAX]`.
-- `create-blank <id> --size BYTES [--mkfs TYPE]` — ADR-0014 modes 2/3:
+- `create-blank <id> --size BYTES [--upper-type lsmt|hybrid] [--mkfs TYPE]` — ADR-0014 modes 2/3:
   create a blank raw device of `BYTES` (positive, multiple of 512, at
   most `kMaxBlankSizeBytes` = 16 TiB — the same bound the supervisor and
   obd-device enforce, so an absurd size is a local usage error rather

@@ -13,6 +13,7 @@
 #include "image/config.hpp"
 #include "image/image_file.hpp"
 #include "format/lsmt_rw.hpp"
+#include "format/hybrid_rw.hpp"
 #include "format/merged_writable.hpp"
 #include "format/sparse_rw.hpp"
 #include "supervisor/device_control.hpp"
@@ -111,8 +112,10 @@ struct Args {
     uint64_t virtual_size = 0;
     // ADR-0014 modes 2/3: blank raw device (--blank-size/--blank-dir).
     bool blank = false;
+    bool recover = false;
     uint64_t blank_size = 0;
     std::string blank_dir;
+    std::string blank_upper_type = "lsmt";
 };
 
 void report(const obd::supervisor::ControlChannelWriterPtr& channel,
@@ -174,6 +177,8 @@ elio::coro::task<int> fake_body(
             obd::image::BlankDeviceSpec spec;
             spec.size = args.blank_size;
             spec.dir = args.blank_dir;
+            spec.upper_type = args.blank_upper_type;
+            spec.recover = args.recover;
             opened.emplace(co_await obd::image::open_blank_device(spec));
             auto* w = dynamic_cast<obd::source::WritableBlobSource*>(
                 opened->root.get());
@@ -240,7 +245,7 @@ elio::coro::task<int> fake_body(
                 // extents, recording nothing.
                 obd::image::GlobalConfig g;
                 g.prefetch_enable = false;
-                opened.emplace(co_await obd::image::open_image(img, g));
+                opened.emplace(co_await obd::image::open_image(img, g, args.virtual_size, args.recover));
             }
 
             // D3 create-time headroom: mirror the real device's grow-only
@@ -255,7 +260,8 @@ elio::coro::task<int> fake_body(
                     opened.has_value()
                         ? opened->virtual_size
                         : (img.writable() ? kVsize : 0);
-                if (args.virtual_size > 0 && declared > 0) {
+                if (args.virtual_size > 0 && declared > 0 &&
+                    !(args.recover && img.upper.type == "hybrid")) {
                     std::string cap_error;
                     const uint64_t cap = obd::image::device_capacity_bytes(
                         declared, args.virtual_size, &cap_error);
@@ -289,6 +295,27 @@ elio::coro::task<int> fake_body(
                     co_return 1;
                 }
                 upper = std::move(lsmt);
+            } else if (img.writable() && img.upper.type == "hybrid") {
+                const auto payload = obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
+                ssize_t written = 0;
+                if (opened) {
+                    auto* merged = dynamic_cast<obd::format::MergedWritable*>(opened->root.get());
+                    if (!merged) co_return 1;
+                    blank_top = &merged->writable_top();
+                    blank_merged = merged;
+                    written = co_await merged->pwrite(payload.data(), payload.size(), 0);
+                } else {
+                    std::filesystem::create_directories(img.upper.dir);
+                    const auto directory = img.upper.dir + "/overlaybd.hybrid";
+                    if (args.recover) {
+                        upper = co_await obd::format::HybridRwLayer::open_existing(
+                            directory + "/data", directory + "/index");
+                    } else {
+                        upper = co_await obd::format::HybridRwLayer::open_or_create(directory, layer_vsize);
+                    }
+                    written = co_await upper->pwrite(payload.data(), payload.size(), 0);
+                }
+                if (written != static_cast<ssize_t>(payload.size())) co_return 1;
             } else if (img.writable()) {
                 // Sparse: open the file so the device is plausible; sparse
                 // state is durable via fiemap and never seals.
@@ -606,6 +633,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
             args.blank_size = parsed;
+        } else if (a == "--blank-upper-type") {
+            args.blank_upper_type = next("--blank-upper-type");
+            if (args.blank_upper_type != "lsmt" && args.blank_upper_type != "hybrid") {
+                std::fprintf(stderr, "--blank-upper-type must be lsmt or hybrid\n");
+                return 2;
+            }
         } else if (a == "--blank-dir") args.blank_dir = next("--blank-dir");
         else if (a == "--control-fd")
             args.control_fd = std::stoi(next("--control-fd"));
@@ -629,7 +662,7 @@ int main(int argc, char** argv) {
             }
             args.virtual_size = b;
         }
-        else if (a == "--recover") { /* accepted, unused */ }
+        else if (a == "--recover") args.recover = true;
         else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
             return 2;

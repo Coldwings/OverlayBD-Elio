@@ -45,7 +45,7 @@ namespace {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s (--config PATH | --blank-size BYTES --blank-dir "
-                 "PATH)\n"
+                 "PATH [--blank-upper-type lsmt|hybrid])\n"
                  "          [--global PATH] [--control-fd N] [--dev-id N] "
                  "[--recover] [--virtual-size BYTES]\n"
                  "          [--startup-socket @NAME]\n",
@@ -70,6 +70,7 @@ struct Args {
     bool blank = false;
     uint64_t blank_size = 0;
     std::string blank_dir;
+    std::string blank_upper_type = "lsmt";
     // Loaded once off-scheduler, before the worker count is committed.
     obd::image::GlobalConfig global_config;
     obd::DeviceTopology topology;
@@ -346,6 +347,8 @@ elio::coro::task<int> device_main(Args args) {
             obd::image::BlankDeviceSpec spec;
             spec.size = args.blank_size;
             spec.dir = args.blank_dir;
+            spec.upper_type = args.blank_upper_type;
+            spec.recover = args.recover;
             opened = co_await obd::image::open_blank_device(spec);
         } else {
             const obd::image::ImageConfig img =
@@ -361,7 +364,7 @@ elio::coro::task<int> device_main(Args args) {
             // device_capacity_bytes (reads past the image's end are
             // zero-filled by the bridge).
             opened = co_await obd::image::open_image(img, global,
-                                                     args.virtual_size);
+                                                     args.virtual_size, args.recover);
         }
 
         if (opened.virtual_size == 0 || opened.virtual_size % 512 != 0) {
@@ -780,6 +783,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
             args.blank_size = parsed;
+        } else if (a == "--blank-upper-type") {
+            args.blank_upper_type = next("--blank-upper-type");
+            if (args.blank_upper_type != "lsmt" && args.blank_upper_type != "hybrid") {
+                std::fprintf(stderr, "--blank-upper-type must be lsmt or hybrid\n");
+                return 2;
+            }
         } else if (a == "--blank-dir") args.blank_dir = next("--blank-dir");
         else if (a == "--global") args.global = next("--global");
         else if (a == "--control-fd")

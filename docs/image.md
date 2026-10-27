@@ -304,6 +304,11 @@ mode:
   — the lowers are never modified);
 - the root then implements `WritableBlobSource`, and `OpenedImage` reports
   `writable = true` plus the `upper_path`;
+- `"hybrid"` → `<dir>/overlaybd.hybrid/{data,index}` (ADR-0026). Assembly
+  creates an absent pair directory atomically or reopens the persisted pair;
+  it never recreates individual missing files. A larger persisted capacity is
+  retained; a larger requested capacity uses the durable grow transaction.
+  An explicit override below the persisted capacity fails as a shrink.
 - an **unknown** `upper.type` is rejected at parse time with
   `obd::error(EINVAL)`; an absent or empty `upper` object keeps the
   read-only behavior exactly.
@@ -317,8 +322,8 @@ A blank device has **no image at all** — no config, no lowers, no
 registry. `obd::image::open_blank_device` (below) assembles the same
 stack shape as the writable mode, but its "lower" is a **sealed empty
 LSMT layer** (docs/format.md, `create_empty_lsmt_layer`): virtual size =
-the requested size, no segments, no data. The writable LSMT-RW upper sits
-on top, also sized to the requested size, so:
+the requested size, no segments, no data. The writable upper (LSMT-RW by default, Hybrid when explicitly selected) sits
+on top, so:
 
 - the device reads as a **zeroed block device from birth** — never-written
   ranges return zeroes through the ordinary merge path, not through any
@@ -333,7 +338,11 @@ on top, also sized to the requested size, so:
 The workspace layout (`overlaybd.zero` + `overlaybd.rw` under a per-device
 directory) is chosen by the caller of `open_blank_device`
 (`BlankDeviceSpec::dir`); the supervisor passes
-`<blank_dir>/<id>/` (docs/supervisor.md).
+`<blank_dir>/<id>/` (docs/supervisor.md). With `upper_type = "hybrid"`, the
+upper is `overlaybd.hybrid/{data,index}` instead. Hybrid recovery opens that
+existing pair without creation, preserves its persisted grown size, and rebuilds
+the empty zero base at that size. A missing or incomplete pair fails recovery.
+The default LSMT mode retains its existing creation behavior.
 
 ## Public API
 
@@ -403,7 +412,7 @@ struct LowerConfig {
 
 struct UpperConfig {
     std::string dir;
-    std::string type = "lsmt";   // "lsmt" | "sparse"
+    std::string type = "lsmt";   // "lsmt" | "sparse" | "hybrid"
 };
 
 struct ImageConfig {
@@ -435,7 +444,7 @@ names a local blob file (empty = the layer is remote).
 `src/image/config.hpp::UpperConfig` — the writable upper (ADR-0008).
 `src/image/config.hpp::dir` holds the layer file; `src/image/config.hpp::type`
 selects `overlaybd.rw` (`"lsmt"`, default) or `overlaybd.sparse`
-(`"sparse"`).
+(`"sparse"`), or the persisted `overlaybd.hybrid/{data,index}` pair (`"hybrid"`).
 
 `src/image/config.hpp::ImageConfig::acceleration_layer` — from the
 top-level `accelerationLayer` boolean (ADR-0013): marks the
@@ -460,7 +469,7 @@ trace layer".
 - `src/image/config.hpp::from_file` / `from_json_text` — parse the config.
   Throw `obd::error` on IO failure, `src/common/errors.hpp::format_error` on
   malformed JSON, and `obd::error(EINVAL)` on an unknown `upper.type`
-  (ADR-0008 — anything but `lsmt`/`sparse`). Both take the global download
+  (ADR-0008 — anything but `lsmt`/`sparse`/`hybrid`). Both take the global download
   `defaults` explicitly. Unknown fields are ignored; known fields keep their
   overlaybd-snapshotter meaning.
 
@@ -483,7 +492,9 @@ struct OpenedImage {
 elio::coro::task<OpenedImage> open_image(const ImageConfig& cfg,
                                          const GlobalConfig& global);
 
-struct BlankDeviceSpec {   // ADR-0014 blank (raw) device
+struct BlankDeviceSpec {   // ADR-0014 / ADR-0026 blank device
+    std::string upper_type = "lsmt"; // lsmt or hybrid
+    bool recover = false; // Hybrid requires existing artifacts
     uint64_t size = 0;     // bytes; positive, sector aligned
     std::string dir;       // per-device workspace (created if missing)
 };
@@ -1158,3 +1169,8 @@ Trace finalization writes the complete encoded span with Elio `pwrite_exactly`
 and awaits `sync_file` before publishing success. Transfers and durability errors
 remain trace-finalization failures; the recorder retains its descriptor and
 encoded buffer until each operation returns.
+
+Hybrid USER_RECOVERY requires both existing artifacts and uses their persisted
+virtual size, ignoring an obsolete create-time headroom override after online
+grow. Missing recovery artifacts fail closed; they never trigger fresh creation.
+This differs from normal first creation, which may publish a new pair directory.

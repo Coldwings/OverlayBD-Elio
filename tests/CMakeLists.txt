@@ -36,6 +36,14 @@ add_executable(obd_unit_tests
     unit/test_common.cpp
     unit/test_device_topology.cpp
     unit/test_format.cpp
+    unit/test_hybrid.cpp
+    unit/test_hybrid_replay.cpp
+    unit/test_hybrid_log_state.cpp
+    unit/test_hybrid_file.cpp
+    unit/test_hybrid_rw.cpp
+    unit/test_hybrid_writer.cpp
+    unit/test_hybrid_compaction.cpp
+    unit/test_hybrid_transaction.cpp
     unit/test_trace.cpp
     unit/test_trace_replay.cpp
     unit/test_device_control.cpp
@@ -73,6 +81,10 @@ obd_target_warnings(obd_unit_tests)
 target_include_directories(obd_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obd_unit_tests PRIVATE obd_core Catch2::Catch2WithMain)
 
+add_executable(obd-test-hybrid-fixture-writer hybrid_fixture_writer.cpp)
+obd_target_warnings(obd-test-hybrid-fixture-writer)
+target_link_libraries(obd-test-hybrid-fixture-writer PRIVATE obd_core)
+
 add_executable(obd-test-sparse-crash-writer sparse_crash_writer.cpp)
 obd_target_warnings(obd-test-sparse-crash-writer)
 target_link_libraries(obd-test-sparse-crash-writer PRIVATE obd_core)
@@ -82,6 +94,7 @@ target_compile_definitions(obd_unit_tests
     PRIVATE OBD_TEST_TURBO_IMPORT_HOOK=1
             OBD_TEST_OBDCTL_BIN="$<TARGET_FILE:obdctl>"
             OBD_TEST_OBD_CONVERT_BIN="$<TARGET_FILE:obd-convert>"
+            OBD_TEST_HYBRID_WRITER_BIN="$<TARGET_FILE:obd-test-hybrid-fixture-writer>"
             OBD_TEST_SPARSE_CRASH_WRITER_BIN="$<TARGET_FILE:obd-test-sparse-crash-writer>"
             OBD_TEST_HAVE_LIBE2FS=$<BOOL:${OBD_ENABLE_LIBE2FS_BACKEND}>)
 find_program(OBD_E2FSCK_EXECUTABLE e2fsck PATHS /usr/sbin /sbin)
@@ -89,7 +102,7 @@ if(OBD_E2FSCK_EXECUTABLE)
     target_compile_definitions(obd_unit_tests PRIVATE
         OBD_TEST_E2FSCK_BIN="${OBD_E2FSCK_EXECUTABLE}")
 endif()
-add_dependencies(obd_unit_tests obdctl obd-convert obd-test-sparse-crash-writer)
+add_dependencies(obd_unit_tests obdctl obd-convert obd-test-sparse-crash-writer obd-test-hybrid-fixture-writer)
 catch_discover_tests(obd_unit_tests TEST_SPEC "~[shutdown]"
     PROPERTIES SKIP_RETURN_CODE 4  # Catch2 "all selected tests skipped"
                TIMEOUT 60)
@@ -158,7 +171,7 @@ target_compile_definitions(obd_integration_tests
 add_dependencies(obd_integration_tests obd-test-fake-device)
 if(OBD_ENABLE_UBLK)
     target_sources(obd_integration_tests PRIVATE
-        integration/test_ublk_e2e.cpp integration/test_startup_kernel.cpp
+        integration/test_ublk_e2e.cpp integration/test_hybrid_supervisor.cpp integration/test_startup_kernel.cpp
         integration/test_startup_active_source.cpp)
     target_link_libraries(obd_integration_tests PRIVATE obd_ublk)
     target_compile_definitions(obd_integration_tests

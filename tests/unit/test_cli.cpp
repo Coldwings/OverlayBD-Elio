@@ -103,6 +103,29 @@ public:
         return nl == std::string::npos ? line : line.substr(0, nl);
     }
 
+    int wait_for_refusal(pid_t child) {
+        bool extra_request = false;
+        for (unsigned attempt = 0; attempt != 500; ++attempt) {
+            pollfd pending{fd_, POLLIN, 0};
+            const int ready = ::poll(&pending, 1, 10);
+            REQUIRE(ready >= 0);
+            if (ready > 0) {
+                extra_request = true;
+                // Release a buggy client, then fail on the actual extra request.
+                receive_and_reply("{\"ok\":false,\"error\":\"unexpected create\"}\n");
+            }
+            int status = 0;
+            const auto reaped = ::waitpid(child, &status, WNOHANG);
+            REQUIRE(reaped >= 0);
+            if (reaped == child) {
+                REQUIRE_FALSE(extra_request);
+                REQUIRE(WIFEXITED(status));
+                return WEXITSTATUS(status);
+            }
+        }
+        FAIL("CLI did not terminate after unsupported Hybrid capability");
+        return -1;
+    }
 private:
     std::string path_;
     int fd_ = -1;
@@ -180,6 +203,22 @@ TEST_CASE("cli: obdctl create-blank sends a create command with the blank object
         REQUIRE(j["blank"]["size"].get<uint64_t>() == 1048576);
         REQUIRE(!j["blank"].contains("mkfs"));
     }
+
+    {
+        OneShotServer server(sock);
+        const pid_t pid = spawn_obdctl(sock,
+            {"create-blank", "hybrid", "--size", "1048576", "--upper-type", "hybrid"});
+        const auto hello = server.receive_and_reply(
+            "{\"ok\":true,\"features\":[\"hybrid_upper\"]}\n");
+        const auto line = server.receive_and_reply("{\"ok\":true}\n");
+        REQUIRE(wait_obdctl(pid) == 0);
+        REQUIRE(nlohmann::json::parse(hello).at("cmd") == "hello");
+        const auto request = nlohmann::json::parse(line);
+        REQUIRE(request["blank"]["upper_type"] == "hybrid");
+        REQUIRE_FALSE(request["blank"].contains("mkfs"));
+    }
+    REQUIRE(wait_obdctl(spawn_obdctl(sock,
+        {"create-blank", "invalid", "--size", "1048576", "--upper-type", "sparse"})) == 2);
 
     // `--dev-id -1` is the documented "auto-assign" spelling, not a usage
     // error: the CLI must forward what the supervisor accepts. `--mkfs`
@@ -263,4 +302,30 @@ TEST_CASE("cli: obdctl create-blank sends a create command with the blank object
     REQUIRE(wait_obdctl(spawn_obdctl(
                 absent, {"create-blank", "d15", "--size",
                          "18014398509481984"})) == 2);
+}
+
+TEST_CASE("cli: explicit Hybrid blank creation requires supervisor capability", "[cli][hybrid]") {
+    test::TempDir dir;
+    const auto socket = dir / "hybrid.sock";
+    for (const auto& reply : {
+            R"({"ok":true,"protocol":5,"features":["blank"]})",
+            R"({"ok":false,"error":"unknown command"})",
+            R"({"ok":true,"features":"hybrid_upper"})"}) {
+        OneShotServer server(socket);
+        const auto child = spawn_obdctl(socket,
+            {"create-blank", "hybrid", "--size", "32768", "--upper-type", "hybrid"});
+        const auto command = nlohmann::json::parse(server.receive_and_reply(std::string(reply) + "\n"));
+        REQUIRE(server.wait_for_refusal(child) == 1);
+        REQUIRE(command.at("cmd") == "hello");
+    }
+    OneShotServer server(socket);
+    const auto child = spawn_obdctl(socket,
+        {"create-blank", "hybrid", "--size", "32768", "--upper-type", "hybrid"});
+    const auto hello = nlohmann::json::parse(server.receive_and_reply(
+        "{\"ok\":true,\"features\":[\"blank\",\"hybrid_upper\"]}\n"));
+    const auto create = nlohmann::json::parse(server.receive_and_reply("{\"ok\":true}\n"));
+    REQUIRE(wait_obdctl(child) == 0);
+    REQUIRE(hello.at("cmd") == "hello");
+    REQUIRE(create.at("cmd") == "create");
+    REQUIRE(create.at("blank").at("upper_type") == "hybrid");
 }

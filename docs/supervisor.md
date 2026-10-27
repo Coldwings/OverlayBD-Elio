@@ -101,7 +101,7 @@ command (`src/supervisor/daemon.cpp`):
   project version string wired from CMake
   (`kProjectVersion`); `features` is a JSON array of strings — the
   capability gate for optional commands, currently
-  `["commit","trace","resize","blank","startup_owner"]`.
+  `["commit","trace","resize","blank","startup_owner","hybrid_upper"]`.
 - **create**: `{"ok":true,"id","pid","device"}` — `device` is the child's
   reported `/dev/ublkb<N>`. With an optional `virtual_size` (bytes > 0)
   the device is created with that capacity instead of the image's
@@ -308,6 +308,14 @@ Contract:
   the retry succeeds once the kernel accepts it).
 
 ### Blank (raw) device creation (ADR-0014)
+
+ADR-0026 adds optional `blank.upper_type`: `"lsmt"` (default) or `"hybrid"`.
+Other values and non-string values fail before spawning the child. The CLI is
+`obdctl create-blank ID --size BYTES --upper-type hybrid`; the child receives
+`--blank-upper-type hybrid`. Hybrid uses `<blank_dir>/<id>/overlaybd.hybrid/`
+with both `data` and `index` captured for offline commit. Recovery passes the
+same type and opens the existing pair, preserving online-grown size. It never
+creates a replacement empty pair. Existing mkfs restrictions remain in force.
 
 `create` with the additive `blank` object makes a **blank raw device**
 instead of opening an image: no `config`, no lowers, no registry. The
@@ -663,7 +671,7 @@ exception behavior are specified under "Daemon shutdown" below.
 - `std::string reply_hello()` — the `hello` handshake reply via the
   `reply_ok` envelope: `protocol` (`kProtocolVersion`), `version`
   (`kProjectVersion`), and `features` (a JSON array of capability strings,
-  currently `["commit","trace","resize","blank","startup_owner"]`).
+  currently `["commit","trace","resize","blank","startup_owner","hybrid_upper"]`).
 - `inline constexpr int kStartupOwnerVersion = 1` — private startup capability.
 - `struct StartupOwnerStatus` — the generation, revision, phase, device ID,
   reason, control/raw-debt and release fields specified above.
@@ -1268,3 +1276,31 @@ task can still access it.
 - **Socket permissions**: the control socket inherits the daemon's umask;
   a dedicated ownership/ACL story (root-only vs. group access) is
   deployment policy, documented in `docs/operations.md`.
+
+### Hybrid image upper commit (ADR-0026)
+
+For an image with `upper.type = "hybrid"`, create captures both
+`<upper.dir>/overlaybd.hybrid/data` and its `index` companion. Commit retains
+those paths even if the config file changes, stops and reaps the device through
+the normal lifecycle, then invokes `HybridRwLayer::seal_file`. The success reply
+reports the data artifact path, full SHA-256 and sealed byte size. An optional
+virtual-size override is grow-only; missing artifacts, an owned pair, invalid
+metadata and already-sealed output report errors without creating a new pair.
+The existing sparse refusal and host-mkfs provenance restriction still apply.
+Blank-device Hybrid selection uses `blank.upper_type = "hybrid"`; the CLI
+requires the advertised `hybrid_upper` capability before sending that request.
+
+### Upper provenance in status and list
+
+`status` and each `list.devices` entry include an additive `upper` object for
+known writable uppers: `type`, `path`, and, for Hybrid, `index_path`. These are
+the creation-time paths used by commit, copied with the observed child under
+the registry lock. Editing an image config afterwards does not redirect them.
+Read-only or unknown uppers omit the object. This reports configured artifact
+provenance, not a fresh filesystem existence or integrity check; failures remain
+in the existing `error` field and operation replies.
+
+Explicit `obdctl create-blank --upper-type hybrid` first checks the supervisor's
+`hello.features` for `hybrid_upper`. Unsupported or malformed capability replies
+fail before sending create, preserving the requested recoverable upper type
+when client and daemon versions differ. Default LSMT creation is unchanged.

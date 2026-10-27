@@ -255,13 +255,24 @@ empty `dir` keeps the device read-only.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `dir` | string | `""` | Directory holding the upper layer file; created if missing. Non-empty engages writable mode (`src/image/config.hpp::UpperConfig`). |
-| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` (unsealed in-place-edit LSMT); `"sparse"` → `<dir>/overlaybd.sparse` plus exact `<dir>/overlaybd.sparse.coverage` metadata. **Any other value is rejected** with `EINVAL`. |
+| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` (unsealed in-place-edit LSMT); `"sparse"` → `<dir>/overlaybd.sparse` plus exact `<dir>/overlaybd.sparse.coverage` metadata; `"hybrid"` → `<dir>/overlaybd.hybrid/{data,index}` (persisted mapping log and metadata-only seal, ADR-0026). **Any other value is rejected** with `EINVAL`. |
 
 Durability note: the `lsmt` upper keeps its segment index in memory
 until `checkpoint()`/`seal()`; unsealed data is not crash-durable (see
 *Limitations & TODO* in `docs/architecture.md`). A graceful device
 shutdown writes the checkpoint that the offline `commit` seal consumes
 (ADR-0014); a `"sparse"` upper never seals.
+
+Hybrid is opt-in. Image assembly atomically creates an absent pair directory or
+reopens both existing files; an incomplete pair fails without recreating either
+file. Recovery preserves a larger persisted virtual size, and a larger requested
+size grows the pair durably. An explicit headroom override smaller than that
+persisted size is rejected. FLUSH and crash semantics are specified in
+[format.md](./format.md) and ADR-0026; in-place overwrites do not promise power-loss
+atomicity. Existing-image Hybrid uppers use the normal shutdown checkpoint and
+stopped-device commit path. Managed writable Hybrid pairs require user-xattr support for local log integrity.
+Blank devices select Hybrid explicitly with `blank.upper_type = "hybrid"`;
+the default remains LSMT. See ADR-0026 for the contract and validation limits.
 
 ### `download` (per-image overrides)
 
@@ -410,3 +421,8 @@ digests are configuration errors. Without `gzipIndex`, target offsets address
 uncompressed tar bytes directly. The metadata lower may independently use the
 ordinary ZFile envelope. Metadata packages must be imported before their
 extracted filesystem metadata and gzip index paths are used here.
+
+Hybrid USER_RECOVERY requires both existing artifacts and uses their persisted
+virtual size, ignoring an obsolete create-time headroom override after online
+grow. Missing recovery artifacts fail closed; they never trigger fresh creation.
+This differs from normal first creation, which may publish a new pair directory.

@@ -27,7 +27,7 @@
 //
 // Flags: bit0 is_header (1 header / 0 trailer), bit1 data_file (1) /
 // index_file (0), bit2 sealed, bit3 gc_layer, bit4 sparse_rw, bit5
-// info_valid.
+// hybrid_rw.
 //
 // All index offsets/lengths are in 512-byte sectors. The data region starts
 // at sector 8 (byte 4096) and a valid moffset lies in
@@ -64,7 +64,7 @@ constexpr int kFlagShiftType = 1;  // 1: data file, 0: index file
 constexpr int kFlagShiftSealed = 2;
 constexpr int kFlagShiftGcLayer = 3;
 constexpr int kFlagShiftSparseRw = 4;
-constexpr int kFlagShiftInfoValid = 5;
+constexpr int kFlagShiftHybridRw = 5;
 
 /// Parsed LSMT HeaderTrailer (the 390 meaningful bytes of a 4096B region).
 struct HeaderTrailer {
