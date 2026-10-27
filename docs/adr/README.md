@@ -147,6 +147,6 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | accepted |
 | [0024](./0024-exact-sparse-upper-coverage.md) | Persist exact sector coverage for sparse uppers | accepted |
 | [0025](./0025-configure-device-queue-and-worker-topology.md) | Resolve device queues and workers together before startup | accepted |
-| [0026](./0026-persist-interoperable-hybrid-uppers.md) | Persist interoperable Hybrid uppers without payload-copy sealing | proposed |
+| [0026](./0026-persist-interoperable-hybrid-uppers.md) | Persist interoperable Hybrid uppers without payload-copy sealing | accepted |
 | [0027](./0027-export-stable-sparse-deltas.md) | Export stable sparse ownership as an independent LSMT delta | accepted |
 | [0028](./0028-cluster-converted-filesystem-metadata.md) | Cluster finalized filesystem metadata in ordinary LSMT payloads | accepted |
