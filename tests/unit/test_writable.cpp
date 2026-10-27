@@ -2860,6 +2860,104 @@ TEST_CASE("format: lsmt rw partial zeroed rewrites survive offline sealing",
     REQUIRE(rc == 0);
 }
 
+TEST_CASE("format: sparse flush retains an already published discard mask",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const int run_result_1 = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 32768);
+        const auto operation_result_1 = co_await layer->discard(0, 512);
+        REQUIRE(operation_result_1 == 0);
+        CoverageTestFd published(::open((path + ".zeroes").c_str(), O_RDONLY | O_CLOEXEC));
+        REQUIRE(published.value >= 0);
+        struct stat before {}, after {};
+        REQUIRE(::fstat(published.value, &before) == 0);
+        const auto operation_result_2 = co_await layer->flush();
+        REQUIRE(operation_result_2 == 0);
+        REQUIRE(::stat((path + ".zeroes").c_str(), &after) == 0);
+        // Keep the old inode open so allocator reuse cannot hide a replacement.
+        REQUIRE(after.st_dev == before.st_dev);
+        REQUIRE(after.st_ino == before.st_ino);
+        layer.reset();
+        layer = co_await format::SparseRwLayer::open(path, 32768);
+        REQUIRE(layer->segments().size() == 1);
+        REQUIRE(layer->segments()[0].zeroed);
+        REQUIRE(layer->segments()[0].offset == 0);
+        REQUIRE(layer->segments()[0].length == 1);
+        co_return 0;
+    });
+    REQUIRE(run_result_1 == 0);
+}
+
+TEST_CASE("format: sparse flush retries a later failed mask publication",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const int run_result_2 = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 32768);
+        const auto operation_result_3 = co_await layer->discard(0, 512);
+        REQUIRE(operation_result_3 == 0);
+        // A previously published generation must not suppress publication of
+        // a later generation whose exact coverage commit already succeeded.
+        const auto temporary = path + ".zeroes.tmp";
+        REQUIRE(::mkdir(temporary.c_str(), 0700) == 0);
+        const auto operation_result_4 = co_await layer->discard(512, 512);
+        REQUIRE(operation_result_4 == -EISDIR);
+        REQUIRE(::rmdir(temporary.c_str()) == 0);
+        const auto operation_result_5 = co_await layer->flush();
+        REQUIRE(operation_result_5 == 0);
+        const auto expected = make_sparse_zero_mask(32768, {{0, 2}});
+        std::vector<uint8_t> actual(expected.size());
+        CoverageTestFd mask(::open((path + ".zeroes").c_str(), O_RDONLY | O_CLOEXEC));
+        REQUIRE(mask.value >= 0);
+        REQUIRE(::pread(mask.value, actual.data(), actual.size(), 0) ==
+                static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        layer.reset();
+        layer = co_await format::SparseRwLayer::open(path, 32768);
+        REQUIRE(layer->segments().size() == 1);
+        REQUIRE(layer->segments()[0].zeroed);
+        REQUIRE(layer->segments()[0].length == 2);
+        co_return 0;
+    });
+    REQUIRE(run_result_2 == 0);
+}
+
+TEST_CASE("format: sparse grow mask dirsync failure retains flush retry",
+          "[format]") {
+    TempDir dir;
+    const std::string path = dir / "upper.sparse";
+    const int run_result_3 = test::run_coro([&]() -> elio::coro::task<int> {
+        auto layer = co_await format::SparseRwLayer::open(path, 32768);
+        const auto operation_result_6 = co_await layer->discard(0, 512);
+        REQUIRE(operation_result_6 == 0);
+        format::SparseRwLayerTestAccess::fail_zero_mask_dirsync_after_commit(*layer);
+        const auto operation_result_7 = co_await elio::spawn_blocking([&] { return layer->grow(65536); });
+        REQUIRE(operation_result_7 == -EIO);
+        REQUIRE(layer->virtual_size() == 32768);
+        CoverageTestFd failed(::open((path + ".zeroes").c_str(), O_RDONLY | O_CLOEXEC));
+        REQUIRE(failed.value >= 0);
+        struct stat before {}, after {};
+        REQUIRE(::fstat(failed.value, &before) == 0);
+        const auto operation_result_8 = co_await layer->flush();
+        REQUIRE(operation_result_8 == 0);
+        REQUIRE(::stat((path + ".zeroes").c_str(), &after) == 0);
+        REQUIRE(after.st_ino != before.st_ino);
+        const auto operation_result_9 = co_await elio::spawn_blocking([&] { return layer->grow(65536); });
+        REQUIRE(operation_result_9 == 0);
+        const auto operation_result_10 = co_await layer->flush();
+        REQUIRE(operation_result_10 == 0);
+        REQUIRE(sparse_zero_mask_vsize(path) == 65536);
+        layer.reset();
+        layer = co_await format::SparseRwLayer::open(path, 32768);
+        REQUIRE(layer->virtual_size() == 65536);
+        REQUIRE(layer->segments().size() == 1);
+        REQUIRE(layer->segments()[0].zeroed);
+        co_return 0;
+    });
+    REQUIRE(run_result_3 == 0);
+}
+
 TEST_CASE("format: sparse layer discard keeps a durable zero mask",
           "[format]") {
     TempDir dir;
@@ -2992,6 +3090,10 @@ TEST_CASE("format: sparse layer checkpoint failure can retry", "[format]") {
         auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
         const int dr = co_await layer->discard(8 * 512, 4 * 512);
         REQUIRE(dr == 0);
+        // Require a new mask publication for the grown capacity. A completed
+        // unchanged discard no longer needs a duplicate publication at checkpoint.
+        const auto operation_result_11 = co_await elio::spawn_blocking([&] { return layer->grow(512 * 64); });
+        REQUIRE(operation_result_11 == 0);
         const std::string sidecar = path + ".zeroes";
         REQUIRE(::unlink(sidecar.c_str()) == 0);
         REQUIRE(::mkdir(sidecar.c_str(), 0700) == 0);

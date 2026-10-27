@@ -123,7 +123,7 @@ private:
     bool dirty_zero_masks_need_data_first() const;
     ZeroMaskPersistResult persist_zero_masks(
         const std::vector<bytes::segment_mapping>& zeroes,
-        uint64_t vsize) const;
+        uint64_t vsize);
     int sync_data_file() const;
     void load_zero_masks();
     static std::unique_ptr<SparseRwLayer> open_sync(std::string path,
@@ -166,6 +166,9 @@ private:
     std::atomic<Lifecycle> lifecycle_{Lifecycle::kOpen};
     mutable std::mutex meta_mu_;
     uint64_t zero_masks_generation_ = 0;
+    // Successful discard publication is reusable by the next flush. This
+    // does not mean payload/coverage are durable; their barriers still run.
+    std::optional<uint64_t> published_zero_masks_generation_;
     bool zero_masks_dirty_ = false;
     bool zero_masks_data_first_ = false;
     bool zero_masks_pending_view_ = false;
