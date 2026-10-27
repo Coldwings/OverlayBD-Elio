@@ -5802,3 +5802,44 @@ TEST_CASE("format: failed LSMT discard preserves masked lower bytes in the live 
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("format: LSMT rejected later write piece preserves readable published prefix", "[format]") {
+    TempDir dir;
+    constexpr uint64_t size = 16384 * 512;
+    const std::vector<uint8_t> lower_bytes(size, 0x5a), payload(size, 0x31);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", lower_bytes, &lower);
+    struct Reset { ~Reset() { format::lsmt_rw::live_limit_for_test(0); } } reset;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::LsmtRwLayer::create(dir / "upper", size);
+        auto* direct = top.get();
+        std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+        lowers.push_back(co_await format::LsmtLayer::open(co_await source::LocalFileSource::open(lower)));
+        auto merged = co_await format::MergedWritable::open(std::move(lowers), std::move(top));
+        format::lsmt_rw::live_limit_for_test(1);
+        const auto failed = co_await merged->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(failed == -EFBIG);
+        format::lsmt_rw::live_limit_for_test(0);
+        std::array<uint8_t, 512> actual{};
+        for (const uint64_t offset : {uint64_t{0}, uint64_t{16382 * 512}}) {
+            const auto live = co_await merged->pread(actual.data(), actual.size(), offset);
+            REQUIRE(live == 512);
+            for (const auto byte : actual) REQUIRE(byte == 0x31);
+            const auto raw = co_await direct->pread(actual.data(), actual.size(), offset);
+            REQUIRE(raw == 512);
+            for (const auto byte : actual) REQUIRE(byte == 0x31);
+        }
+        const auto inherited = co_await merged->pread(actual.data(), actual.size(), 16383 * 512);
+        REQUIRE(inherited == 512);
+        for (const auto byte : actual) REQUIRE(byte == 0x5a);
+        merged.reset();
+        auto reopened = co_await format::LsmtRwLayer::open_existing(dir / "upper", dir / "upper.index");
+        for (const uint64_t offset : {uint64_t{0}, uint64_t{16382 * 512}}) {
+            const auto read = co_await reopened->pread(actual.data(), actual.size(), offset);
+            REQUIRE(read == 512);
+            for (const auto byte : actual) REQUIRE(byte == 0x31);
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}

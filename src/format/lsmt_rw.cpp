@@ -511,6 +511,11 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
                 rc != 0) {
                 co_return rc;
             }
+            // A later piece may fail after this payload becomes mapped.
+            // Publish the readable extent before exposing its ownership.
+            const auto end = (op.moff + op.nsector) * kSector;
+            data_bytes_.store(std::max(data_bytes_.load(std::memory_order_acquire), end),
+                              std::memory_order_release);
         }
 
         // Publish new ownership only after payload completion. In-place DATA

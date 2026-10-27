@@ -445,6 +445,10 @@ Every test, grouped by area, with the property it guards.
   and grown-tail contents for image and blank devices, including explicit
   write/discard/FLUSH/reopen cycles; a missing index fails
   without replacing the upper.
+- `format: LSMT rejected later write piece preserves readable published prefix` —
+  after a later piece hits the admission limit, live merged, direct and reopened
+  reads agree on the completed prefix while the unpublished suffix inherits
+  the nonzero lower.
 - `format: failed LSMT discard preserves masked lower bytes in the live merged view` —
   failed journal publication preserves both prior DATA and ZERO over a nonzero
   lower immediately and after reopen.
