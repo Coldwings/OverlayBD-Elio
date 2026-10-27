@@ -110,6 +110,21 @@ elio::coro::task<std::unique_ptr<LsmtLayer>> LsmtLayer::open_impl(
         throw format_error(
             "lsmt: trailer magic, type or sealedness doesn't match");
     }
+    const bool hybrid = hht.get_flag_bit(lsmt::kFlagShiftHybridRw);
+    if (hybrid != tht.get_flag_bit(lsmt::kFlagShiftHybridRw)) {
+        throw format_error("lsmt: mismatched Hybrid header and trailer");
+    }
+    if (hybrid) {
+        constexpr uint32_t allowed = (1u << lsmt::kFlagShiftHeader) |
+                                     (1u << lsmt::kFlagShiftType) |
+                                     (1u << lsmt::kFlagShiftSealed) |
+                                     (1u << lsmt::kFlagShiftHybridRw);
+        if (target || (hht.flags & ~allowed) != 0 || (tht.flags & ~allowed) != 0 ||
+            hht.version != 1 || hht.sub_version != 1 ||
+            tht.version != 1 || tht.sub_version != 1) {
+            throw format_error("lsmt: unsupported Hybrid layout");
+        }
+    }
     if (tht.index_size > lsmt::kMaxRoIndexSize) {
         throw format_error("lsmt: RO index size " +
                            std::to_string(tht.index_size) +
@@ -170,6 +185,10 @@ elio::coro::task<std::unique_ptr<LsmtLayer>> LsmtLayer::open_impl(
     const uint64_t moffset_begin = lsmt::kDataStartSector;
     const uint64_t moffset_end = tht.index_offset / lsmt::kAlignment;
     for (auto& m : segments) {
+        if (hybrid && (m.length == 0 || tht.virtual_size % lsmt::kAlignment != 0 ||
+                       m.end() > tht.virtual_size / lsmt::kAlignment)) {
+            throw format_error("lsmt: invalid Hybrid logical extent");
+        }
         if (target) {
             const auto source_tag = m.tag - min_tag;
             if (source_tag > 1)
@@ -190,9 +209,15 @@ elio::coro::task<std::unique_ptr<LsmtLayer>> LsmtLayer::open_impl(
                 continue;
             }
         }
+        // AgentENV encodes unbacked ZERO with the all-ones physical offset.
+        // It owns no payload and is never dereferenced. Accept it only for
+        // the verified Hybrid layout, preserving ordinary LSMT validation.
+        const bool unbacked_hybrid_zero = hybrid && m.zeroed &&
+            m.moffset == bytes::segment_mapping::kMaxMoffset;
         const bool ok = m.zeroed
-                            ? (moffset_begin <= m.moffset &&
-                               m.moffset <= moffset_end)
+                            ? (unbacked_hybrid_zero ||
+                               (moffset_begin <= m.moffset &&
+                                m.moffset <= moffset_end))
                             : (moffset_begin <= m.moffset &&
                                m.moffset < moffset_end &&
                                moffset_begin < m.mend() &&

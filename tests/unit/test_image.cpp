@@ -2,6 +2,11 @@
 #include "common/errors.hpp"
 #include "image/image_file.hpp"
 #include "format/writer.hpp"
+#include "format/merged_writable.hpp"
+#include "format/hybrid_rw.hpp"
+#include <elio/runtime/spawn_blocking.hpp>
+#include <fstream>
+#include <iterator>
 
 #include "../support.hpp"
 
@@ -361,4 +366,216 @@ TEST_CASE("image: TurboOCI assembly retains original tar byte offsets", "[image]
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("image: hybrid workspace ancestor sync failures are retried before publication",
+          "[image][hybrid]") {
+    for (bool blank : {false, true}) {
+        DYNAMIC_SECTION("blank=" << blank) {
+            TempDir temporary;
+            const std::string workspace = temporary / "new/upper";
+            struct Probe {
+                std::string ancestor;
+                bool fail = true;
+                unsigned visits = 0;
+            } probe{temporary / "new"};
+            image::test_hooks::WorkspaceSyncHook hook{
+                [](int fd, void* context) -> int {
+                    auto& p = *static_cast<Probe*>(context);
+                    struct stat actual{}, target{};
+                    if (::fstat(fd, &actual) != 0 || ::stat(p.ancestor.c_str(), &target) != 0)
+                        return errno;
+                    if (actual.st_dev != target.st_dev || actual.st_ino != target.st_ino)
+                        return 0;
+                    ++p.visits;
+                    return p.fail ? EIO : 0;
+                }, &probe};
+            struct ResetHook {
+                ~ResetHook() { image::test_hooks::set_workspace_sync_hook_for_test(nullptr); }
+            } reset;
+            image::test_hooks::set_workspace_sync_hook_for_test(&hook);
+            const auto fixture = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                                 "fixtures/hybrid/overlaybd/sealed.data";
+            const auto cfg = image::ImageConfig::from_json_text(nlohmann::json{
+                {"lowers", {{{"file", fixture.string()}}}},
+                {"upper", {{"dir", workspace}, {"type", "hybrid"}}}}.dump(), {});
+            image::GlobalConfig global;
+            global.prefetch_enable = false;
+            image::BlankDeviceSpec spec;
+            spec.upper_type = "hybrid";
+            spec.dir = workspace;
+            spec.size = 32768;
+            auto open = [&]() -> elio::coro::task<image::OpenedImage> {
+                if (blank) co_return co_await image::open_blank_device(spec);
+                co_return co_await image::open_image(cfg, global);
+            };
+            const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+                // The first failure leaves the directories behind. Existing
+                // names on retry must not bypass the unsatisfied durability.
+                for (unsigned attempt = 1; attempt <= 2; ++attempt) {
+                    int failure = 0;
+                    try { (void)co_await open(); }
+                    catch (const error& e) { failure = e.errno_value(); }
+                    REQUIRE(failure == EIO);
+                    REQUIRE(probe.visits == attempt);
+                    REQUIRE(std::filesystem::is_directory(workspace));
+                    REQUIRE_FALSE(std::filesystem::exists(workspace + "/overlaybd.hybrid"));
+                }
+                probe.fail = false;
+                auto opened = co_await open();
+                REQUIRE(probe.visits == 3);
+                auto* writable = dynamic_cast<format::MergedWritable*>(opened.root.get());
+                REQUIRE(writable != nullptr);
+                std::vector<uint8_t> payload(512, 0x79), actual(512);
+                const auto written = co_await writable->pwrite(payload.data(), payload.size(), 0);
+                REQUIRE(written == 512);
+                const int flushed = co_await writable->flush();
+                REQUIRE(flushed == 0);
+                opened.root.reset();
+                probe.fail = true;
+                int failure = 0;
+                try { (void)co_await open(); }
+                catch (const error& e) { failure = e.errno_value(); }
+                REQUIRE(failure == EIO);
+                REQUIRE(probe.visits == 4);
+                probe.fail = false;
+                opened = co_await open();
+                const auto read = co_await opened.root->pread(actual.data(), actual.size(), 0);
+                REQUIRE(read == 512);
+                REQUIRE(actual == payload);
+                co_return 0;
+            });
+            REQUIRE(rc == 0);
+        }
+    }
+}
+#endif
+
+TEST_CASE("image: hybrid assembly reopens durable upper and refuses incomplete pairs",
+          "[image][hybrid]") {
+    TempDir temporary;
+    const auto fixtures = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                          "fixtures/hybrid/overlaybd";
+    std::ifstream oracle(fixtures / "expected.raw", std::ios::binary);
+    std::vector<uint8_t> expected{std::istreambuf_iterator<char>(oracle), std::istreambuf_iterator<char>()};
+    REQUIRE(expected.size() == 32768);
+    const std::string workspace = temporary / "new/upper";
+    const std::string directory = workspace + "/overlaybd.hybrid";
+    nlohmann::json config = {{"lowers", {{{"file", (fixtures / "sealed.data").string()}}}},
+                            {"upper", {{"dir", workspace}, {"type", "hybrid"}}}};
+    const auto cfg = image::ImageConfig::from_json_text(config.dump(), {});
+    REQUIRE(cfg.upper.type == "hybrid");
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        image::GlobalConfig global;
+        global.prefetch_enable = false;
+        auto opened = co_await image::open_image(cfg, global, 65536);
+        REQUIRE(opened.writable);
+        REQUIRE(opened.upper_path == directory + "/data");
+        auto* merged = dynamic_cast<format::MergedWritable*>(opened.root.get());
+        REQUIRE(merged != nullptr);
+        REQUIRE(dynamic_cast<format::HybridRwLayer*>(&merged->writable_top()) != nullptr);
+        std::vector<uint8_t> bytes(512, 0x37);
+        const auto write = co_await merged->pwrite(bytes.data(), bytes.size(), 65536 - 512);
+        REQUIRE(write == 512);
+        const int discard = co_await merged->discard(512, 512);
+        REQUIRE(discard == 0);
+        const int flush = co_await merged->flush();
+        REQUIRE(flush == 0);
+        // Deliberately reopen without terminal checkpoint: Hybrid has a log.
+        opened.root.reset();
+        opened = co_await image::open_image(cfg, global);
+        REQUIRE(opened.virtual_size == 65536);
+        expected.resize(65536, 0);
+        std::fill_n(expected.begin() + 512, 512, 0);
+        std::fill_n(expected.end() - 512, 512, 0x37);
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await opened.root->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(expected.size()));
+        REQUIRE(actual == expected);
+        opened.root.reset();
+        bool shrink_refused = false;
+        try { (void)co_await image::open_image(cfg, global, 32768); }
+        catch (const error& e) { shrink_refused = e.errno_value() == EINVAL; }
+        REQUIRE(shrink_refused);
+        opened = co_await image::open_image(cfg, global, 98304);
+        REQUIRE(opened.virtual_size == 98304);
+        opened.root.reset();
+        opened = co_await image::open_image(cfg, global, 32768, true);
+        REQUIRE(opened.virtual_size == 98304); // Original create argument is stale after grow.
+        opened.root.reset();
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    const auto data_size = std::filesystem::file_size(directory + "/data");
+    const image::GlobalConfig recovery_global;
+    std::filesystem::rename(directory + "/index", directory + "/saved-index");
+    const int missing = test::run_coro([&]() -> elio::coro::task<int> {
+        try { (void)co_await image::open_image(cfg, recovery_global); }
+        catch (const error& e) { co_return e.errno_value(); }
+        co_return 0;
+    });
+    REQUIRE(missing == ENOENT);
+    REQUIRE_FALSE(std::filesystem::exists(directory + "/index"));
+    REQUIRE(std::filesystem::file_size(directory + "/data") == data_size);
+    REQUIRE(std::filesystem::exists(directory + "/saved-index"));
+    std::filesystem::rename(directory + "/saved-index", directory + "/index");
+    std::filesystem::rename(directory, directory + ".saved");
+    const int missing_recovery = test::run_coro([&]() -> elio::coro::task<int> {
+        try { (void)co_await image::open_image(cfg, recovery_global, 32768, true); }
+        catch (const error& e) { co_return e.errno_value(); }
+        co_return 0;
+    });
+    REQUIRE(missing_recovery == ENOENT);
+    REQUIRE_FALSE(std::filesystem::exists(directory));
+    REQUIRE(std::filesystem::file_size(directory + ".saved/data") == data_size);
+}
+
+TEST_CASE("image: hybrid blank recovery preserves writes and grown size", "[image][hybrid]") {
+    TempDir dir;
+    image::BlankDeviceSpec spec;
+    spec.size = 32768;
+    spec.dir = dir / "blank";
+    spec.upper_type = "hybrid";
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::vector<uint8_t> payload(512, 0x59), actual(512, 0xff);
+        {
+            auto opened = co_await image::open_blank_device(spec);
+            auto* merged = dynamic_cast<format::MergedWritable*>(opened.root.get());
+            REQUIRE(merged != nullptr);
+            const auto empty = co_await merged->pread(actual.data(), actual.size(), 0);
+            REQUIRE(empty == 512);
+            REQUIRE(actual == std::vector<uint8_t>(512, 0));
+            const auto written = co_await merged->pwrite(payload.data(), payload.size(), 512);
+            REQUIRE(written == 512);
+            const int grown = co_await elio::spawn_blocking([merged] { return merged->grow(65536); });
+            REQUIRE(grown == 0);
+            const auto tail = co_await merged->pwrite(payload.data(), payload.size(), 65024);
+            REQUIRE(tail == 512);
+            const int flush = co_await merged->flush();
+            REQUIRE(flush == 0);
+        }
+        spec.recover = true; // Original create size intentionally remains 32768.
+        {
+            auto recovered = co_await image::open_blank_device(spec);
+            REQUIRE(recovered.virtual_size == 65536);
+            REQUIRE(recovered.upper_path == spec.dir + "/overlaybd.hybrid/data");
+            for (const uint64_t offset : {uint64_t{512}, uint64_t{65024}}) {
+                const auto read = co_await recovered.root->pread(actual.data(), actual.size(), offset);
+                REQUIRE(read == 512);
+                REQUIRE(actual == payload);
+            }
+        }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    const auto pair = spec.dir + "/overlaybd.hybrid";
+    std::filesystem::rename(pair, spec.dir + "/saved");
+    const int missing = test::run_coro([&]() -> elio::coro::task<int> {
+        try { (void)co_await image::open_blank_device(spec); }
+        catch (const error& e) { co_return e.errno_value(); }
+        co_return 0;
+    });
+    REQUIRE(missing == ENOENT);
+    REQUIRE_FALSE(std::filesystem::exists(pair));
 }

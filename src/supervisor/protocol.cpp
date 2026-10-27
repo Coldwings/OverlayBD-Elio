@@ -233,6 +233,17 @@ std::optional<BlankSpec> parse_blank_spec(const nlohmann::json& blank,
     }
     BlankSpec spec;
     spec.size = vsize;
+    if (blank.contains("upper_type")) {
+        if (!blank["upper_type"].is_string()) {
+            error = "blank 'upper_type' must be a string";
+            return std::nullopt;
+        }
+        spec.upper_type = blank["upper_type"].get<std::string>();
+        if (spec.upper_type != "lsmt" && spec.upper_type != "hybrid") {
+            error = "blank 'upper_type' must be lsmt or hybrid";
+            return std::nullopt;
+        }
+    }
     if (blank.contains("mkfs")) {
         const std::string mkfs = blank["mkfs"].get<std::string>();
         if (!valid_mkfs_type(mkfs)) {
@@ -269,7 +280,7 @@ std::string reply_hello() {
     // grow-only online resize command is served; "blank" = create
     // accepts the ADR-0014 blank (raw) device modes 2/3.
     fields["features"] =
-        nlohmann::json::array({"commit", "trace", "resize", "blank", "startup_owner", "sparse_export"});
+        nlohmann::json::array({"commit", "trace", "resize", "blank", "startup_owner", "hybrid_upper", "sparse_export"});
     return reply_ok(fields);
 }
 

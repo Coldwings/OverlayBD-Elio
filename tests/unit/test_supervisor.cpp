@@ -139,6 +139,10 @@ TEST_CASE("supervisor: hello handshake replies with protocol version and feature
     REQUIRE(!reply["version"].get<std::string>().empty());
     REQUIRE(reply.contains("features"));
     REQUIRE(reply["features"].is_array());
+    REQUIRE(std::find(reply["features"].begin(), reply["features"].end(),
+                      nlohmann::json("hybrid_upper")) != reply["features"].end());
+    REQUIRE(std::find(reply["features"].begin(), reply["features"].end(),
+                      nlohmann::json("sparse_export")) != reply["features"].end());
 
     // Bad input is still answered, never dropped: unknown cmd and malformed
     // JSON are rejected with a reason the daemon can reply with.
@@ -953,6 +957,24 @@ TEST_CASE("supervisor: fake device rejects malformed blank flags like obd-device
     REQUIRE(run_fake({"--blank-size", "4096", "--blank-dir", ws}) == 1);
 }
 #endif
+
+TEST_CASE("supervisor: blank upper type is explicit and validated", "[supervisor][hybrid]") {
+    std::string error;
+    for (const auto type : {"lsmt", "hybrid"}) {
+        const auto spec = supervisor::parse_blank_spec(
+            nlohmann::json{{"size", 32768}, {"upper_type", type}}, error);
+        REQUIRE(spec);
+        REQUIRE(spec->upper_type == type);
+    }
+    const auto implicit = supervisor::parse_blank_spec(nlohmann::json{{"size", 32768}}, error);
+    REQUIRE(implicit);
+    REQUIRE(implicit->upper_type == "lsmt");
+    for (const auto& invalid : {nlohmann::json(42), nlohmann::json("sparse"), nlohmann::json("")}) {
+        REQUIRE_FALSE(supervisor::parse_blank_spec(
+            nlohmann::json{{"size", 32768}, {"upper_type", invalid}}, error));
+        REQUIRE(error.find("upper_type") != std::string::npos);
+    }
+}
 
 TEST_CASE("supervisor: ready parent identity distinguishes missing and bottom layers",
           "[supervisor]") {

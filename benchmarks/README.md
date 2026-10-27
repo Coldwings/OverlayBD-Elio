@@ -160,6 +160,140 @@ generator and ordinary-child timeout handling without creating a Device. The
 default build-test CI job compiles the optional driver and runs these controls;
 CI does not run this privileged performance matrix.
 
+## Writable upper comparison (issue #146)
+
+`obd-bench-writable SETTINGS.json REPORT.json` uses owned ordinary files through
+`MergedWritable`, the same merged write interface used by the device. It creates
+a **new** absolute `directory` and exclusively creates its report; it does not
+remove artifacts or overwrite existing directories/reports. Example settings:
+
+```json
+{
+  "mode": "hybrid",
+  "directory": "/absolute/new/trial-directory",
+  "size_bytes": 1073741824,
+  "populate_bytes": 1073741824,
+  "samples": 4096,
+  "seed": 146,
+  "qd": 16,
+  "workers": 2,
+  "cycles": 2
+}
+```
+
+Repeat for `lsmt`, `sparse`, and `hybrid`, and QD1/QD16, with a fresh directory
+and report each time. QD means concurrent awaiting application operations, not
+kernel queue depth; merged-layer serialization remains part of the measurement.
+The tool records observed awaiting concurrency. Random first writes use unique
+4 KiB offsets, then rewrite those exact offsets. Each discard/rewrite cycle
+measures a discard plus a write as one operation. The same seeded offsets and
+payload are used for every mode. All sampled reads are checked after each phase.
+Flush time is reported separately from request latency and throughput. Durability
+contracts differ: LSMT FLUSH does not make its volatile mapping index recoverable.
+
+Full population follows the random phases, using 1 MiB requests, and is timed
+separately including its final FLUSH. Set `populate_bytes == size_bytes` for a
+fully populated trial; a larger virtual capacity alone is not a full-size write
+or seal benchmark. After writable reopen (sparse/Hybrid), every populated byte
+is checked. For all three modes, the sealed output is then reopened through the
+ordinary LSMT reader and checked across every populated byte plus sampled writes
+outside that region. This additional readback is outside seal timing and reported
+separately; process CPU/RSS include verification. Uncheckpointed LSMT has no equivalent resumable writable reopen, so
+that field is null, with an explanation. Sparse uses the separate export API
+(ADR-0027): its `seal_ms` includes owner release, source reopen, output publication
+and the API's digest. Its source remains reusable and contributes to retained
+and peak space. LSMT/Hybrid instead time their live seal APIs without an external
+digest pass. `seal_note` records that distinction; these are not identical APIs
+or equal durability contracts. Every mode verifies the full populated prefix
+and sampled tail of its sealed output.
+
+The report includes per-file logical/allocated sizes after each random phase,
+reopen time, live-seal time, and peak allocated space sampled every 10 ms during
+seal. The sampled peak is a lower bound: short-lived temporary files between
+samples may be missed. Publication includes the format's required synchronization;
+LSMT/Hybrid do not add an external digest pass, while Sparse includes its API
+digest. OS caches are warm; this tool does not
+drop global caches. RSS includes the driver, seeded permutation and readback
+buffers. Keep raw JSON, exact build/source provenance, CPU/filesystem details,
+and repetition counts alongside any performance summary. Small smoke runs
+validate the harness only and are not acceptance-size benchmark results.
+
+The completed development matrix used fully populated 1/10/32 GiB uppers,
+QD1/QD16, two workers, 4096 sampled offsets, four discard/rewrite cycles,
+and three seeds per cell (54 trials). All trials passed, including complete
+sealed-output readback for LSMT and Hybrid. On the shared, warm-cache host,
+Hybrid cell-median first-write throughput was 51–162 operations/s, versus
+20.1–25.4 thousand operations/s for already-owned rewrites. Hybrid is therefore
+not a general first-write throughput improvement. Metadata-only seal medians
+were 78–102 ms; the copying LSMT seal grew from approximately 6.4 seconds at
+1 GiB to 396–413 seconds at 32 GiB. These are observations under different
+durability contracts, not portable performance guarantees. Sparse export was
+not implemented in this frozen comparison. QD16 does not establish multicore
+scaling, and these ordinary-file measurements do not validate kernel or
+supervisor crash recovery. This frozen matrix predates the final trailer-based seal classification; its
+seal timings are historical evidence, not measurements of the final implementation.
+
+## Small Hybrid process-crash comparison
+
+The [numeric results](hybrid-writable-results.json) record the basic development
+comparison: 32 MiB fully populated before seal, 256 sampled 4 KiB offsets per
+random phase, one discard/rewrite cycle, seed 146, two workers, QD1/QD16,
+and one trial per cell. All eight trials passed full sealed-output readback.
+These measurements replace further large benchmark runs for this change;
+the later 1/10/32 GiB rerun was stopped at the user's request and is incomplete.
+The older completed matrix above remains historical evidence only.
+
+| Build / format | QD | First write ops/s | Rewrite ops/s | Discard + rewrite ops/s | First FLUSH ms | Seal ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline-hybrid-qd1 | 1 | 409 | 30574 | 409 | 6.0 | 40.0 |
+| optimized-hybrid-qd1 | 1 | 7136 | 29201 | 4446 | 14.5 | 27.4 |
+| baseline-hybrid-qd16 | 16 | 368 | 27831 | 386 | 6.4 | 29.0 |
+| optimized-hybrid-qd16 | 16 | 7953 | 29129 | 4465 | 31.1 | 27.5 |
+| optimized-lsmt-qd1 | 1 | 29016 | 28900 | 22590 | 15.9 | 246.4 |
+| optimized-lsmt-qd16 | 16 | 29006 | 28731 | 23568 | 7.2 | 241.6 |
+| optimized-sparse-qd1 | 1 | 8396 | 37233 | 51 | 45.3 | 225.8 |
+| optimized-sparse-qd16 | 16 | 9540 | 36266 | 81 | 34.0 | 248.8 |
+
+Baseline Hybrid synchronizes payload on every ownership transition. Optimized
+Hybrid completes payload, mapping, and recovery-progress writes before returning,
+without that per-transition sync; explicit FLUSH retains persistence ordering.
+This comparison measures that selected process-crash contract, not a speedup
+under identical power-loss guarantees. Request timings exclude the separately
+reported FLUSH. Remaining first-write cost includes index/progress updates;
+these measurements do not attribute the remaining gap to a specific operation.
+
+The shared host and warm caches, small sample, and single trials do not support
+a statistical format ranking or multicore scaling claim. Sparse export includes
+its API digest; LSMT and Hybrid live seal do not. Identical benchmark payloads
+cannot independently detect skipped rewrites; separate semantic regression tests
+cover those transitions. The local LSMT writable-reopen gap is tracked in
+[issue 164](https://github.com/Coldwings/OverlayBD-Elio/issues/164); it is not an
+upstream LSMT format restriction. Source archive, dirty-patch, binary, and original
+report hashes are recorded in the JSON for this development snapshot. It predates
+the later removal of terminal-seal xattr publication and its extra sync, so seal
+timings are not measurements of that final seal path.
+
+## Hybrid log scaling and compaction cadence
+
+`obd-bench-hybrid-log NEW_ABSOLUTE_DIRECTORY` creates controlled, valid synthetic
+upstream-layout logs with 1, 4,096, 65,536, 1,048,576 and the supported maximum
+record count. Every record describes the same live 512-byte DATA extent. This
+isolates history length from live-map count; it is not a claim that the native
+writer ordinarily retains that history despite automatic compaction. The tool
+measures unmanaged read-only replay, initial writable adoption, then three
+managed writable reopens, validating the mapping and bytes. Caches are warm.
+
+A separate native Writer workload initializes 1 or 4,096 live mappings separated by logical gaps (so compaction
+cannot merge them), verifies the live count stays fixed, and
+performs 8,192 alternating discard/rewrite operations on an owned sector.
+It records actual index-generation changes with before/after record counts,
+live-map count and the expected `max(4096, 2*live+16)` trigger, and verifies
+constant physical payload size and final bytes. This checks compaction cadence
+directly; its heavily observed wall time is not a throughput benchmark.
+Fixture construction happens outside replay timing. Output files are retained,
+and existing directories are refused. Build and run serially with the other
+benchmarks and preserve source/binary hashes with the resulting report.
+
 ## Native converter metadata placement
 
 See [metadata layout measurements](metadata-layout.md) for the controlled

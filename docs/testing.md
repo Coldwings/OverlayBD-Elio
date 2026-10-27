@@ -2237,3 +2237,65 @@ The default build-test CI configuration enables the optional target so it is
 compiled; other configurations leave it OFF and no privileged performance CI
 is introduced. Direct driver configs can request `fail_after_warmup` to validate
 real-body-failure drain without treating that diagnostic as a measured sample.
+
+### Hybrid blank selection and recovery (ADR-0026)
+
+- `supervisor: blank upper type is explicit and validated` covers defaults,
+  accepted choices and invalid type/value rejection.
+- `image: hybrid blank recovery preserves writes and grown size` verifies
+  zero initialization, payload recovery at original and grown offsets, and
+  missing-pair refusal without recreation.
+- `supervisor: hybrid blank device commits its captured artifact pair` uses
+  the real control socket and an owned test device process to exercise type
+  propagation, real Hybrid writes/checkpoint, offline commit and sealed reads.
+  It does not require a host ublk device or run mkfs.
+
+### Hybrid native IO failure boundaries (ADR-0026)
+
+- `format: hybrid interrupted append never exposes an unpublished mapping`
+  preserves a flushed prefix while injecting payload and index-append failures;
+  complete unconfirmed records are discarded and partial records fail closed.
+- `format: hybrid interrupted in place write does not promise rollback`
+  observes the exact mixed payload after a short overwrite and reopen.
+- `format: hybrid checkpoint retries each failed sync boundary` verifies
+  nonterminal checkpoint failure at data, index and directory sync, followed by
+  another write, successful retry and byte-exact reopen.
+
+These cases use owned ordinary files and native asynchronous writes. Test-only
+hooks report EIO at controlled boundaries; they do not simulate power loss.
+
+### Hybrid kernel request integration
+
+`integration: hybrid ublk flush discard and write zeroes survive reopen`
+runs with one and two queues, using a real Hybrid upper behind the ublk bridge.
+It writes through the kernel block device, calls fsync, BLKDISCARD and BLKZEROOUT,
+and requires observed FLUSH, DISCARD and WRITE_ZEROES requests in the bridge.
+After closing and removing the device, it reopens the upper and checks the
+retained payload and exact zero ranges. Test-only request counters are enabled
+only for this serial fixture; they are absent from builds without test hooks.
+Like other `[ublk]` cases, it skips when the kernel prerequisites are absent.
+Run it in the privileged test job or an isolated VM with the ublk module; a skip
+is not evidence that the kernel path passed.
+
+`integration: hybrid ublk recovers persisted writes after server death` extends
+USER_RECOVERY coverage to real Hybrid artifacts with one and two queues. The
+original child serves writes, discard and zeroes followed by FLUSH; the parent
+invalidates block cache, terminates only its owned serving child, and waits for
+that process to exit. The replacement opens the persisted pair, validates all
+bytes before attaching to the retained kernel device, resumes kernel reads and
+writes, then releases the device. A final pair reopen verifies the original
+payload, zero masks and post-recovery writes. The test requires negotiated
+USER_RECOVERY and REISSUE; unsupported negotiation remains an explicit skip.
+
+`integration: real supervisor recovers a Hybrid device and durable bytes` uses
+the production supervisor and device binaries with a two-queue blank Hybrid
+upper. It pins the original child before delivering the intentional fault,
+requires automatic recovery on the same kernel device with a new generation,
+and reads the complete capacity through direct block IO. After another write
+and FLUSH, it destroys the device, checks process reap and kernel removal, and
+reopens the persisted upper to compare all bytes and exact per-sector
+DATA/ZERO/INHERIT ownership. The fault follows FLUSH with no outstanding request;
+this does not prove in-flight request reissue, power-loss durability, or traffic
+on both negotiated queues. Failed fixtures retain their
+workspace and unresolved ownership for diagnosis. This case requires real ublk
+prerequisites; compilation or a local skip does not establish a runtime pass.

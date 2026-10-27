@@ -1,4 +1,6 @@
 #include "ublk/tag_engine.hpp"
+#include "ublk/request_counts.hpp"
+#include <array>
 
 #include <elio/coro/task_group.hpp>
 #include <elio/log/macros.hpp>
@@ -16,6 +18,17 @@
 #include <utility>
 
 namespace obd::ublk {
+#ifdef OBD_TEST_HOOKS
+namespace {
+std::atomic<bool> count_requests{false};
+std::array<std::atomic<uint64_t>, 256> request_counts{};
+}
+void count_requests_for_test(bool enable) {
+    if (enable) for (auto& count : request_counts) count.store(0);
+    count_requests.store(enable);
+}
+uint64_t request_count_for_test(uint8_t operation) { return request_counts[operation].load(); }
+#endif
 
 namespace {
 
@@ -34,6 +47,10 @@ elio::coro::task<int32_t> handle_io(Queue* queue,
                                     source::BlobSource* blob_source,
                                     IoRequest request) {
     int32_t result = 0;
+#ifdef OBD_TEST_HOOKS
+    if (count_requests.load(std::memory_order_relaxed))
+        request_counts[static_cast<uint8_t>(request.op)].fetch_add(1, std::memory_order_relaxed);
+#endif
     try {
         switch (request.op) {
         case UBLK_IO_OP_READ: {

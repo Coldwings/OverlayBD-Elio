@@ -31,7 +31,9 @@ public:
     /// is_data_file + is_sealed; trailer fields are authoritative; index
     /// entries with offset == INVALID_OFFSET are dropped; remaining entries
     /// must be strictly ordered (a.end() <= b.offset) and every moffset must
-    /// lie within the data region [8, index_offset/512) sectors.
+    /// lie within the data region [8, index_offset/512) sectors. Supported
+    /// Hybrid ZERO records may additionally use the all-ones 55-bit unbacked
+    /// marker, which is never dereferenced. Hybrid DATA still requires bounds.
     /// Throws obd::format_error / obd::error on any violation.
     static elio::coro::task<std::unique_ptr<LsmtLayer>> open(
         source::BlobSourcePtr src);

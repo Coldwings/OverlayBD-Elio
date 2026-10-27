@@ -690,6 +690,15 @@ The nonprivileged shutdown unit tests cover normal completion with one worker
 and one blocking thread, while privileged E2E still validates actual kernel
 registration and teardown.
 
+### Recoverable Hybrid blank devices (ADR-0026)
+
+Use `obdctl create-blank ID --size BYTES --upper-type hybrid` to select a
+persisted Hybrid upper. The default remains LSMT. Keep the complete
+`<blank_dir>/<id>/overlaybd.hybrid/{data,index}` pair and its user xattrs.
+Device-process recovery reopens this pair and retains online-grown capacity;
+missing artifacts are errors, not requests for a fresh blank device. Commit
+uses the pair captured at creation and seals without copying live payload.
+
 ## Native conversion layout selection
 
 `obd-convert --lsmt-layout metadata-tail` opts into the finalized-filesystem

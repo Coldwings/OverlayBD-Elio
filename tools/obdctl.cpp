@@ -27,7 +27,7 @@ void usage(const char* argv0) {
                  "usage:\n"
                  "  %s [--socket PATH] hello\n"
                  "  %s [--socket PATH] create <id> <config.json> [--global PATH] [--dev-id N] [--virtual-size BYTES]\n"
-                 "  %s [--socket PATH] create-blank <id> --size BYTES [--mkfs TYPE] [--global PATH] [--dev-id N]\n"
+                 "  %s [--socket PATH] create-blank <id> --size BYTES [--upper-type lsmt|hybrid] [--mkfs TYPE] [--global PATH] [--dev-id N]\n"
                  "  %s [--socket PATH] destroy <id>\n"
                  "  %s [--socket PATH] list\n"
                  "  %s [--socket PATH] status <id>\n"
@@ -166,6 +166,13 @@ int main(int argc, char** argv) {
                 }
                 blank["size"] = static_cast<uint64_t>(n);
                 have_size = true;
+            } else if (a == "--upper-type" && i < argc) {
+                const std::string type = argv[i++];
+                if (type != "lsmt" && type != "hybrid") {
+                    std::fprintf(stderr, "--upper-type must be lsmt or hybrid\n");
+                    return 2;
+                }
+                blank["upper_type"] = type;
             } else if (a == "--mkfs" && i < argc) {
                 const char* v = argv[i++];
                 // The supervisor's own predicate, not a mirror of it: the
@@ -322,47 +329,63 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        std::perror("socket");
-        return 1;
-    }
-    sockaddr_un sa {};
-    sa.sun_family = AF_UNIX;
-    if (socket_path.size() >= sizeof(sa.sun_path)) {
-        std::fprintf(stderr, "socket path too long\n");
-        return 2;
-    }
-    std::strcpy(sa.sun_path, socket_path.c_str());
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-        std::fprintf(stderr, "cannot connect to %s: %s\n",
-                     socket_path.c_str(), std::strerror(errno));
-        return 1;
-    }
-    std::string line = req.dump() + "\n";
-    if (!send_all(fd, line)) {
-        std::perror("write");
-        return 1;
-    }
-    std::string reply;
-    char buf[4096];
+    // Old supervisors ignore unknown blank fields; never silently downgrade
+    // an explicit recoverable Hybrid request to the default LSMT upper.
+    bool checking_hybrid = req.contains("blank") &&
+        req["blank"].value("upper_type", "lsmt") == "hybrid";
     for (;;) {
-        const ssize_t r = ::read(fd, buf, sizeof(buf));
-        if (r <= 0) break;
-        reply.append(buf, static_cast<size_t>(r));
-        if (reply.find('\n') != std::string::npos) break;
-    }
-    ::close(fd);
-    if (reply.empty()) {
-        std::fprintf(stderr, "no reply from supervisor\n");
-        return 1;
-    }
-    try {
-        const auto j = nlohmann::json::parse(reply);
-        std::puts(j.dump(2).c_str());
-        return j.value("ok", false) ? 0 : 1;
-    } catch (const nlohmann::json::exception&) {
-        std::fputs(reply.c_str(), stdout);
-        return 1;
+        const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            std::perror("socket");
+            return 1;
+        }
+        sockaddr_un sa {};
+        sa.sun_family = AF_UNIX;
+        if (socket_path.size() >= sizeof(sa.sun_path)) {
+            std::fprintf(stderr, "socket path too long\n");
+            return 2;
+        }
+        std::strcpy(sa.sun_path, socket_path.c_str());
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+            std::fprintf(stderr, "cannot connect to %s: %s\n",
+                         socket_path.c_str(), std::strerror(errno));
+            return 1;
+        }
+        std::string line = (checking_hybrid ? nlohmann::json{{"cmd", "hello"}} : req).dump() + "\n";
+        if (!send_all(fd, line)) {
+            std::perror("write");
+            return 1;
+        }
+        std::string reply;
+        char buf[4096];
+        for (;;) {
+            const ssize_t r = ::read(fd, buf, sizeof(buf));
+            if (r <= 0) break;
+            reply.append(buf, static_cast<size_t>(r));
+            if (reply.find('\n') != std::string::npos) break;
+        }
+        ::close(fd);
+        if (reply.empty()) {
+            std::fprintf(stderr, "no reply from supervisor\n");
+            return 1;
+        }
+        try {
+            const auto j = nlohmann::json::parse(reply);
+            if (checking_hybrid) {
+                const auto features = j.find("features");
+                if (!j.value("ok", false) || features == j.end() || !features->is_array() ||
+                    std::find(features->begin(), features->end(), nlohmann::json("hybrid_upper")) == features->end()) {
+                    std::fprintf(stderr, "supervisor does not advertise hybrid_upper; creation refused\n");
+                    return 1;
+                }
+                checking_hybrid = false;
+                continue;
+            }
+            std::puts(j.dump(2).c_str());
+            return j.value("ok", false) ? 0 : 1;
+        } catch (const nlohmann::json::exception&) {
+            std::fputs(reply.c_str(), stdout);
+            return 1;
+        }
     }
 }

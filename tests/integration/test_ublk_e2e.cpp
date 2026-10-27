@@ -3,6 +3,9 @@
 // The privileged CI job loads ublk_drv and runs exactly these ([ublk]).
 #include "common/errors.hpp"
 #include "ublk/device.hpp"
+#include "ublk/request_counts.hpp"
+#include "format/hybrid_rw.hpp"
+#include "format/merged_writable.hpp"
 
 #include "../support.hpp"
 #include "../ublk_prerequisites.hpp"
@@ -461,7 +464,9 @@ TEST_CASE("integration: ublk device grows online and serves the new capacity",
 
 namespace {
 
-void check_recovery(bool request_recovery, uint16_t nr_queues) {
+void check_recovery(bool request_recovery, uint16_t nr_queues, bool hybrid = false) {
+    test::TempDir temporary;
+    const auto pair_directory = temporary / "recovery.hybrid";
     // A child process creates and serves the device; the parent kills it
     // and attaches a replacement server (the real kernel handshake,
     // ADR-0010). The block device must survive and keep serving reads.
@@ -477,12 +482,16 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
         ::close(server.pipefd[0]);
         int rc = 1;
         try {
-            rc = elio::run([](int out, bool requested, uint16_t queue_count)
+            rc = elio::run([](int out, bool requested, uint16_t queue_count, bool use_hybrid, const char* directory)
                 -> elio::coro::task<int> {
                 auto data = test::pattern_bytes(512 * 64, 84);
-                source::BlobSourcePtr src =
-                    std::make_unique<test::VectorSource>(data);
+                source::BlobSourcePtr src;
+                if (use_hybrid) {
+                    auto top = co_await format::HybridRwLayer::create(directory, data.size());
+                    src = co_await format::MergedWritable::open({}, std::move(top));
+                } else src = std::make_unique<test::VectorSource>(data);
                 ublk::DeviceParams params;
+                params.read_only = !use_hybrid;
                 params.dev_sectors = data.size() / 512;
                 params.enable_recovery = requested;
                 params.nr_queues = queue_count;
@@ -511,7 +520,7 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
                         co_await elio::time::sleep_for(std::chrono::hours(1));
                     }
                 });
-            }, server.pipefd[1], request_recovery, nr_queues);
+            }, server.pipefd[1], request_recovery, nr_queues, hybrid, pair_directory.c_str());
         } catch (const std::exception& e) {
             std::fprintf(stderr, "recovery child failed: %s\n", e.what());
         } catch (...) {
@@ -549,13 +558,24 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
     server.dev_id = dev_id;
 
     // The device answers reads while the first server is alive.
-    const auto expected = test::pattern_bytes(512 * 64, 84);
-    server.client_fd = ::open(bdev.c_str(), O_RDONLY);
+    auto expected = test::pattern_bytes(512 * 64, 84);
+    server.client_fd = ::open(bdev.c_str(), hybrid ? O_RDWR : O_RDONLY);
     REQUIRE(server.client_fd >= 0);
+    if (hybrid) {
+        REQUIRE(::pwrite(server.client_fd, expected.data(), expected.size(), 0) ==
+                static_cast<ssize_t>(expected.size()));
+        REQUIRE(::fsync(server.client_fd) == 0);
+        uint64_t discard[2] = {4096, 4096}, zero[2] = {8192, 4096};
+        REQUIRE(::ioctl(server.client_fd, BLKDISCARD, discard) == 0);
+        REQUIRE(::ioctl(server.client_fd, BLKZEROOUT, zero) == 0);
+        REQUIRE(::fsync(server.client_fd) == 0);
+        std::fill(expected.begin() + 4096, expected.begin() + 12288, 0);
+    }
     std::vector<uint8_t> buf(4096);
     REQUIRE(::pread(server.client_fd, buf.data(), buf.size(), 2048) == 4096);
     REQUIRE(buf == std::vector<uint8_t>(expected.begin() + 2048,
                                         expected.begin() + 2048 + 4096));
+    if (hybrid) REQUIRE(::ioctl(server.client_fd, BLKFLSBUF) == 0);
     ::close(server.client_fd);
     server.client_fd = -1;
 
@@ -589,9 +609,18 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
     try {
         rc = test::run_coro([&]() -> elio::coro::task<int> {
             auto data = test::pattern_bytes(512 * 64, 84);
-            source::BlobSourcePtr src =
-                std::make_unique<test::VectorSource>(data);
+            source::BlobSourcePtr src;
+            if (hybrid) {
+                auto top = co_await format::HybridRwLayer::open_existing(
+                    pair_directory + "/data", pair_directory + "/index");
+                std::vector<uint8_t> recovered(expected.size());
+                const auto bytes = co_await top->pread(recovered.data(), recovered.size(), 0);
+                REQUIRE(bytes == static_cast<ssize_t>(recovered.size()));
+                REQUIRE(recovered == expected);
+                src = co_await format::MergedWritable::open({}, std::move(top));
+            } else src = std::make_unique<test::VectorSource>(data);
             ublk::DeviceParams params;
+            params.read_only = !hybrid;
             params.dev_sectors = data.size() / 512;
             params.nr_queues = nr_queues;
             auto dev = co_await ublk::Device::attach(
@@ -601,7 +630,7 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
             co_return co_await with_device_cleanup(dev, fd2, [&]()
                 -> elio::coro::task<int> {
                 fd2 = co_await bdev_io([&] {
-                    return ::open(dev->bdev_path().c_str(), O_RDONLY);
+                    return ::open(dev->bdev_path().c_str(), hybrid ? O_RDWR : O_RDONLY);
                 });
                 REQUIRE(fd2 >= 0);
                 std::vector<uint8_t> buf2(4096);
@@ -611,6 +640,16 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
                 REQUIRE(nread2 == 4096);
                 REQUIRE(buf2 == std::vector<uint8_t>(expected.begin() + 2048,
                                                      expected.begin() + 2048 + 4096));
+                if (hybrid) {
+                    const auto patch = test::pattern_bytes(4096, 1461);
+                    const auto written = co_await bdev_io([&] {
+                        return ::pwrite(fd2, patch.data(), patch.size(), 16384);
+                    });
+                    REQUIRE(written == 4096);
+                    const int flushed = co_await bdev_io([&] { return ::fsync(fd2); });
+                    REQUIRE(flushed == 0);
+                    std::copy(patch.begin(), patch.end(), expected.begin() + 16384);
+                }
                 co_return 0;
             });
         });
@@ -634,6 +673,20 @@ void check_recovery(bool request_recovery, uint16_t nr_queues) {
     release_observer.join();
     REQUIRE(rc == 0);
     REQUIRE(kernel_device_absent(dev_id));
+    if (hybrid) {
+        const int reopened = test::run_coro([&]() -> elio::coro::task<int> {
+            auto top = co_await format::HybridRwLayer::open_existing(
+                pair_directory + "/data", pair_directory + "/index");
+            std::vector<uint8_t> actual(expected.size());
+            const auto read = co_await top->pread(actual.data(), actual.size(), 0);
+            REQUIRE(read == static_cast<ssize_t>(actual.size()));
+            REQUIRE(actual == expected);
+            co_return 0;
+        });
+        REQUIRE(reopened == 0);
+        std::fprintf(stderr, "HYBRID_RECOVERY queues=%u flags=%llu passed\n", nr_queues,
+            static_cast<unsigned long long>(report[1]));
+    }
 }
 
 }  // namespace
@@ -652,4 +705,76 @@ TEST_CASE("integration: ublk device survives server death via USER_RECOVERY",
     SECTION("recover a device that negotiated USER_RECOVERY") {
         check_recovery(true, nr_queues);
     }
+}
+
+TEST_CASE("integration: hybrid ublk flush discard and write zeroes survive reopen",
+          "[ublk][hybrid]") {
+    if (const auto reason = test::ublk_prerequisite_skip_reason(); !reason.empty())
+        SKIP(reason);
+    const uint16_t queues = GENERATE(1, 2);
+    INFO("queues=" << queues);
+    test::TempDir temporary;
+    const auto directory = temporary / "hybrid";
+    struct ResetCounts {
+        ~ResetCounts() { ublk::count_requests_for_test(false); }
+    } reset;
+    ublk::count_requests_for_test(true);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::HybridRwLayer::create(directory, 65536);
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        ublk::DeviceParams params;
+        params.nr_queues = queues;
+        params.dev_sectors = 128;
+        params.read_only = false;
+        auto dev = co_await ublk::Device::create(params, std::move(merged));
+        int fd = -1;
+        const auto payload = test::pattern_bytes(16384, 146);
+        const int operations = co_await with_device_cleanup(dev, fd, [&]() -> elio::coro::task<int> {
+            fd = co_await bdev_io([&] { return ::open(dev->bdev_path().c_str(), O_RDWR); });
+            REQUIRE(fd >= 0);
+            const auto written = co_await bdev_io([&] {
+                return ::pwrite(fd, payload.data(), payload.size(), 0);
+            });
+            REQUIRE(written == static_cast<ssize_t>(payload.size()));
+            const int flushed = co_await bdev_io([&] { return ::fsync(fd); });
+            REQUIRE(flushed == 0);
+            uint64_t discard[2] = {4096, 4096}, zero[2] = {8192, 4096};
+            const int discarded = co_await bdev_io([&] { return ::ioctl(fd, BLKDISCARD, discard); });
+            REQUIRE(discarded == 0);
+            const int zeroed = co_await bdev_io([&] { return ::ioctl(fd, BLKZEROOUT, zero); });
+            REQUIRE(zeroed == 0);
+            const int final_flush = co_await bdev_io([&] { return ::fsync(fd); });
+            REQUIRE(final_flush == 0);
+            REQUIRE(ublk::request_count_for_test(UBLK_IO_OP_FLUSH) > 0);
+            REQUIRE(ublk::request_count_for_test(UBLK_IO_OP_DISCARD) > 0);
+            REQUIRE(ublk::request_count_for_test(UBLK_IO_OP_WRITE_ZEROES) > 0);
+            std::fprintf(stderr, "HYBRID_KERNEL queues=%u flush=%llu discard=%llu zeroes=%llu\n",
+                queues,
+                static_cast<unsigned long long>(ublk::request_count_for_test(UBLK_IO_OP_FLUSH)),
+                static_cast<unsigned long long>(ublk::request_count_for_test(UBLK_IO_OP_DISCARD)),
+                static_cast<unsigned long long>(ublk::request_count_for_test(UBLK_IO_OP_WRITE_ZEROES)));
+            co_return 0;
+        });
+        REQUIRE(operations == 0);
+        // Device teardown releases the old writer. Reopen the real pair; no
+        // kernel page cache or graceful upper checkpoint supplies this oracle.
+        auto reopened = co_await format::HybridRwLayer::open_existing(
+            directory + "/data", directory + "/index");
+        std::vector<uint8_t> expected = payload, actual(payload.size());
+        std::fill(expected.begin() + 4096, expected.begin() + 12288, 0);
+        const auto read = co_await reopened->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: hybrid ublk recovers persisted writes after server death",
+          "[ublk][hybrid]") {
+    if (const auto reason = test::ublk_prerequisite_skip_reason(); !reason.empty())
+        SKIP(reason);
+    const uint16_t queues = GENERATE(1, 2);
+    INFO("queues=" << queues);
+    check_recovery(true, queues, true);
 }

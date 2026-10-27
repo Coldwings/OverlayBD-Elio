@@ -4,6 +4,7 @@
 
 #include "common/errors.hpp"
 #include "format/lsmt_rw.hpp"
+#include "format/hybrid_rw.hpp"
 #include "format/sparse_rw.hpp"
 #include "image/config.hpp"
 #include "supervisor/child.hpp"
@@ -397,7 +398,8 @@ class Daemon {
         int dev_id = -1;
         int recoveries = 0;   // completed respawns
         bool destroying = false;  // intentional teardown: never respawn
-        std::string upper_path;   // <upper.dir>/overlaybd.rw when lsmt
+        std::string upper_path;   // Writable data artifact captured at create.
+        std::string upper_index_path; // Hybrid companion captured with data path.
         std::string upper_type;   // "" = no writable upper recorded
         // Guarded by mu_; first valid ready captures parent association.
         std::optional<std::string> upper_parent_uuid;
@@ -1225,11 +1227,18 @@ private:
             spec.dev_id_request = dev_id;
             spec.blank = true;
             spec.blank_size = blank->size;
+            spec.blank_upper_type = blank->upper_type;
             spec.blank_dir = cfg_.blank_dir + "/" + id;
             entry->spec = std::move(spec);
             entry->upper_known = true;  // no config; upper known by layout
-            entry->upper_type = "lsmt";
-            entry->upper_path = cfg_.blank_dir + "/" + id + "/overlaybd.rw";
+            entry->upper_type = blank->upper_type;
+            const auto workspace = cfg_.blank_dir + "/" + id;
+            if (blank->upper_type == "hybrid") {
+                entry->upper_path = workspace + "/overlaybd.hybrid/data";
+                entry->upper_index_path = workspace + "/overlaybd.hybrid/index";
+            } else {
+                entry->upper_path = workspace + "/overlaybd.rw";
+            }
             entry->blank = true;
             // Recorded NOW (before the entry is published and before mkfs
             // runs) so the unsealable-upper rule holds in every ordering.
@@ -1262,6 +1271,9 @@ private:
                         entry->upper_path = img.upper.dir + "/overlaybd.rw";
                     } else if (img.upper.type == "sparse") {
                         entry->upper_path = img.upper.dir + "/overlaybd.sparse";
+                    } else if (img.upper.type == "hybrid") {
+                        entry->upper_path = img.upper.dir + "/overlaybd.hybrid/data";
+                        entry->upper_index_path = img.upper.dir + "/overlaybd.hybrid/index";
                     }
                 }
             } catch (const std::exception& e) {
@@ -1991,7 +2003,8 @@ private:
         if (entry->upper_type.empty()) {
             co_return reply_error("device has no writable upper: " + id);
         }
-        if (entry->upper_type != "lsmt" && entry->upper_type != "sparse")
+        if (entry->upper_type != "lsmt" && entry->upper_type != "sparse" &&
+            entry->upper_type != "hybrid")
             co_return reply_error("unsupported writable upper type: " + entry->upper_type);
         if (!output.empty() && entry->upper_type != "sparse")
             co_return reply_error("commit output is supported only for sparse uppers");
@@ -2071,8 +2084,11 @@ private:
         std::string sha256;
         uint64_t size = 0;
         std::string seal_reject;
-        const int rc = co_await format::LsmtRwLayer::seal_file(
-            upper, user_tag, &sha256, &size, virtual_size, &seal_reject);
+        const int rc = entry->upper_type == "hybrid"
+            ? co_await format::HybridRwLayer::seal_file(
+                upper, entry->upper_index_path, user_tag, &sha256, &size, virtual_size, &seal_reject)
+            : co_await format::LsmtRwLayer::seal_file(
+                upper, user_tag, &sha256, &size, virtual_size, &seal_reject);
         if (rc == -ENOENT) {
             co_return reply_error("upper file not found: " + upper);
         }
@@ -2109,6 +2125,7 @@ private:
         std::shared_ptr<Child> child;
         int recoveries;
         nlohmann::json trace;
+        std::string upper_type, upper_path, upper_index_path;
     };
 
     elio::coro::task<nlohmann::json> status_fields(const EntrySnapshot& snapshot,
@@ -2131,6 +2148,11 @@ private:
         if (child.startup_owner)
             fields["startup_owner"] = startup_owner_json(*child.startup_owner);
         if (!snapshot.trace.is_null()) fields["trace"] = snapshot.trace;
+        if (!snapshot.upper_type.empty()) {
+            fields["upper"] = {{"type", snapshot.upper_type}, {"path", snapshot.upper_path}};
+            if (!snapshot.upper_index_path.empty())
+                fields["upper"]["index_path"] = snapshot.upper_index_path;
+        }
         co_return fields;
     }
 
@@ -2142,7 +2164,8 @@ private:
             snapshots.reserve(children_.size());
             for (const auto& [id, entry] : children_) {
                 snapshots.push_back(
-                    {id, entry->child, entry->recoveries, entry->trace});
+                    {id, entry->child, entry->recoveries, entry->trace,
+                     entry->upper_type, entry->upper_path, entry->upper_index_path});
             }
         }
         nlohmann::json arr = nlohmann::json::array();
@@ -2163,7 +2186,8 @@ private:
             if (it != children_.end()) {
                 const auto& entry = it->second;
                 snapshot.emplace(EntrySnapshot{
-                    id, entry->child, entry->recoveries, entry->trace});
+                    id, entry->child, entry->recoveries, entry->trace,
+                     entry->upper_type, entry->upper_path, entry->upper_index_path});
             }
         }
         if (!snapshot) co_return reply_error("no such device: " + id);

@@ -55,6 +55,7 @@ struct ChildSpec {
     /// opening an image config (obd-device --blank-size/--blank-dir).
     bool blank = false;
     uint64_t blank_size = 0;  // bytes; positive, sector aligned
+    std::string blank_upper_type = "lsmt";
     std::string blank_dir;    // per-device workspace (device creates files)
 #ifdef OBD_TEST_HOOKS
     // Borrowed only for the synchronous spawn call; never used by the child.

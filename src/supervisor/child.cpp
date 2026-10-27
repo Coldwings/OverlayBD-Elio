@@ -42,6 +42,8 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
         std::string vsize;
         std::string blank_size_flag = "--blank-size";
         std::string blank_size;
+        std::string blank_type_flag = "--blank-upper-type";
+        std::string blank_type;
         std::string blank_dir_flag = "--blank-dir";
         std::string blank_dir;
         std::vector<char*> argv;
@@ -68,6 +70,11 @@ std::unique_ptr<Child> Child::spawn(const ChildSpec& spec) {
         a.argv.push_back(a.blank_size.data());
         a.argv.push_back(a.blank_dir_flag.data());
         a.argv.push_back(a.blank_dir.data());
+        if (spec.blank_upper_type != "lsmt") {
+            a.blank_type = spec.blank_upper_type;
+            a.argv.push_back(a.blank_type_flag.data());
+            a.argv.push_back(a.blank_type.data());
+        }
     } else {
         a.argv.push_back(a.config_flag.data());
         a.argv.push_back(a.config.data());

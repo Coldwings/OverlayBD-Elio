@@ -1,0 +1,1126 @@
+{
+  "schema_version": 1,
+  "scope": "32 MiB; 256 random 4KiB samples per phase; one discard/rewrite cycle; one trial per cell",
+  "complete": true,
+  "builds": {
+    "baseline": {
+      "binary_sha256": "1e3b8a98bc402b55751c184d77da7669ffedcec0026050ad85d98976fab86dfb",
+      "head": "46770bee7af8f4bf3014209780f64709e98163e8",
+      "source_archive_sha256": "73dc2f0e473ec018e4d3afbe2b8b293c029c75fb52feecb26706fcc1affa650b",
+      "source_patch_sha256": null
+    },
+    "optimized": {
+      "binary_sha256": "63050008189574cc36a9799a8c7de32a32321bb5098790e8a50db27463908fe9",
+      "head": "46770bee7af8f4bf3014209780f64709e98163e8",
+      "source_archive_sha256": "73dc2f0e473ec018e4d3afbe2b8b293c029c75fb52feecb26706fcc1affa650b",
+      "source_patch_sha256": "248d9a2eaaedbf0e9622ea6034fc4edb9d0b194f77d555785632a6dab17a1055"
+    }
+  },
+  "limitations": [
+    "Shared host and warm cache; single trials are diagnostic, not a statistical ranking.",
+    "Request timings exclude separately reported FLUSH.",
+    "Sparse export includes digest work; LSMT and Hybrid live seal do not.",
+    "Baseline Hybrid uses per-transition data sync; optimized Hybrid targets process-crash recovery with explicit FLUSH durability.",
+    "QD counts concurrent awaiting requests, not physical storage concurrency.",
+    "Identical payloads across phases cannot independently detect a skipped rewrite; semantic correctness is covered by regression tests.",
+    "The local LsmtRwLayer reopen limitation is not an upstream LSMT format limitation; persistent writable reopen is tracked in issue 164."
+  ],
+  "trials": [
+    {
+      "label": "baseline-hybrid-qd1",
+      "original_report_sha256": "33d1c826ff8ec55e08c06a9d8fe8a64756408cbf617f7552f3bfb26dfeb9be19",
+      "result": {
+        "after_seal": {
+          "allocated_bytes": 33583104,
+          "files": {
+            "upper/data": {
+              "allocated_bytes": 33570816,
+              "bytes": 33570816
+            },
+            "upper/index": {
+              "allocated_bytes": 12288,
+              "bytes": 12192
+            }
+          },
+          "logical_bytes": 33583008
+        },
+        "before_reopen": {
+          "allocated_bytes": 33583104,
+          "files": {
+            "upper/data": {
+              "allocated_bytes": 33558528,
+              "bytes": 33558528
+            },
+            "upper/index": {
+              "allocated_bytes": 24576,
+              "bytes": 20880
+            }
+          },
+          "logical_bytes": 33579408
+        },
+        "cache": "warm OS cache, no global cache drop",
+        "cpu_system_seconds": 0.765917,
+        "cpu_user_seconds": 0.12904,
+        "max_rss_kib": 19128,
+        "path": "MergedWritable userspace IO; QD counts awaiting operations, not kernel queue depth",
+        "phases": {
+          "discard_rewrite_1": {
+            "flush_ms": 6.696901,
+            "footprint": {
+              "allocated_bytes": 1069056,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 16384,
+                  "bytes": 16384
+                }
+              },
+              "logical_bytes": 1069056
+            },
+            "latency_max_ms": 5.95336,
+            "latency_p50_ms": 2.319332,
+            "latency_p99_ms": 4.389545,
+            "live_mappings": 256,
+            "log_records": 768,
+            "operations": 256,
+            "operations_per_second": 409.48384482981436,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 625.177289
+          },
+          "first_write": {
+            "flush_ms": 6.004211,
+            "footprint": {
+              "allocated_bytes": 1060864,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 8192,
+                  "bytes": 8192
+                }
+              },
+              "logical_bytes": 1060864
+            },
+            "latency_max_ms": 10.099772,
+            "latency_p50_ms": 2.235592,
+            "latency_p99_ms": 8.961121,
+            "live_mappings": 256,
+            "log_records": 256,
+            "operations": 256,
+            "operations_per_second": 408.86544999552547,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 626.122848
+          },
+          "rewrite": {
+            "flush_ms": 10.018625,
+            "footprint": {
+              "allocated_bytes": 1060864,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 8192,
+                  "bytes": 8192
+                }
+              },
+              "logical_bytes": 1060864
+            },
+            "latency_max_ms": 0.119557,
+            "latency_p50_ms": 0.027941,
+            "latency_p99_ms": 0.09518,
+            "live_mappings": 256,
+            "log_records": 256,
+            "operations": 256,
+            "operations_per_second": 30574.334088614927,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 8.373036
+          }
+        },
+        "populate_ms_including_flush": 1019.057458,
+        "reopen_ms": 11.641556,
+        "seal_ms": 40.037086,
+        "seal_note": "Live seal, including format-required durability; no external digest pass.",
+        "seal_peak_allocated_bytes_sampled": 33599488,
+        "seal_peak_sample_period_ms": 10,
+        "sealed_verification": {
+          "passed": true,
+          "populated_bytes": 33554432,
+          "sampled_tail_bytes": 0,
+          "wall_ms": 12.488663
+        },
+        "settings": {
+          "cycles": 1,
+          "mode": "hybrid",
+          "populate_bytes": 33554432,
+          "qd": 1,
+          "samples": 256,
+          "seed": 146,
+          "size_bytes": 33554432,
+          "workers": 2
+        },
+        "status": "passed"
+      }
+    },
+    {
+      "label": "optimized-hybrid-qd1",
+      "original_report_sha256": "7bb379fe6bac4e455658dbe178ab9c4c3103693cee29f9d505dc8e3d9f2f6779",
+      "result": {
+        "after_seal": {
+          "allocated_bytes": 33583104,
+          "files": {
+            "upper/data": {
+              "allocated_bytes": 33570816,
+              "bytes": 33570816
+            },
+            "upper/index": {
+              "allocated_bytes": 12288,
+              "bytes": 12192
+            }
+          },
+          "logical_bytes": 33583008
+        },
+        "before_reopen": {
+          "allocated_bytes": 33583104,
+          "files": {
+            "upper/data": {
+              "allocated_bytes": 33558528,
+              "bytes": 33558528
+            },
+            "upper/index": {
+              "allocated_bytes": 24576,
+              "bytes": 20880
+            }
+          },
+          "logical_bytes": 33579408
+        },
+        "cache": "warm OS cache, no global cache drop",
+        "cpu_system_seconds": 0.170504,
+        "cpu_user_seconds": 0.074855,
+        "max_rss_kib": 19128,
+        "path": "MergedWritable userspace IO; QD counts awaiting operations, not kernel queue depth",
+        "phases": {
+          "discard_rewrite_1": {
+            "flush_ms": 10.742673,
+            "footprint": {
+              "allocated_bytes": 1069056,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 16384,
+                  "bytes": 16384
+                }
+              },
+              "logical_bytes": 1069056
+            },
+            "latency_max_ms": 0.850764,
+            "latency_p50_ms": 0.206955,
+            "latency_p99_ms": 0.394896,
+            "live_mappings": 256,
+            "log_records": 768,
+            "operations": 256,
+            "operations_per_second": 4446.079227638232,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 57.578821
+          },
+          "first_write": {
+            "flush_ms": 14.477406,
+            "footprint": {
+              "allocated_bytes": 1060864,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 8192,
+                  "bytes": 8192
+                }
+              },
+              "logical_bytes": 1060864
+            },
+            "latency_max_ms": 0.818731,
+            "latency_p50_ms": 0.112936,
+            "latency_p99_ms": 0.427618,
+            "live_mappings": 256,
+            "log_records": 256,
+            "operations": 256,
+            "operations_per_second": 7136.402322709396,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 35.872417
+          },
+          "rewrite": {
+            "flush_ms": 37.753936,
+            "footprint": {
+              "allocated_bytes": 1060864,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 8192,
+                  "bytes": 8192
+                }
+              },
+              "logical_bytes": 1060864
+            },
+            "latency_max_ms": 0.139967,
+            "latency_p50_ms": 0.030715,
+            "latency_p99_ms": 0.098159,
+            "live_mappings": 256,
+            "log_records": 256,
+            "operations": 256,
+            "operations_per_second": 29201.026826732403,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 8.766815
+          }
+        },
+        "populate_ms_including_flush": 213.792702,
+        "reopen_ms": 9.522026,
+        "seal_ms": 27.409441,
+        "seal_note": "Live seal, including format-required durability; no external digest pass.",
+        "seal_peak_allocated_bytes_sampled": 33599488,
+        "seal_peak_sample_period_ms": 10,
+        "sealed_verification": {
+          "passed": true,
+          "populated_bytes": 33554432,
+          "sampled_tail_bytes": 0,
+          "wall_ms": 13.800248
+        },
+        "settings": {
+          "cycles": 1,
+          "mode": "hybrid",
+          "populate_bytes": 33554432,
+          "qd": 1,
+          "samples": 256,
+          "seed": 146,
+          "size_bytes": 33554432,
+          "workers": 2
+        },
+        "status": "passed"
+      }
+    },
+    {
+      "label": "baseline-hybrid-qd16",
+      "original_report_sha256": "864d632148e6a85e635f20393f9386a9706fe190a6e477094516b4e832ba2473",
+      "result": {
+        "after_seal": {
+          "allocated_bytes": 33583104,
+          "files": {
+            "upper/data": {
+              "allocated_bytes": 33570816,
+              "bytes": 33570816
+            },
+            "upper/index": {
+              "allocated_bytes": 12288,
+              "bytes": 12192
+            }
+          },
+          "logical_bytes": 33583008
+        },
+        "before_reopen": {
+          "allocated_bytes": 33583104,
+          "files": {
+            "upper/data": {
+              "allocated_bytes": 33558528,
+              "bytes": 33558528
+            },
+            "upper/index": {
+              "allocated_bytes": 24576,
+              "bytes": 20880
+            }
+          },
+          "logical_bytes": 33579408
+        },
+        "cache": "warm OS cache, no global cache drop",
+        "cpu_system_seconds": 0.818,
+        "cpu_user_seconds": 0.128674,
+        "max_rss_kib": 19128,
+        "path": "MergedWritable userspace IO; QD counts awaiting operations, not kernel queue depth",
+        "phases": {
+          "discard_rewrite_1": {
+            "flush_ms": 4.807296,
+            "footprint": {
+              "allocated_bytes": 1069056,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 16384,
+                  "bytes": 16384
+                }
+              },
+              "logical_bytes": 1069056
+            },
+            "latency_max_ms": 56.640941,
+            "latency_p50_ms": 40.506725,
+            "latency_p99_ms": 55.871553,
+            "live_mappings": 256,
+            "log_records": 768,
+            "operations": 256,
+            "operations_per_second": 385.71601332167285,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 663.700731
+          },
+          "first_write": {
+            "flush_ms": 6.355083,
+            "footprint": {
+              "allocated_bytes": 1060864,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 8192,
+                  "bytes": 8192
+                }
+              },
+              "logical_bytes": 1060864
+            },
+            "latency_max_ms": 120.994207,
+            "latency_p50_ms": 38.594905,
+            "latency_p99_ms": 115.845561,
+            "live_mappings": 256,
+            "log_records": 256,
+            "operations": 256,
+            "operations_per_second": 368.4543581330563,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 694.794333
+          },
+          "rewrite": {
+            "flush_ms": 12.152528,
+            "footprint": {
+              "allocated_bytes": 1060864,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 8192,
+                  "bytes": 8192
+                }
+              },
+              "logical_bytes": 1060864
+            },
+            "latency_max_ms": 0.748193,
+            "latency_p50_ms": 0.545674,
+            "latency_p99_ms": 0.744814,
+            "live_mappings": 256,
+            "log_records": 256,
+            "operations": 256,
+            "operations_per_second": 27830.500510896236,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 9.198541
+          }
+        },
+        "populate_ms_including_flush": 1002.608539,
+        "reopen_ms": 9.595284,
+        "seal_ms": 29.016655,
+        "seal_note": "Live seal, including format-required durability; no external digest pass.",
+        "seal_peak_allocated_bytes_sampled": 33587200,
+        "seal_peak_sample_period_ms": 10,
+        "sealed_verification": {
+          "passed": true,
+          "populated_bytes": 33554432,
+          "sampled_tail_bytes": 0,
+          "wall_ms": 14.20249
+        },
+        "settings": {
+          "cycles": 1,
+          "mode": "hybrid",
+          "populate_bytes": 33554432,
+          "qd": 16,
+          "samples": 256,
+          "seed": 146,
+          "size_bytes": 33554432,
+          "workers": 2
+        },
+        "status": "passed"
+      }
+    },
+    {
+      "label": "optimized-hybrid-qd16",
+      "original_report_sha256": "6674f26c11fe4ae6a04731dbb94ea920ea94c3f322210090b380f160034ed7cf",
+      "result": {
+        "after_seal": {
+          "allocated_bytes": 33583104,
+          "files": {
+            "upper/data": {
+              "allocated_bytes": 33570816,
+              "bytes": 33570816
+            },
+            "upper/index": {
+              "allocated_bytes": 12288,
+              "bytes": 12192
+            }
+          },
+          "logical_bytes": 33583008
+        },
+        "before_reopen": {
+          "allocated_bytes": 33583104,
+          "files": {
+            "upper/data": {
+              "allocated_bytes": 33558528,
+              "bytes": 33558528
+            },
+            "upper/index": {
+              "allocated_bytes": 24576,
+              "bytes": 20880
+            }
+          },
+          "logical_bytes": 33579408
+        },
+        "cache": "warm OS cache, no global cache drop",
+        "cpu_system_seconds": 0.167929,
+        "cpu_user_seconds": 0.094204,
+        "max_rss_kib": 19128,
+        "path": "MergedWritable userspace IO; QD counts awaiting operations, not kernel queue depth",
+        "phases": {
+          "discard_rewrite_1": {
+            "flush_ms": 9.326164,
+            "footprint": {
+              "allocated_bytes": 1069056,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 16384,
+                  "bytes": 16384
+                }
+              },
+              "logical_bytes": 1069056
+            },
+            "latency_max_ms": 5.333898,
+            "latency_p50_ms": 3.57042,
+            "latency_p99_ms": 5.258824,
+            "live_mappings": 256,
+            "log_records": 768,
+            "operations": 256,
+            "operations_per_second": 4465.012181983431,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 57.33467
+          },
+          "first_write": {
+            "flush_ms": 31.145113,
+            "footprint": {
+              "allocated_bytes": 1060864,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 8192,
+                  "bytes": 8192
+                }
+              },
+              "logical_bytes": 1060864
+            },
+            "latency_max_ms": 2.978879,
+            "latency_p50_ms": 1.863717,
+            "latency_p99_ms": 2.936522,
+            "live_mappings": 256,
+            "log_records": 256,
+            "operations": 256,
+            "operations_per_second": 7953.037067583511,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 32.188961
+          },
+          "rewrite": {
+            "flush_ms": 37.95034,
+            "footprint": {
+              "allocated_bytes": 1060864,
+              "files": {
+                "upper/data": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                },
+                "upper/index": {
+                  "allocated_bytes": 8192,
+                  "bytes": 8192
+                }
+              },
+              "logical_bytes": 1060864
+            },
+            "latency_max_ms": 0.772906,
+            "latency_p50_ms": 0.474856,
+            "latency_p99_ms": 0.763575,
+            "live_mappings": 256,
+            "log_records": 256,
+            "operations": 256,
+            "operations_per_second": 29129.369789498203,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 8.788381
+          }
+        },
+        "populate_ms_including_flush": 212.601944,
+        "reopen_ms": 9.009735,
+        "seal_ms": 27.496815,
+        "seal_note": "Live seal, including format-required durability; no external digest pass.",
+        "seal_peak_allocated_bytes_sampled": 33595392,
+        "seal_peak_sample_period_ms": 10,
+        "sealed_verification": {
+          "passed": true,
+          "populated_bytes": 33554432,
+          "sampled_tail_bytes": 0,
+          "wall_ms": 11.608071
+        },
+        "settings": {
+          "cycles": 1,
+          "mode": "hybrid",
+          "populate_bytes": 33554432,
+          "qd": 16,
+          "samples": 256,
+          "seed": 146,
+          "size_bytes": 33554432,
+          "workers": 2
+        },
+        "status": "passed"
+      }
+    },
+    {
+      "label": "optimized-lsmt-qd1",
+      "original_report_sha256": "e754462286a997bdf1ac8a4496a1c254833ac22a21413712652bd8f8ddef1c23",
+      "result": {
+        "after_seal": {
+          "allocated_bytes": 33566720,
+          "files": {
+            "upper": {
+              "allocated_bytes": 33566720,
+              "bytes": 33566720
+            }
+          },
+          "logical_bytes": 33566720
+        },
+        "before_reopen": {
+          "allocated_bytes": 34607104,
+          "files": {
+            "upper": {
+              "allocated_bytes": 34607104,
+              "bytes": 34607104
+            }
+          },
+          "logical_bytes": 34607104
+        },
+        "cache": "warm OS cache, no global cache drop",
+        "cpu_system_seconds": 0.163508,
+        "cpu_user_seconds": 0.088042,
+        "max_rss_kib": 19128,
+        "path": "MergedWritable userspace IO; QD counts awaiting operations, not kernel queue depth",
+        "phases": {
+          "discard_rewrite_1": {
+            "flush_ms": 6.444334,
+            "footprint": {
+              "allocated_bytes": 2101248,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 2101248,
+                  "bytes": 2101248
+                }
+              },
+              "logical_bytes": 2101248
+            },
+            "latency_max_ms": 0.213568,
+            "latency_p50_ms": 0.040145,
+            "latency_p99_ms": 0.08794,
+            "live_mappings": 256,
+            "operations": 256,
+            "operations_per_second": 22589.724887152854,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 11.332586
+          },
+          "first_write": {
+            "flush_ms": 15.879167,
+            "footprint": {
+              "allocated_bytes": 1052672,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                }
+              },
+              "logical_bytes": 1052672
+            },
+            "latency_max_ms": 0.121416,
+            "latency_p50_ms": 0.031265,
+            "latency_p99_ms": 0.074709,
+            "live_mappings": 256,
+            "operations": 256,
+            "operations_per_second": 29016.494970625332,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 8.822568
+          },
+          "rewrite": {
+            "flush_ms": 6.925601,
+            "footprint": {
+              "allocated_bytes": 1052672,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                }
+              },
+              "logical_bytes": 1052672
+            },
+            "latency_max_ms": 0.098596,
+            "latency_p50_ms": 0.032218,
+            "latency_p99_ms": 0.071307,
+            "live_mappings": 256,
+            "operations": 256,
+            "operations_per_second": 28900.2984858953,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 8.85804
+          }
+        },
+        "populate_ms_including_flush": 168.541391,
+        "reopen_ms": null,
+        "reopen_note": "Uncheckpointed LSMT is not restart-recoverable; no equivalent writable reopen API.",
+        "seal_ms": 246.411723,
+        "seal_note": "Live seal, including format-required durability; no external digest pass.",
+        "seal_peak_allocated_bytes_sampled": 68173824,
+        "seal_peak_sample_period_ms": 10,
+        "sealed_verification": {
+          "passed": true,
+          "populated_bytes": 33554432,
+          "sampled_tail_bytes": 0,
+          "wall_ms": 16.931008
+        },
+        "settings": {
+          "cycles": 1,
+          "mode": "lsmt",
+          "populate_bytes": 33554432,
+          "qd": 1,
+          "samples": 256,
+          "seed": 146,
+          "size_bytes": 33554432,
+          "workers": 2
+        },
+        "status": "passed"
+      }
+    },
+    {
+      "label": "optimized-lsmt-qd16",
+      "original_report_sha256": "1d964672ed7c9cc57076cb2744c5b22b10f57841778f63819de3a9e4ea4bb4be",
+      "result": {
+        "after_seal": {
+          "allocated_bytes": 33566720,
+          "files": {
+            "upper": {
+              "allocated_bytes": 33566720,
+              "bytes": 33566720
+            }
+          },
+          "logical_bytes": 33566720
+        },
+        "before_reopen": {
+          "allocated_bytes": 34607104,
+          "files": {
+            "upper": {
+              "allocated_bytes": 34607104,
+              "bytes": 34607104
+            }
+          },
+          "logical_bytes": 34607104
+        },
+        "cache": "warm OS cache, no global cache drop",
+        "cpu_system_seconds": 0.169737,
+        "cpu_user_seconds": 0.07834,
+        "max_rss_kib": 19128,
+        "path": "MergedWritable userspace IO; QD counts awaiting operations, not kernel queue depth",
+        "phases": {
+          "discard_rewrite_1": {
+            "flush_ms": 6.587041,
+            "footprint": {
+              "allocated_bytes": 2101248,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 2101248,
+                  "bytes": 2101248
+                }
+              },
+              "logical_bytes": 2101248
+            },
+            "latency_max_ms": 0.881239,
+            "latency_p50_ms": 0.653889,
+            "latency_p99_ms": 0.875562,
+            "live_mappings": 256,
+            "operations": 256,
+            "operations_per_second": 23567.63335390898,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 10.862355
+          },
+          "first_write": {
+            "flush_ms": 7.246699,
+            "footprint": {
+              "allocated_bytes": 1052672,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                }
+              },
+              "logical_bytes": 1052672
+            },
+            "latency_max_ms": 0.745023,
+            "latency_p50_ms": 0.536701,
+            "latency_p99_ms": 0.719983,
+            "live_mappings": 256,
+            "operations": 256,
+            "operations_per_second": 29006.33913146636,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 8.825657
+          },
+          "rewrite": {
+            "flush_ms": 6.686363,
+            "footprint": {
+              "allocated_bytes": 1052672,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1052672,
+                  "bytes": 1052672
+                }
+              },
+              "logical_bytes": 1052672
+            },
+            "latency_max_ms": 0.894078,
+            "latency_p50_ms": 0.528921,
+            "latency_p99_ms": 0.89036,
+            "live_mappings": 256,
+            "operations": 256,
+            "operations_per_second": 28730.73988276736,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 8.910317
+          }
+        },
+        "populate_ms_including_flush": 169.001651,
+        "reopen_ms": null,
+        "reopen_note": "Uncheckpointed LSMT is not restart-recoverable; no equivalent writable reopen API.",
+        "seal_ms": 241.604102,
+        "seal_note": "Live seal, including format-required durability; no external digest pass.",
+        "seal_peak_allocated_bytes_sampled": 68173824,
+        "seal_peak_sample_period_ms": 10,
+        "sealed_verification": {
+          "passed": true,
+          "populated_bytes": 33554432,
+          "sampled_tail_bytes": 0,
+          "wall_ms": 13.133371
+        },
+        "settings": {
+          "cycles": 1,
+          "mode": "lsmt",
+          "populate_bytes": 33554432,
+          "qd": 16,
+          "samples": 256,
+          "seed": 146,
+          "size_bytes": 33554432,
+          "workers": 2
+        },
+        "status": "passed"
+      }
+    },
+    {
+      "label": "optimized-sparse-qd1",
+      "original_report_sha256": "d94b64e16f6d1f45bc1d693c962a82884a36c900e3c05c3d6a2aa428ebe77fa8",
+      "result": {
+        "after_seal": {
+          "allocated_bytes": 67162112,
+          "files": {
+            "upper": {
+              "allocated_bytes": 33554432,
+              "bytes": 33554432
+            },
+            "upper.coverage": {
+              "allocated_bytes": 40960,
+              "bytes": 37376
+            },
+            "upper.lsmt": {
+              "allocated_bytes": 33566720,
+              "bytes": 33566720
+            }
+          },
+          "logical_bytes": 67158528
+        },
+        "before_reopen": {
+          "allocated_bytes": 33595392,
+          "files": {
+            "upper": {
+              "allocated_bytes": 33554432,
+              "bytes": 33554432
+            },
+            "upper.coverage": {
+              "allocated_bytes": 40960,
+              "bytes": 37376
+            }
+          },
+          "logical_bytes": 33591808
+        },
+        "cache": "warm OS cache, no global cache drop",
+        "cpu_system_seconds": 1.826519,
+        "cpu_user_seconds": 0.168465,
+        "export_sha256": "b92f6a6f33c83c5b117ec222a92132bd30d2b732a1baec1a2267696e459ec9db",
+        "max_rss_kib": 19128,
+        "path": "MergedWritable userspace IO; QD counts awaiting operations, not kernel queue depth",
+        "phases": {
+          "discard_rewrite_1": {
+            "flush_ms": 1.905274,
+            "footprint": {
+              "allocated_bytes": 1089536,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1048576,
+                  "bytes": 33554432
+                },
+                "upper.coverage": {
+                  "allocated_bytes": 40960,
+                  "bytes": 37376
+                }
+              },
+              "logical_bytes": 33591808
+            },
+            "latency_max_ms": 48.991501,
+            "latency_p50_ms": 18.885335,
+            "latency_p99_ms": 34.637929,
+            "live_mappings": 249,
+            "operations": 256,
+            "operations_per_second": 50.80081240794143,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 5039.289489
+          },
+          "first_write": {
+            "flush_ms": 45.258353,
+            "footprint": {
+              "allocated_bytes": 1089536,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1048576,
+                  "bytes": 33554432
+                },
+                "upper.coverage": {
+                  "allocated_bytes": 40960,
+                  "bytes": 37376
+                }
+              },
+              "logical_bytes": 33591808
+            },
+            "latency_max_ms": 0.37843,
+            "latency_p50_ms": 0.109807,
+            "latency_p99_ms": 0.295321,
+            "live_mappings": 249,
+            "operations": 256,
+            "operations_per_second": 8396.182531302757,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 30.490047
+          },
+          "rewrite": {
+            "flush_ms": 21.570416,
+            "footprint": {
+              "allocated_bytes": 1089536,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1048576,
+                  "bytes": 33554432
+                },
+                "upper.coverage": {
+                  "allocated_bytes": 40960,
+                  "bytes": 37376
+                }
+              },
+              "logical_bytes": 33591808
+            },
+            "latency_max_ms": 0.17193,
+            "latency_p50_ms": 0.023552,
+            "latency_p99_ms": 0.056841,
+            "live_mappings": 249,
+            "operations": 256,
+            "operations_per_second": 37233.20626047275,
+            "peak_awaiting_operations": 1,
+            "wall_ms": 6.875583
+          }
+        },
+        "populate_ms_including_flush": 217.400359,
+        "reopen_ms": 0.355711,
+        "seal_ms": 225.782593,
+        "seal_note": "Offline export to a separate LSMT delta, including owner release, reopen and API digest; source retained.",
+        "seal_peak_allocated_bytes_sampled": 67162112,
+        "seal_peak_sample_period_ms": 10,
+        "sealed_verification": {
+          "passed": true,
+          "populated_bytes": 33554432,
+          "sampled_tail_bytes": 0,
+          "wall_ms": 7.879043
+        },
+        "settings": {
+          "cycles": 1,
+          "mode": "sparse",
+          "populate_bytes": 33554432,
+          "qd": 1,
+          "samples": 256,
+          "seed": 146,
+          "size_bytes": 33554432,
+          "workers": 2
+        },
+        "status": "passed"
+      }
+    },
+    {
+      "label": "optimized-sparse-qd16",
+      "original_report_sha256": "fdbdc7d22ab3ab91889effe8ccd8013d22f768c6a9526af7466aa544e4cc5f04",
+      "result": {
+        "after_seal": {
+          "allocated_bytes": 67162112,
+          "files": {
+            "upper": {
+              "allocated_bytes": 33554432,
+              "bytes": 33554432
+            },
+            "upper.coverage": {
+              "allocated_bytes": 40960,
+              "bytes": 37376
+            },
+            "upper.lsmt": {
+              "allocated_bytes": 33566720,
+              "bytes": 33566720
+            }
+          },
+          "logical_bytes": 67158528
+        },
+        "before_reopen": {
+          "allocated_bytes": 33595392,
+          "files": {
+            "upper": {
+              "allocated_bytes": 33554432,
+              "bytes": 33554432
+            },
+            "upper.coverage": {
+              "allocated_bytes": 40960,
+              "bytes": 37376
+            }
+          },
+          "logical_bytes": 33591808
+        },
+        "cache": "warm OS cache, no global cache drop",
+        "cpu_system_seconds": 1.24521,
+        "cpu_user_seconds": 0.179077,
+        "export_sha256": "b92f6a6f33c83c5b117ec222a92132bd30d2b732a1baec1a2267696e459ec9db",
+        "max_rss_kib": 19128,
+        "path": "MergedWritable userspace IO; QD counts awaiting operations, not kernel queue depth",
+        "phases": {
+          "discard_rewrite_1": {
+            "flush_ms": 2.275016,
+            "footprint": {
+              "allocated_bytes": 1089536,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1048576,
+                  "bytes": 33554432
+                },
+                "upper.coverage": {
+                  "allocated_bytes": 40960,
+                  "bytes": 37376
+                }
+              },
+              "logical_bytes": 33591808
+            },
+            "latency_max_ms": 242.060247,
+            "latency_p50_ms": 191.31243,
+            "latency_p99_ms": 240.348435,
+            "live_mappings": 249,
+            "operations": 256,
+            "operations_per_second": 81.18169812512805,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 3153.420117
+          },
+          "first_write": {
+            "flush_ms": 33.977441,
+            "footprint": {
+              "allocated_bytes": 1089536,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1048576,
+                  "bytes": 33554432
+                },
+                "upper.coverage": {
+                  "allocated_bytes": 40960,
+                  "bytes": 37376
+                }
+              },
+              "logical_bytes": 33591808
+            },
+            "latency_max_ms": 2.049271,
+            "latency_p50_ms": 1.629792,
+            "latency_p99_ms": 2.033654,
+            "live_mappings": 249,
+            "operations": 256,
+            "operations_per_second": 9539.630475705972,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 26.835421
+          },
+          "rewrite": {
+            "flush_ms": 39.219644,
+            "footprint": {
+              "allocated_bytes": 1089536,
+              "files": {
+                "upper": {
+                  "allocated_bytes": 1048576,
+                  "bytes": 33554432
+                },
+                "upper.coverage": {
+                  "allocated_bytes": 40960,
+                  "bytes": 37376
+                }
+              },
+              "logical_bytes": 33591808
+            },
+            "latency_max_ms": 0.579893,
+            "latency_p50_ms": 0.419445,
+            "latency_p99_ms": 0.503691,
+            "live_mappings": 249,
+            "operations": 256,
+            "operations_per_second": 36265.61103517212,
+            "peak_awaiting_operations": 16,
+            "wall_ms": 7.059029
+          }
+        },
+        "populate_ms_including_flush": 196.144031,
+        "reopen_ms": 0.669513,
+        "seal_ms": 248.848624,
+        "seal_note": "Offline export to a separate LSMT delta, including owner release, reopen and API digest; source retained.",
+        "seal_peak_allocated_bytes_sampled": 67162112,
+        "seal_peak_sample_period_ms": 10,
+        "sealed_verification": {
+          "passed": true,
+          "populated_bytes": 33554432,
+          "sampled_tail_bytes": 0,
+          "wall_ms": 7.138307
+        },
+        "settings": {
+          "cycles": 1,
+          "mode": "sparse",
+          "populate_bytes": 33554432,
+          "qd": 16,
+          "samples": 256,
+          "seed": 146,
+          "size_bytes": 33554432,
+          "workers": 2
+        },
+        "status": "passed"
+      }
+    }
+  ]
+}
