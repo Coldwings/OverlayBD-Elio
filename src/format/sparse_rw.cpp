@@ -1826,8 +1826,18 @@ ZeroMaskPersistJob* make_zero_mask_persist_job(
 
 ZeroMaskPersistResult SparseRwLayer::persist_zero_masks(
     const std::vector<bytes::segment_mapping>& zeroes,
-    uint64_t vsize) const {
-    return persist_zero_masks_to_path(zero_mask_path_, zeroes, vsize);
+    uint64_t vsize) {
+    // A same-generation replacement can rename successfully and then fail
+    // directory synchronization. Its previous success must not suppress retry.
+    {
+        std::lock_guard lock(meta_mu_);
+        published_zero_masks_generation_.reset();
+    }
+    return persist_zero_masks_to_path(zero_mask_path_, zeroes, vsize
+#ifdef OBD_TEST_HOOKS
+        , std::exchange(fail_zero_mask_dirsync_after_commit_for_test_, false)
+#endif
+    );
 }
 
 int SparseRwLayer::sync_data_file() const {
@@ -2353,6 +2363,10 @@ elio::coro::task<int> SparseRwLayer::discard(uint64_t offset, uint64_t len) {
             co_return -ENOMEM;
         }
         if (prc.rc != 0) co_return prc.rc;
+        {
+            std::lock_guard lock(meta_mu_);
+            published_zero_masks_generation_ = zero_masks_generation_;
+        }
 
         // Real deallocation: the blocks return to the filesystem and the range
         // reads back as zeroes from this layer. The sidecar already carries the
@@ -2389,6 +2403,7 @@ elio::coro::task<int> SparseRwLayer::flush_locked() {
     bool dirty = false;
     bool data_first = false;
     bool pending_view = false;
+    bool already_published = false;
     try {
         std::lock_guard lock(meta_mu_);
         dirty = zero_masks_dirty_;
@@ -2398,6 +2413,8 @@ elio::coro::task<int> SparseRwLayer::flush_locked() {
             zeroes = pending_view ? pending_zero_masks_
                                   : zero_mask_segments_locked();
             generation = zero_masks_generation_;
+            already_published = !pending_view &&
+                published_zero_masks_generation_ == generation;
             flush_vsize = vsize_.load(std::memory_order_acquire);
         }
     } catch (const std::bad_alloc&) {
@@ -2408,16 +2425,18 @@ elio::coro::task<int> SparseRwLayer::flush_locked() {
             const auto status = co_await elio::io::sync_file(fd_, elio::io::file_sync_mode::data_only);
             if (!status) co_return -status.error_value();
         }
-        int prepare_error = 0;
-        ZeroMaskPersistJob* job = make_zero_mask_persist_job(
-            zero_mask_path_, std::move(zeroes), flush_vsize, false,
-            &prepare_error);
-        if (job == nullptr) co_return prepare_error;
-        ZeroMaskPersistResult persisted;
-        try {
-            persisted = co_await run_owned_blocking(job);
-        } catch (const std::bad_alloc&) {
-            co_return -ENOMEM;
+        ZeroMaskPersistResult persisted{0, true};
+        if (!already_published) {
+            int prepare_error = 0;
+            ZeroMaskPersistJob* job = make_zero_mask_persist_job(
+                zero_mask_path_, std::move(zeroes), flush_vsize, false,
+                &prepare_error);
+            if (job == nullptr) co_return prepare_error;
+            try {
+                persisted = co_await run_owned_blocking(job);
+            } catch (const std::bad_alloc&) {
+                co_return -ENOMEM;
+            }
         }
         if (persisted.namespace_committed && pending_view) {
             std::lock_guard lock(meta_mu_);

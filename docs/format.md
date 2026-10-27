@@ -954,6 +954,12 @@ On reopen, exact coverage is authoritative and `.zeroes` overlays only ZERO.
 Thus a 512-byte write inside a filesystem-reported 4 KiB extent does not hide
 the seven adjacent lower sectors, while a sub-block discard remains a
 top-layer zero mask independently of physical hole-punch granularity.
+A successful discard remembers which zero-mask generation it already published.
+The next FLUSH can reuse that unchanged publication while still synchronizing
+payload and exact coverage in the existing order. Failed publication, a newer
+mask generation, grow, and reopen do not acquire this in-memory shortcut.
+The persisted format and recovery precedence remain unchanged.
+
 Opening this format with a pre-v2 binary is unsafe because that binary ignores
 `.coverage` and reconstructs ownership from allocation extents. There is no
 in-place downgrade contract.
