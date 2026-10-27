@@ -36,8 +36,8 @@ Provide opt-in `upper.type = "hybrid"` using a paired upstream-compatible data
 file and mapping log, validate exclusive physical ownership before reuse, and
 seal by appending the compact live index and trailer to the existing payload.
 
-This proposed record describes the intended implementation contract. It is not
-an assertion that the implementation or acceptance gates are complete.
+This record defines the implementation contract. Validation results and their
+scope are recorded separately from this architectural decision.
 
 ### Import, ownership and export
 
@@ -203,9 +203,10 @@ large-run evidence as historical measurements, not current implementation
 results. Small performance samples establish neither a statistical ranking nor
 large-image scaling and do not replace the deterministic fault matrix.
 
-Before acceptance, finish all integrations and fault/performance validation, update current module
-contracts, and pass deterministic fault/concurrency tests, bidirectional fixture
-checks, repository gates and independent final-head reviews.
+Acceptance requires integration and fault/performance validation, current module
+contracts, deterministic fault/concurrency tests, bidirectional fixture checks,
+repository gates and independent final-head reviews. These gates do not imply
+exhaustive concurrency or host-power-loss guarantees.
 
 ## Blank device integration
 
