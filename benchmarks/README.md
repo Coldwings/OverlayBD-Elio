@@ -204,7 +204,8 @@ that field is null, with an explanation. Sparse uses the separate export API
 and the API's digest. Its source remains reusable and contributes to retained
 and peak space. LSMT/Hybrid instead time their live seal APIs without an external
 digest pass. `seal_note` records that distinction; these are not identical APIs
-or equal durability contracts. Every mode receives full sealed-byte verification.
+or equal durability contracts. Every mode verifies the full populated prefix
+and sampled tail of its sealed output.
 
 The report includes per-file logical/allocated sizes after each random phase,
 reopen time, live-seal time, and peak allocated space sampled every 10 ms during
