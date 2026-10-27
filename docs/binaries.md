@@ -610,7 +610,7 @@ Import applies the same tar-prefix check to every original target, including
 parent targets: a USTAR/GNU prefix or two complete zero terminator blocks for an
 empty archive. This check does not replace full tar parsing during conversion.
 
-### Native LSMT payload layout (proposed ADR-0028)
+### Native LSMT payload layout (ADR-0028)
 
 `obd-convert --lsmt-layout logical|metadata-tail` selects native final packing.
 The current default is `logical`. `metadata-tail` analyzes the closed, finalized
@@ -632,5 +632,7 @@ complete logical images, deterministic repeated output, filesystem contents and
 physical placement of superblock, inode table, directory and indirect blocks.
 `cli: obd-convert rejects invalid and nonnative layout selections` checks
 unknown/missing values and TurboOCI/import combinations fail before creating
-output directories. Actual independent-reader/filesystem and four-way performance validation remain
-required before accepting the proposed optimization/default policy.
+output directories. The [metadata layout measurement report](../benchmarks/metadata-layout.md)
+records independent-reader/filesystem validation, conversion costs and controlled
+four-way startup comparisons, with explicit workload and measurement limits.
+Tail placement is opt-in; physical clustering alone is not a startup guarantee.

@@ -1431,6 +1431,10 @@ closed cdevs and Ctrl destruction. Test seams are absent with
   ZSTD ZFiles with 64 KiB blocks and verifies complete decompressed logical
   readback with checksum verification. Enabled libe2fs builds check structural block placement,
   including an external symlink block; dependency-free builds check fallback.
+- `cli: obd-convert metadata tail preserves an empty filesystem` — converts
+  a root-directory-only tar with both layouts, checks complete logical-byte equality and the
+  empty root directory, and exercises either metadata placement or the
+  dependency-free fallback when no ordinary file payload exists.
 - `convert: finalized ext2 classification preserves hardlinks and external xattrs`
   — modifies a converter-produced ordinary filesystem file through libe2fs,
   closes it, and checks classification, packed logical bytes, inode sharing,

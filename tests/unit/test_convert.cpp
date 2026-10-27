@@ -1516,6 +1516,38 @@ TEST_CASE("cli: obd-convert metadata tail preserves the complete filesystem",
 #endif
 }
 
+TEST_CASE("cli: obd-convert metadata tail preserves an empty filesystem", "[cli]") {
+    TempDir dir;
+    // The converter deliberately rejects a stream without any tar entry.
+    // A root-directory-only archive produces a valid empty filesystem.
+    std::vector<uint8_t> tar;
+    append_tar_entry(tar, "./", '5', 0755, 0, 0);
+    tar.resize(tar.size() + 1024, 0);
+    const auto input = test::write_file(dir / "empty.tar", tar);
+    const auto logical = run_convert({"--input", input, "--out-dir", dir / "logical",
+        "--name", "empty", "--size", "8388608", "--lsmt-layout", "logical"}, nullptr, false);
+    const auto tail = run_convert({"--input", input, "--out-dir", dir / "tail",
+        "--name", "empty", "--size", "8388608", "--lsmt-layout", "metadata-tail"}, nullptr, false);
+    INFO(logical.err);
+    INFO(tail.err);
+    REQUIRE(logical.exit_code == 0);
+    REQUIRE(tail.exit_code == 0);
+    const auto logical_path = nlohmann::json::parse(logical.out)["lowers"][0]["file"].get<std::string>();
+    const auto tail_path = nlohmann::json::parse(tail.out)["lowers"][0]["file"].get<std::string>();
+    const auto raw = read_layer_raw(logical_path);
+    REQUIRE(read_layer_raw(tail_path) == raw);
+    Ext2View filesystem(raw);
+    const auto entries = filesystem.list_dir(2);
+    REQUIRE(entries.size() == 2);
+    REQUIRE(entries.at(".") == 2);
+    REQUIRE(entries.at("..") == 2);
+#if OBD_TEST_HAVE_LIBE2FS
+    REQUIRE(tail.err.find("LSMT metadata-tail:") != std::string::npos);
+#else
+    REQUIRE(tail.err.find("logical layout fallback") != std::string::npos);
+#endif
+}
+
 TEST_CASE("convert: finalized ext2 classification preserves hardlinks and external xattrs", "[convert]") {
 #if OBD_TEST_HAVE_LIBE2FS
     TempDir dir;

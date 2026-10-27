@@ -1,6 +1,6 @@
 # ADR-0028: Cluster finalized filesystem metadata in ordinary LSMT payloads
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-26
 - Supersedes: none
 - Binds: src/format/writer.hpp, src/format/writer.cpp, tools/ext2_layout.hpp,
@@ -14,9 +14,10 @@ ordinary index. Logical-order payload packing scatters this metadata across
 remote ranges. Physical proximity alone does not prove a startup improvement;
 the existing structural warm-up and compression/cache boundaries must be measured.
 
-This record and branch are work in progress. The transient packing interface
-is a prerequisite, not completion of the classifier, converter integration or
-performance acceptance.
+The transient packing interface, finalized-filesystem classifier and converter
+selection are implemented. The [measurement report](../../benchmarks/metadata-layout.md)
+separates complete-view compatibility, controlled measurements and application
+workload coverage; geometry alone does not satisfy performance acceptance.
 
 ## Decision
 
@@ -33,8 +34,8 @@ limits. Bound the resulting index before creating or truncating the destination.
 Equivalent normalized range sets and identical content/header inputs produce
 identical bytes, independent of the range fragmentation supplied by the caller.
 
-The eventual classifier must inspect the finalized filesystem after all writes
-and final flush/close updates, account for actual live block ownership, and keep
+The classifier inspects the finalized filesystem after all writes
+and final flush/close updates, accounts for actual live block ownership, and keeps
 structural and uncertain blocks conservative. Current-tar payload tracking alone
 cannot classify a final native filesystem. Differential workflows retain lower
 inheritance and must not copy lower-only bytes merely to arrange a tail.
@@ -50,11 +51,10 @@ Classification currently supports FILETYPE, LARGE_FILE, SPARSE_SUPER and EXT_ATT
 with at most 2^26 filesystem blocks and 2^20 inodes. Unsupported geometry/features,
 inconsistent references and excessive resulting index fragmentation fall back
 to logical packing with a diagnostic. Native conversion exposes
-`--lsmt-layout logical|metadata-tail`; logical remains the default while the
-performance evaluation is pending. Explicit layout selection is rejected for
+`--lsmt-layout logical|metadata-tail`; logical remains the default. Controlled
+and application measurements show workload-dependent gains and warm-up costs,
+so tail placement stays opt-in. Explicit layout selection is rejected for
 TurboOCI conversion/import, whose differential coverage remains unchanged.
-The final default policy and measured trade-offs must be completed before
-accepting this record.
 
 ## Consequences
 

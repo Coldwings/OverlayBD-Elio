@@ -1043,7 +1043,7 @@ one segment per ≤ 16383-sector chunk, data region starting at sector 8.
 Throws `obd::error` / `obd::format_error` on IO or serialization failure.
 Layout: `header 4096 | data | index | trailer 4096`.
 Optional `tail_ranges` supply sorted, disjoint logical sector ranges for stable
-physical tail packing (proposed ADR-0028). Ordinary payload comes first, then
+physical tail packing (ADR-0028). Ordinary payload comes first, then
 selected payload, both in logical order; the index remains logically sorted.
 No classification is serialized and full logical coverage is preserved.
 Adjacent ranges normalize before splitting at the ordinary segment-length bound.
