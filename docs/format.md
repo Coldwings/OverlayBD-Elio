@@ -405,7 +405,9 @@ fit the declared virtual size. Ordinary LSMT keeps its existing ZERO bounds.
 `hybrid::FilePair::open_existing` opens both existing artifacts without creation
 or truncation. Setup filesystem calls run on the blocking pool; header and log
 contents use native asynchronous reads. Both regular-file descriptors retain
-shared reader or exclusive writer locks. Pair validation precedes bounded
+shared reader or exclusive writer locks. Callers must drain operations before
+destroying the pair; destruction releases both locks immediately even when
+descriptor close is deferred by the runtime. Pair validation precedes bounded
 64 KiB log reads; a sealed artifact is refused with `EALREADY`.
 
 `hybrid::FilePair::create` publishes a new directory containing `data` and

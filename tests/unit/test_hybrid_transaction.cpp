@@ -350,17 +350,18 @@ TEST_CASE("format: hybrid sealed EOF ZERO marker never becomes writable metadata
 TEST_CASE("format: hybrid terminal seal state rejects corruption", "[format][hybrid]") {
     test::TempDir temporary;
     const auto directory = temporary / "pair";
-    REQUIRE(test::run_coro([&]() -> elio::coro::task<int> {
+    const int seal_rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto pair = co_await format::hybrid::FilePair::create(directory, 32768);
         format::hybrid::Writer writer(std::move(pair));
         co_return co_await writer.seal("terminal marker");
-    }) == 0);
+    });
+    REQUIRE(seal_rc == 0);
     const auto data = directory + "/data";
     std::array<uint8_t, 24> marker{};
     REQUIRE(::getxattr(data.c_str(), "user.overlaybd.hybrid.sealed", marker.data(), marker.size()) == 24);
     marker[20] ^= 1; // Marker checksum, not guest payload.
     REQUIRE(::setxattr(data.c_str(), "user.overlaybd.hybrid.sealed", marker.data(), marker.size(), 0) == 0);
-    REQUIRE(test::run_coro([&]() -> elio::coro::task<int> {
+    const int open_rc = test::run_coro([&]() -> elio::coro::task<int> {
         bool rejected = false;
         try {
             auto pair = co_await format::hybrid::FilePair::open_existing(data, directory + "/index", true);
@@ -368,5 +369,6 @@ TEST_CASE("format: hybrid terminal seal state rejects corruption", "[format][hyb
         } catch (const format_error&) { rejected = true; }
         REQUIRE(rejected);
         co_return 0;
-    }) == 0);
+    });
+    REQUIRE(open_rc == 0);
 }

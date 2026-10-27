@@ -114,6 +114,13 @@ std::atomic<int> FilePair::replace_fail_stage_{-1};
 #endif
 
 FilePair::~FilePair() {
+    // Callers drain operations before destruction. End pair ownership now:
+    // Elio's asynchronous close may otherwise keep the locks past destruction.
+    for (const int fd : {index_fd_, data_fd_}) {
+        if (fd >= 0) {
+            while (::flock(fd, LOCK_UN) != 0 && errno == EINTR) {}
+        }
+    }
     if (index_directory_fd_ >= 0) elio::io::close_fd_for_destructor(index_directory_fd_);
     if (index_fd_ >= 0) elio::io::close_fd_for_destructor(index_fd_);
     if (data_fd_ >= 0) elio::io::close_fd_for_destructor(data_fd_);

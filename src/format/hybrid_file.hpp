@@ -17,7 +17,9 @@ public:
     FilePair& operator=(const FilePair&) = delete;
 
     /// Never creates or truncates either artifact. The data descriptor holds
-    /// a shared read lock or exclusive writer lock until destruction. Metadata
+    /// a shared read lock or exclusive writer lock until destruction. Callers
+    /// must drain operations before destruction, which releases both artifact
+    /// locks before deferring descriptor close. Metadata
     /// filesystem calls run on the blocking pool; contents use native async IO.
     static elio::coro::task<std::unique_ptr<FilePair>> open_existing(
         std::string data_path, std::string index_path, bool writable = false);
