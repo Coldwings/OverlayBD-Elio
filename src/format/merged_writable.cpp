@@ -14,17 +14,7 @@ namespace obd::format {
 namespace {
 constexpr uint64_t kSector = lsmt::kAlignment;
 
-struct SyncMutexGuard {
-    elio::sync::mutex* mu = nullptr;
-
-    explicit SyncMutexGuard(elio::sync::mutex& m) : mu(&m) {}
-    ~SyncMutexGuard() {
-        if (mu != nullptr) mu->unlock();
-    }
-
-    SyncMutexGuard(const SyncMutexGuard&) = delete;
-    SyncMutexGuard& operator=(const SyncMutexGuard&) = delete;
-};
+using SyncMutexGuard = elio::sync::unique_lock_guard;
 
 struct AdoptActiveOp {};
 
@@ -159,12 +149,12 @@ elio::coro::task<ssize_t> MergedWritable::pread(void* buf, size_t count,
         co_return -EINVAL;
     }
     std::optional<ActiveOpGuard> active;
-    std::optional<SyncMutexGuard> operation;
+    std::optional<elio::sync::shared_lock_guard> operation;
     if (top_->serialize_merged_reads()) {
         const int gate = begin_flush_op();
         if (gate != 0) co_return gate;
         active.emplace(active_ops_, AdoptActiveOp{});
-        co_await op_mu_.lock();
+        co_await op_mu_.lock_shared();
         operation.emplace(op_mu_);
     }
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);

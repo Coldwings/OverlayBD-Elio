@@ -100,6 +100,7 @@ public:
     /// In-place ownership transitions may invalidate a physical mapping held
     /// by a concurrent merged reader. Such tops require the merger to serialize
     /// the entire snapshot-plus-payload read with mutations and grow admission.
+    /// Readers may overlap each other while excluding those mutations.
     virtual bool serialize_merged_reads() const noexcept { return false; }
 };
 

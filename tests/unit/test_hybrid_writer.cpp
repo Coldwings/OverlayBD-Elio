@@ -10,6 +10,9 @@
 #include <iterator>
 #include <algorithm>
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/runtime/spawn.hpp>
+#include <elio/sync/event.hpp>
+#include <array>
 
 using namespace obd;
 namespace {
@@ -320,3 +323,114 @@ TEST_CASE("format: hybrid checkpoint retries each failed sync boundary",
         }
     }
 }
+
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("format: hybrid shared reads overlap and exclude queued mutations",
+          "[format][hybrid][shared-read]") {
+    for (const std::string mode : {"write", "discard", "flush", "checkpoint", "compact", "seal"}) {
+    DYNAMIC_SECTION(mode) {
+        test::TempDir temporary;
+        const int rc = elio::run([&]() -> elio::coro::task<int> {
+            auto pair = co_await format::hybrid::FilePair::create(temporary / "pair", 32768);
+            format::hybrid::Writer writer(std::move(pair));
+            std::vector<uint8_t> old(512, 0x31), replacement(512, 0x72);
+            const auto wrote = co_await writer.pwrite(old.data(), old.size(), 0);
+            REQUIRE(wrote == 512);
+            const auto physical = writer.snapshot().front().moffset * 512;
+            elio::sync::event release, attempted;
+            unsigned entries = 0;
+            bool mutation_done = false, late_saw_mutation = false;
+            writer.read_hook_for_test = [&]() -> elio::coro::task<void> {
+                ++entries;
+                if (entries > 2) late_saw_mutation = mutation_done;
+                co_await release.wait();
+            };
+            std::array<std::array<uint8_t, 512>, 3> data{};
+            std::vector<elio::coro::join_handle<ssize_t>> tasks;
+            tasks.reserve(4);
+            std::vector<ssize_t> results;
+            std::exception_ptr failure;
+            unsigned before_release = 0;
+            int grow_result = 0;
+            bool overlapped = false, mutation_blocked = false;
+            try {
+                tasks.push_back(elio::spawn([&]() -> elio::coro::task<ssize_t> {
+                    co_return co_await writer.pread(data[0].data(), 512, 0);
+                }));
+                tasks.push_back(elio::spawn([&]() -> elio::coro::task<ssize_t> {
+                    co_return co_await writer.pread_physical(data[1].data(), 512, physical);
+                }));
+                for (unsigned i = 0; i < 100 && entries < 2; ++i)
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                overlapped = entries == 2;
+                grow_result = co_await elio::spawn_blocking([&] { return writer.grow(65536); });
+                tasks.push_back(elio::spawn([&]() -> elio::coro::task<ssize_t> {
+                    attempted.set();
+                    ssize_t result = 0;
+                    if (mode == "write") result = co_await writer.pwrite(replacement.data(), 512, 0);
+                    else if (mode == "discard") result = co_await writer.discard(0, 512);
+                    else if (mode == "flush") result = co_await writer.flush();
+                    else if (mode == "checkpoint") result = co_await writer.checkpoint();
+                    else if (mode == "compact") result = co_await writer.compact();
+                    else result = co_await writer.seal();
+                    mutation_done = true;
+                    co_return result;
+                }));
+                co_await attempted.wait();
+                tasks.push_back(elio::spawn([&]() -> elio::coro::task<ssize_t> {
+                    co_return co_await writer.pread(data[2].data(), 512, 0);
+                }));
+                co_await elio::time::sleep_for(std::chrono::milliseconds(2));
+                mutation_blocked = !mutation_done;
+                before_release = entries;
+            } catch (...) { failure = std::current_exception(); }
+            release.set();
+            for (auto& task : tasks) {
+                try { results.push_back(co_await task); }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+                co_await task.wait_destroyed_async();
+            }
+            writer.read_hook_for_test = {};
+            if (failure) std::rethrow_exception(failure);
+            REQUIRE(overlapped);
+            REQUIRE(grow_result == -EBUSY);
+            REQUIRE(mutation_blocked);
+            REQUIRE(before_release == 2);
+            REQUIRE(late_saw_mutation);
+            REQUIRE(results == std::vector<ssize_t>{512, 512, mode == "write" ? 512 : 0, 512});
+            REQUIRE(std::equal(old.begin(), old.end(), data[0].begin()));
+            REQUIRE(std::equal(old.begin(), old.end(), data[1].begin()));
+            const uint8_t expected = mode == "write" ? 0x72 : mode == "discard" ? 0 : 0x31;
+            REQUIRE(std::all_of(data[2].begin(), data[2].end(), [expected](auto b) { return b == expected; }));
+            co_return 0;
+        }, {.num_threads = 1, .blocking_threads = 1});
+        REQUIRE(rc == 0);
+    }
+    }
+}
+
+TEST_CASE("format: hybrid shared read exceptions release ownership",
+          "[format][hybrid][shared-read]") {
+    test::TempDir temporary;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto pair = co_await format::hybrid::FilePair::create(temporary / "pair", 32768);
+        format::hybrid::Writer writer(std::move(pair));
+        std::array<uint8_t, 512> bytes{};
+        writer.read_hook_for_test = []() -> elio::coro::task<void> {
+            throw std::runtime_error("read failure after shared acquire");
+            co_return;
+        };
+        bool failed = false;
+        try { (void)co_await writer.pread(bytes.data(), bytes.size(), 0); }
+        catch (const std::runtime_error&) { failed = true; }
+        writer.read_hook_for_test = {};
+        const auto written = co_await writer.pwrite(bytes.data(), bytes.size(), 0);
+        const auto read = co_await writer.pread(bytes.data(), bytes.size(), 0);
+        REQUIRE(failed);
+        REQUIRE(written == 512);
+        REQUIRE(read == 512);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+#endif

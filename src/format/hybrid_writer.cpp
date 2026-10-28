@@ -23,10 +23,7 @@ bool io_fault(int stage) {
 #endif
 }
 using Mapping = bytes::segment_mapping;
-struct Unlock {
-    elio::sync::mutex& mutex;
-    ~Unlock() { mutex.unlock(); }
-};
+using Unlock = elio::sync::unique_lock_guard;
 elio::coro::task<int> write_exact(int fd, const void* data, size_t size, uint64_t offset) {
     const auto result = co_await elio::io::pwrite_exactly(fd,
         std::span<const std::byte>(static_cast<const std::byte*>(data), size), offset);
@@ -90,8 +87,11 @@ std::vector<Mapping> Writer::snapshot() const {
 
 elio::coro::task<ssize_t> Writer::pread(void* buffer, size_t count, uint64_t offset) {
     if (offset % 512 != 0 || count % 512 != 0) co_return -EINVAL;
-    co_await operation_.lock();
-    Unlock unlock{operation_};
+    co_await operation_.lock_shared();
+    elio::sync::shared_lock_guard unlock{operation_};
+#ifdef OBD_TEST_HOOKS
+    if (read_hook_for_test) co_await read_hook_for_test();
+#endif
     {
         std::lock_guard lock(index_mutex_);
         if (failed_) co_return -EIO;
@@ -118,8 +118,11 @@ elio::coro::task<ssize_t> Writer::pread(void* buffer, size_t count, uint64_t off
 }
 
 elio::coro::task<ssize_t> Writer::pread_physical(void* buffer, size_t count, uint64_t offset) {
-    co_await operation_.lock();
-    Unlock unlock{operation_};
+    co_await operation_.lock_shared();
+    elio::sync::shared_lock_guard unlock{operation_};
+#ifdef OBD_TEST_HOOKS
+    if (read_hook_for_test) co_await read_hook_for_test();
+#endif
     {
         std::lock_guard lock(index_mutex_);
         if (failed_) co_return -EIO;

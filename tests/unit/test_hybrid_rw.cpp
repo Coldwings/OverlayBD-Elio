@@ -5,6 +5,8 @@
 #include "source/local_file.hpp"
 #include "../support.hpp"
 #include <elio/coro/task_group.hpp>
+#include <elio/runtime/spawn.hpp>
+#include <array>
 #include <elio/runtime/spawn_blocking.hpp>
 #include <elio/sync/event.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -30,13 +32,17 @@ public:
     public:
         explicit HeldView(source::BlobSource& source) : source_(source) {}
         elio::coro::task<ssize_t> pread(void* b, size_t n, uint64_t o) override {
+            ++entries;
             entered.set();
             co_await release.wait();
+            if (fail) throw std::runtime_error("held read failure");
             co_return co_await source_.pread(b, n, o);
         }
         uint64_t size() const noexcept override { return source_.size(); }
         std::string_view label() const noexcept override { return "held-hybrid"; }
         elio::sync::event entered, release;
+        unsigned entries = 0; // Single-worker directed tests.
+        bool fail = false;
     private:
         source::BlobSource& source_;
     };
@@ -273,4 +279,131 @@ TEST_CASE("format: hybrid offline seal does not create missing artifacts",
     REQUIRE_FALSE(std::filesystem::exists(index));
     REQUIRE(digest == "untouched");
     REQUIRE(size == 123);
+}
+
+TEST_CASE("format: hybrid merged shared reads overlap and release mutation guards",
+          "[format][hybrid][shared-read]") {
+    for (bool fail : {false, true}) {
+    DYNAMIC_SECTION("read exception=" << fail) {
+        test::TempDir temporary;
+        const int rc = elio::run([&]() -> elio::coro::task<int> {
+            auto upper = co_await format::HybridRwLayer::create(temporary / "pair", 32768);
+            std::array<uint8_t, 512> old{};
+            old.fill(0x41);
+            const auto wrote = co_await upper->pwrite(old.data(), old.size(), 0);
+            REQUIRE(wrote == 512);
+            auto held = std::make_unique<HeldHybrid>(std::move(upper));
+            auto* observed = held.get();
+            observed->view.fail = fail;
+            auto merged = co_await format::MergedWritable::open({}, std::move(held));
+            std::array<std::array<uint8_t, 512>, 2> data{};
+            std::vector<elio::coro::join_handle<ssize_t>> tasks;
+            tasks.reserve(3);
+            std::vector<ssize_t> results;
+            elio::sync::event attempted;
+            std::exception_ptr failure;
+            bool overlapped = false, excluded = false;
+            int grow_result = 0;
+            try {
+                for (size_t i = 0; i < data.size(); ++i)
+                    tasks.push_back(elio::spawn([&, i]() -> elio::coro::task<ssize_t> {
+                        try { co_return co_await merged->pread(data[i].data(), 512, 0); }
+                        catch (const std::runtime_error&) { co_return -ECANCELED; }
+                    }));
+                for (unsigned i = 0; i < 100 && observed->view.entries < 2; ++i)
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                overlapped = observed->view.entries == 2;
+                grow_result = co_await elio::spawn_blocking([&] { return merged->grow(65536); });
+                tasks.push_back(elio::spawn([&]() -> elio::coro::task<ssize_t> {
+                    attempted.set();
+                    co_return co_await merged->discard(0, 512);
+                }));
+                co_await attempted.wait();
+                excluded = observed->mutation_entries == 0;
+            } catch (...) { failure = std::current_exception(); }
+            observed->view.release.set();
+            for (auto& task : tasks) {
+                try { results.push_back(co_await task); }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+                co_await task.wait_destroyed_async();
+            }
+            observed->view.fail = false;
+            if (failure) std::rethrow_exception(failure);
+            REQUIRE(overlapped);
+            REQUIRE(excluded);
+            REQUIRE(grow_result == -EBUSY);
+            REQUIRE(results == std::vector<ssize_t>{fail ? -ECANCELED : 512, fail ? -ECANCELED : 512, 0});
+            if (!fail) { REQUIRE(data[0] == old); REQUIRE(data[1] == old); }
+            const auto read = co_await merged->pread(data[0].data(), 512, 0);
+            REQUIRE(read == 512);
+            REQUIRE(std::all_of(data[0].begin(), data[0].end(), [](auto b) { return b == 0; }));
+            const auto grown = co_await elio::spawn_blocking([&] { return merged->grow(65536); });
+            REQUIRE(grown == 0);
+            co_return 0;
+        }, {.num_threads = 1, .blocking_threads = 1});
+        REQUIRE(rc == 0);
+    }
+    }
+}
+
+TEST_CASE("format: hybrid concurrent readers observe complete write and discard states",
+          "[format][hybrid][shared-read]") {
+    test::TempDir temporary;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        auto upper = co_await format::HybridRwLayer::create(temporary / "pair", 32768);
+        auto merged = co_await format::MergedWritable::open({}, std::move(upper));
+        std::array<uint8_t, 4096> initial{};
+        initial.fill(0x11);
+        const auto wrote = co_await merged->pwrite(initial.data(), initial.size(), 0);
+        REQUIRE(wrote == 4096);
+        std::vector<elio::coro::join_handle<bool>> tasks;
+        tasks.reserve(5);
+        elio::sync::event start;
+        std::exception_ptr failure;
+        bool valid = true;
+        try {
+            for (unsigned i = 0; i < 4; ++i) {
+                tasks.push_back(elio::spawn([&]() -> elio::coro::task<bool> {
+                    std::array<uint8_t, 4096> data{};
+                    co_await start.wait();
+                    bool ok = true;
+                    for (unsigned read = 0; read < 200; ++read) {
+                        const auto n = co_await merged->pread(data.data(), data.size(), 0);
+                        const auto value = data.front();
+                        ok = ok && n == 4096 && (value == 0 || value == 0x11 || value == 0x22) &&
+                             std::all_of(data.begin(), data.end(), [value](auto b) { return b == value; });
+                    }
+                    co_return ok;
+                }));
+            }
+            tasks.push_back(elio::spawn([&]() -> elio::coro::task<bool> {
+                std::array<uint8_t, 4096> data{};
+                co_await start.wait();
+                bool ok = true;
+                for (unsigned write = 0; write < 200; ++write) {
+                    if (write % 3 == 0) {
+                        const int result = co_await merged->discard(0, data.size());
+                        ok = ok && result == 0;
+                    } else {
+                        data.fill(write % 3 == 1 ? 0x11 : 0x22);
+                        const auto result = co_await merged->pwrite(data.data(), data.size(), 0);
+                        ok = ok && result == 4096;
+                    }
+                }
+                co_return ok;
+            }));
+        } catch (...) { failure = std::current_exception(); }
+        start.set();
+        for (auto& task : tasks) {
+            try { const bool ok = co_await task; valid = valid && ok; }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+            co_await task.wait_destroyed_async();
+        }
+        if (failure) std::rethrow_exception(failure);
+        REQUIRE(valid);
+        const int flushed = co_await merged->flush();
+        REQUIRE(flushed == 0);
+        co_return 0;
+    }, {.num_threads = 4, .blocking_threads = 1});
+    REQUIRE(rc == 0);
 }

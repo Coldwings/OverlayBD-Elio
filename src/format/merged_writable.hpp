@@ -10,7 +10,7 @@
 #include "format/writable.hpp"
 #include "source/blob_source.hpp"
 
-#include <elio/sync/mutex.hpp>
+#include <elio/sync/shared_mutex.hpp>
 
 #include <atomic>
 #include <memory>
@@ -74,8 +74,8 @@ private:
     std::unique_ptr<WritableLayer> top_;
     /// Serializes top-layer mutations and their merged-index rebuilds so an
     /// older rebuild cannot publish after a newer write/discard. Opt-in tops
-    /// also hold this across merged snapshot selection and physical reads.
-    elio::sync::mutex op_mu_;
+    /// also hold shared ownership across snapshot selection and physical reads.
+    elio::sync::shared_mutex op_mu_;
     /// Synchronous admission gate shared by grow and coroutine operations.
     /// Operations increment active_ops_ while holding this mutex, so grow
     /// cannot slip between an operation's state check and active registration.
