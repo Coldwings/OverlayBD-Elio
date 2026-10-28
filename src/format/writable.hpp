@@ -16,6 +16,7 @@
 #include <elio/coro/task.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace obd::format {
@@ -81,6 +82,15 @@ public:
     /// that may finish a deferred index transition. Implementations that do
     /// not change their segment view in those operations may keep the default.
     virtual uint64_t segments_generation() const noexcept { return 0; }
+
+    /// Optional exact mapping revision (ADR-0030). Under caller-serialized
+    /// mutations, equal available revisions on the same instance prove that
+    /// every segment field stayed unchanged between observations. Unknown is
+    /// the conservative default; this is distinct from best-effort generation.
+    /// Implementations must become unknown before a counter can wrap.
+    virtual std::optional<uint64_t> segments_revision() const noexcept {
+        return std::nullopt;
+    }
 
     /// The file view segment data is read from (identity for sparse). A
     /// grow-capable writable layer may expose a view whose size() tracks

@@ -2421,3 +2421,10 @@ fixture generation and layer parsing. Timing checks a byte per payload sector;
 the `[lookup]` regression checks all returned bytes across gaps, directory
 boundaries, threshold sizes, the directory cap and extreme sparse offsets.
 These are memory-source CPU costs, not disk, registry or ublk throughput.
+
+The `[revision]` writable tests cover optional exact mapping revisions
+(ADR-0030): successful snapshot reuse, unknown fallback, changed ownership,
+failed/throwing prefix publication, invalidated-snapshot repair, counter
+saturation, and full-byte LSMT overwrite/reseal checks across the internal
+piece boundary. Existing pair-recovery tests retain the durability/error
+coverage; a mapping revision never establishes payload durability.

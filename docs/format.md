@@ -733,6 +733,7 @@ public:
     virtual int grow(uint64_t vsize) = 0;
     virtual const std::vector<bytes::segment_mapping>& segments() const = 0;
     virtual std::vector<bytes::segment_mapping> segments_snapshot() const;
+    virtual std::optional<uint64_t> segments_revision() const noexcept;
     virtual source::BlobSource& data_source() = 0;
 };
 ```
@@ -755,6 +756,16 @@ the current index: sorted, disjoint, 512B sector units, tag 0.
 `segments_snapshot()` returns a stable copy for callers that cannot borrow
 `segments()` across concurrent writable-layer mutations. `data_source()` is
 the file view segment data is read from.
+
+`segments_revision()` is an optional exact mapping revision (ADR-0030).
+With mutations serialized by the caller, equal available revisions on the
+same instance prove that every mapping field stayed unchanged between the
+observations. Unknown (`nullopt`) is the default; this is distinct from the
+best-effort `segments_generation()` notification used for flush/grow. LSMT-RW
+opts in, advances before live mapping mutations, and permanently becomes
+unknown at counter saturation. In-place DATA overwrites leave the mappings
+and revision unchanged. This is a snapshot-reuse proof, not a data version,
+durability indication, or substitute for mutation serialization.
 
 `grow(vsize)` (D3) extends the layer's write window to `vsize` bytes so
 `pwrite`/`discard` accept the new range. Grow-only: a request smaller
@@ -1241,8 +1252,10 @@ plus a writable top layer, as one block source.
   merged index on every request.
 - `pwrite` validates alignment and bounds, delegates to
   `top_->pwrite` — **RO lowers are never modified** — and then rebuilds the
-  merged index (`rebuild_index()`). Write-heavy workloads should batch,
-  since the rebuild is O(index size) per write.
+  merged index (`rebuild_index()`). A successful write may instead reuse an
+  already-valid snapshot when equal available exact revisions prove its
+  mappings unchanged (ADR-0030). Unknown revisions, errors and invalidated
+  snapshots always rebuild; exceptions retain rebuild-or-invalidate behavior.
 - `flush()` delegates to the top layer's `flush()` and rebuilds the merged
   index if a deferred ownership transition changes its generation.
   `pwrite()`, `discard()`, and `flush()` also rebuild or invalidate the index
@@ -1738,9 +1751,11 @@ writers and readers agree on the same bytes.
   exact DATA intent, so its one-time extent import can retain an already
   over-wide filesystem-block extent. All writes after v2 publication and all
   fresh uppers recover exactly (ADR-0024).
-- **Merged index rebuild is O(index) per write.** `MergedWritable` rebuilds
-  after every `pwrite`; read requests reuse the published immutable snapshot
-  instead of copying the full index. Write-heavy workloads should batch writes.
+- **Changed mappings still require O(index) rebuilding.** `MergedWritable`
+  reuses a valid snapshot only for successful writes with an exact unchanged
+  revision. Other writes and ownership changes still rebuild the full index;
+  incremental changed-range updates remain unimplemented. Reads reuse the
+  published immutable snapshot instead of copying the full index.
 - **Trace packaging is external.** The trace codec (`trace.hpp`) is
   implemented and tested; replay is wired into device bring-up
   (`trace_replay.hpp`, ADR-0013) and recording into the supervisor's

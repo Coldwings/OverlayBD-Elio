@@ -1,8 +1,9 @@
 // Merged writable view (ADR-0008): RO lowers plus a writable top layer as
 // one block source. Reads walk the merged index (top wins, holes zero);
 // writes always land in the writable top layer (copy-on-write — lower
-// layers are never modified). The merged index is recomputed after every
-// write; write-heavy workloads should batch (documented in docs/format.md).
+// layers are never modified). Successful writes may reuse a valid snapshot
+// when exact mapping revisions prove it unchanged (ADR-0030); other writes
+// retain conservative rebuilding (documented in docs/format.md).
 #pragma once
 
 #include "format/lsmt.hpp"

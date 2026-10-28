@@ -151,3 +151,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0027](./0027-export-stable-sparse-deltas.md) | Export stable sparse ownership as an independent LSMT delta | accepted |
 | [0028](./0028-cluster-converted-filesystem-metadata.md) | Cluster finalized filesystem metadata in ordinary LSMT payloads | accepted |
 | [0029](./0029-persistent-lsmt-writable-pairs.md) | Resume LSMT writable data/index pairs after process exit | accepted |
+| [0030](./0030-reuse-proven-unchanged-writable-mappings.md) | Reuse writable snapshots only with exact unchanged mapping revisions | accepted |

@@ -51,6 +51,9 @@ struct LsmtRwLayerTestAccess {
     static void end_terminal(LsmtRwLayer& layer) {
         layer.end_terminal_op();
     }
+    static void set_revision(LsmtRwLayer& layer, uint64_t value) {
+        layer.segments_revision_.store(value);
+    }
 };
 
 struct SparseRwLayerTestAccess {
@@ -316,6 +319,60 @@ private:
     test::VectorSource data_;
     std::vector<bytes::segment_mapping> segments_;
     uint64_t generation_ = 0;
+};
+
+// A controllable opt-in layer for snapshot publication/error-path tests.
+class RevisionWritableLayer final : public format::WritableLayer {
+public:
+    mutable unsigned snapshots = 0;
+    mutable bool fail_snapshot = false;
+    bool exact = true;
+    bool fail_write = false;
+    bool throw_write = false;
+    elio::coro::task<ssize_t> pwrite(const void* input, size_t count,
+                                    uint64_t offset) override {
+        if (offset != 0 || count != 512) co_return -EINVAL;
+        std::memcpy(data_.data().data(), input, count);
+        if (segments_.empty()) {
+            bytes::segment_mapping mapping;
+            mapping.length = 1;
+            segments_.push_back(mapping);
+            ++revision_;
+        }
+        if (throw_write) throw std::bad_alloc();
+        co_return fail_write ? -EIO : static_cast<ssize_t>(count);
+    }
+    elio::coro::task<ssize_t> pread(void* out, size_t count,
+                                   uint64_t offset) override {
+        co_return co_await data_.pread(out, count, offset);
+    }
+    elio::coro::task<int> discard(uint64_t, uint64_t) override {
+        co_return -EOPNOTSUPP;
+    }
+    elio::coro::task<int> flush() override { co_return 0; }
+    elio::coro::task<int> checkpoint() override { co_return 0; }
+    uint64_t virtual_size() const override { return 512; }
+    int grow(uint64_t) override { return -EOPNOTSUPP; }
+    const std::vector<bytes::segment_mapping>& segments() const override {
+        return segments_;
+    }
+    std::vector<bytes::segment_mapping> segments_snapshot() const override {
+        ++snapshots;
+        if (fail_snapshot) {
+            fail_snapshot = false;
+            throw std::bad_alloc();
+        }
+        return segments_;
+    }
+    std::optional<uint64_t> segments_revision() const noexcept override {
+        if (!exact) return std::nullopt;
+        return revision_;
+    }
+    source::BlobSource& data_source() override { return data_; }
+private:
+    test::VectorSource data_{std::vector<uint8_t>(512)};
+    std::vector<bytes::segment_mapping> segments_;
+    uint64_t revision_ = 0;
 };
 
 /// Synchronous whole-file sha256 (test-side digest oracle for the
@@ -5839,6 +5896,146 @@ TEST_CASE("format: LSMT rejected later write piece preserves readable published 
             REQUIRE(read == 512);
             for (const auto byte : actual) REQUIRE(byte == 0x31);
         }
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: merged writes reuse only proven unchanged mapping snapshots",
+          "[format][writable][revision]") {
+    bool exact = true;
+    SECTION("exact revision") {}
+    SECTION("unknown revision") { exact = false; }
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = std::make_unique<RevisionWritableLayer>();
+        auto* state = top.get();
+        state->exact = exact;
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        REQUIRE(state->snapshots == 1);
+        std::vector<uint8_t> bytes(512, 0xa5), actual(512);
+        const auto first = co_await merged->pwrite(bytes.data(), bytes.size(), 0);
+        REQUIRE(first == 512);
+        REQUIRE(state->snapshots == 2); // New DATA ownership must publish.
+        std::fill(bytes.begin(), bytes.end(), 0x7c);
+        const auto second = co_await merged->pwrite(bytes.data(), bytes.size(), 0);
+        REQUIRE(second == 512);
+        REQUIRE(state->snapshots == (exact ? 2 : 3));
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 512);
+        REQUIRE(actual == bytes);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: unchanged revision repairs an invalidated merged snapshot",
+          "[format][writable][revision]") {
+    const int rc = test::run_coro([]() -> elio::coro::task<int> {
+        auto top = std::make_unique<RevisionWritableLayer>();
+        auto* state = top.get();
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        state->fail_snapshot = true;
+        std::vector<uint8_t> bytes(512, 0xa5), actual(512);
+        const auto failed = co_await merged->pwrite(bytes.data(), bytes.size(), 0);
+        REQUIRE(failed == -ENOMEM);
+        const auto invalid = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(invalid == -EIO);
+        const auto revision = state->segments_revision();
+        std::fill(bytes.begin(), bytes.end(), 0x7c);
+        const auto healed = co_await merged->pwrite(bytes.data(), bytes.size(), 0);
+        REQUIRE(healed == 512);
+        REQUIRE(state->segments_revision() == revision);
+        REQUIRE(state->snapshots == 3);
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 512);
+        REQUIRE(actual == bytes);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: exact revision retains error and exception prefix publication",
+          "[format][writable][revision]") {
+    bool throwing = false;
+    SECTION("error") {}
+    SECTION("exception") { throwing = true; }
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = std::make_unique<RevisionWritableLayer>();
+        auto* state = top.get();
+        state->fail_write = true;
+        state->throw_write = throwing;
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        std::vector<uint8_t> bytes(512, 0xa5), actual(512);
+        bool threw = false;
+        ssize_t result = 0;
+        try { result = co_await merged->pwrite(bytes.data(), bytes.size(), 0); }
+        catch (const std::bad_alloc&) { threw = true; }
+        REQUIRE(threw == throwing);
+        if (!throwing) REQUIRE(result == -EIO);
+        REQUIRE(state->snapshots == 2);
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 512);
+        REQUIRE(actual == bytes);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: LSMT exact revision tracks ownership and preserves large overwrites",
+          "[format][lsmt][revision]") {
+    TempDir dir;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        constexpr size_t size = 8 * 1024 * 1024; // Crosses the 16383-sector piece limit.
+        auto top = co_await format::LsmtRwLayer::create(dir / "revision.lsmt", size);
+        const auto empty = top->segments_revision();
+        REQUIRE(empty.has_value());
+        auto bytes = test::pattern_bytes(size, 178);
+        std::vector<uint8_t> actual(size);
+        const auto first = co_await top->pwrite(bytes.data(), bytes.size(), 0);
+        REQUIRE(first == static_cast<ssize_t>(size));
+        const auto populated = top->segments_revision();
+        REQUIRE(populated != empty);
+        REQUIRE(top->segments().size() >= 2);
+        bytes = test::pattern_bytes(size, 179);
+        const auto overwrite = co_await top->pwrite(bytes.data(), bytes.size(), 0);
+        REQUIRE(overwrite == static_cast<ssize_t>(size));
+        REQUIRE(top->segments_revision() == populated);
+        const auto read = co_await top->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(size));
+        REQUIRE(actual == bytes);
+        const int discarded = co_await top->discard(1024, 512);
+        REQUIRE(discarded == 0);
+        const auto zeroed = top->segments_revision();
+        REQUIRE(zeroed != populated);
+        const auto rewritten = co_await top->pwrite(bytes.data() + 1024, 512, 1024);
+        REQUIRE(rewritten == 512);
+        const auto appended = top->segments_revision();
+        REQUIRE(appended != zeroed);
+        const int sealed = co_await top->seal();
+        REQUIRE(sealed == 0);
+        REQUIRE(top->segments_revision() != appended);
+        const auto sealed_read = co_await top->pread(actual.data(), actual.size(), 0);
+        REQUIRE(sealed_read == static_cast<ssize_t>(size));
+        REQUIRE(actual == bytes);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: LSMT revision saturation becomes permanently unknown",
+          "[format][lsmt][revision]") {
+    TempDir dir;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::LsmtRwLayer::create(dir / "saturation.lsmt", 4096);
+        format::LsmtRwLayerTestAccess::set_revision(*top, ~uint64_t{0} - 1);
+        REQUIRE(top->segments_revision().has_value());
+        std::vector<uint8_t> bytes(512, 0xa5);
+        const auto first = co_await top->pwrite(bytes.data(), bytes.size(), 0);
+        REQUIRE(first == 512);
+        REQUIRE_FALSE(top->segments_revision().has_value());
+        const int discarded = co_await top->discard(0, 512);
+        REQUIRE(discarded == 0);
+        REQUIRE_FALSE(top->segments_revision().has_value());
         co_return 0;
     });
     REQUIRE(rc == 0);

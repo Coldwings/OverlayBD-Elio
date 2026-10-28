@@ -248,6 +248,12 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
     }
     co_await op_mu_.lock();
     SyncMutexGuard op_guard(op_mu_);
+    const auto revision = top_->segments_revision();
+    bool valid_snapshot;
+    {
+        std::lock_guard lock(index_mu_);
+        valid_snapshot = static_cast<bool>(index_);
+    }
     ssize_t r = 0;
     try {
         r = co_await top_->pwrite(buf, count, offset);
@@ -257,9 +263,12 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
         (void)rebuild_index();
         throw;
     }
-    // Rebuild even on error: writable tops can publish complete sector-aligned
-    // prefixes before returning a later failure.
-    const int rebuild = rebuild_index();
+    // Only exact opt-in revisions can prove a successful write kept a valid
+    // snapshot current. Unknown revisions, errors (possibly published prefixes),
+    // and a previously invalidated snapshot retain the conservative rebuild.
+    const bool unchanged = r >= 0 && valid_snapshot && revision &&
+                           revision == top_->segments_revision();
+    const int rebuild = unchanged ? 0 : rebuild_index();
     if (r < 0) co_return r;
     if (rebuild != 0) co_return rebuild;
     co_return r;
