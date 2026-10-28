@@ -71,10 +71,18 @@ worker.
 
 A completed FETCH is admitted directly to that queue's reusable TagEngine.
 Source operations can suspend and resume on another worker, but each handler
-restores the queue owner before touching tag state or submitting
-COMMIT_AND_FETCH. The normal request and completion path therefore has no
-mutex deque or application eventfd handoff. Only stop/failure and exceptional
-foreign handler retirement write the owner eventfd.
+restores the queue owner before touching tag state or preparing COMMIT_AND_FETCH.
+Ready completions follow the bounded submission policy in ADR-0032: a lone
+outstanding request submits directly; with other delivered requests still
+active, prepared replies may share a submission. The first pending batch wakes
+the owner eventfd, and the pump flushes it before the next CQ turn without
+waiting for unfinished sources. A final ready handler can submit the batch
+sooner. Completion data remains in owner-local state, with no mutex deque.
+Stop/failure and exceptional foreign handler retirement also wake the owner.
+
+Before closing admission and joining source handlers, the owner disables
+batching and flushes pending replies. Later drain-time completions submit
+directly, so they cannot depend on a pump suspended in the handler join.
 
 The pump consumes at most 32 raw CQEs per turn. If CQ work remains, it takes a
 native-timer turn before continuing so older local tasks, Elio native I/O,
@@ -125,9 +133,9 @@ in (writes) and out (reads).
    to the reusable handler for that tag. Different tags remain independent
    TaskGroup children and can overlap remote or local source I/O.
 3. After source I/O, the handler restores its fixed owner, validates the exact
-   tag generation, and directly prepares and submits
-   `UBLK_U_IO_COMMIT_AND_FETCH_REQ`. No foreign worker may inspect raw slot or
-   ring state.
+   tag generation, and prepares `UBLK_U_IO_COMMIT_AND_FETCH_REQ` under the
+   bounded owner submission policy above. No foreign worker may inspect raw
+   slot or ring state.
 4. The next raw CQE retires the command's unique cookie and either delivers the
    next request for that tag or records its terminal kernel result.
 
@@ -413,7 +421,11 @@ Fixed-worker owner side (ADR-0023):
   preallocated owner-local storage. It returns whether CQ work remains.
 - `bool try_pop_request(IoRequest&)` — owner-only pop from that storage.
 - `void complete_on_owner(uint16_t tag, int32_t result)` — owner-only exact
-  obligation check plus direct COMMIT_AND_FETCH preparation and submission.
+  obligation check plus COMMIT_AND_FETCH preparation and bounded owner-local
+  submission batching (ADR-0032).
+- `void flush_owner_completions()` — independently submits an existing batch.
+- `void close_owner_completion_batching()` — disables batching and flushes
+  before the handler join; later completions submit directly.
 - `void maintain_owner()` — after source admission closes, rejects unadmitted
   delivered requests, repairs missing handler results only after the source
   fence, prepares cancellation replies, submits them, and republishes the
@@ -505,7 +517,8 @@ sink, so a delayed result cannot complete a reused tag. TaskGroup frame lifetime
 and the per-request completion obligation remain separate facts.
 
 The production sink calls `Queue::complete_on_owner`, so a normal handler
-submits COMMIT_AND_FETCH directly after restoring the fixed worker. The legacy
+prepares COMMIT_AND_FETCH after restoring the fixed worker and applies the
+bounded submission policy (ADR-0032). The legacy
 fixture sink still targets `Queue::push_completion`; it is not selected by a
 production or real-kernel Device.
 
@@ -658,8 +671,8 @@ startup mailbox; the returned Device's ordinary owner handles later shutdown.
 | Foreign failure path | any worker during rejected/destroyed handler cleanup | atomic generation mailbox, sticky failure, owner eventfd wake only |
 
 - The registered queue eventfd is the only cross-thread wake in production.
-  Raw completions and stop/failure increment it; normal request and completion
-  data stays in owner-local preallocated state.
+  Raw completions, stop/failure, and pending-batch flushes increment it;
+  request and completion data stays in owner-local preallocated state.
 - Tag buffers transfer ownership with the protocol: kernel before FETCH CQE,
   one source handler until it publishes a result, then kernel after the owner
   submits COMMIT_AND_FETCH. Reuse waits for both exact-generation and raw-cookie

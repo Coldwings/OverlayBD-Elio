@@ -144,7 +144,7 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0020](./0020-native-turbooci.md) | Read TurboOCI natively and build its metadata locally | superseded by ADR-0029 |
 | [0021](./0021-reuse-tag-handlers-on-the-bridge-worker.md) | Reuse tag handlers on their bridge worker | accepted |
 | [0022](./0022-retain-failed-startup-owners.md) | Retain failed startup owners until positive retirement | proposed |
-| [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | accepted |
+| [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | superseded by ADR-0032 |
 | [0024](./0024-exact-sparse-upper-coverage.md) | Persist exact sector coverage for sparse uppers | accepted |
 | [0025](./0025-configure-device-queue-and-worker-topology.md) | Resolve device queues and workers together before startup | accepted |
 | [0026](./0026-persist-interoperable-hybrid-uppers.md) | Persist interoperable Hybrid uppers without payload-copy sealing | accepted |
@@ -153,3 +153,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0029](./0029-persistent-lsmt-writable-pairs.md) | Resume LSMT writable data/index pairs after process exit | accepted |
 | [0030](./0030-reuse-proven-unchanged-writable-mappings.md) | Reuse writable snapshots only with exact unchanged mapping revisions | accepted |
 | [0031](./0031-reuse-verified-layer-store-extents.md) | Reuse verified LayerStore extent buffers | accepted |
+| [0032](./0032-batch-ready-owner-completions.md) | Batch ready completions on the fixed queue owner | accepted |

@@ -232,6 +232,8 @@ public:
     /// the tag obligation, prepares COMMIT_AND_FETCH, and submits it from the
     /// same task identity that issued FETCH.
     void complete_on_owner(uint16_t tag, int32_t result);
+    void flush_owner_completions();
+    void close_owner_completion_batching();
 
     /// Reject delivered-but-unadmitted work and drive reply/raw retirement.
     void maintain_owner();
@@ -391,6 +393,9 @@ private:
     uint64_t raw_published_ = 0;
     uint64_t raw_retired_ = 0;
     unsigned owner_submit_remaining_ = 0;
+    unsigned delivered_count_ = 0;
+    bool owner_completion_pending_ = false;
+    bool owner_batching_closed_ = false;
     bool owner_initial_preparing_ = false;
     uint64_t poll_cookie_ = 0;
     bool debt_known_ = true;

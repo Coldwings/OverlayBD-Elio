@@ -311,6 +311,7 @@ void Queue::prep_io_cmd(uint32_t cmd_op, uint16_t tag, int32_t result) {
     slot.cookie = (next_cookie_++ << 16) | tag;
     slot.pending = true; // Includes prepared/ambiguous publication.
     slot.completing = cmd_op == UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+    if (slot.delivered) --delivered_count_;
     slot.delivered = false; // The pending command now covers this obligation.
     slot.reply_ready = false;
     sqe->user_data = slot.cookie;
@@ -378,6 +379,7 @@ void Queue::dispatch_cqe(const io_uring_cqe* cqe) {
         // retired. ENODEV is the supported driver's accepted-command abort.
         if (slot.completing && cqe->res != -ENODEV) {
             slot.delivered = true;
+            ++delivered_count_;
             debt_known_ = false;
         }
         slot.completing = false;
@@ -387,6 +389,7 @@ void Queue::dispatch_cqe(const io_uring_cqe* cqe) {
     }
     slot.completing = false;
     slot.delivered = true;
+    ++delivered_count_;
     if (releasing_.load() || failed_.load()) {
         slot.reply = -ECANCELED;
         slot.reply_ready = true;
@@ -603,7 +606,32 @@ void Queue::complete_on_owner(uint16_t tag, int32_t result) {
     raw_[tag].reply = result;
     raw_[tag].reply_ready = true;
     prep_io_cmd(UBLK_U_IO_COMMIT_AND_FETCH_REQ, tag, result);
+    if (delivered_count_ == 0 || owner_batching_closed_ || failed()) {
+        owner_completion_pending_ = false;
+        submit_owner();
+    } else if (!owner_completion_pending_) {
+        // The owner must flush independently of remaining source operations.
+        // A final ready result may submit the whole batch before this wake.
+        owner_completion_pending_ = true;
+        notify_elio();
+    }
+}
+
+void Queue::flush_owner_completions() {
+    assert_owner();
+    if (!owner_completion_pending_) return;
+    owner_completion_pending_ = false;
     submit_owner();
+}
+
+void Queue::close_owner_completion_batching() {
+    assert_owner();
+    owner_batching_closed_ = true;
+    flush_owner_completions();
+#ifdef OBD_TEST_HOOKS
+    if (test_hooks_) test_hooks_->observe({.kind = detail::StartupTestKind::owner_batching_closed,
+        .queue = q_id_});
+#endif
 }
 
 void Queue::maintain_owner() {

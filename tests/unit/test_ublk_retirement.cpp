@@ -25,6 +25,7 @@ namespace obd::ublk {
 struct QueueRetirementTestAccess {
     static void delivered(Queue& queue, uint16_t tag) {
         queue.raw_.resize(queue.depth_);
+        if (!queue.raw_[tag].delivered) ++queue.delivered_count_;
         queue.raw_[tag].delivered = true;
     }
     static void pending(Queue& queue, uint16_t tag) {
@@ -63,6 +64,7 @@ struct QueueRetirementTestAccess {
         return queue.ring_.flags;
     }
     static bool prepare_post_stop_commit(Queue& queue) {
+        if (!queue.raw_[0].delivered) ++queue.delivered_count_;
         queue.raw_[0].delivered = true;
         queue.raw_[0].reply_ready = true;
         queue.raw_[0].reply = -ECANCELED;
@@ -136,6 +138,30 @@ TEST_CASE("ublk: owner submission drain retries flushed EINTR and partial progre
     CHECK(direct_enters == 1);
     CHECK(partial.remaining == 0);
     CHECK(partial.error == 0);
+
+    // A failed batch retains only the unaccepted commands. Retrying that debt
+    // must enter the already-published SQ, never flush the private SQ again.
+    for (int terminal : {-EAGAIN, 0, 3}) {
+        unsigned attempts = 0;
+        const auto interrupted = obd::ublk::detail::drain_submissions(
+            3, true, [] { return 1; },
+            [&](unsigned remaining) {
+                CHECK(remaining == 2);
+                ++attempts;
+                return terminal;
+            });
+        CHECK(attempts == 1);
+        CHECK(interrupted.remaining == 2);
+        CHECK(interrupted.error == (terminal < 0 ? EAGAIN : terminal == 0 ? EIO : EPROTO));
+        unsigned repeated_flushes = 0;
+        const auto resumed = obd::ublk::detail::drain_submissions(
+            interrupted.remaining, false,
+            [&] { ++repeated_flushes; return 2; },
+            [](unsigned remaining) { return static_cast<int>(remaining); });
+        CHECK(repeated_flushes == 0);
+        CHECK(resumed.remaining == 0);
+        CHECK(resumed.error == 0);
+    }
 }
 
 TEST_CASE("ublk: owner CQ turn coalesces trailing hints without losing new work",

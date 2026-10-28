@@ -316,6 +316,7 @@ elio::coro::task<void> run_owner_pump(Queue* queue,
            !queue->failed()) {
         try {
             engine->collect_foreign_results();
+            queue->flush_owner_completions();
             const bool more = queue->drive_owner_cq(kCqTurn);
             IoRequest request;
             while (queue->try_pop_request(request)) {
@@ -361,6 +362,7 @@ elio::coro::task<void> run_owner_pump(Queue* queue,
     // Admission closes before the source-loan fence. Existing handlers may
     // finish and submit COMMIT_AND_FETCH directly on this worker; no raw CQ
     // processing is required for those source frames to retire.
+    queue->close_owner_completion_batching();
     engine->begin_close();
     for (uint16_t tag = 0; tag < queue->depth(); ++tag) {
         while (!engine->retry_close_signal(tag)) {
