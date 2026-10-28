@@ -18,6 +18,7 @@
 #include "../runtime_faults.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
@@ -1751,4 +1752,296 @@ TEST_CASE("source: layer store fill does not starve readers", "[source]") {
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store verified buffers retain four partial extents",
+          "[source][verified-cache]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(8 * kExtent, 180);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto store = co_await source::LayerStore::open(
+            std::make_unique<VectorSource>(blob), dir.str(), digest_of(blob));
+        std::vector<uint8_t> buf(kExtent);
+        for (size_t e = 0; e < 5; ++e) {
+            const auto n = co_await store->pread(buf.data(), buf.size(), e * kExtent);
+            REQUIRE(n == static_cast<ssize_t>(buf.size()));
+        }
+        const bool warm = co_await poll_until([&] { return store->extents_present() == 5; });
+        REQUIRE(warm);
+        auto read_partial = [&](size_t e) -> elio::coro::task<void> {
+            const auto n = co_await store->pread(buf.data(), 512, e * kExtent + 17);
+            REQUIRE(n == 512);
+            REQUIRE(std::equal(buf.begin(), buf.begin() + 512,
+                               blob.begin() + e * kExtent + 17));
+        };
+        for (size_t e = 0; e < 4; ++e) co_await read_partial(e);
+        REQUIRE(store->verified_cache_hits() == 0);
+        for (size_t e = 0; e < 4; ++e) co_await read_partial(e);
+        REQUIRE(store->verified_cache_hits() == 4);
+        co_await read_partial(4);  // evicts least recently used extent zero
+        co_await read_partial(0);
+        REQUIRE(store->verified_cache_hits() == 4);
+        co_await read_partial(0);
+        REQUIRE(store->verified_cache_hits() == 5);
+        const auto n = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(n == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == slice(blob, 0, kExtent));
+        REQUIRE(store->verified_cache_hits() == 5);  // whole-extent bypass
+        REQUIRE(store->remote_fetches() == 5);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store verified buffers obey byte cap and tail length",
+          "[source][verified-cache]") {
+    test::TempDir dir;
+    const size_t extent = GENERATE(size_t{128 * 1024}, size_t{512 * 1024});
+    auto blob = test::pattern_bytes(4 * extent + 777, 181);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        source::LayerStore::Config cfg;
+        cfg.extent_size = extent;
+        auto store = co_await source::LayerStore::open(
+            std::make_unique<VectorSource>(blob), dir.str(), digest_of(blob), cfg);
+        std::vector<uint8_t> buf(extent);
+        for (size_t e : {size_t{0}, size_t{1}, size_t{2}, size_t{4}}) {
+            const auto n = co_await store->pread(buf.data(), buf.size(), e * extent);
+            REQUIRE(n == static_cast<ssize_t>(e == 4 ? 777 : extent));
+        }
+        const bool warm = co_await poll_until([&] { return store->extents_present() == 4; });
+        REQUIRE(warm);
+        for (size_t e : {size_t{0}, size_t{1}, size_t{2}, size_t{0}}) {
+            const auto n = co_await store->pread(buf.data(), 512, e * extent + 3);
+            REQUIRE(n == 512);
+            REQUIRE(std::equal(buf.begin(), buf.begin() + 512, blob.begin() + e * extent + 3));
+        }
+        REQUIRE(store->verified_cache_hits() == 0); // byte cap evicts or excludes
+        const auto n = co_await store->pread(buf.data(), 512, 3);
+        REQUIRE(n == 512);
+        REQUIRE(store->verified_cache_hits() == (extent == 128 * 1024 ? 1 : 0));
+        const auto before = store->verified_cache_hits();
+        for (int i = 0; i < 2; ++i) {
+            const auto tail = co_await store->pread(buf.data(), 512, 4 * extent + 700);
+            REQUIRE(tail == 77);
+            REQUIRE(std::equal(buf.begin(), buf.begin() + 77, blob.begin() + 4 * extent + 700));
+        }
+        REQUIRE(store->verified_cache_hits() == before + 1);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("source: layer store full disk reads invalidate corrupt cached extents",
+          "[source][verified-cache]") {
+    test::TempDir dir;
+    auto blob = test::pattern_bytes(3 * kExtent, 182);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto store = co_await source::LayerStore::open(
+            std::make_unique<VectorSource>(blob), dir.str(), digest_of(blob));
+        std::vector<uint8_t> buf(kExtent);
+        const auto initial = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(initial == static_cast<ssize_t>(buf.size()));
+        const bool warm = co_await poll_until([&] { return store->extents_present() == 1; });
+        REQUIRE(warm);
+        const auto first = co_await store->pread(buf.data(), 512, 0);
+        REQUIRE(first == 512);
+        co_await elio::spawn_blocking([&] {
+            const auto paths = names_with_prefix(dir.str(), ".download.");
+            REQUIRE(paths.size() == 1);
+            overwrite_file(paths[0], 0, std::vector<uint8_t>(kExtent, 0xff));
+        });
+        const auto cached = co_await store->pread(buf.data(), 512, 0);
+        REQUIRE(cached == 512);
+        REQUIRE(std::equal(buf.begin(), buf.begin() + 512, blob.begin()));
+        REQUIRE(store->verified_cache_hits() == 1);
+        REQUIRE(store->crc_failures() == 0);
+        const auto full = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(full == static_cast<ssize_t>(buf.size()));
+        REQUIRE(buf == slice(blob, 0, kExtent));
+        REQUIRE(store->crc_failures() == 1);
+        REQUIRE(store->remote_fetches() == 2);
+        const auto again = co_await store->pread(buf.data(), 512, 0);
+        REQUIRE(again == 512);
+        REQUIRE(std::equal(buf.begin(), buf.begin() + 512, blob.begin()));
+        REQUIRE(store->verified_cache_hits() == 1); // demoted entry was removed
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("source: layer store rejects verified buffers from a retired staging pair",
+          "[source][verified-cache]") {
+    test::TempDir dir;
+    bool new_generation_window = false;
+    SECTION("read starts before generation advance") { new_generation_window = false; }
+    SECTION("read starts with new generation and old descriptor") { new_generation_window = true; }
+    const auto old_bytes = test::pattern_bytes(3 * kExtent, 183);
+    auto new_bytes = old_bytes;
+    // Extent zero deliberately has the SAME CRC in both attempts. In the
+    // second section only descriptor identity rejects the stale publication.
+    new_bytes[kExtent + 17] ^= 0xff;
+    bool paused = false, restarted = false, no_stale_entry = false;
+    bool old_valid = false, new_valid = false;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto remote = std::make_unique<SwitchAfterCompletionSource>(old_bytes, new_bytes);
+        auto* switching = remote.get();
+        switching->gate.set();
+        auto store = co_await source::LayerStore::open(
+            std::move(remote), dir.str(), digest_of(new_bytes));
+        store->set_test_completion_hook([&](uint32_t) { switching->switch_to_replacement(); });
+        std::vector<uint8_t> buf(kExtent), held(512);
+        const auto first = co_await store->pread(buf.data(), buf.size(), 0);
+        const bool warm = co_await poll_until([&] { return store->extents_present() == 1; });
+        REQUIRE(first == static_cast<ssize_t>(kExtent));
+        REQUIRE(warm);
+        std::atomic<bool> entered{false}, release{false};
+        std::atomic<bool> generation_advanced{false}, release_writer{false};
+        std::atomic<bool> writer_timeout{false};
+        if (new_generation_window) {
+            store->set_test_retry_generation_hook([&] {
+                generation_advanced.store(true);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                while (!release_writer.load()) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        writer_timeout.store(true);
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            });
+        }
+        store->set_test_verified_read_hook([&]() -> elio::coro::task<void> {
+            entered.store(true);
+            // Bounded cooperative gate: no assertion can strand this reader.
+            for (int i = 0; !release.load() && i < 10000; ++i)
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        });
+        ssize_t rest = 0;
+        bool generation_window = true;
+        if (new_generation_window) {
+            rest = co_await store->populate(kExtent, 2 * kExtent);
+            generation_window = co_await poll_until([&] { return generation_advanced.load(); }, 5000);
+        }
+        auto reader = elio::spawn(store->pread(held.data(), held.size(), 17));
+        paused = co_await poll_until([&] { return entered.load(); }, 5000);
+        // After spawning, collect outcomes and drain before any assertion.
+        if (!new_generation_window) rest = co_await store->populate(kExtent, 2 * kExtent);
+        release_writer.store(true);
+        restarted = co_await poll_until([&] {
+            return switching->reads_completed() >= 3 && store->extents_present() == 0;
+        }, 5000);
+        // Queue a fresh read only after all records are demoted. Even if it
+        // begins before descriptor exchange, the writer persists into the new pair.
+        const auto fresh = co_await store->pread(buf.data(), buf.size(), 0);
+        const bool new_present = co_await poll_until([&] { return store->extents_present() == 1; }, 5000);
+        release.store(true);
+        const auto old_result = co_await reader;
+        co_await reader.wait_destroyed_async();
+        no_stale_entry = store->test_verified_cache_entries() == 0;
+        old_valid = old_result == 512 && std::equal(held.begin(), held.end(), old_bytes.begin() + 17);
+        new_valid = rest == 0 && generation_window && !writer_timeout.load() &&
+                    fresh == static_cast<ssize_t>(kExtent) && new_present &&
+                    buf == slice(new_bytes, 0, kExtent);
+        store->set_test_verified_read_hook({});
+        const auto latest = co_await store->pread(held.data(), held.size(), 17);
+        new_valid = new_valid && latest == 512 &&
+                    std::equal(held.begin(), held.end(), new_bytes.begin() + 17);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+    CHECK(paused);
+    CHECK(restarted);
+    CHECK(no_stale_entry);
+    CHECK(old_valid);
+    CHECK(new_valid);
+}
+#endif
+
+#ifdef OBD_TEST_HOOKS
+TEST_CASE("source: layer store terminal states release verified buffers",
+          "[source][verified-cache]") {
+    bool bypass = false;
+    SECTION("successful completion") { bypass = false; }
+    SECTION("exhausted checksum retry") { bypass = true; }
+    test::TempDir dir;
+    const auto blob = test::pattern_bytes(2 * kExtent, 185);
+    // Keep the selected digest outside the co_await operand: the supported
+    // GCC coroutine lowering must not share a conditional temporary's storage.
+    const std::string expected_digest = bypass ? std::string(64, '0') : digest_of(blob);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        source::LayerStore::Config cfg;
+        cfg.try_count = 1;
+        auto store = co_await source::LayerStore::open(
+            std::make_unique<VectorSource>(blob), dir.str(), expected_digest, cfg);
+        std::vector<uint8_t> buf(kExtent);
+        const auto initial = co_await store->pread(buf.data(), buf.size(), 0);
+        REQUIRE(initial == static_cast<ssize_t>(kExtent));
+        const bool warm = co_await poll_until([&] { return store->extents_present() == 1; });
+        REQUIRE(warm);
+        const auto partial = co_await store->pread(buf.data(), 512, 17);
+        REQUIRE(partial == 512);
+        REQUIRE(store->test_verified_cache_entries() == 1);
+        const auto populated = co_await store->populate(kExtent, kExtent);
+        REQUIRE(populated == 0);
+        const auto expected = bypass ? source::LayerStore::State::Bypass
+                                     : source::LayerStore::State::Complete;
+        const bool terminal = co_await poll_until([&] {
+            return store->state() == expected && store->test_verified_cache_entries() == 0;
+        });
+        REQUIRE(terminal);
+        const auto fetches = store->remote_fetches();
+        const auto final = co_await store->pread(buf.data(), 512, 17);
+        REQUIRE(final == 512);
+        REQUIRE(std::equal(buf.begin(), buf.begin() + 512, blob.begin() + 17));
+        REQUIRE(store->verified_cache_hits() == 0);
+        REQUIRE(store->remote_fetches() == fetches + (bypass ? 1 : 0));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+#endif
+
+TEST_CASE("source: layer store concurrent partial readers survive cache eviction",
+          "[source][verified-cache]") {
+    test::TempDir dir;
+    const auto blob = test::pattern_bytes(8 * kExtent, 186);
+    bool bytes_ok = true;
+    elio::run_config runtime;
+    runtime.num_threads = 2;
+    runtime.blocking_threads = 1;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        auto store = co_await source::LayerStore::open(
+            std::make_unique<VectorSource>(blob), dir.str(), digest_of(blob));
+        const auto populated = co_await store->populate(0, 6 * kExtent);
+        REQUIRE(populated == 0);
+        const bool warm = co_await poll_until([&] { return store->extents_present() == 6; });
+        REQUIRE(warm);
+        auto read_many = [&](size_t id) -> elio::coro::task<bool> {
+            std::vector<uint8_t> bytes(512);
+            bool valid = true;
+            for (size_t i = 0; i < 80; ++i) {
+                const size_t offset = ((i + id) % 6) * kExtent + (i * 31) % 4096;
+                const auto n = co_await store->pread(bytes.data(), bytes.size(), offset);
+                valid = valid && n == 512 &&
+                        std::equal(bytes.begin(), bytes.end(), blob.begin() + offset);
+            }
+            co_return valid;
+        };
+        std::vector<elio::coro::join_handle<bool>> readers;
+        readers.reserve(6);
+        for (size_t i = 0; i < 6; ++i) readers.push_back(elio::spawn(read_many, i));
+        for (auto& reader : readers) {
+            try {
+                const bool valid = co_await reader;
+                bytes_ok = bytes_ok && valid;
+            } catch (...) { bytes_ok = false; }
+            co_await reader.wait_destroyed_async();
+        }
+        REQUIRE(store->remote_fetches() == 6);
+        REQUIRE(store->crc_failures() == 0);
+        co_return 0;
+    }, runtime);
+    REQUIRE(rc == 0);
+    REQUIRE(bytes_ok);
 }

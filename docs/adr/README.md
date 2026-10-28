@@ -152,3 +152,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0028](./0028-cluster-converted-filesystem-metadata.md) | Cluster finalized filesystem metadata in ordinary LSMT payloads | accepted |
 | [0029](./0029-persistent-lsmt-writable-pairs.md) | Resume LSMT writable data/index pairs after process exit | accepted |
 | [0030](./0030-reuse-proven-unchanged-writable-mappings.md) | Reuse writable snapshots only with exact unchanged mapping revisions | accepted |
+| [0031](./0031-reuse-verified-layer-store-extents.md) | Reuse verified LayerStore extent buffers | accepted |

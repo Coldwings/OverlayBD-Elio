@@ -13,7 +13,7 @@
 //     be attached to a fresh staging file;
 //   * a uniform extent granularity (64 KiB default) for remote fetches,
 //     persistence accounting, and sidecar records;
-//   * per-extent CRC32 verification on local reads: a mismatch demotes the
+//   * per-extent CRC32 verification on local disk reads: a mismatch demotes the
 //     extent to a hole and re-fetches (torn writes become deterministic
 //     cache misses, never silent corruption);
 //   * a bounded, droppable write-behind queue drained by a dedicated plain
@@ -161,6 +161,9 @@ public:
     uint64_t crc_failures() const noexcept {
         return crc_failures_.load(std::memory_order_relaxed);
     }
+    uint64_t verified_cache_hits() const noexcept {
+        return verified_cache_hits_.load(std::memory_order_relaxed);
+    }
     uint64_t remote_fetches() const noexcept {
         return remote_fetches_.load(std::memory_order_relaxed);
     }
@@ -196,6 +199,20 @@ public:
     /// API.
     void set_test_fetch_done_hook(std::function<void()> hook);
 #ifdef OBD_TEST_HOOKS
+    // Set before starting readers; retain the callable until all readers drain.
+    void set_test_verified_read_hook(std::function<elio::coro::task<void>()> hook) {
+        verified_read_hook_ = std::move(hook);
+    }
+    void set_test_retry_generation_hook(std::function<void()> hook) {
+        std::lock_guard lk(qmu_);
+        retry_generation_hook_ = std::move(hook);
+    }
+    size_t test_verified_cache_entries() {
+        std::lock_guard lk(cache_mu_);
+        size_t n = 0;
+        for (const auto& entry : verified_cache_) if (entry.data) ++n;
+        return n;
+    }
     void set_test_fill_wait_hook(std::function<void(bool)> hook) {
         std::lock_guard lk(qmu_);
         fill_wait_hook_ = std::move(hook);
@@ -262,6 +279,27 @@ private:
                        std::shared_ptr<const std::vector<uint8_t>> data,
                        uint64_t generation, size_t data_offset = 0);
     void enqueue_clear(uint64_t extent_id);
+
+    // Four immutable, CRC-verified partial-read buffers, at most 256 KiB.
+    // No await or queue lock while cache_mu_ is held. Active readers retain
+    // shared ownership after eviction; this bounds retained cache bytes only.
+    static constexpr size_t kVerifiedCacheBytes = 256 * 1024;
+    struct VerifiedExtent {
+        uint64_t eid = 0;
+        uint64_t record = 0;
+        uint64_t generation = 0;
+        int fd = -1;
+        std::shared_ptr<const std::vector<uint8_t>> data;
+    };
+    bool cache_identity_current(const VerifiedExtent& entry) const;
+    std::shared_ptr<const std::vector<uint8_t>> find_verified(
+        uint64_t eid, uint64_t record, uint64_t generation, int fd);
+    void retain_verified(VerifiedExtent entry);
+    void clear_verified();
+    void invalidate_verified(uint64_t eid);
+    std::mutex cache_mu_;
+    std::array<VerifiedExtent, 4> verified_cache_{};
+    std::atomic<uint64_t> verified_cache_hits_{0};
 
     // Background fill (one coroutine, spawned by open when fill.enable).
     elio::coro::task<void> run_fill();
@@ -343,6 +381,8 @@ private:
     std::function<void(uint32_t)> completion_hook_;  // test-only, under qmu_
     std::function<void()> fetch_done_hook_;    // test-only, coroutine-side
 #ifdef OBD_TEST_HOOKS
+    std::function<elio::coro::task<void>()> verified_read_hook_;
+    std::function<void()> retry_generation_hook_; // writer, after generation advance
     std::function<void(bool)> fill_wait_hook_;  // reset-before-wait boundary
 #endif
     uint32_t attempts_ = 0;        // completion-verify attempts (writer only)

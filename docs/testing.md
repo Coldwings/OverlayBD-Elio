@@ -2428,3 +2428,19 @@ failed/throwing prefix publication, invalidated-snapshot repair, counter
 saturation, and full-byte LSMT overwrite/reseal checks across the internal
 piece boundary. Existing pair-recovery tests retain the durability/error
 coverage; a mapping revision never establishes payload durability.
+
+### Bounded LayerStore partial-read comparison
+
+With `OBD_BUILD_BENCHMARKS=ON`, run
+`obd-bench-layer-store-read NEW_DIRECTORY`. The directory must not exist;
+its ordinary staging/sidecar files remain for inspection. The fixture holds
+1 MiB in memory and persists only eight of sixteen 64 KiB extents, keeping
+background fill disabled and the store Filling. One worker and one blocking
+thread perform 100 warm-up reads followed by three rounds of 1000 reads per
+cell: 4 KiB reads over one, four or eight extents, plus a whole-extent control.
+All requested bytes are compared with the fixture inside each timed region.
+The command rejects remote fetches, CRC failures or completion during timing.
+Compare matched binaries in interleaved order and fresh directories. These
+elapsed reader timings include byte validation and do not measure ublk IOPS,
+cold storage latency or independent CPU consumption. Small shared-host timing
+changes require caution; retain hot-set and thrashing controls together.
