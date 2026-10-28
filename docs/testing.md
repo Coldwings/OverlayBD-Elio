@@ -2495,3 +2495,25 @@ reads check length and endpoint bytes; JSON lines report IOPS and process CPU
 microseconds per read. Use a fresh directory for each matched baseline/candidate
 trial, pin both to the same CPUs, and balance trial order. This is warm local
 file evidence, not cold-storage, remote-source, or ublk performance.
+
+### Local writable mapping publication
+
+`format: local mapping splices match full merges over multiple lowers` checks
+160 mixed updates against full merged-index resolution and every byte of a
+64 KiB model, then verifies writable reopen. `format: mapping splice failure
+invalidates and repairs the full view` injects `bad_alloc` before range-vector
+allocation and immutable publication, checks fail-closed reads and full repair,
+and retains an old immutable snapshot. `format: mapping locality is distinct
+from revision and uncovered ranges fall back` covers the separate opt-in,
+unknown revision, uncovered ranges and top-snapshot allocation failure.
+`format: mapping splices preserve capped ZERO boundaries and DATA offsets`
+checks length-limit boundaries and physical-offset clipping against the full
+merger. `format: locality opt-in retains full repair after errors and exceptions`
+checks that a failed opt-in mutation still republishes its visible prefix by
+full rebuilding. Existing sparse deferred-transition cases remain required; locality does not relax those repair paths.
+
+The existing `obd-bench-writable` driver measures changed-map first writes,
+unchanged overwrites and discard/rewrite cycles with `cycles=1`. Compare matched
+baseline/candidate builds and fresh directories, reporting mapping counts and
+actual payload separately from virtual size. The range update still copies
+linear vectors and does not claim sublinear mutation cost.

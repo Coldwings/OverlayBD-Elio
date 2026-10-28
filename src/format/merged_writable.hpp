@@ -2,8 +2,9 @@
 // one block source. Reads walk the merged index (top wins, holes zero);
 // writes always land in the writable top layer (copy-on-write — lower
 // layers are never modified). Successful writes may reuse a valid snapshot
-// when exact mapping revisions prove it unchanged (ADR-0030); other writes
-// retain conservative rebuilding (documented in docs/format.md).
+// when exact mapping revisions prove it unchanged (ADR-0030). Fully successful
+// local mutations may splice a covered range (ADR-0035); errors and unknown
+// locality retain conservative rebuilding (documented in docs/format.md).
 #pragma once
 
 #include "format/lsmt.hpp"
@@ -68,7 +69,12 @@ private:
     void end_data_op();
     void end_grow_op();
     int rebuild_index();
+    int rebuild_range(uint64_t offset, size_t count);
     void invalidate_index();
+#ifdef OBD_TEST_HOOKS
+    unsigned range_splices_for_test_ = 0;
+    int range_failure_stage_for_test_ = 0;
+#endif
 
     std::vector<std::unique_ptr<LsmtLayer>> layers_;  // topmost first (RO)
     std::unique_ptr<WritableLayer> top_;

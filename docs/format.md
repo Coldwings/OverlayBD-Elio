@@ -754,6 +754,7 @@ public:
     virtual const std::vector<bytes::segment_mapping>& segments() const = 0;
     virtual std::vector<bytes::segment_mapping> segments_snapshot() const;
     virtual std::optional<uint64_t> segments_revision() const noexcept;
+    virtual bool supports_local_mapping_updates() const noexcept;
     virtual source::BlobSource& data_source() = 0;
 };
 ```
@@ -786,6 +787,14 @@ opts in, advances before live mapping mutations, and permanently becomes
 unknown at counter saturation. In-place DATA overwrites leave the mappings
 and revision unchanged. This is a snapshot-reuse proof, not a data version,
 durability indication, or substitute for mutation serialization.
+
+`supports_local_mapping_updates()` is a separate opt-in (ADR-0035), false by
+default. After a fully successful `pwrite` or `discard`, every sector outside
+the requested interval must retain its DATA/ZERO ownership and physical offset,
+including any preparatory or retry work. Segment partitioning may change.
+LSMT-RW opts in; sparse and Hybrid retain the default. This capability neither
+follows from an exact revision nor makes a failed mutation local. The merger
+checks complete top coverage of the successful interval before splicing it.
 
 `grow(vsize)` (D3) extends the layer's write window to `vsize` bytes so
 `pwrite`/`discard` accept the new range. Grow-only: a request smaller
@@ -1274,8 +1283,14 @@ plus a writable top layer, as one block source.
   `top_->pwrite` — **RO lowers are never modified** — and then rebuilds the
   merged index (`rebuild_index()`). A successful write may instead reuse an
   already-valid snapshot when equal available exact revisions prove its
-  mappings unchanged (ADR-0030). Unknown revisions, errors and invalidated
-  snapshots always rebuild; exceptions retain rebuild-or-invalidate behavior.
+  mappings unchanged (ADR-0030). Alternatively, a fully successful write on a
+  locality-capable top may splice its completely covered interval into a new
+  immutable snapshot (ADR-0035). Unchanged prefix/suffix mappings are copied in
+  bulk; only replacement/boundary mappings require merging. Unknown locality,
+  incomplete coverage, partial results, errors and invalid snapshots use full
+  rebuilding; exceptions retain rebuild-or-invalidate behavior. Allocation
+  failure during splicing invalidates the view and reports `-ENOMEM`, because
+  the top may already have committed its mutation.
 - `flush()` delegates to the top layer's `flush()` and rebuilds the merged
   index if a deferred ownership transition changes its generation.
   `pwrite()`, `discard()`, and `flush()` also rebuild or invalidate the index
@@ -1283,7 +1298,8 @@ plus a writable top layer, as one block source.
 - `grow()` widens the writable top before publishing the merged view size;
   direct overlap with `pwrite()`/`discard()`/`flush()` returns `-EBUSY` so
   a resize cannot overtake a top mutation or durability boundary.
-- `discard()` (ADR-0009) delegates to the top layer and rebuilds the index.
+- `discard()` (ADR-0009) delegates to the top layer and updates the index. Full
+  success may use the same proven-local splice; failures still rebuild fully.
   With an LSMT-RW top, discarded ranges stay covered by zeroed segments and
   mask lower-layer data (matching upstream LSMT trim). With a sparse top,
   discarded ranges publish a sidecar zero map before best-effort top-file
@@ -1772,11 +1788,11 @@ writers and readers agree on the same bytes.
   exact DATA intent, so its one-time extent import can retain an already
   over-wide filesystem-block extent. All writes after v2 publication and all
   fresh uppers recover exactly (ADR-0024).
-- **Changed mappings still require O(index) rebuilding.** `MergedWritable`
-  reuses a valid snapshot only for successful writes with an exact unchanged
-  revision. Other writes and ownership changes still rebuild the full index;
-  incremental changed-range updates remain unimplemented. Reads reuse the
-  published immutable snapshot instead of copying the full index.
+- **Changed snapshots still require linear copying.** Proven-local updates
+  avoid a full merge, but copy the top snapshot and the unchanged prefix/suffix
+  into a new contiguous immutable vector. This is not a persistent tree or a
+  sublinear-memory update. Unknown locality and failed operations retain full
+  rebuilding. Reads reuse the published snapshot without copying it.
 - **Trace packaging is external.** The trace codec (`trace.hpp`) is
   implemented and tested; replay is wired into device bring-up
   (`trace_replay.hpp`, ADR-0013) and recording into the supervisor's

@@ -102,6 +102,13 @@ public:
     /// the entire snapshot-plus-payload read with mutations and grow admission.
     /// Readers may overlap each other while excluding those mutations.
     virtual bool serialize_merged_reads() const noexcept { return false; }
+
+    /// After a fully successful pwrite/discard, resolved per-sector DATA/ZERO
+    /// ownership and physical offsets outside the requested range are unchanged,
+    /// including preparatory/retry work. Segment partitioning may differ.
+    /// This is a separate opt-in from exact revisions; the default is unknown.
+    /// Callers serialize mutations and retain ordinary full repair on failure.
+    virtual bool supports_local_mapping_updates() const noexcept { return false; }
 };
 
 }  // namespace obd::format
