@@ -19,6 +19,8 @@ images built by upstream `overlaybd-*` tools load identically here:
   bottom-up stack of layers into the final read-only block view (topmost
   wins, holes read as zeroes). Adjacent compatible mappings are
   coalesced in the merged view; source indexes and sealed files are unchanged.
+  Large immutable merged indexes use a sampled endpoint directory (at most
+  32 KiB per view) to narrow binary searches; small indexes search directly.
 - **Writable layers** (`writable.hpp`, `sparse_rw.hpp`, `lsmt_rw.hpp`, `hybrid_rw.hpp`,
   `merged_writable.hpp`) — the ADR-0008 writable top of an image stack:
   `SparseRwLayer` (sparse data plus exact persisted coverage, ADR-0024),
@@ -697,6 +699,10 @@ public:
   Clamped at `size()`; a short layer read is retried once and then the tail
   is zero-filled (upstream `file.cpp` behavior). Returns `count` (or the
   remaining bytes at EOF), negative -errno on failure.
+  For at least 65,536 merged segments, an immutable directory stores the last
+  endpoint of each group (at least 64 segments, at most 4096 groups). Reads
+  select a group by endpoint before searching the original segment array.
+  This changes only lookup cost; hole and ownership semantics are unchanged.
 - `src/format/lsmt.hpp::merge_indexes` is the static gap-merge helper,
   exposed for unit tests: `layers[i]` is the segment list of layer `i`,
   **topmost first**; appends the merged, sorted, disjoint list to `out` with
