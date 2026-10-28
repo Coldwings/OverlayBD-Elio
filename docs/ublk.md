@@ -140,8 +140,12 @@ owner before any queue state changes.
 
 ### Op dispatch table
 
-The tag engine (`src/ublk/tag_engine.cpp`, function `handle_io`) implements the
-device's op policy:
+The tag engine (`src/ublk/tag_engine.cpp`, `TagEngine::Impl::run_tag`) implements
+the device's op policy directly in each reusable handler. Operation dispatch
+adds no intermediate per-request coroutine frame; source operations retain
+their own asynchronous lifetime. Source failures are converted to completion
+results before the handler restores its owner and publishes the generation:
+
 
 | ublk op | Behavior |
 |---|---|

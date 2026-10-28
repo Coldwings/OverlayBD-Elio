@@ -43,102 +43,6 @@ constexpr uint64_t mailbox_state(uint64_t generation, uint64_t state) {
     return (generation << kStateBits) | state;
 }
 
-elio::coro::task<int32_t> handle_io(Queue* queue,
-                                    source::BlobSource* blob_source,
-                                    IoRequest request) {
-    int32_t result = 0;
-#ifdef OBD_TEST_HOOKS
-    if (count_requests.load(std::memory_order_relaxed))
-        request_counts[static_cast<uint8_t>(request.op)].fetch_add(1, std::memory_order_relaxed);
-#endif
-    try {
-        switch (request.op) {
-        case UBLK_IO_OP_READ: {
-            void* buffer = queue->io_buf(request.tag);
-            const uint32_t length = request.byte_len();
-            const ssize_t read =
-                co_await blob_source->pread(buffer, length,
-                                            request.byte_offset());
-            if (read < 0) {
-                result = static_cast<int32_t>(read);
-            } else {
-                if (static_cast<uint32_t>(read) < length) {
-                    std::memset(static_cast<uint8_t*>(buffer) + read, 0,
-                                length - read);
-                }
-                result = static_cast<int32_t>(length);
-            }
-            break;
-        }
-        case UBLK_IO_OP_FLUSH: {
-            auto* writable =
-                dynamic_cast<source::WritableBlobSource*>(blob_source);
-            result = writable ? co_await writable->flush() : 0;
-            break;
-        }
-        case UBLK_IO_OP_WRITE: {
-            auto* writable =
-                dynamic_cast<source::WritableBlobSource*>(blob_source);
-            if (!writable) {
-                result = -EROFS;
-                break;
-            }
-            const uint32_t length = request.byte_len();
-            const ssize_t written = co_await writable->pwrite(
-                queue->io_buf(request.tag), length, request.byte_offset());
-            result = written < 0 ? static_cast<int32_t>(written)
-                                 : static_cast<int32_t>(length);
-            break;
-        }
-        case UBLK_IO_OP_DISCARD: {
-            auto* writable =
-                dynamic_cast<source::WritableBlobSource*>(blob_source);
-            result = writable
-                ? co_await writable->discard(request.byte_offset(),
-                                             request.byte_len())
-                : -EROFS;
-            break;
-        }
-        case UBLK_IO_OP_WRITE_ZEROES: {
-            auto* writable =
-                dynamic_cast<source::WritableBlobSource*>(blob_source);
-            if (!writable) {
-                result = -EROFS;
-                break;
-            }
-            if (request.flags & UBLK_IO_F_NOUNMAP) {
-                const uint32_t length = request.byte_len();
-                void* buffer = queue->io_buf(request.tag);
-                std::memset(buffer, 0, length);
-                const ssize_t written = co_await writable->pwrite(
-                    buffer, length, request.byte_offset());
-                result = written < 0 ? static_cast<int32_t>(written) : 0;
-            } else {
-                result = co_await writable->discard(request.byte_offset(),
-                                                    request.byte_len());
-            }
-            break;
-        }
-        case UBLK_IO_OP_WRITE_SAME:
-            result = -EOPNOTSUPP;
-            break;
-        default:
-            result = -EOPNOTSUPP;
-            break;
-        }
-    } catch (const std::exception& error) {
-        ELIO_LOG_ERROR("ublk tag {} source failed: {}", request.tag,
-                       error.what());
-        result = -EIO;
-    } catch (...) {
-        ELIO_LOG_ERROR("ublk tag {} source failed: unknown exception",
-                       request.tag);
-        result = -EIO;
-    }
-    ELIO_LOG_DEBUG("ublk bridge: tag {} op {} -> {}", request.tag,
-                   request.op, result);
-    co_return result;
-}
 
 }  // namespace
 
@@ -341,8 +245,99 @@ struct TagEngine::Impl {
             const uint64_t generation = slot.generation;
             try {
                 int32_t result = -EIO;
-                if (!elio::coro::this_coro::cancel_token().is_cancelled())
-                    result = co_await handle_io(queue, blob_source, request);
+                if (!elio::coro::this_coro::cancel_token().is_cancelled()) {
+                    result = 0;
+#ifdef OBD_TEST_HOOKS
+                    if (count_requests.load(std::memory_order_relaxed))
+                        request_counts[static_cast<uint8_t>(request.op)].fetch_add(1, std::memory_order_relaxed);
+#endif
+                    try {
+                        switch (request.op) {
+                        case UBLK_IO_OP_READ: {
+                            void* buffer = queue->io_buf(request.tag);
+                            const uint32_t length = request.byte_len();
+                            const ssize_t read =
+                                co_await blob_source->pread(buffer, length,
+                                                            request.byte_offset());
+                            if (read < 0) {
+                                result = static_cast<int32_t>(read);
+                            } else {
+                                if (static_cast<uint32_t>(read) < length) {
+                                    std::memset(static_cast<uint8_t*>(buffer) + read, 0,
+                                                length - read);
+                                }
+                                result = static_cast<int32_t>(length);
+                            }
+                            break;
+                        }
+                        case UBLK_IO_OP_FLUSH: {
+                            auto* writable =
+                                dynamic_cast<source::WritableBlobSource*>(blob_source);
+                            result = writable ? co_await writable->flush() : 0;
+                            break;
+                        }
+                        case UBLK_IO_OP_WRITE: {
+                            auto* writable =
+                                dynamic_cast<source::WritableBlobSource*>(blob_source);
+                            if (!writable) {
+                                result = -EROFS;
+                                break;
+                            }
+                            const uint32_t length = request.byte_len();
+                            const ssize_t written = co_await writable->pwrite(
+                                queue->io_buf(request.tag), length, request.byte_offset());
+                            result = written < 0 ? static_cast<int32_t>(written)
+                                                 : static_cast<int32_t>(length);
+                            break;
+                        }
+                        case UBLK_IO_OP_DISCARD: {
+                            auto* writable =
+                                dynamic_cast<source::WritableBlobSource*>(blob_source);
+                            result = writable
+                                ? co_await writable->discard(request.byte_offset(),
+                                                             request.byte_len())
+                                : -EROFS;
+                            break;
+                        }
+                        case UBLK_IO_OP_WRITE_ZEROES: {
+                            auto* writable =
+                                dynamic_cast<source::WritableBlobSource*>(blob_source);
+                            if (!writable) {
+                                result = -EROFS;
+                                break;
+                            }
+                            if (request.flags & UBLK_IO_F_NOUNMAP) {
+                                const uint32_t length = request.byte_len();
+                                void* buffer = queue->io_buf(request.tag);
+                                std::memset(buffer, 0, length);
+                                const ssize_t written = co_await writable->pwrite(
+                                    buffer, length, request.byte_offset());
+                                result = written < 0 ? static_cast<int32_t>(written) : 0;
+                            } else {
+                                result = co_await writable->discard(request.byte_offset(),
+                                                                    request.byte_len());
+                            }
+                            break;
+                        }
+                        case UBLK_IO_OP_WRITE_SAME:
+                            result = -EOPNOTSUPP;
+                            break;
+                        default:
+                            result = -EOPNOTSUPP;
+                            break;
+                        }
+                    } catch (const std::exception& error) {
+                        ELIO_LOG_ERROR("ublk tag {} source failed: {}", request.tag,
+                                       error.what());
+                        result = -EIO;
+                    } catch (...) {
+                        ELIO_LOG_ERROR("ublk tag {} source failed: unknown exception",
+                                       request.tag);
+                        result = -EIO;
+                    }
+                    ELIO_LOG_DEBUG("ublk bridge: tag {} op {} -> {}", request.tag,
+                                   request.op, result);
+                }
 #ifdef OBD_TEST_HOOKS
                 if (const auto& hook = queue->bridge_resume_hook_for_test(); hook)
                     co_await hook(BridgeResumePoint::source_return);
