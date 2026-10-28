@@ -241,7 +241,7 @@ every remote layer with a non-empty `dir`:
   followed by one 8-byte `{crc32, flags}` record per extent, each written
   with a single atomic `pwrite` **after** its data write completed (a crash
   may lose a bit whose data survived — safe — never the reverse);
-- reads of a "present" extent verify its CRC32 first; a mismatch demotes the
+- disk reads of a "present" extent verify its CRC32 first; a mismatch demotes the
   extent to a hole and re-fetches, making torn writes a deterministic cache
   miss instead of silent corruption;
 - persistence is write-behind on a bounded, droppable queue drained by a
@@ -859,7 +859,8 @@ remote bytes into a sparse local staging file with a sidecar extent map
 - `pread` — splits the request into extents. In `Complete` state: plain
   positional reads from the commit file. In `Filling` state, a present
   extent is read locally and CRC32-verified (the tail extent over its actual
-  length); a mismatch clears the bit (memory and sidecar), counts
+  length), or served from an immutable previously verified partial-read buffer
+  (ADR-0031); a mismatch clears the bit (memory and sidecar), counts
   `crc_failures`, and re-fetches. A missing extent (or any extent in
   `Bypass`) is fetched whole from the remote with in-flight coalescing —
   concurrent readers of the same missing extent join one fetch
@@ -931,7 +932,17 @@ remote bytes into a sparse local staging file with a sidecar extent map
   inject write failures or schedule completion-verification races. Not part
   of the module API.
 
-Complexity: `pread` costs one local read + CRC32 per present extent, one
+Partial local reads retain at most four verified extent buffers totaling
+256 KiB (ADR-0031). The key includes extent, CRC/presence record, retry
+generation and staging descriptor; publication rechecks the live identity.
+Retry, Complete and Bypass clear retained entries; demotion invalidates the
+extent. Whole-extent reads bypass this cache. Cache hits reuse immutable
+verified bytes and do not detect subsequent external corruption until a disk
+read occurs. `verified_cache_hits()` counts these hits. Concurrent readers may
+retain shared buffers after eviction, outside the retained-cache byte cap.
+
+Complexity: a verified buffer hit costs a bounded four-entry lookup and copy.
+A miss costs one local read + CRC32 per present extent, one
 coalesced remote fetch per missing extent, plus one memcpy per extent; the
 sidecar costs 8 bytes per extent on disk and in memory.
 
@@ -973,7 +984,7 @@ Callers may rely on:
   configured); a `.download.<nonce>` staging file is never served to
   readers (every byte of it is per-extent CRC-verified before it is).
 - **LayerStore crash rule** — a sidecar bit is set only after the extent's
-  data write completed, and every local read verifies the extent's CRC32:
+  data write completed, and every local disk read verifies the extent's CRC32:
   a crash or torn write degrades to a re-fetch, never to bad data.
 - **Registry byte-exactness** — `RegistryClient::get_data` returns `count`
   or an error, never a short count; a server short body maps to `-EIO`.
@@ -1508,3 +1519,17 @@ error even after progress; LayerStore keeps its POSIX partial-return policy.
 Both return the transferred prefix on early EOF and retain the existing
 source-size clamping. Dedicated writer-thread persistence remains synchronous:
 those operations do not execute in an Elio scheduler coroutine.
+
+Verified extent buffer tests (ADR-0031):
+- `source: layer store verified buffers retain four partial extents` covers
+  byte equality, cache hits, LRU eviction and whole-extent bypass.
+- `source: layer store verified buffers obey byte cap and tail length` covers
+  byte-bound eviction, oversized extents and exact tail lengths.
+- `source: layer store full disk reads invalidate corrupt cached extents` checks
+  immutable-memory reuse after external corruption and full-read CRC demotion.
+- `source: layer store rejects verified buffers from a retired staging pair`
+  suspends a verified local read across a SHA retry and checks publication.
+- `source: layer store terminal states release verified buffers` covers
+  successful completion and exhausted SHA retry into Bypass.
+- `source: layer store concurrent partial readers survive cache eviction`
+  checks full slice equality under concurrent readers and cache pressure.

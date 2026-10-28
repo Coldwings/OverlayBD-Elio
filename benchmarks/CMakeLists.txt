@@ -21,3 +21,7 @@ target_link_libraries(obd-bench-zfile-read PRIVATE obd_core)
 add_executable(obd-bench-lsmt-lookup lsmt_lookup.cpp)
 obd_target_warnings(obd-bench-lsmt-lookup)
 target_link_libraries(obd-bench-lsmt-lookup PRIVATE obd_core)
+
+add_executable(obd-bench-layer-store-read layer_store_read.cpp)
+obd_target_warnings(obd-bench-layer-store-read)
+target_link_libraries(obd-bench-layer-store-read PRIVATE obd_core)

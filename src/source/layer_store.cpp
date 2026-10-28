@@ -660,6 +660,60 @@ void LayerStore::enqueue_clear(uint64_t extent_id) {
     qcv_.notify_one();
 }
 
+bool LayerStore::cache_identity_current(const VerifiedExtent& entry) const {
+    return state() == State::Filling &&
+           generation_.load(std::memory_order_acquire) == entry.generation &&
+           staging_fd_.load(std::memory_order_acquire) == entry.fd &&
+           records_[entry.eid].load(std::memory_order_acquire) == entry.record;
+}
+
+std::shared_ptr<const std::vector<uint8_t>> LayerStore::find_verified(
+    uint64_t eid, uint64_t record, uint64_t generation, int fd) {
+    std::lock_guard lk(cache_mu_);
+    for (size_t i = 0; i < verified_cache_.size(); ++i) {
+        auto& entry = verified_cache_[i];
+        if (!entry.data || entry.eid != eid || entry.record != record ||
+            entry.generation != generation || entry.fd != fd) continue;
+        if (!cache_identity_current(entry)) return {};
+        auto hit = std::move(entry);
+        for (size_t j = i; j > 0; --j)
+            verified_cache_[j] = std::move(verified_cache_[j - 1]);
+        verified_cache_[0] = std::move(hit);
+        verified_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+        return verified_cache_[0].data;
+    }
+    return {};
+}
+
+void LayerStore::retain_verified(VerifiedExtent entry) {
+    std::lock_guard lk(cache_mu_);
+    if (!cache_identity_current(entry)) return;
+    // Compact valid, nonduplicate entries and retain newest entries first.
+    std::array<VerifiedExtent, 4> next{};
+    size_t bytes = entry.data->size();
+    size_t n = 1;
+    next[0] = std::move(entry);
+    for (auto& old : verified_cache_) {
+        if (!old.data || old.eid == next[0].eid ||
+            !cache_identity_current(old) || n == next.size() ||
+            old.data->size() > kVerifiedCacheBytes - bytes) continue;
+        bytes += old.data->size();
+        next[n++] = std::move(old);
+    }
+    verified_cache_ = std::move(next);
+}
+
+void LayerStore::clear_verified() {
+    std::lock_guard lk(cache_mu_);
+    verified_cache_ = {};
+}
+
+void LayerStore::invalidate_verified(uint64_t eid) {
+    std::lock_guard lk(cache_mu_);
+    for (auto& entry : verified_cache_)
+        if (entry.eid == eid) entry = {};
+}
+
 elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
                                             uint64_t offset) {
     if (offset >= size_) co_return 0;
@@ -691,6 +745,18 @@ elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
             const uint64_t rec =
                 records_[eid].load(std::memory_order_acquire);
             if (rec & kFlagPresent) {
+                const uint64_t generation =
+                    generation_.load(std::memory_order_acquire);
+                const int fd = staging_fd_.load(std::memory_order_acquire);
+                const bool partial = within != 0 || need != elen;
+                if (partial && elen <= kVerifiedCacheBytes) {
+                    auto cached = find_verified(eid, rec, generation, fd);
+                    if (cached) {
+                        std::memcpy(out + done, cached->data() + within, need);
+                        done += need;
+                        continue;
+                    }
+                }
                 const uint32_t expected_crc = static_cast<uint32_t>(rec >> 32);
                 // Fast path: a request covering the whole extent CRCs the
                 // caller's buffer directly, avoiding a copy and an alloc.
@@ -701,8 +767,7 @@ elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
                     dst = tmp.data();
                 }
                 const ssize_t r = co_await read_fd_loop(
-                    staging_fd_.load(std::memory_order_acquire), dst, elen,
-                    ebase);
+                    fd, dst, elen, ebase);
                 if (r < 0) {
                     co_return done > 0 ? static_cast<ssize_t>(done) : r;
                 }
@@ -714,6 +779,19 @@ elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
                                     need);
                     }
                     served = true;
+                    if (partial && elen <= kVerifiedCacheBytes) {
+#ifdef OBD_TEST_HOOKS
+                        if (verified_read_hook_) co_await verified_read_hook_();
+#endif
+                        // Cache allocation is optional after the caller's
+                        // bytes have already been delivered successfully.
+                        try {
+                            retain_verified({eid, rec, generation, fd,
+                                std::make_shared<const std::vector<uint8_t>>(
+                                    std::move(tmp))});
+                        } catch (const std::bad_alloc&) {
+                        }
+                    }
                 } else {
                     // Corrupt or torn extent: demote to a hole and re-fetch.
                     crc_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -722,6 +800,7 @@ elio::coro::task<ssize_t> LayerStore::pread(void* buf, size_t count,
                     if (old & kFlagPresent) {
                         present_.fetch_sub(1, std::memory_order_relaxed);
                     }
+                    invalidate_verified(eid);
                     enqueue_clear(eid);
                 }
             }
@@ -1176,6 +1255,7 @@ void LayerStore::process_job(
         if (old & kFlagPresent) {
             present_.fetch_sub(1, std::memory_order_relaxed);
         }
+        invalidate_verified(job.extent_id);
         return;
     }
     if (hook) {
@@ -1226,6 +1306,7 @@ void LayerStore::enter_bypass(int err, const char* what) {
     if (state_.compare_exchange_strong(expected,
                                        static_cast<int>(State::Bypass),
                                        std::memory_order_acq_rel)) {
+        clear_verified();
         stop_fill();
         signal_fill_events_from_writer(true);
         // Logged once: only the first transition wins the CAS.
@@ -1297,6 +1378,7 @@ void LayerStore::complete_layer() {
                          std::memory_order_release);
         state_.store(static_cast<int>(State::Complete),
                      std::memory_order_release);
+        clear_verified();
         signal_fill_events_from_writer(true);
         ELIO_LOG_INFO("layer store {} complete: {} ({} extents)", dir_,
                       commit_path(dir_), extent_count_);
@@ -1321,6 +1403,15 @@ void LayerStore::restart_fresh() {
     // publish the replacement pair, so a watcher that observes the new
     // pair's files already sees cleared records.
     generation_.fetch_add(1, std::memory_order_acq_rel);
+#ifdef OBD_TEST_HOOKS
+    std::function<void()> retry_hook;
+    {
+        std::lock_guard lk(qmu_);
+        retry_hook = retry_generation_hook_;
+    }
+    if (retry_hook) retry_hook();
+#endif
+    clear_verified();
     for (auto& rec : records_) rec.store(0, std::memory_order_relaxed);
     present_.store(0, std::memory_order_relaxed);
     {
@@ -1345,6 +1436,10 @@ void LayerStore::restart_fresh() {
     // the destructor.
     const int old_fd =
         staging_fd_.exchange(p.staging_fd, std::memory_order_acq_rel);
+    // A reader can observe the new generation with the old descriptor before
+    // records are cleared. Fence its publication after descriptor replacement
+    // too: cache_mu_ orders this clear against its final identity check.
+    clear_verified();
     retired_fds_.push_back(old_fd);
     if (sidecar_fd_ >= 0) {
         ::close(sidecar_fd_);
