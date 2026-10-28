@@ -122,6 +122,10 @@ private:
 
     std::vector<std::unique_ptr<LsmtLayer>> layers_;  // topmost first
     std::vector<bytes::segment_mapping> index_;
+    // Last endpoint in each fixed-size group; immutable after open. At most
+    // 4096 entries (32 KiB), omitted for small merged indexes.
+    std::vector<uint64_t> lookup_ends_;
+    size_t lookup_stride_ = 0;
     uint64_t vsize_ = 0;
     std::string label_;
 };

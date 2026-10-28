@@ -345,6 +345,18 @@ elio::coro::task<std::unique_ptr<MergedLsmt>> MergedLsmt::open(
 
     auto merged = std::unique_ptr<MergedLsmt>(new MergedLsmt());
     merge_indexes(seg_ptrs, merged->index_);
+    if (merged->index_.size() >= 65536) {
+        constexpr size_t kMaxDirectory = 4096;
+        const size_t size = merged->index_.size();
+        merged->lookup_stride_ = std::max<size_t>(
+            64, size / kMaxDirectory + (size % kMaxDirectory != 0));
+        const size_t stride = merged->lookup_stride_;
+        merged->lookup_ends_.reserve(size / stride + (size % stride != 0));
+        for (size_t begin = 0; begin < size; begin += stride) {
+            const size_t end = begin + std::min(stride, size - begin);
+            merged->lookup_ends_.push_back(merged->index_[end - 1].end());
+        }
+    }
     merged->layers_ = std::move(layers);
     merged->vsize_ = vsize;
     merged->label_ = "lsmt-merged(" +
@@ -368,8 +380,18 @@ elio::coro::task<ssize_t> MergedLsmt::pread(void* buf, size_t count,
 
     // First merged segment with end() > start_sec (index.cpp lookup
     // semantics: lower_bound under `a.end() <= b.offset`).
+    auto first = index_.begin();
+    auto last = index_.end();
+    if (!lookup_ends_.empty()) {
+        const size_t group = std::upper_bound(
+            lookup_ends_.begin(), lookup_ends_.end(), start_sec) -
+            lookup_ends_.begin();
+        const size_t begin = std::min(group * lookup_stride_, index_.size());
+        first += begin;
+        last = first + std::min(lookup_stride_, index_.size() - begin);
+    }
     auto it = std::upper_bound(
-        index_.begin(), index_.end(), start_sec,
+        first, last, start_sec,
         [](uint64_t x, const bytes::segment_mapping& s) { return x < s.end(); });
 
     uint64_t cur = start_sec;

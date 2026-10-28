@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <algorithm>
+#include <array>
 
 using namespace obd;
 using obd::test::TempDir;
@@ -602,4 +603,69 @@ TEST_CASE("format: zfile partial edges cross compressed read windows",
         co_return 0;
     });
     REQUIRE(result == 0);
+}
+
+TEST_CASE("format: large merged lookup preserves gaps endpoints and sparse offsets",
+          "[format][lsmt][lookup]") {
+    for (size_t entries : {4096u, 65535u, 65536u, 65537u, 262145u}) {
+        constexpr uint64_t far = bytes::segment_mapping::kMaxOffset - 4;
+        constexpr size_t index_offset = 5120;
+        const size_t trailer_offset = index_offset + entries * 16;
+        std::vector<uint8_t> file(trailer_offset + 4096);
+        std::fill_n(file.data() + 4096, 512, 0x55);
+        std::fill_n(file.data() + 4608, 512, 0xaa);
+        format::lsmt::HeaderTrailer ht;
+        ht.flags = 7; ht.virtual_size = (far + 3) * 512;
+        ht.index_offset = index_offset; ht.index_size = entries;
+        ht.serialize(file.data()); ht.flags = 6;
+        ht.serialize(file.data() + trailer_offset);
+        for (size_t i = 0; i < entries; ++i) {
+            bytes::segment_mapping m;
+            m.offset = i + 1 == entries ? far : i * 3;
+            m.length = 1 + i % 2;
+            m.moffset = 8;
+            m.zeroed = i % 7 == 0;
+            if (i + 1 == entries) { m.length = 1; m.zeroed = false; }
+            bytes::store_segment_le(file.data() + index_offset + i * 16, m);
+        }
+        const int result = test::run_coro([&]() -> elio::coro::task<int> {
+            auto layer = co_await format::LsmtLayer::open(
+                std::make_unique<test::VectorSource>(file));
+            std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+            layers.push_back(std::move(layer));
+            auto merged = co_await format::MergedLsmt::open(std::move(layers));
+            REQUIRE(merged->merged_index().size() == entries);
+            std::vector<uint64_t> queries{0, 1, 63 * 3, 64 * 3 - 1,
+                64 * 3, 65 * 3, (entries - 2) * 3, (entries - 1) * 3,
+                far - 1, far, far + 1, far + 3};
+            uint64_t random = 173;
+            for (unsigned i = 0; i < 2000; ++i) {
+                random = random * 6364136223846793005ULL + 1;
+                queries.push_back((random >> 32) % (entries * 3));
+            }
+            for (uint64_t sector : queries) {
+                std::array<uint8_t, 4096> actual;
+                actual.fill(0xa5);
+                const size_t count = std::min<uint64_t>(8, far + 3 - sector) * 512;
+                const auto read = co_await merged->pread(
+                    actual.data(), count, sector * 512);
+                REQUIRE(read == static_cast<ssize_t>(count));
+                for (size_t byte = 0; byte < count; ++byte) {
+                    const uint64_t current = sector + byte / 512;
+                    uint8_t expected = 0;
+                    if (current == far) expected = 0x55;
+                    else if (current % 3 < 1 + (current / 3) % 2 &&
+                             current / 3 < entries - 1 &&
+                             (current / 3) % 7 != 0)
+                        expected = current % 3 ? 0xaa : 0x55;
+                    if (actual[byte] != expected) {
+                        INFO("entries=" << entries << " sector=" << current);
+                        REQUIRE(actual[byte] == expected);
+                    }
+                }
+            }
+            co_return 0;
+        });
+        REQUIRE(result == 0);
+    }
 }

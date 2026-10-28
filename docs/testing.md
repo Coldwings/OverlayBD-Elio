@@ -2405,3 +2405,19 @@ first and last bytes are checked against the reference. Unit tests cover full
 byte equality and partial edges across compressed windows. Disk loading is
 excluded from timing. Results describe memory-source decode/buffer overhead,
 not disk or ublk IOPS, and depend on codec, block size and compressibility.
+
+### Bounded large-index lookup experiment
+
+With `OBD_BUILD_BENCHMARKS=ON`, `obd-bench-lsmt-lookup` measures the actual
+read-only merged reader over 1,024, 4,096, 16,384, 65,536 and 262,144 fragmented mappings.
+Each fixture uses 4 MiB of memory-backed payload; repeated physical extents
+and logical gaps preserve a large merged index without large disk allocation.
+One worker issues random aligned 4 KiB reads, with 10k warmup followed by five
+50k-read rounds. JSON output includes merged-view preparation time, segment
+count, read cost, source calls and checksum. Compare matching warmed baseline
+and candidate builds in both orders; a small-index cell is the control.
+Preparation includes index merging and any directory construction, but excludes
+fixture generation and layer parsing. Timing checks a byte per payload sector;
+the `[lookup]` regression checks all returned bytes across gaps, directory
+boundaries, threshold sizes, the directory cap and extreme sparse offsets.
+These are memory-source CPU costs, not disk, registry or ublk throughput.
