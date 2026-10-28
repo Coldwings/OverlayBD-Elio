@@ -413,3 +413,143 @@ TEST_CASE("format: lsmt tail packing splits wire boundaries and normalizes unifo
     });
     REQUIRE(rc == 0);
 }
+
+TEST_CASE("format: merged index coalesces only compatible bounded mappings",
+          "[format][lsmt][coalesce]") {
+    using Mapping = bytes::segment_mapping;
+    const auto mapping = [](uint64_t offset, uint32_t length, uint64_t physical,
+                            bool zero = false) {
+        Mapping m;
+        m.offset = offset; m.length = length; m.moffset = physical;
+        m.zeroed = zero;
+        return m;
+    };
+    std::vector<Mapping> top{
+        mapping(0, 2, 8), mapping(2, 2, 10), // compatible DATA
+        mapping(4, 2, 30),                  // physical discontinuity
+        mapping(6, 2, 40, true), mapping(8, 2, 99, true),
+        mapping(12, 2, 50)};               // logical hole
+    std::vector<Mapping> bottom{mapping(10, 2, 48)};
+    std::vector<Mapping> merged;
+    format::MergedLsmt::merge_indexes({&top, &bottom}, merged);
+    REQUIRE(merged.size() == 5);
+    CHECK(merged[0].length == 4);
+    CHECK(merged[1].moffset == 30);
+    CHECK(merged[2].zeroed);
+    CHECK(merged[2].length == 4);
+    CHECK(merged[3].tag == 1);
+    CHECK(merged[4].tag == 0); // contiguous bytes, different layer
+
+    top = {mapping(0, Mapping::kMaxLength - 1, 8),
+           mapping(Mapping::kMaxLength - 1, 1, 8 + Mapping::kMaxLength - 1),
+           mapping(Mapping::kMaxLength, 1, 8 + Mapping::kMaxLength),
+           mapping(Mapping::kMaxLength + 2, 1, 8 + Mapping::kMaxLength + 1)};
+    merged.clear();
+    format::MergedLsmt::merge_indexes({&top}, merged);
+    REQUIRE(merged.size() == 3);
+    CHECK(merged[0].length == Mapping::kMaxLength);
+    CHECK(merged[1].length == 1);
+    CHECK(merged[2].offset == Mapping::kMaxLength + 2); // retain hole
+
+    // The public helper appends; a pre-existing prefix is not ours to rewrite.
+    top = {mapping(2, 2, 10)};
+    merged = {mapping(0, 2, 8)};
+    format::MergedLsmt::merge_indexes({&top}, merged);
+    REQUIRE(merged.size() == 2);
+    CHECK(merged[0].length == 2);
+}
+
+TEST_CASE("format: coalesced layer clipping preserves per-sector ownership",
+          "[format][lsmt][coalesce]") {
+    using Mapping = bytes::segment_mapping;
+    // Independently resolve ownership from the original top-first layer
+    // arrays. Vary holes, ZERO, physical continuity and overlap deterministically.
+    for (uint64_t seed = 1; seed <= 16; ++seed) {
+        uint64_t rng = seed;
+        std::vector<std::vector<Mapping>> layers(3);
+        for (auto& layer : layers) {
+            for (uint64_t sector = 0; sector < 256;) {
+                rng = rng * 6364136223846793005ULL + 1;
+                const uint32_t length = static_cast<uint32_t>(
+                    std::min<uint64_t>(1 + ((rng >> 32) % 7), 256 - sector));
+                if (rng & 1) {
+                    Mapping m;
+                    m.offset = sector; m.length = length;
+                    m.moffset = 8 + sector + ((rng & 4) ? 512 : 0);
+                    m.zeroed = (rng & 8) != 0;
+                    layer.push_back(m);
+                }
+                sector += length;
+            }
+        }
+        std::vector<Mapping> merged;
+        format::MergedLsmt::merge_indexes(
+            {&layers[0], &layers[1], &layers[2]}, merged);
+        for (uint64_t sector = 0; sector < 256; ++sector) {
+            const Mapping* expected = nullptr;
+            size_t expected_tag = 0;
+            for (size_t tag = 0; tag < layers.size() && !expected; ++tag) {
+                for (const auto& m : layers[tag]) {
+                    if (sector >= m.offset && sector < m.end()) {
+                        expected = &m; expected_tag = tag; break;
+                    }
+                }
+            }
+            const Mapping* actual = nullptr;
+            for (const auto& m : merged) {
+                CHECK(m.length <= Mapping::kMaxLength);
+                if (sector >= m.offset && sector < m.end()) {
+                    REQUIRE(actual == nullptr);
+                    actual = &m;
+                }
+            }
+            REQUIRE((actual != nullptr) == (expected != nullptr));
+            if (!expected) continue;
+            CHECK(actual->tag == expected_tag);
+            CHECK(actual->zeroed == expected->zeroed);
+            if (!expected->zeroed)
+                CHECK(actual->moffset + sector - actual->offset ==
+                      expected->moffset + sector - expected->offset);
+        }
+    }
+}
+
+TEST_CASE("format: contiguous tiny mappings read once with exact bytes",
+          "[format][lsmt][coalesce]") {
+    // A small sealed fixture with eight independently encoded sector mappings.
+    // Expected payload bytes are generated independently of index merging.
+    constexpr size_t index_offset = 8192;
+    constexpr size_t trailer_offset = index_offset + 8 * 16;
+    std::vector<uint8_t> file(trailer_offset + 4096);
+    format::lsmt::HeaderTrailer ht;
+    ht.flags = 7; ht.virtual_size = 4096;
+    ht.index_offset = index_offset; ht.index_size = 8;
+    ht.serialize(file.data()); ht.flags = 6;
+    ht.serialize(file.data() + trailer_offset);
+    std::vector<uint8_t> expected(4096);
+    for (size_t sector = 0; sector < 8; ++sector) {
+        std::fill_n(expected.data() + sector * 512, 512,
+                    static_cast<uint8_t>(sector + 1));
+        bytes::segment_mapping m;
+        m.offset = sector; m.length = 1; m.moffset = sector + 8;
+        bytes::store_segment_le(file.data() + index_offset + sector * 16, m);
+    }
+    std::copy(expected.begin(), expected.end(), file.begin() + 4096);
+    const int result = test::run_coro([&]() -> elio::coro::task<int> {
+        auto source = std::make_unique<test::VectorSource>(file);
+        auto* observation = source.get();
+        auto layer = co_await format::LsmtLayer::open(std::move(source));
+        REQUIRE(layer->segments().size() == 8); // source index remains intact
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        layers.push_back(std::move(layer));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        const auto before = observation->reads();
+        std::vector<uint8_t> actual(4096);
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 4096);
+        REQUIRE(actual == expected);
+        REQUIRE(observation->reads() - before == 1);
+        co_return 0;
+    });
+    REQUIRE(result == 0);
+}

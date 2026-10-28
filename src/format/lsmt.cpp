@@ -249,7 +249,7 @@ elio::coro::task<std::unique_ptr<LsmtLayer>> LsmtLayer::open_impl(
 void MergedLsmt::merge_range(
     const std::vector<const std::vector<bytes::segment_mapping>*>& layers,
     size_t level, uint64_t lo, uint64_t hi,
-    std::vector<bytes::segment_mapping>& out) {
+    std::vector<bytes::segment_mapping>& out, size_t output_begin) {
     if (level >= layers.size() || lo >= hi) return;
     const auto& segs = *layers[level];
     // First segment with end() > lo (segments are sorted and disjoint, so
@@ -260,7 +260,7 @@ void MergedLsmt::merge_range(
     for (; it != segs.end() && it->offset < hi; ++it) {
         if (it->offset > lo) {
             // Gap not covered by this level: recurse into lower levels.
-            merge_range(layers, level + 1, lo, it->offset, out);
+            merge_range(layers, level + 1, lo, it->offset, out, output_begin);
         }
         bytes::segment_mapping s = *it;
         if (s.offset < lo) {  // clip head
@@ -274,19 +274,32 @@ void MergedLsmt::merge_range(
         }
         if (s.length == 0) continue;
         s.tag = static_cast<uint8_t>(level);
-        out.push_back(s);
+        if (out.size() > output_begin) {
+            auto& previous = out.back();
+            if (previous.end() == s.offset && previous.tag == s.tag &&
+                previous.zeroed == s.zeroed &&
+                (s.zeroed || previous.mend() == s.moffset) &&
+                s.length <= bytes::segment_mapping::kMaxLength - previous.length) {
+                previous.length += s.length;
+            } else {
+                out.push_back(s);
+            }
+        } else {
+            out.push_back(s);
+        }
         lo = s.end();
         if (lo >= hi) break;
     }
     if (lo < hi) {
-        merge_range(layers, level + 1, lo, hi, out);
+        merge_range(layers, level + 1, lo, hi, out, output_begin);
     }
 }
 
 void MergedLsmt::merge_indexes(
     const std::vector<const std::vector<bytes::segment_mapping>*>& layers,
     std::vector<bytes::segment_mapping>& out) {
-    merge_range(layers, 0, 0, bytes::segment_mapping::kMaxOffset, out);
+    merge_range(layers, 0, 0, bytes::segment_mapping::kMaxOffset, out,
+                out.size());
     if (out.size() > lsmt::kMaxRoIndexSize) {
         throw format_error("lsmt: merged index size " + std::to_string(out.size()) +
                            " exceeds maximum");
