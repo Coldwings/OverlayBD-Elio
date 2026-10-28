@@ -1,6 +1,6 @@
 # ADR-0026: Persist interoperable Hybrid uppers without payload-copy sealing
 
-- Status: accepted
+- Status: superseded by ADR-0034
 - Date: 2026-10-27
 - Supersedes: none
 - Binds: src/format/hybrid_format.hpp, src/format/hybrid_format.cpp,

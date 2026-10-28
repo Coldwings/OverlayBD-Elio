@@ -2469,3 +2469,29 @@ changes require caution; retain hot-set and thrashing controls together.
   compares every returned byte, and drains/destroys all reader handles before
   destroying the source. It is bounded concurrency coverage, not a proof of
   every possible scheduling interleaving.
+
+### Hybrid shared-read checks and bounded reader measurement
+
+`format: hybrid shared reads overlap and exclude queued mutations` holds a
+logical and physical read inside the actual writer, then queues each of write,
+discard, FLUSH, checkpoint, compaction and seal. It checks read overlap, mutation
+exclusion, direct grow rejection, and a later reader observing the mutation. `format: hybrid shared
+read exceptions release ownership` checks a subsequent write after an exception
+under shared ownership. `format: hybrid merged shared reads overlap and release
+mutation guards` checks two merged reads, queued discard, grow rejection, and
+normal/error draining before later grow. These directed cases use one scheduler
+worker for deterministic queue ordering. `format: hybrid concurrent readers
+observe complete write and discard states` runs four readers and one mutator
+on four workers, checking all 4 KiB bytes against whole pre/post-operation
+states across 800 reads and 200 mutations. Existing multiworker integration and
+format/recovery tests remain required. They do not claim automatic cancellation
+of the non-cancellable operation-lock waits.
+
+With `OBD_BUILD_BENCHMARKS=ON`, `obd-bench-hybrid-read NEW_DIRECTORY` creates and
+retains a 4 MiB ordinary-file Hybrid pair. It uses four scheduler workers and
+one blocking worker, fully checks the fixture before timing, and measures QD1
+and QD16 with 10,000 warmup reads and five rounds of 100,000 4 KiB reads. Timed
+reads check length and endpoint bytes; JSON lines report IOPS and process CPU
+microseconds per read. Use a fresh directory for each matched baseline/candidate
+trial, pin both to the same CPUs, and balance trial order. This is warm local
+file evidence, not cold-storage, remote-source, or ublk performance.

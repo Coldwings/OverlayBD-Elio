@@ -447,7 +447,9 @@ and settles its parent-directory sync. These tests exercise publication and
 retry control flow, not physical power-loss behavior.
 
 `hybrid::Writer` owns an exclusively opened pair. Its asynchronous operation
-mutex serializes direct reads, writes, discard and FLUSH. DATA rewrites reuse
+shared mutex permits overlapping direct reads and excludes writes, discard,
+FLUSH, checkpoint, compaction and seal until readers release ownership; grow
+rejects an active reader with `-EBUSY` (ADR-0034). DATA rewrites reuse
 current-upper physical ranges without appending mapping records. New ownership
 and ZERO-to-DATA transitions prepare the replacement in-memory index first,
 complete payload writes and then append the mapping record without a per-request
@@ -585,8 +587,9 @@ writes, data sync and intent retirement. They do not simulate storage-cache loss
 or prove power-loss atomicity of in-place payload overwrites. The extended
 attributes do not alter the upstream file byte layout or reader protocol.
 
-`HybridRwLayer` adapts the engine to `WritableLayer`: direct logical reads,
-writes, discard, grow, FLUSH and checkpoint delegate to the serialized engine.
+`HybridRwLayer` adapts the engine to `WritableLayer`: direct logical reads use
+shared ownership; writes, discard, grow, FLUSH and checkpoint delegate to its
+exclusively guarded mutation paths.
 Its physical `BlobSource` reads the existing payload descriptor and reports the
 current allocated payload boundary. Segment snapshots are owned copies; the
 legacy borrowed `segments()` view requires external exclusion of other calls.
@@ -615,10 +618,14 @@ uses this helper after stopping and reaping the child. Later config edits cannot
 redirect either artifact.
 
 Hybrid requests `serialize_merged_reads()`. `MergedWritable` then registers
-reads with its grow admission gate and holds its operation mutex from snapshot
-selection through completion of every physical read. Mutations and their index
-rebuilds use that same mutex. The lock order is merged operation, upper engine
-operation, then the short snapshot mutex; no lock is held across a reverse call
+reads with its grow admission gate and holds shared operation ownership from
+snapshot selection through completion of every physical read. Multiple readers
+may overlap. Mutations and their index rebuilds take exclusive ownership of the
+same mutex. Queued writers prevent new reader admission; a continuous stream
+of writers can delay readers. Lock waits remain non-cancellable, as before;
+callers drain operations before destroying the view. Scope guards release
+shared ownership on ordinary returns and exception unwinding. The lock order is
+merged operation, upper engine operation, then the short snapshot mutex; no lock is held across a reverse call
 into the merger. Existing tops retain their current read scheduling. Once an
 upper belongs to a merger, mutations must use that merged interface; direct
 lifecycle access is for callers that have drained merged IO. Taking a snapshot
