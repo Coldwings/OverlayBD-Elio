@@ -329,8 +329,10 @@ public:
   `count`, clamped at EOF (0 at/after EOF), negative -errno on failure.
   Consecutive blocks are batched into one underlying pread per
   `kReadWindow` (512 KiB) window; full-block destinations decompress
-  directly into the caller's buffer, partial blocks through a scratch
-  buffer. Returns `-EIO` on a short underlying read or a `crc32c_salt`
+  directly into the caller's buffer, partial blocks through a lazily allocated
+  scratch buffer. Request-local buffers are not zero-initialized: an exact
+  compressed read or successful full-block decode initializes every byte
+  before it is consumed. Compressed-window capacity is reused within a request. Returns `-EIO` on a short underlying read or a `crc32c_salt`
   mismatch, and propagates codec errors. Complexity: O(blocks touched).
 
 ### `src/format/lsmt_format.hpp` — `namespace obd::format::lsmt`
