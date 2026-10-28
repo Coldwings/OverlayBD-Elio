@@ -104,6 +104,7 @@ public:
         if (value == kUnknownRevision) return std::nullopt;
         return value;
     }
+    bool supports_local_mapping_updates() const noexcept override { return true; }
     /// The file view segment data is read from; its descriptor handle and
     /// size track appends and a successful live seal (unlike a
     /// LocalFileSource, which pins the size at open).

@@ -19,10 +19,12 @@
 #include <elio/runtime/spawn_blocking.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
@@ -137,6 +139,27 @@ struct MergedWritableTestAccess {
     static void end_grow(MergedWritable& merged) { merged.end_grow_op(); }
     static void invalidate_index(MergedWritable& merged) {
         merged.invalidate_index();
+    }
+    static unsigned splices(const MergedWritable& merged) {
+        return merged.range_splices_for_test_;
+    }
+    static void fail_range(MergedWritable& merged, int stage) {
+        merged.range_failure_stage_for_test_ = stage;
+    }
+    static int rebuild_range(MergedWritable& merged, uint64_t offset, size_t count) {
+        return merged.rebuild_range(offset, count);
+    }
+    static auto hold_index(const MergedWritable& merged) {
+        std::lock_guard lock(merged.index_mu_);
+        return merged.index_;
+    }
+    static std::vector<bytes::segment_mapping> full_reference(MergedWritable& merged) {
+        auto top = merged.top_->segments_snapshot();
+        std::vector<const std::vector<bytes::segment_mapping>*> layers{&top};
+        for (const auto& layer : merged.layers_) layers.push_back(&layer->segments());
+        std::vector<bytes::segment_mapping> out;
+        MergedLsmt::merge_indexes(layers, out);
+        return out;
     }
 };
 
@@ -327,6 +350,7 @@ public:
     mutable unsigned snapshots = 0;
     mutable bool fail_snapshot = false;
     bool exact = true;
+    bool local = false;
     bool fail_write = false;
     bool throw_write = false;
     elio::coro::task<ssize_t> pwrite(const void* input, size_t count,
@@ -364,6 +388,7 @@ public:
         }
         return segments_;
     }
+    bool supports_local_mapping_updates() const noexcept override { return local; }
     std::optional<uint64_t> segments_revision() const noexcept override {
         if (!exact) return std::nullopt;
         return revision_;
@@ -6036,6 +6061,209 @@ TEST_CASE("format: LSMT revision saturation becomes permanently unknown",
         const int discarded = co_await top->discard(0, 512);
         REQUIRE(discarded == 0);
         REQUIRE_FALSE(top->segments_revision().has_value());
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+namespace {
+std::array<uint64_t, 3> mapping_at(
+        const std::vector<bytes::segment_mapping>& index, uint64_t sector) {
+    for (const auto& m : index)
+        if (m.offset <= sector && sector < m.end())
+            return {m.tag, m.zeroed, m.zeroed ? 0 : m.moffset + sector - m.offset};
+    return {UINT64_MAX, 0, 0};
+}
+void require_full_reference(format::MergedWritable& merged) {
+    const auto actual = merged.merged_index();
+    const auto expected = format::MergedWritableTestAccess::full_reference(merged);
+    bool equivalent = true;
+    uint64_t end = 0;
+    for (const auto& m : actual) {
+        REQUIRE(m.length > 0);
+        REQUIRE(m.offset >= end);
+        end = m.end();
+    }
+    for (uint64_t sector = 0; sector < merged.size() / 512; ++sector)
+        equivalent = equivalent && mapping_at(actual, sector) == mapping_at(expected, sector);
+    REQUIRE(equivalent);
+}
+}
+
+TEST_CASE("format: local mapping splices match full merges over multiple lowers",
+          "[format][writable][mapping-splice]") {
+    TempDir dir;
+    constexpr size_t size = 128 * 512;
+    auto expected = test::pattern_bytes(size, 195);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "base", expected, &lower);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto middle = co_await format::LsmtRwLayer::create(dir / "middle", size);
+        const auto middle_bytes = test::pattern_bytes(24 * 512, 196);
+        const auto mid_write = co_await middle->pwrite(middle_bytes.data(), middle_bytes.size(), 32 * 512);
+        REQUIRE(mid_write == static_cast<ssize_t>(middle_bytes.size()));
+        std::copy(middle_bytes.begin(), middle_bytes.end(), expected.begin() + 32 * 512);
+        const auto mid_seal = co_await middle->seal();
+        REQUIRE(mid_seal == 0);
+        middle.reset();
+        std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+        lowers.push_back(co_await format::LsmtLayer::open(co_await source::LocalFileSource::open(lower)));
+        lowers.push_back(co_await format::LsmtLayer::open(co_await source::LocalFileSource::open(dir / "middle")));
+        auto top = co_await format::LsmtRwLayer::create(dir / "upper", size);
+        auto merged = co_await format::MergedWritable::open(std::move(lowers), std::move(top));
+        std::vector<uint8_t> actual(size);
+        uint32_t random = 195;
+        for (unsigned step = 0; step < 160; ++step) {
+            random = random * 1664525u + 1013904223u;
+            const size_t sector = random % 128;
+            const size_t sectors = std::min<size_t>(1 + ((random >> 8) % 12), 128 - sector);
+            const size_t offset = sector * 512, count = sectors * 512;
+            if (step % 3 == 0) {
+                const int discarded = co_await merged->discard(offset, count);
+                REQUIRE(discarded == 0);
+                std::fill_n(expected.begin() + offset, count, 0);
+            } else {
+                const auto payload = test::pattern_bytes(count, random);
+                const auto written = co_await merged->pwrite(payload.data(), count, offset);
+                REQUIRE(written == static_cast<ssize_t>(count));
+                std::copy(payload.begin(), payload.end(), expected.begin() + offset);
+            }
+            const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+            REQUIRE(read == static_cast<ssize_t>(size));
+            REQUIRE(actual == expected);
+            require_full_reference(*merged);
+        }
+        REQUIRE(format::MergedWritableTestAccess::splices(*merged) > 40);
+        const int flushed = co_await merged->flush();
+        REQUIRE(flushed == 0);
+        merged.reset();
+        lowers.push_back(co_await format::LsmtLayer::open(co_await source::LocalFileSource::open(lower)));
+        lowers.push_back(co_await format::LsmtLayer::open(co_await source::LocalFileSource::open(dir / "middle")));
+        top = co_await format::LsmtRwLayer::open_existing(dir / "upper", dir / "upper.index");
+        merged = co_await format::MergedWritable::open(std::move(lowers), std::move(top));
+        const auto reread = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(reread == static_cast<ssize_t>(size));
+        REQUIRE(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: mapping splice failure invalidates and repairs the full view",
+          "[format][writable][mapping-splice]") {
+    const int stage = GENERATE(1, 2);
+    TempDir dir;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::LsmtRwLayer::create(dir / "upper", 4096);
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        std::vector<uint8_t> payload(512, 0x41), actual(1536);
+        const auto first = co_await merged->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(first == 512);
+        REQUIRE(format::MergedWritableTestAccess::splices(*merged) == 1);
+        const auto held = format::MergedWritableTestAccess::hold_index(*merged);
+        const auto old = *held;
+        format::MergedWritableTestAccess::fail_range(*merged, stage);
+        const auto failed = co_await merged->pwrite(payload.data(), payload.size(), 512);
+        format::MergedWritableTestAccess::fail_range(*merged, 0);
+        REQUIRE(failed == -ENOMEM);
+        const auto invalid = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(invalid == -EIO);
+        const auto repaired = co_await merged->pwrite(payload.data(), payload.size(), 1024);
+        REQUIRE(repaired == 512);
+        REQUIRE(format::MergedWritableTestAccess::splices(*merged) == 1);
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 1536);
+        REQUIRE(std::all_of(actual.begin(), actual.end(), [](auto b) { return b == 0x41; }));
+        REQUIRE(held->size() == old.size());
+        for (uint64_t s = 0; s < 8; ++s) REQUIRE(mapping_at(*held, s) == mapping_at(old, s));
+        require_full_reference(*merged);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: mapping locality is distinct from revision and uncovered ranges fall back",
+          "[format][writable][mapping-splice]") {
+    const bool local = GENERATE(false, true);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = std::make_unique<RevisionWritableLayer>();
+        auto* state = top.get();
+        state->local = local;
+        state->exact = false;
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        const int holes = format::MergedWritableTestAccess::rebuild_range(*merged, 0, 512);
+        REQUIRE(holes == 0);
+        REQUIRE(format::MergedWritableTestAccess::splices(*merged) == 0);
+        std::vector<uint8_t> payload(512, 0x73), actual(512);
+        const auto written = co_await merged->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(written == 512);
+        REQUIRE(format::MergedWritableTestAccess::splices(*merged) == (local ? 1 : 0));
+        state->fail_snapshot = true;
+        const auto failed = co_await merged->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(failed == -ENOMEM);
+        const auto invalid = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(invalid == -EIO);
+        const auto healed = co_await merged->pwrite(payload.data(), payload.size(), 0);
+        REQUIRE(healed == 512);
+        REQUIRE(format::MergedWritableTestAccess::splices(*merged) == (local ? 1 : 0));
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 512);
+        REQUIRE(actual == payload);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: mapping splices preserve capped ZERO boundaries and DATA offsets",
+          "[format][writable][mapping-splice]") {
+    TempDir dir;
+    constexpr uint64_t cap = bytes::segment_mapping::kMaxLength;
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = co_await format::LsmtRwLayer::create(dir / "upper", (2 * cap + 64) * 512);
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        const auto discarded = co_await merged->discard(0, merged->size());
+        REQUIRE(discarded == 0);
+        require_full_reference(*merged);
+        std::vector<uint8_t> payload(1024, 0x37), actual(2048);
+        for (const uint64_t sector : {cap - 1, cap + 30, uint64_t{1}, 2 * cap + 62}) {
+            const auto written = co_await merged->pwrite(payload.data(), payload.size(), sector * 512);
+            REQUIRE(written == 1024);
+            require_full_reference(*merged);
+            const auto read = co_await merged->pread(actual.data(), payload.size(), sector * 512);
+            REQUIRE(read == 1024);
+            REQUIRE(std::equal(payload.begin(), payload.end(), actual.begin()));
+            const auto zeroed = co_await merged->discard(sector * 512, payload.size());
+            REQUIRE(zeroed == 0);
+            require_full_reference(*merged);
+        }
+        REQUIRE(format::MergedWritableTestAccess::splices(*merged) == 9);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: locality opt-in retains full repair after errors and exceptions",
+          "[format][writable][mapping-splice]") {
+    const bool throwing = GENERATE(false, true);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = std::make_unique<RevisionWritableLayer>();
+        auto* state = top.get();
+        state->local = true;
+        state->fail_write = true;
+        state->throw_write = throwing;
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        std::vector<uint8_t> payload(512, 0x5d), actual(512);
+        bool threw = false;
+        ssize_t result = 0;
+        try { result = co_await merged->pwrite(payload.data(), payload.size(), 0); }
+        catch (const std::bad_alloc&) { threw = true; }
+        REQUIRE(threw == throwing);
+        if (!throwing) REQUIRE(result == -EIO);
+        REQUIRE(format::MergedWritableTestAccess::splices(*merged) == 0);
+        REQUIRE(state->snapshots == 2);
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 512);
+        REQUIRE(actual == payload);
         co_return 0;
     });
     REQUIRE(rc == 0);

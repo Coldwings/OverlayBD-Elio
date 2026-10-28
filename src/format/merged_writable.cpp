@@ -143,6 +143,110 @@ int MergedWritable::rebuild_index() {
     }
 }
 
+// Caller holds exclusive operation ownership. The top's locality contract
+// preserves every resolved sector outside this interval, so copy those parts
+// of the immutable old snapshot and merge only the changed boundaries.
+int MergedWritable::rebuild_range(uint64_t offset, size_t count) {
+    if (!top_->supports_local_mapping_updates() || !count) return rebuild_index();
+    try {
+        std::shared_ptr<const std::vector<bytes::segment_mapping>> old;
+        {
+            std::lock_guard lock(index_mu_);
+            old = index_;
+        }
+        if (!old) return rebuild_index();
+        const auto top = top_->segments_snapshot();
+#ifdef OBD_TEST_HOOKS
+        if (range_failure_stage_for_test_ == 1) throw std::bad_alloc();
+#endif
+        const uint64_t lo = offset / kSector;
+        const uint64_t hi = lo + count / kSector;
+        std::vector<bytes::segment_mapping> next;
+        next.reserve(old->size() + 4);
+        auto append = [&](bytes::segment_mapping m) {
+            if (!m.length) return false;
+            if (!next.empty()) {
+                auto& prior = next.back();
+                if (prior.end() == m.offset && prior.tag == m.tag &&
+                    prior.zeroed == m.zeroed &&
+                    (m.zeroed || prior.moffset + prior.length == m.moffset) &&
+                    static_cast<uint64_t>(prior.length) + m.length <= bytes::segment_mapping::kMaxLength) {
+                    prior.length += m.length;
+                    return true;
+                }
+            }
+            next.push_back(m);
+            return false;
+        };
+        const auto first = std::upper_bound(old->begin(), old->end(), lo,
+            [](uint64_t x, const bytes::segment_mapping& m) { return x < m.end(); });
+        next.insert(next.end(), old->begin(), first);
+        if (first != old->end() && first->offset < lo) {
+            auto left = *first;
+            left.length = static_cast<uint32_t>(lo - left.offset);
+            append(left);
+        }
+        uint64_t cursor = lo;
+        auto it = std::upper_bound(top.begin(), top.end(), lo,
+            [](uint64_t x, const bytes::segment_mapping& m) { return x < m.end(); });
+        for (; it != top.end() && it->offset < hi; ++it) {
+            auto m = *it;
+            const auto first = std::max<uint64_t>(lo, m.offset);
+            const auto last = std::min<uint64_t>(hi, m.end());
+            if (first != cursor) return rebuild_index();
+            if (!m.zeroed) m.moffset += first - m.offset;
+            m.offset = first;
+            m.length = static_cast<uint32_t>(last - first);
+            m.tag = 0;
+            append(m);
+            cursor = last;
+        }
+        // Locality does not promise complete top coverage. A hole may need
+        // lower-layer resolution, which remains the full merger's job.
+        if (cursor != hi) return rebuild_index();
+        it = std::upper_bound(old->begin(), old->end(), hi,
+            [](uint64_t x, const bytes::segment_mapping& m) { return x < m.end(); });
+        if (it != old->end() && it->offset < hi) {
+            auto tail = *it;
+            const auto delta = hi - tail.offset;
+            tail.offset = hi;
+            tail.length -= static_cast<uint32_t>(delta);
+            if (!tail.zeroed) tail.moffset += delta;
+            append(tail);
+            ++it;
+        }
+        while (it != old->end()) {
+            const bool merged = append(*it++);
+            if (!merged) break;
+        }
+        next.insert(next.end(), it, old->end());
+        if (next.size() > lsmt::kMaxRoIndexSize) return rebuild_index();
+#ifdef OBD_TEST_HOOKS
+        if (range_failure_stage_for_test_ == 2) throw std::bad_alloc();
+#endif
+        auto published =
+            std::make_shared<const std::vector<bytes::segment_mapping>>(
+                std::move(next));
+        {
+            std::lock_guard lock(index_mu_);
+            index_ = std::move(published);
+        }
+#ifdef OBD_TEST_HOOKS
+        ++range_splices_for_test_;
+#endif
+        return 0;
+    } catch (const std::bad_alloc&) {
+        invalidate_index();
+        return -ENOMEM;
+    } catch (const error& e) {
+        invalidate_index();
+        return -e.errno_value();
+    } catch (...) {
+        invalidate_index();
+        return -EIO;
+    }
+}
+
 elio::coro::task<ssize_t> MergedWritable::pread(void* buf, size_t count,
                                                 uint64_t offset) {
     if ((offset % kSector) != 0 || (count % kSector) != 0) {
@@ -254,11 +358,14 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
         throw;
     }
     // Only exact opt-in revisions can prove a successful write kept a valid
-    // snapshot current. Unknown revisions, errors (possibly published prefixes),
-    // and a previously invalidated snapshot retain the conservative rebuild.
+    // snapshot current. A separate locality proof permits a covered range
+    // splice after full success. Errors, partial results and invalid snapshots
+    // retain the conservative rebuild.
     const bool unchanged = r >= 0 && valid_snapshot && revision &&
                            revision == top_->segments_revision();
-    const int rebuild = unchanged ? 0 : rebuild_index();
+    const int rebuild = unchanged ? 0 :
+        (r >= 0 && static_cast<size_t>(r) == count
+            ? rebuild_range(offset, count) : rebuild_index());
     if (r < 0) co_return r;
     if (rebuild != 0) co_return rebuild;
     co_return r;
@@ -281,7 +388,7 @@ elio::coro::task<int> MergedWritable::discard(uint64_t offset,
     }
     // Rebuild even on error: sparse discard can publish the protective sidecar
     // mask before a later durability step reports failure.
-    const int rebuild = rebuild_index();
+    const int rebuild = r == 0 ? rebuild_range(offset, len) : rebuild_index();
     if (r != 0) co_return r;
     if (rebuild != 0) co_return rebuild;
     co_return 0;

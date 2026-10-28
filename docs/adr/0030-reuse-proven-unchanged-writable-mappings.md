@@ -1,6 +1,6 @@
 # ADR-0030: Reuse writable snapshots only with exact unchanged mapping revisions
 
-- Status: accepted
+- Status: superseded by ADR-0035
 - Date: 2026-10-28
 - Supersedes: none
 - Binds: src/format/writable.hpp, src/format/lsmt_rw.hpp,
