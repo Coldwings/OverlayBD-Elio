@@ -2213,6 +2213,9 @@ Elio task-ownership and notification migration regressions:
   log-and-continue policy and worker placement alongside staged group joins.
 - `ublk: task group drains every admitted tag including source failures` —
   concurrent tag handlers and terminal completion for a throwing source.
+- `ublk: reused tag preserves short reads and source error conversion` — one
+  tag serves a suspended short read, a negative source error, an exception, and
+  a normal read in sequence; verifies zero-fill and continued reuse after errors.
 - `ublk: a cancelled task group still completes a skipped tag` — the kernel
   completion obligation survives pre-invocation child cancellation.
 - `ublk: failed completion publication wakes the queue before stop` —

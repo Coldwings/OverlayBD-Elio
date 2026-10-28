@@ -1182,6 +1182,62 @@ TEST_CASE("ublk: task group drains every admitted tag including source failures"
     CHECK(state.destroyed.load());
 }
 
+TEST_CASE("ublk: reused tag preserves short reads and source error conversion",
+          "[ublk][shutdown][dispatch]") {
+    class SequenceSource final : public obd::source::BlobSource {
+    public:
+        elio::coro::task<ssize_t> pread(void* buffer, size_t length,
+                                      uint64_t) override {
+            const unsigned current = calls++;
+            // Exercise a real suspension inside the operation being dispatched.
+            co_await elio::time::sleep_for(std::chrono::nanoseconds(1));
+            if (current == 1) co_return -ENODATA;
+            if (current == 2) throw std::runtime_error("dispatch source error");
+            const size_t produced = current == 0 ? 17 : length;
+            std::memset(buffer, current == 0 ? 0x31 : 0x72, produced);
+            co_return static_cast<ssize_t>(produced);
+        }
+        uint64_t size() const noexcept override { return 4096; }
+        std::string_view label() const noexcept override { return "dispatch-sequence"; }
+        unsigned calls = 0;
+    };
+    using obd::ublk::DeviceTestAccess;
+    std::array<int32_t, 4> results{};
+    std::array<std::array<uint8_t, 512>, 4> bytes{};
+    unsigned calls = 0;
+    unsigned completed = 0;
+    elio::run([&]() -> elio::coro::task<void> {
+        auto source = std::make_unique<SequenceSource>();
+        auto* observed = source.get();
+        auto dev = DeviceTestAccess::make(std::move(source));
+        DeviceTestAccess::start(*dev);
+        for (unsigned iteration = 0; iteration < results.size(); ++iteration) {
+            std::memset(DeviceTestAccess::queue(*dev).io_buf(0), 0xa5, 512);
+            DeviceTestAccess::enqueue_read(*dev);
+            for (unsigned wait = 0; wait < 5000 &&
+                 DeviceTestAccess::completion_count(*dev) == 0; ++wait)
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            const auto completions = DeviceTestAccess::completions(*dev);
+            if (completions.size() != 1) break;
+            results[iteration] = completions.front().second;
+            std::memcpy(bytes[iteration].data(),
+                        DeviceTestAccess::queue(*dev).io_buf(0), 512);
+            DeviceTestAccess::clear_completions(*dev);
+            ++completed;
+        }
+        co_await dev->stop_async();
+        calls = observed->calls;
+        co_await elio::spawn_blocking([&] { dev.reset(); });
+    }, one_worker());
+    REQUIRE(completed == 4);
+    CHECK(calls == 4);
+    CHECK(results == std::array<int32_t, 4>{512, -ENODATA, -EIO, 512});
+    for (size_t index = 0; index < 512; ++index) {
+        CHECK(bytes[0][index] == (index < 17 ? 0x31 : 0));
+        CHECK(bytes[3][index] == 0x72);
+    }
+}
+
 TEST_CASE("ublk: a cancelled task group still completes a skipped tag", "[ublk][shutdown]") {
     using obd::ublk::DeviceTestAccess;
     ReadState state;
