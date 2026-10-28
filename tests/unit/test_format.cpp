@@ -14,6 +14,9 @@
 #include <fcntl.h>
 #include <algorithm>
 #include <array>
+#include <fstream>
+#include <iterator>
+#include <elio/runtime/spawn.hpp>
 
 using namespace obd;
 using obd::test::TempDir;
@@ -668,4 +671,186 @@ TEST_CASE("format: large merged lookup preserves gaps endpoints and sparse offse
         });
         REQUIRE(result == 0);
     }
+}
+
+namespace {
+std::vector<uint8_t> cache_fixture(const test::TempDir& dir,
+                                   const std::vector<uint8_t>& raw,
+                                   const format::ZFileWriteOptions& options) {
+    const auto input = test::write_file(dir / "cache.raw", raw);
+    const auto output = dir / "cache.zfile";
+    const int fd = ::open(input.c_str(), O_RDONLY | O_CLOEXEC);
+    REQUIRE(fd >= 0);
+    try { format::write_zfile(fd, raw.size(), output, options); }
+    catch (...) { ::close(fd); throw; }
+    REQUIRE(::close(fd) == 0);
+    std::ifstream stream(output, std::ios::binary);
+    REQUIRE(stream.good());
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {});
+}
+
+class DecodedCacheSource final : public source::BlobSource {
+public:
+    explicit DecodedCacheSource(std::vector<uint8_t> bytes)
+        : bytes_(std::move(bytes)) {}
+    elio::coro::task<ssize_t> pread(void* out, size_t count,
+                                    uint64_t offset) override {
+        reads.fetch_add(1, std::memory_order_relaxed);
+        if (delay) co_await elio::time::sleep_for(std::chrono::microseconds(10));
+        if (fault == 1) co_return -EIO;
+        if (offset >= bytes_.size()) co_return 0;
+        count = std::min(count, bytes_.size() - offset);
+        if (fault == 2 && count != 0) --count;
+        std::memcpy(out, bytes_.data() + offset, count);
+        if (fault == 3 && count != 0) static_cast<uint8_t*>(out)[0] ^= 0xff;
+        co_return static_cast<ssize_t>(count);
+    }
+    uint64_t size() const noexcept override { return bytes_.size(); }
+    std::string_view label() const noexcept override { return "decoded-cache-test"; }
+    std::atomic<size_t> reads{0};
+    int fault = 0; // Changed only between completed requests.
+    bool delay = false; // Fixed before concurrent readers start.
+private:
+    std::vector<uint8_t> bytes_;
+};
+}
+
+TEST_CASE("format: decoded cache admits repeated partial blocks and bounds retention",
+          "[format][zfile][decoded-cache]") {
+    test::TempDir dir;
+    format::ZFileWriteOptions options;
+    SECTION("4 KiB LZ4") { options.block_size = 4096; }
+    SECTION("64 KiB LZ4") { options.block_size = 65536; }
+#if OBD_HAVE_ZSTD
+    SECTION("64 KiB ZSTD") {
+        options.block_size = 65536;
+        options.algo = format::zfile::kAlgoZstd;
+    }
+#endif
+    const size_t block = options.block_size;
+    const auto raw = test::pattern_bytes(10 * block + 1000, 190);
+    auto encoded = cache_fixture(dir, raw, options);
+    const int result = test::run_coro([&]() -> elio::coro::task<int> {
+        auto source = std::make_unique<DecodedCacheSource>(std::move(encoded));
+        auto* observed = source.get();
+        auto zfile = co_await format::ZFileSource::open(std::move(source), true);
+        std::vector<uint8_t> bytes(block * 2);
+        auto check_read = [&](size_t offset, size_t count,
+                              size_t source_reads) -> elio::coro::task<void> {
+            const auto before = observed->reads.load();
+            const auto n = co_await zfile->pread(bytes.data(), count, offset);
+            const auto expected = std::min(count, raw.size() - offset);
+            REQUIRE(n == static_cast<ssize_t>(expected));
+            REQUIRE(std::equal(bytes.begin(), bytes.begin() + expected,
+                               raw.begin() + offset));
+            REQUIRE(observed->reads.load() - before == source_reads);
+        };
+        co_await check_read(17, 512, 1); // First observation does not retain.
+        co_await check_read(33, 512, 1); // Second access publishes a whole block.
+        co_await check_read(71, 512, 0);
+        co_await check_read(0, block, 1); // Full blocks bypass the cache.
+        co_await check_read(block - 256, 512, 1); // Cross-block batching remains.
+        for (size_t i = 1; i <= 8; ++i) {
+            co_await check_read(i * block + 17, 512, 1);
+            co_await check_read(i * block + 17, 512, 1);
+        }
+        co_await check_read(17, 512, 1); // Ninth admitted block evicted zero.
+        co_await check_read(17, 512, 0);
+        co_await check_read(10 * block + 600, 512, 1); // Clamped partial tail.
+        co_await check_read(10 * block + 600, 512, 1);
+        co_await check_read(10 * block + 800, 512, 0);
+        co_await check_read(10 * block, 1000, 1); // Whole short final block.
+        co_return 0;
+    });
+    REQUIRE(result == 0);
+}
+
+TEST_CASE("format: decoded cache does not retain scans or failed reads",
+          "[format][zfile][decoded-cache]") {
+    test::TempDir dir;
+    const auto raw = test::pattern_bytes(32 * 4096, 191);
+    auto encoded = cache_fixture(dir, raw, {});
+    const int result = test::run_coro([&]() -> elio::coro::task<int> {
+        auto source = std::make_unique<DecodedCacheSource>(std::move(encoded));
+        auto* observed = source.get();
+        auto zfile = co_await format::ZFileSource::open(std::move(source), true);
+        std::array<uint8_t, 512> bytes{};
+        const auto before = observed->reads.load();
+        for (size_t round = 0; round < 3; ++round) {
+            for (size_t block = 0; block < 32; ++block) {
+                const auto n = co_await zfile->pread(bytes.data(), bytes.size(),
+                                                    block * 4096 + 17);
+                REQUIRE(n == 512);
+                REQUIRE(std::equal(bytes.begin(), bytes.end(),
+                                   raw.begin() + block * 4096 + 17));
+            }
+        }
+        REQUIRE(observed->reads.load() - before == 96);
+        for (int fault : {1, 2, 3}) {
+            observed->fault = fault;
+            const auto start = observed->reads.load();
+            for (size_t repeat = 0; repeat < 3; ++repeat) {
+                const auto n = co_await zfile->pread(bytes.data(), bytes.size(),
+                                                    fault * 4096 + 17);
+                REQUIRE(n == -EIO);
+            }
+            REQUIRE(observed->reads.load() - start == 3);
+            observed->fault = 0;
+            const auto n = co_await zfile->pread(bytes.data(), bytes.size(),
+                                                fault * 4096 + 17);
+            REQUIRE(n == 512);
+            REQUIRE(std::equal(bytes.begin(), bytes.end(),
+                               raw.begin() + fault * 4096 + 17));
+            const auto filled = observed->reads.load();
+            const auto hit = co_await zfile->pread(bytes.data(), bytes.size(),
+                                                  fault * 4096 + 17);
+            REQUIRE(hit == 512);
+            REQUIRE(observed->reads.load() == filled);
+        }
+        co_return 0;
+    });
+    REQUIRE(result == 0);
+}
+
+TEST_CASE("format: concurrent decoded readers survive duplicate misses and eviction",
+          "[format][zfile][decoded-cache]") {
+    test::TempDir dir;
+    const auto raw = test::pattern_bytes(20 * 65536, 192);
+    format::ZFileWriteOptions options;
+    options.block_size = 65536;
+    auto encoded = cache_fixture(dir, raw, options);
+    const int result = elio::run([&]() -> elio::coro::task<int> {
+        auto source = std::make_unique<DecodedCacheSource>(std::move(encoded));
+        source->delay = true;
+        auto zfile = co_await format::ZFileSource::open(std::move(source), true);
+        auto read_many = [&](size_t id) -> elio::coro::task<bool> {
+            std::array<uint8_t, 512> bytes{};
+            bool valid = true;
+            for (size_t i = 0; i < 120; ++i) {
+                // Start together on one block, then alternate cache pressure
+                // with repeated reads across distinct worker continuations.
+                const size_t block = i < 8 ? 0 : (i / 3 + id) % 20;
+                const size_t offset = block * 65536 + (i * 37 + id) % 4096;
+                const auto n = co_await zfile->pread(bytes.data(), bytes.size(), offset);
+                valid = valid && n == 512 &&
+                        std::equal(bytes.begin(), bytes.end(), raw.begin() + offset);
+            }
+            co_return valid;
+        };
+        std::vector<elio::coro::join_handle<bool>> readers;
+        readers.reserve(6);
+        bool valid = true;
+        try {
+            for (size_t i = 0; i < 6; ++i)
+                readers.push_back(elio::spawn(read_many, i));
+        } catch (...) { valid = false; }
+        for (auto& reader : readers) {
+            try { const bool ok = co_await reader; valid = valid && ok; }
+            catch (...) { valid = false; }
+            co_await reader.wait_destroyed_async();
+        }
+        REQUIRE(valid);
+        co_return 0;
+    }, {.num_threads = 4, .blocking_threads = 1});
+    REQUIRE(result == 0);
 }

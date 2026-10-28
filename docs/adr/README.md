@@ -154,3 +154,4 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0030](./0030-reuse-proven-unchanged-writable-mappings.md) | Reuse writable snapshots only with exact unchanged mapping revisions | accepted |
 | [0031](./0031-reuse-verified-layer-store-extents.md) | Reuse verified LayerStore extent buffers | accepted |
 | [0032](./0032-batch-ready-owner-completions.md) | Batch ready completions on the fixed queue owner | accepted |
+| [0033](./0033-reuse-repeated-decoded-zfile-blocks.md) | Reuse repeatedly read decoded ZFile blocks | accepted |

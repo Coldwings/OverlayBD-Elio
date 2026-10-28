@@ -2453,3 +2453,19 @@ changes require caution; retain hot-set and thrashing controls together.
   source read remains held, both during steady operation and after the owner
   closes batching to join handlers. The stop task must still wait for the held
   source. Client tasks drain and the descriptor closes before stop is joined.
+
+
+### Bounded decoded ZFile reuse
+
+- `format: decoded cache admits repeated partial blocks and bounds retention`
+  checks complete returned bytes, source-call suppression after admission,
+  eight-entry eviction, 4 KiB/64 KiB LZ4 and 64 KiB ZSTD blocks, clamped
+  tails, whole-block bypass and cross-block reads.
+- `format: decoded cache does not retain scans or failed reads`
+  checks a 32-block scan plus repeated source errors, short reads and CRC
+  failures, followed by successful retry and reuse.
+- `format: concurrent decoded readers survive duplicate misses and eviction`
+  runs six readers on four workers with source suspensions and cache pressure,
+  compares every returned byte, and drains/destroys all reader handles before
+  destroying the source. It is bounded concurrency coverage, not a proof of
+  every possible scheduling interleaving.

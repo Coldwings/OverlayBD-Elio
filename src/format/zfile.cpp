@@ -131,6 +131,36 @@ elio::coro::task<std::unique_ptr<ZFileSource>> ZFileSource::open(
     co_return z;
 }
 
+std::shared_ptr<const uint8_t[]> ZFileSource::decoded_get(
+    size_t index, bool& admit) noexcept {
+    try {
+        std::lock_guard lock(decoded_mutex_);
+        for (const auto& entry : decoded_)
+            if (entry.bytes && entry.index == index) return entry.bytes;
+        for (size_t i = 0; i < seen_count_; ++i)
+            if (seen_[i] == index) { admit = true; return {}; }
+        seen_[seen_next_] = index;
+        seen_next_ = (seen_next_ + 1) % seen_.size();
+        seen_count_ = std::min(seen_count_ + 1, seen_.size());
+    } catch (...) {
+        // Reuse is optional; fall through to the ordinary validated read.
+    }
+    return {};
+}
+
+void ZFileSource::decoded_put(
+    size_t index, std::shared_ptr<const uint8_t[]> data) noexcept {
+    try {
+        std::lock_guard lock(decoded_mutex_);
+        for (const auto& entry : decoded_)
+            if (entry.bytes && entry.index == index) return;
+        decoded_[replacement_] = DecodedBlock{index, std::move(data)};
+        replacement_ = (replacement_ + 1) % decoded_.size();
+    } catch (...) {
+        // Cache publication must never fail an otherwise successful read.
+    }
+}
+
 elio::coro::task<ssize_t> ZFileSource::pread(void* buf, size_t count,
                                              uint64_t offset) {
     const uint64_t fsize = ht_.original_file_size;
@@ -138,13 +168,29 @@ elio::coro::task<ssize_t> ZFileSource::pread(void* buf, size_t count,
     if (count > fsize - offset) count = static_cast<size_t>(fsize - offset);
     if (count == 0) co_return 0;
 
+    const size_t cache_index = static_cast<size_t>(offset / block_size_);
+    const size_t cache_offset = static_cast<size_t>(offset % block_size_);
+    const size_t decoded_size = static_cast<size_t>(std::min<uint64_t>(
+        block_size_, fsize - cache_index * uint64_t(block_size_)));
+    // Keep multi-block batching and whole-block direct decode unchanged.
+    const bool cacheable = count < decoded_size &&
+                           count <= decoded_size - cache_offset;
+    bool admit = false;
+    if (cacheable) {
+        if (auto hit = decoded_get(cache_index, admit)) {
+            std::memcpy(buf, hit.get() + cache_offset, count);
+            co_return static_cast<ssize_t>(count);
+        }
+    }
     uint8_t* out = static_cast<uint8_t*>(buf);
     size_t done = 0;
     // Request-local buffers survive source awaits. Only consume bytes after
     // an exact source read or a successful full-block decode initializes them.
     std::unique_ptr<uint8_t[]> window;
     size_t window_capacity = 0;
-    std::unique_ptr<uint8_t[]> scratch;
+    std::shared_ptr<uint8_t[]> retained;
+    std::unique_ptr<uint8_t[]> local;
+    uint8_t* scratch = nullptr;
 
     while (done < count) {
         const uint64_t pos = offset + done;
@@ -197,17 +243,33 @@ elio::coro::task<ssize_t> ZFileSource::pread(void* buf, size_t count,
             const size_t in_len = static_cast<size_t>(abs_to - abs_from);
 
             const bool direct = (in_start == 0 && in_len == blk_uncomp);
-            if (!direct && !scratch)
-                scratch = std::make_unique_for_overwrite<uint8_t[]>(block_size_);
+            if (!direct && !scratch) {
+                if (admit) {
+                    try {
+                        retained = std::make_shared_for_overwrite<uint8_t[]>(
+                            block_size_);
+                        scratch = retained.get();
+                    } catch (const std::bad_alloc&) {
+                        admit = false;
+                    }
+                }
+                if (!scratch) {
+                    local = std::make_unique_for_overwrite<uint8_t[]>(block_size_);
+                    scratch = local.get();
+                }
+            }
             void* dtarget = direct ? static_cast<void*>(out + done)
-                                   : static_cast<void*>(scratch.get());
+                                   : static_cast<void*>(scratch);
             const size_t dcapacity = direct ? in_len : block_size_;
             const int rc = codec_->decompress(window.get() + off_in_win,
                                               comp_len, dtarget, dcapacity,
                                               static_cast<size_t>(blk_uncomp));
             if (rc != 0) co_return rc;
+            // Only single-block partial requests publish: the shared bytes
+            // are fully initialized and this request cannot decode over them.
+            if (admit) decoded_put(i, retained);
             if (!direct) {
-                std::memcpy(out + done, scratch.get() + in_start, in_len);
+                std::memcpy(out + done, scratch + in_start, in_len);
             }
             done += in_len;
         }

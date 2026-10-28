@@ -12,7 +12,9 @@
 
 #include <elio/coro/task.hpp>
 
+#include <array>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -51,6 +53,24 @@ public:
 
 private:
     ZFileSource() = default;
+
+    struct DecodedBlock {
+        size_t index = 0;
+        std::shared_ptr<const uint8_t[]> bytes;
+    };
+    // Eight retained blocks (at most 512 KiB). Active readers may outlive
+    // eviction. Admission needs a repeat within the last sixteen miss keys.
+    std::mutex decoded_mutex_;
+    std::array<DecodedBlock, 8> decoded_{};
+    size_t replacement_ = 0;
+    std::array<size_t, 16> seen_{};
+    size_t seen_count_ = 0;
+    size_t seen_next_ = 0;
+
+    std::shared_ptr<const uint8_t[]> decoded_get(size_t index,
+                                                bool& admit) noexcept;
+    void decoded_put(size_t index,
+                     std::shared_ptr<const uint8_t[]> data) noexcept;
 
     source::BlobSourcePtr src_;
     zfile::HeaderTrailer ht_;     // effective (trailer unless overwritten)

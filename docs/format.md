@@ -336,6 +336,19 @@ public:
   compressed read or successful full-block decode initializes every byte
   before it is consumed. Compressed-window capacity is reused within a request. Returns `-EIO` on a short underlying read or a `crc32c_salt`
   mismatch, and propagates codec errors. Complexity: O(blocks touched).
+- Single-block partial reads may reuse a fully decoded immutable block after
+  its second recent access. Each instance retains at most eight blocks
+  (512 KiB maximum payload), with sixteen recent miss keys controlling
+  admission. Replacement is FIFO; hits do not update recency. Full-block
+  and cross-block requests keep the existing direct/batched path. Required
+  CRC checks and exact decode lengths precede publication. Errors are never
+  cached. Optional cache allocation failure falls back to ordinary scratch.
+  A hit copies previously validated bytes; it does not re-read the source or
+  promise immediate observation of later external corruption. Sources must
+  remain immutable. See [ADR-0033](adr/0033-reuse-repeated-decoded-zfile-blocks.md).
+  Evicted buffers remain alive while active readers hold them, so the cache
+  cap bounds retained payload, not total concurrent request memory. No cache
+  mutex is held across a source await or a decode.
 
 ### `src/format/lsmt_format.hpp` — `namespace obd::format::lsmt`
 
@@ -1486,7 +1499,8 @@ an output file in `src/image/trace_record.hpp` / `.cpp`.
   writers are the opposite: plain blocking POSIX IO for **plain threads /
   cold paths only** — never call them from an Elio worker.
 - **Readers.** `ZFileSource`, `LsmtLayer`, and `MergedLsmt` are immutable
-  after `open` returns; concurrent `pread`s on one instance are safe (the
+  in their logical contents after `open` returns; `ZFileSource` may internally
+  memoize validated decoded blocks. Concurrent `pread`s on one instance are safe (the
   `source::BlobSource` contract), including from multiple coroutines and
   fixed ublk tag handlers. Accessor-returned references (`header()`,
   `segments()`, `MergedLsmt::merged_index()`, `jump_table()`) borrow the
