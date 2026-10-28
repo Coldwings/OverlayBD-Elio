@@ -553,3 +553,53 @@ TEST_CASE("format: contiguous tiny mappings read once with exact bytes",
     });
     REQUIRE(result == 0);
 }
+
+TEST_CASE("format: zfile partial edges cross compressed read windows",
+          "[format][zfile][buffers]") {
+    TempDir dir;
+    const auto raw = pattern_bytes(2 * format::ZFileSource::kReadWindow + 13, 173);
+    const auto input = test::write_file(dir / "window.raw", raw);
+    format::ZFileWriteOptions options;
+    SECTION("4 KiB LZ4 blocks") { options.block_size = 4096; }
+    SECTION("64 KiB LZ4 blocks") { options.block_size = 65536; }
+#if OBD_HAVE_ZSTD
+    SECTION("64 KiB ZSTD blocks") {
+        options.block_size = 65536;
+        options.algo = format::zfile::kAlgoZstd;
+    }
+#endif
+    const int fd = ::open(input.c_str(), O_RDONLY | O_CLOEXEC);
+    REQUIRE(fd >= 0);
+    const auto output = dir / "window.zfile";
+    try {
+        format::write_zfile(fd, raw.size(), output, options);
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+    REQUIRE(::close(fd) == 0);
+    const int result = test::run_coro([&]() -> elio::coro::task<int> {
+        auto local = co_await source::LocalFileSource::open(output);
+        auto zfile = co_await format::ZFileSource::open(std::move(local), true);
+        // Random payload remains larger than one compressed window. Both
+        // window reuse and partial/full decoding occur in the same request.
+        const auto& jump = zfile->jump_table();
+        REQUIRE(jump[jump.size() - 1] - jump[0] >
+                format::ZFileSource::kReadWindow);
+        constexpr size_t offset = 512;
+        const size_t count = raw.size() - offset - 7;
+        std::vector<uint8_t> actual(count, 0xa5);
+        const auto read = co_await zfile->pread(actual.data(), count, offset);
+        REQUIRE(read == static_cast<ssize_t>(count));
+        REQUIRE(std::equal(actual.begin(), actual.end(), raw.begin() + offset));
+        // A fresh full-block request needs no partial decode buffer.
+        actual.assign(options.block_size, 0xa5);
+        const auto direct = co_await zfile->pread(
+            actual.data(), actual.size(), options.block_size);
+        REQUIRE(direct == static_cast<ssize_t>(actual.size()));
+        REQUIRE(std::equal(actual.begin(), actual.end(),
+                           raw.begin() + options.block_size));
+        co_return 0;
+    });
+    REQUIRE(result == 0);
+}

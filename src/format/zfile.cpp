@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
 namespace obd::format {
 
@@ -139,8 +140,11 @@ elio::coro::task<ssize_t> ZFileSource::pread(void* buf, size_t count,
 
     uint8_t* out = static_cast<uint8_t*>(buf);
     size_t done = 0;
-    std::vector<uint8_t> window;              // batched compressed blocks
-    std::vector<uint8_t> scratch(block_size_);  // partial-block decompression
+    // Request-local buffers survive source awaits. Only consume bytes after
+    // an exact source read or a successful full-block decode initializes them.
+    std::unique_ptr<uint8_t[]> window;
+    size_t window_capacity = 0;
+    std::unique_ptr<uint8_t[]> scratch;
 
     while (done < count) {
         const uint64_t pos = offset + done;
@@ -157,9 +161,12 @@ elio::coro::task<ssize_t> ZFileSource::pread(void* buf, size_t count,
         }
         const size_t comp_total =
             static_cast<size_t>(jump_[end_idx] - jump_[begin_idx]);
-        window.resize(comp_total);
+        if (comp_total > window_capacity) {
+            window = std::make_unique_for_overwrite<uint8_t[]>(comp_total);
+            window_capacity = comp_total;
+        }
         const ssize_t r =
-            co_await src_->pread(window.data(), comp_total, jump_[begin_idx]);
+            co_await src_->pread(window.get(), comp_total, jump_[begin_idx]);
         if (r < 0) co_return r;
         if (static_cast<size_t>(r) != comp_total) co_return -EIO;
 
@@ -172,9 +179,9 @@ elio::coro::task<ssize_t> ZFileSource::pread(void* buf, size_t count,
             if (verify_) {
                 comp_len -= sizeof(uint32_t);
                 const uint32_t expect = bytes::load_u32_le(
-                    window.data() + off_in_win + comp_len);
+                    window.get() + off_in_win + comp_len);
                 const uint32_t got = crc32::crc32c_salt(
-                    window.data() + off_in_win, comp_len);
+                    window.get() + off_in_win, comp_len);
                 if (got != expect) {
                     co_return -EIO;  // block checksum mismatch
                 }
@@ -190,15 +197,17 @@ elio::coro::task<ssize_t> ZFileSource::pread(void* buf, size_t count,
             const size_t in_len = static_cast<size_t>(abs_to - abs_from);
 
             const bool direct = (in_start == 0 && in_len == blk_uncomp);
+            if (!direct && !scratch)
+                scratch = std::make_unique_for_overwrite<uint8_t[]>(block_size_);
             void* dtarget = direct ? static_cast<void*>(out + done)
-                                   : static_cast<void*>(scratch.data());
+                                   : static_cast<void*>(scratch.get());
             const size_t dcapacity = direct ? in_len : block_size_;
-            const int rc = codec_->decompress(window.data() + off_in_win,
+            const int rc = codec_->decompress(window.get() + off_in_win,
                                               comp_len, dtarget, dcapacity,
                                               static_cast<size_t>(blk_uncomp));
             if (rc != 0) co_return rc;
             if (!direct) {
-                std::memcpy(out + done, scratch.data() + in_start, in_len);
+                std::memcpy(out + done, scratch.get() + in_start, in_len);
             }
             done += in_len;
         }

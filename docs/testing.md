@@ -2384,3 +2384,24 @@ index and coroutine dispatch costs and samples each returned sector; full
 byte equality is covered by the format regression tests. It does not measure
 ublk, disk or compressed-source performance and is not evidence of a general
 IOPS improvement. Keep repetitions bounded on shared nodes.
+
+### Bounded ZFile request-buffer CPU experiment
+
+With `OBD_BUILD_BENCHMARKS=ON`, `obd-bench-zfile-read compressed.zfile reference.raw`
+loads both inputs into memory before timing. Supply the exact uncompressed bytes
+as the reference; for an `obd-mkimage --zfile --bs 4096` fixture, these are the
+produced `.lsmt` file. The tool only reads its inputs and rejects encoded files
+over 32 MiB or references over 16 MiB. A 4 MiB fixture is sufficient for a small
+comparison.
+
+Use the same fixture, release settings and allowed CPU for both versions (for
+example, `taskset -c CPU build/benchmarks/obd-bench-zfile-read layer.zfile layer.lsmt`)
+and run both execution orders. One worker performs 10,000 warm-up reads and five
+rounds of 50,000 deterministic random reads for each of two request lengths:
+aligned 4 KiB and 512 B starting 512 B into a 4 KiB-aligned region. With 4 KiB
+compression blocks these exercise direct and partial decoding respectively.
+JSON lines report elapsed time per read and a payload checksum; each request's
+first and last bytes are checked against the reference. Unit tests cover full
+byte equality and partial edges across compressed windows. Disk loading is
+excluded from timing. Results describe memory-source decode/buffer overhead,
+not disk or ublk IOPS, and depend on codec, block size and compressibility.
