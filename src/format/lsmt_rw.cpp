@@ -481,7 +481,13 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
         };
         std::vector<Op> ops;
         uint64_t cur = lo;
-        for (const auto& s : segments_) {
+        const auto first = std::upper_bound(
+            segments_.begin(), segments_.end(), lo,
+            [](uint64_t sector, const bytes::segment_mapping& mapping) {
+                return sector < mapping.end();
+            });
+        for (auto it = first; it != segments_.end(); ++it) {
+            const auto& s = *it;
             if (s.offset >= hi) break;
             if (s.zeroed || s.end() <= lo) continue;
             if (s.offset > cur) {
@@ -520,6 +526,11 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
 
         // Publish new ownership only after payload completion. In-place DATA
         // overwrites retain their mapping and need no additional log record.
+        if (std::all_of(ops.begin(), ops.end(),
+                        [](const Op& op) { return op.inplace; })) {
+            done += piece;
+            continue;
+        }
         if (pair_) {
             bool ownership_published = false;
             for (const auto& op : ops) {
@@ -558,6 +569,7 @@ elio::coro::task<ssize_t> LsmtRwLayer::pwrite(const void* buf, size_t count,
                 next.push_back(tail);
             }
         }
+        mappings_changed();
         segments_.swap(next);
         for (const auto& op : ops) {
             bytes::segment_mapping m;
@@ -687,6 +699,7 @@ elio::coro::task<int> LsmtRwLayer::discard(uint64_t offset, uint64_t len) {
         insert_sorted(next, m);
         cur += n;
     }
+    mappings_changed();
     segments_.swap(next);
     co_return 0;
 }
@@ -888,6 +901,7 @@ elio::coro::task<int> LsmtRwLayer::seal(const std::string& user_tag) {
         goto out;
     }
     uuid_ = std::move(sealed_uuid);
+    mappings_changed();
     segments_ = std::move(packed);
     data_bytes_.store(sealed_bytes, std::memory_order_release);
     fd_.store(std::move(sealed_handle), std::memory_order_release);

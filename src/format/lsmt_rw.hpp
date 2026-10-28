@@ -99,6 +99,11 @@ public:
     const std::vector<bytes::segment_mapping>& segments() const override {
         return segments_;
     }
+    std::optional<uint64_t> segments_revision() const noexcept override {
+        const auto value = segments_revision_.load(std::memory_order_acquire);
+        if (value == kUnknownRevision) return std::nullopt;
+        return value;
+    }
     /// The file view segment data is read from; its descriptor handle and
     /// size track appends and a successful live seal (unlike a
     /// LocalFileSource, which pins the size at open).
@@ -184,6 +189,15 @@ private:
     bool grow_op_in_progress_ = false;
     bool terminal_op_in_progress_ = false;
     std::vector<bytes::segment_mapping> segments_;
+    static constexpr uint64_t kUnknownRevision = ~uint64_t{0};
+    std::atomic<uint64_t> segments_revision_{0};
+    // Mutations are caller-serialized, like access to segments_. Publish a
+    // changed revision before any potentially partial live-vector update.
+    void mappings_changed() noexcept {
+        const auto value = segments_revision_.load(std::memory_order_relaxed);
+        if (value != kUnknownRevision)
+            segments_revision_.store(value + 1, std::memory_order_release);
+    }
 };
 
 }  // namespace obd::format
