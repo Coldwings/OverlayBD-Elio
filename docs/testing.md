@@ -2366,3 +2366,20 @@ this does not prove in-flight request reissue, power-loss durability, or traffic
 on both negotiated queues. Failed fixtures retain their
 workspace and unresolved ownership for diagnosis. This case requires real ublk
 prerequisites; compilation or a local skip does not establish a runtime pass.
+
+### Bounded LSMT merged-reader CPU experiment
+
+With `OBD_BUILD_BENCHMARKS=ON`, run `obd-bench-lsmt-read` from the build's
+`benchmarks/` directory. It uses one Elio worker and a 4 MiB in-memory sealed
+fixture; no device, privilege, disk payload or network is needed. Each of
+three mapping sizes (512 B, 4 KiB, and one compact 4 MiB segment) runs five
+rounds of 20,000 deterministic random aligned 4 KiB reads through the actual
+`MergedLsmt` reader. JSON lines report per-read elapsed time, source-call
+count, merged segment count and a checked payload checksum.
+
+Compare release builds in both execution orders. The compact case is a
+control: coalescing cannot reduce its dispatch count. This experiment isolates
+index and coroutine dispatch costs and samples each returned sector; full
+byte equality is covered by the format regression tests. It does not measure
+ublk, disk or compressed-source performance and is not evidence of a general
+IOPS improvement. Keep repetitions bounded on shared nodes.

@@ -17,7 +17,8 @@ images built by upstream `overlaybd-*` tools load identically here:
 - **LSMT** (`lsmt_format.hpp`, `lsmt.hpp`) — the log-structured merge tree
   layer format. `LsmtLayer` parses one sealed layer; `MergedLsmt` merges a
   bottom-up stack of layers into the final read-only block view (topmost
-  wins, holes read as zeroes).
+  wins, holes read as zeroes). Adjacent compatible mappings are
+  coalesced in the merged view; source indexes and sealed files are unchanged.
 - **Writable layers** (`writable.hpp`, `sparse_rw.hpp`, `lsmt_rw.hpp`, `hybrid_rw.hpp`,
   `merged_writable.hpp`) — the ADR-0008 writable top of an image stack:
   `SparseRwLayer` (sparse data plus exact persisted coverage, ADR-0024),
@@ -698,7 +699,11 @@ public:
   exposed for unit tests: `layers[i]` is the segment list of layer `i`,
   **topmost first**; appends the merged, sorted, disjoint list to `out` with
   `tag = layer index`. Throws `obd::format_error` if the merged index
-  exceeds `kMaxRoIndexSize`.
+  exceeds `kMaxRoIndexSize`. Within the appended range, adjacent mappings
+  coalesce only when their layer tags and DATA/ZERO state match; DATA also
+  requires contiguous physical offsets. Combined lengths never exceed
+  `segment_mapping::kMaxLength`. Existing output prefixes and original layer
+  indexes are preserved.
 
 ### `src/format/writable.hpp` — `namespace obd::format`
 

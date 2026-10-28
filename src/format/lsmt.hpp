@@ -118,7 +118,7 @@ private:
     static void merge_range(
         const std::vector<const std::vector<bytes::segment_mapping>*>& layers,
         size_t level, uint64_t lo, uint64_t hi,
-        std::vector<bytes::segment_mapping>& out);
+        std::vector<bytes::segment_mapping>& out, size_t output_begin);
 
     std::vector<std::unique_ptr<LsmtLayer>> layers_;  // topmost first
     std::vector<bytes::segment_mapping> index_;
