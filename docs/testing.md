@@ -2373,11 +2373,12 @@ With `OBD_BUILD_BENCHMARKS=ON`, run `obd-bench-lsmt-read` from the build's
 `benchmarks/` directory. It uses one Elio worker and a 4 MiB in-memory sealed
 fixture; no device, privilege, disk payload or network is needed. Each of
 three mapping sizes (512 B, 4 KiB, and one compact 4 MiB segment) runs five
-rounds of 20,000 deterministic random aligned 4 KiB reads through the actual
-`MergedLsmt` reader. JSON lines report per-read elapsed time, source-call
+rounds of 100,000 deterministic random aligned 4 KiB reads through the actual
+`MergedLsmt` reader, after 10,000 warm-up reads for each mapping size. JSON lines report per-read elapsed time, source-call
 count, merged segment count and a checked payload checksum.
 
-Compare release builds in both execution orders. The compact case is a
+Compare release builds in both execution orders on the same allowed CPU (for
+example, `taskset -c CPU build/benchmarks/obd-bench-lsmt-read`). The compact case is a
 control: coalescing cannot reduce its dispatch count. This experiment isolates
 index and coroutine dispatch costs and samples each returned sector; full
 byte equality is covered by the format regression tests. It does not measure

@@ -33,7 +33,8 @@ public:
 
 elio::coro::task<void> measure(unsigned chunk_sectors) {
     constexpr unsigned sectors = 8192;
-    constexpr unsigned iterations = 20000;
+    constexpr unsigned iterations = 100000;
+    constexpr unsigned warmup_iterations = 10000;
     auto source = std::make_unique<MemorySource>();
     auto* observation = source.get();
     const unsigned entries = (sectors + chunk_sectors - 1) / chunk_sectors;
@@ -64,12 +65,13 @@ elio::coro::task<void> measure(unsigned chunk_sectors) {
     layers.push_back(std::move(layer));
     auto view = co_await format::MergedLsmt::open(std::move(layers));
     std::array<uint8_t, 4096> output{};
-    for (unsigned round = 0; round < 5; ++round) {
+    for (unsigned round = 0; round < 6; ++round) {
+        const unsigned count = round == 0 ? warmup_iterations : iterations;
         uint64_t random = 12345;
         uint64_t checksum = 0;
         observation->calls = 0;
         const auto start = std::chrono::steady_clock::now();
-        for (unsigned i = 0; i < iterations; ++i) {
+        for (unsigned i = 0; i < count; ++i) {
             random = random * 6364136223846793005ULL + 1;
             const uint64_t sector = ((random >> 32) % 1024) * 8;
             const auto read = co_await view->pread(
@@ -83,8 +85,9 @@ elio::coro::task<void> measure(unsigned chunk_sectors) {
         }
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count();
+        if (round == 0) continue;
         std::cout << "{\"chunk_sectors\":" << chunk_sectors
-                  << ",\"round\":" << round
+                  << ",\"round\":" << round - 1
                   << ",\"segments\":" << view->merged_index().size()
                   << ",\"ns_per_read\":" << double(elapsed) / iterations
                   << ",\"source_calls\":" << observation->calls
