@@ -2447,3 +2447,9 @@ Compare matched binaries in interleaved order and fresh directories. These
 elapsed reader timings include byte validation and do not measure ublk IOPS,
 cold storage latency or independent CPU consumption. Small shared-host timing
 changes require caution; retain hot-set and thrashing controls together.
+
+- `integration: completed ublk read does not wait for a held source` — one
+  fixed worker and two queue slots; an O_DIRECT read must finish while another
+  source read remains held, both during steady operation and after the owner
+  closes batching to join handlers. The stop task must still wait for the held
+  source. Client tasks drain and the descriptor closes before stop is joined.

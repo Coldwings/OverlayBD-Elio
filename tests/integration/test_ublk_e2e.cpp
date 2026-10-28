@@ -4,6 +4,7 @@
 #include "common/errors.hpp"
 #include "ublk/device.hpp"
 #include "ublk/request_counts.hpp"
+#include "ublk/startup_test_hooks.hpp"
 #include "format/hybrid_rw.hpp"
 #include "format/lsmt_rw.hpp"
 #include "format/merged_writable.hpp"
@@ -12,6 +13,7 @@
 #include "../ublk_prerequisites.hpp"
 
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/runtime/spawn.hpp>
 #include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -26,6 +28,8 @@
 #include <csignal>
 #include <system_error>
 #include <thread>
+#include <optional>
+#include <cstdlib>
 
 #include <fcntl.h>
 
@@ -255,6 +259,164 @@ TEST_CASE("integration: ublk device serves sector reads from a blob",
         });
     });
     REQUIRE(rc == 0);
+}
+
+TEST_CASE("integration: completed ublk read does not wait for a held source",
+          "[ublk][completion-batch]") {
+    if (const auto reason = test::ublk_prerequisite_skip_reason(); !reason.empty())
+        SKIP(reason);
+    const bool stop_during_read = GENERATE(false, true);
+    INFO("stop_during_read=" << stop_during_read);
+    struct State {
+        std::atomic<bool> armed{false}, entered{false}, release{false};
+        std::atomic<bool> fast_entered{false}, fast_release{false};
+    } state;
+    state.fast_release.store(!stop_during_read);
+    class Observer final : public ublk::detail::StartupTestHooks {
+    public:
+        std::atomic<bool> closed{false};
+        void observe(ublk::detail::StartupTestEvent event) noexcept override {
+            if (event.kind == ublk::detail::StartupTestKind::owner_batching_closed)
+                closed.store(true);
+        }
+        void before_initial_submit(uint16_t) noexcept override {}
+    } observer;
+    ublk::StartupControl startup(1);
+    startup.set_test_hooks(&observer);
+    class HeldSource final : public source::BlobSource {
+    public:
+        explicit HeldSource(State& state) : state_(state) {}
+        elio::coro::task<ssize_t> pread(void* buffer, size_t length,
+                                      uint64_t offset) override {
+            if (state_.armed.load() && offset == (1U << 20)) {
+                state_.entered.store(true);
+                while (!state_.release.load())
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (state_.armed.load() && offset == (2U << 20)) {
+                state_.fast_entered.store(true);
+                while (!state_.fast_release.load())
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            auto* bytes = static_cast<uint8_t*>(buffer);
+            for (size_t i = 0; i < length; ++i)
+                bytes[i] = static_cast<uint8_t>((offset + i) % 251);
+            co_return static_cast<ssize_t>(length);
+        }
+        uint64_t size() const noexcept override { return 4U << 20; }
+        std::string_view label() const noexcept override { return "held-source"; }
+    private:
+        State& state_;
+    };
+    void* allocated = nullptr;
+    REQUIRE(::posix_memalign(&allocated, 4096, 4096) == 0);
+    std::unique_ptr<void, decltype(&std::free)> slow_buffer(allocated, &std::free);
+    allocated = nullptr;
+    REQUIRE(::posix_memalign(&allocated, 4096, 4096) == 0);
+    std::unique_ptr<void, decltype(&std::free)> fast_buffer(allocated, &std::free);
+    bool held = false, completed_before_release = false;
+    bool closed_before_fast_release = false, stop_waited_for_slow = false;
+    ssize_t slow_result = -1, fast_result = -1;
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        ublk::DeviceParams params;
+        params.nr_queues = 1;
+        params.queue_depth = 2;
+        params.dev_sectors = (4U << 20) / 512;
+        auto dev = co_await ublk::Device::create(
+            params, std::make_unique<HeldSource>(state), startup);
+        int fd = -1;
+        co_return co_await with_device_cleanup(dev, fd, [&]() -> elio::coro::task<int> {
+            fd = co_await bdev_io([&] {
+                return ::open(dev->bdev_path().c_str(), O_RDONLY | O_DIRECT);
+            });
+            REQUIRE(fd >= 0);
+            std::optional<elio::coro::join_handle<ssize_t>> slow, fast;
+            std::optional<elio::coro::join_handle<void>> stopping;
+            std::exception_ptr failure;
+            state.armed.store(true);
+            auto read_slow = [&]() -> elio::coro::task<ssize_t> {
+                co_return co_await bdev_io([&] {
+                    return ::pread(fd, slow_buffer.get(), 4096, 1U << 20);
+                });
+            };
+            auto read_fast = [&]() -> elio::coro::task<ssize_t> {
+                co_return co_await bdev_io([&] {
+                    return ::pread(fd, fast_buffer.get(), 4096, 2U << 20);
+                });
+            };
+            auto stop_device = [&]() -> elio::coro::task<void> {
+                co_await dev->stop_async();
+            };
+            try {
+                slow.emplace(elio::spawn(read_slow));
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!state.entered.load() && !slow->is_ready() &&
+                       std::chrono::steady_clock::now() < deadline)
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                held = state.entered.load();
+                fast.emplace(elio::spawn(read_fast));
+                if (stop_during_read) {
+                    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (!state.fast_entered.load() && !fast->is_ready() &&
+                           std::chrono::steady_clock::now() < deadline)
+                        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                    stopping.emplace(elio::spawn(stop_device));
+                    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (!observer.closed.load() && !stopping->is_ready() &&
+                           std::chrono::steady_clock::now() < deadline)
+                        co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                    closed_before_fast_release = observer.closed.load() && state.fast_entered.load();
+                    state.fast_release.store(true);
+                }
+                deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!fast->is_ready() && std::chrono::steady_clock::now() < deadline)
+                    co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+                completed_before_release = fast->is_ready() && !slow->is_ready();
+                if (stopping) stop_waited_for_slow = !stopping->is_ready();
+            } catch (...) { failure = std::current_exception(); }
+            // Release and destroy both children before assertions or device cleanup,
+            // including allocation/scheduler failures while admitting the fast read.
+            state.release.store(true);
+            state.fast_release.store(true);
+            if (slow) {
+                auto& handle = *slow;
+                try { slow_result = co_await handle; }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+                co_await slow->wait_destroyed_async();
+            }
+            if (fast) {
+                auto& handle = *fast;
+                try { fast_result = co_await handle; }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+                co_await fast->wait_destroyed_async();
+            }
+            if (stopping) {
+                // DEL can wait for the client's final block-device reference.
+                // Reads have retired, so close it before joining stop_async.
+                co_await bdev_io([&] { return ::close(fd); });
+                fd = -1;
+                auto& handle = *stopping;
+                try { co_await handle; }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+                co_await stopping->wait_destroyed_async();
+            }
+            if (failure) std::rethrow_exception(failure);
+            co_return 0;
+        });
+    }, {.num_threads = 1, .blocking_threads = 2});
+    REQUIRE(rc == 0);
+    CHECK(held);
+    CHECK(completed_before_release);
+    if (stop_during_read) {
+        CHECK(closed_before_fast_release);
+        CHECK(stop_waited_for_slow);
+    }
+    REQUIRE(slow_result == 4096);
+    REQUIRE(fast_result == 4096);
+    for (size_t i = 0; i < 4096; ++i) {
+        CHECK(static_cast<uint8_t*>(slow_buffer.get())[i] == ((1U << 20) + i) % 251);
+        CHECK(static_cast<uint8_t*>(fast_buffer.get())[i] == ((2U << 20) + i) % 251);
+    }
 }
 
 TEST_CASE("integration: ublk writable device serves writes and discard",

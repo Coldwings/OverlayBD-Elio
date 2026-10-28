@@ -1,6 +1,6 @@
 # ADR-0023: Own each ublk ring on one fixed Elio worker
 
-- Status: accepted
+- Status: superseded by ADR-0032
 - Date: 2026-10-23
 - Supersedes: ADR-0006
 - Binds: docs/design-assumptions.md, docs/ublk.md, AGENTS.md, src/ublk/

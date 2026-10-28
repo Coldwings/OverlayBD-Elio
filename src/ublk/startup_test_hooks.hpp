@@ -26,7 +26,7 @@ enum class StartupTestKind : uint32_t {
     caller_terminal, post_control_enter, post_control_fail, source_enter,
     source_result, source_scope_exit, source_destroyed, request_delivered, release_admitted,
     failure_report_throw, failure_report_caught, failure_report_constructed, release_setup_throw,
-    control_destroyed, retained_entered,
+    control_destroyed, retained_entered, owner_batching_closed,
 };
 struct StartupTestEvent {
     StartupTestKind kind{};

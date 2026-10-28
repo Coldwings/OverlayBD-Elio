@@ -65,7 +65,7 @@ operational list/status/destroy service while such owners remain.
 ## A7. Fixed-worker ublk ring ownership
 
 Each ublk per-queue ring, bounded command pump, and reusable tag-handler set
-is owned by one fixed Elio worker (ADR-0023). Only that Linux task submits
+is owned by one fixed Elio worker (ADR-0032, carrying forward ADR-0023). Only that Linux task submits
 FETCH or COMMIT_AND_FETCH. Source continuations may migrate while suspended,
 but must restore the owner before touching queue-local state. Raw CQ progress
 wakes an Elio-native wait through a registered eventfd; normal request and
