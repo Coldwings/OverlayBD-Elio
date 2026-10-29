@@ -284,8 +284,9 @@ A per-image config may add a writable upper:
   a legacy memory-only upper without a checkpoint cannot recover its mappings.
   Recovery never replaces a missing index with empty ownership.
 - `type: "sparse"` → a sparse file (`<dir>/overlaybd.sparse`); after an
-  unclean shutdown exact 512-byte DATA/ZERO ownership is recovered from
-  `<dir>/overlaybd.sparse.coverage` (ADR-0024). Offline export produces a
+  device-process exit ownership is recovered from extents and surviving
+  cached DATA (ADR-0037). The disk/backing size is 4 KiB aligned; guest writes
+  remain 512-byte addressable. Offline export produces a
   separate sealed LSMT delta while preserving the Sparse source (ADR-0027).
 
 With an upper present the device is created read-write; without one it is
@@ -608,7 +609,7 @@ correlate by device id and by the supervisor's spawn logs.
 | A device child crashed | Siblings and the supervisor are isolated (ADR-0004). For an ordinary ready-device crash, the supervisor attempts bounded recovery and respawns the child with `--recover` and the kernel reissues outstanding I/O (ADR-0010). Check `obdctl status <id>` — the `recoveries` counter increments per respawn; after `max_recovery_attempts` (default 3) the device is left down for inspection. A retained startup generation blocks further replacement; inspect ownership status and use explicit `destroy` before recreating. Current LSMT data/index pairs recover completed operations without a shutdown checkpoint (ADR-0029); legacy memory-only uppers still require a valid checkpoint for migration. Interrupted operations may be partial. |
 | Legacy LSMT `commit` reports an invalid checkpoint | Old memory-only uppers require a complete shutdown checkpoint for migration; missing ownership cannot be reconstructed. Preserve the artifacts for inspection. Current data/index pairs require no shutdown checkpoint; missing or invalid pair metadata is a separate recovery error (ADR-0029). |
 | Sparse `commit` reports unavailable or changed parent identity | Use a device child supporting the `sparse_export` protocol batch. Keep its parent chain stable across recovery. The refusal occurs before stopping; do not substitute an unrelated parent merely to make export succeed. See ADR-0027. |
-| `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard reaches only writable devices; writable uppers satisfy ADR-0009 zero-mask semantics. LSMT-RW records zeroed segments, while sparse uppers publish exact ZERO coverage plus the compatibility zero-mask before punching holes. |
+| `discard`/`fstrim` fails with EROFS | The image is read-only (no writable upper configured). Discard reaches only writable devices; writable uppers satisfy ADR-0009 zero-mask semantics. LSMT-RW records zeroed segments, while Sparse uppers use UNWRITTEN zero ranges or physical zero DATA and preserve neighboring bytes in partial blocks. |
 | `resize` fails with a "grow-only" error | The requested size is at or below the device's current capacity; shrink is unsupported (ADR-0014). Grow to a larger size, or create with `--virtual-size` headroom if you need to plan ahead. |
 | `resize` fails with an `UPDATE_SIZE`-related error (`ENOTSUPP` 524 or `EOPNOTSUPP` 95) | The kernel driver predates `UBLK_U_CMD_UPDATE_SIZE` (needs the 6.16 cycle; pre-6.15 drivers answer `ENOTSUPP` 524, 6.15+ answer `EOPNOTSUPP` 95); the kernel capacity is unchanged and a retry succeeds once the driver accepts the command. `create --virtual-size` and `commit --virtual-size` do not need kernel support. |
 | A grown device crashes and its replacement rejects any resize back down toward the image size | Correct: the kernel kept the grown capacity across USER_RECOVERY, and the replacement seeds its grow-only baseline from that real capacity (GET_PARAMS) — shrinking is unsupported (ADR-0014). The fresh upper starts at the image's declared size (ADR-0008); grow further, or destroy + re-create from a committed layer, to change the size. |
@@ -622,24 +623,26 @@ correlate by device id and by the supervisor's spawn logs.
   retain both data and index artifacts. This does not promise rollback of an
   interrupted overwrite or power-loss durability before explicit FLUSH
   (ADR-0029).
-- **Sparse v2 uppers cannot be opened safely by an older binary.** Older
-  versions ignore `.coverage` and can widen a 512-byte DATA write to a
-  filesystem allocation extent. Recreate or export the upper through a
-  format-aware workflow before downgrade; retaining `.zeroes` alone is not a
-  downgrade mechanism.
-- **No-xattr filesystems have a sidecar-loss detection limit.** The fallback
-  header binds a surviving `.coverage` file to device+inode, but if all
-  coverage artifacts are deleted there is no marker left on the data inode to
-  distinguish the loss from a genuine legacy upper. Open then attempts legacy
-  extent import. Back up the data file and its `.coverage`/`.coverage.tmp`
-  artifacts as one unit.
+- **Sparse requires extent reporting.** Keep the full-sized sparse file and
+  preserve its holes and UNWRITTEN extents when moving it. No format xattr is
+  used. ext4/XFS are
+  the reference backings; tmpfs without FIEMAP is unsupported. Use 4 KiB host
+  pages and filesystem blocks. Extent-size hints above 4 KiB (including inherited
+  XFS directory hints) and realtime allocation are rejected; select a compatible
+  backing location instead of changing an existing upper's policy. Exclusive access
+  is required; external writes or mmap are outside the contract.
+- **Recreate old development Sparse uppers.** This unpublished format change
+  has no automatic migration or downgrade protocol. Normal opens reject old
+  coverage/zero sidecars. The existing offline legacy reader can export them
+  to sealed LSMT if development data needs to be retained.
 - **LSMT-RW discard masks, it does not punch through.** A discarded range
   on an LSMT-RW upper reads back as zeroes even if lower layers have data
   there (ADR-0009); this is the upstream LSMT trim semantics,
-  intentional. Sparse uppers also mask lowers by publishing exact ZERO
-  coverage and the compatibility zero-mask before best-effort punch-hole
-  deallocation. A successful guest FLUSH synchronizes backing data before the
-  authoritative coverage artifact.
+  intentional. Sparse uppers also mask lowers with zero extents/data. Sparse
+  discard can reserve or allocate blocks and does not promise physical
+  reclamation. Guest FLUSH synchronizes the backing inode and namespace;
+  ordinary writes do not add internal flushes. Sparse recovery covers process
+  exit with a surviving kernel/page cache, not whole-machine failure.
 - **Read-first scope.** The stack serves OverlayBD images; it does not push
   or mutate registry content (ADR-0007). Writable uppers are local-only;
   `commit` (ADR-0014) and `obd-convert` (ADR-0019) produce local layer files —

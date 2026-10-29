@@ -47,6 +47,64 @@ struct BoolResetGuard {
 };
 }
 
+// Used only under exclusive op_mu_ ownership. Unlike public pread, a short
+// mapped-source read is an error: copy-up must never persist invented zeros.
+class MergedWritable::MutationView final : public source::BlobSource {
+public:
+    explicit MutationView(MergedWritable& owner)
+        : owner_(owner), size_(owner.size()) {
+        std::lock_guard lock(owner_.index_mu_);
+        index_ = owner_.index_;
+    }
+    uint64_t size() const noexcept override { return size_; }
+    std::string_view label() const noexcept override { return "mutation-view"; }
+    elio::coro::task<ssize_t> pread(void* buffer, size_t count,
+                                  uint64_t offset) override {
+        if (offset % kSector || count % kSector) co_return -EINVAL;
+        if (!index_) co_return -EIO;
+        if (offset >= size_) co_return 0;
+        count = static_cast<size_t>(std::min<uint64_t>(count, size_ - offset));
+        auto* out = static_cast<uint8_t*>(buffer);
+        const uint64_t start = offset / kSector;
+        const uint64_t end = (offset + count) / kSector;
+        uint64_t cur = start;
+        auto it = std::upper_bound(index_->begin(), index_->end(), start,
+            [](uint64_t value, const bytes::segment_mapping& s) {
+                return value < s.end();
+            });
+        while (cur < end) {
+            if (it == index_->end() || it->offset > cur) {
+                const uint64_t next = it == index_->end()
+                    ? end : std::min<uint64_t>(end, it->offset);
+                std::memset(out + (cur - start) * kSector, 0,
+                            static_cast<size_t>(next - cur) * kSector);
+                cur = next;
+                continue;
+            }
+            const uint64_t next = std::min<uint64_t>(end, it->end());
+            const size_t length = static_cast<size_t>(next - cur) * kSector;
+            void* piece = out + (cur - start) * kSector;
+            if (it->zeroed) {
+                std::memset(piece, 0, length);
+            } else {
+                auto& src = it->tag == 0 ? owner_.top_->data_source()
+                    : owner_.layers_[it->tag - 1]->data_source();
+                const auto result = co_await src.pread(
+                    piece, length, (it->moffset + cur - it->offset) * kSector);
+                if (result < 0) co_return result;
+                if (static_cast<size_t>(result) != length) co_return -EIO;
+            }
+            cur = next;
+            if (cur == it->end()) ++it;
+        }
+        co_return static_cast<ssize_t>(count);
+    }
+private:
+    MergedWritable& owner_;
+    const uint64_t size_;
+    std::shared_ptr<const std::vector<bytes::segment_mapping>> index_;
+};
+
 int MergedWritable::begin_data_op(uint64_t offset, uint64_t len) {
     std::lock_guard lock(state_gate_mu_);
     if (grow_active_.load(std::memory_order_acquire)) return -EBUSY;
@@ -254,7 +312,7 @@ elio::coro::task<ssize_t> MergedWritable::pread(void* buf, size_t count,
     }
     std::optional<ActiveOpGuard> active;
     std::optional<elio::sync::shared_lock_guard> operation;
-    if (top_->serialize_merged_reads()) {
+    if (top_->serialize_merged_reads() || top_->requires_current_view()) {
         const int gate = begin_flush_op();
         if (gate != 0) co_return gate;
         active.emplace(active_ops_, AdoptActiveOp{});
@@ -350,7 +408,16 @@ elio::coro::task<ssize_t> MergedWritable::pwrite(const void* buf,
     }
     ssize_t r = 0;
     try {
-        r = co_await top_->pwrite(buf, count, offset);
+        if (top_->requires_current_view()) {
+            if (!valid_snapshot) {
+                const int repair = rebuild_index();
+                if (repair != 0) co_return repair;
+            }
+            MutationView view(*this);
+            r = co_await top_->pwrite_with_view(buf, count, offset, view);
+        } else {
+            r = co_await top_->pwrite(buf, count, offset);
+        }
     } catch (...) {
         // A top may throw after publishing a prefix. Refresh or invalidate
         // before preserving the exception, including native cancellation.
@@ -381,7 +448,15 @@ elio::coro::task<int> MergedWritable::discard(uint64_t offset,
     SyncMutexGuard op_guard(op_mu_);
     int r = 0;
     try {
-        r = co_await top_->discard(offset, len);
+        if (top_->requires_current_view()) {
+            // Repair before copy-up; an invalid snapshot must not become data.
+            const int repair = rebuild_index();
+            if (repair != 0) co_return repair;
+            MutationView view(*this);
+            r = co_await top_->discard_with_view(offset, len, view);
+        } else {
+            r = co_await top_->discard(offset, len);
+        }
     } catch (...) {
         (void)rebuild_index();
         throw;

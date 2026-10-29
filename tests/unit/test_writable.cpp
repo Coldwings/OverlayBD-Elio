@@ -17,6 +17,9 @@
 #include "../support.hpp"
 
 #include <elio/runtime/spawn_blocking.hpp>
+#include <elio/runtime/spawn.hpp>
+#include <elio/sync/event.hpp>
+#include <elio/time/timer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -33,6 +36,8 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -242,7 +247,7 @@ elio::coro::task<int> expect_sparse_zero_mask_reject(
     test::write_file(path + ".zeroes", raw);
     bool threw = false;
     try {
-        auto reopened = co_await format::SparseRwLayer::open(path, open_vsize);
+        auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, open_vsize);
         (void)reopened;
     } catch (const std::exception& e) {
         threw = true;
@@ -430,7 +435,8 @@ std::string sealed_header_uuid(const std::string& path) {
 
 int run_sparse_crash_writer(const std::string& path,
                             const std::string& operation, uint64_t vsize,
-                            uint64_t offset, uint64_t length) {
+                            uint64_t offset, uint64_t length,
+                            const std::string& lower = {}) {
     const std::string vsize_arg = std::to_string(vsize);
     const std::string offset_arg = std::to_string(offset);
     const std::string length_arg = std::to_string(length);
@@ -440,7 +446,7 @@ int run_sparse_crash_writer(const std::string& path,
         ::execl(OBD_TEST_SPARSE_CRASH_WRITER_BIN,
                 OBD_TEST_SPARSE_CRASH_WRITER_BIN, path.c_str(),
                 operation.c_str(), vsize_arg.c_str(), offset_arg.c_str(),
-                length_arg.c_str(), static_cast<char*>(nullptr));
+                length_arg.c_str(), lower.c_str(), static_cast<char*>(nullptr));
         ::_exit(127);
     }
     int status = 0;
@@ -463,7 +469,7 @@ TEST_CASE("format: sparse layer writes, reads and recovers extents",
     int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 64);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
             ssize_t r =
                 co_await layer->pwrite(a.data(), a.size(), 8 * 512);
             REQUIRE(r == static_cast<ssize_t>(a.size()));
@@ -493,7 +499,7 @@ TEST_CASE("format: sparse layer writes, reads and recovers extents",
         // Reopen: exact coverage comes from the v2 coverage sidecar.
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 64);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
             REQUIRE(layer->segments().size() == 1);
             REQUIRE(layer->segments()[0].offset == 8);
             REQUIRE(layer->segments()[0].length == 8);
@@ -527,7 +533,7 @@ TEST_CASE("format: sparse exact data coverage preserves adjacent lowers on reope
             layers.push_back(
                 co_await format::LsmtLayer::open(std::move(blob)));
             auto top =
-                co_await format::SparseRwLayer::open(upper, lower_raw.size());
+                co_await format::SparseRwLayer::open_legacy_for_test(upper, lower_raw.size());
             co_return co_await format::MergedWritable::open(
                 std::move(layers), std::move(top));
         };
@@ -598,7 +604,7 @@ TEST_CASE("format: sparse completed operations survive process exit without flus
         source::BlobSourcePtr blob = std::move(local);
         layers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
         auto top =
-            co_await format::SparseRwLayer::open(upper, lower_raw.size());
+            co_await format::SparseRwLayer::open_legacy_for_test(upper, lower_raw.size());
         const auto covered = std::find_if(top->segments().begin(), top->segments().end(),
             [](const auto& segment) { return segment.offset <= 9 && segment.end() > 9; });
         REQUIRE(covered != top->segments().end());
@@ -629,7 +635,7 @@ TEST_CASE("format: sparse coverage packs mixed and uniform sector states",
     const auto second = test::pattern_bytes(2 * 512, 14406);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto layer = co_await format::SparseRwLayer::open(path, vsize);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             auto written = co_await layer->pwrite(first.data(), first.size(), 512);
             REQUIRE(written == static_cast<ssize_t>(first.size()));
             auto discarded = co_await layer->discard(4 * 512, 8 * 512);
@@ -655,7 +661,7 @@ TEST_CASE("format: sparse coverage packs mixed and uniform sector states",
                                         slot.begin() + 24);
         REQUIRE(matches);
 
-        auto layer = co_await format::SparseRwLayer::open(path, vsize);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
         const auto& segments = layer->segments();
         REQUIRE(segments.size() == 5);
         const std::array<uint64_t, 5> offsets{1, 4, 7, 9, 16};
@@ -704,7 +710,7 @@ TEST_CASE("format: sparse coverage rejects invalid packed states and runs",
     }
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto layer = co_await format::SparseRwLayer::open(path, vsize);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             const std::array<uint8_t, 512> data{};
             const auto written = co_await layer->pwrite(data.data(), data.size(), 0);
             REQUIRE(written == static_cast<ssize_t>(data.size()));
@@ -722,7 +728,7 @@ TEST_CASE("format: sparse coverage rejects invalid packed states and runs",
         }
         bool rejected = false;
         try {
-            auto layer = co_await format::SparseRwLayer::open(path, reopened_vsize);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, reopened_vsize);
             (void)layer;
         } catch (const format_error& error) {
             rejected = true;
@@ -757,7 +763,7 @@ TEST_CASE("format: sparse DATA rewrite preserves coverage publication",
     };
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto layer = co_await format::SparseRwLayer::open(path, vsize);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             auto written = co_await layer->pwrite(original.data(), original.size(), 0);
             REQUIRE(written == static_cast<ssize_t>(original.size()));
             REQUIRE(layer->segments().size() >= 2);
@@ -769,7 +775,7 @@ TEST_CASE("format: sparse DATA rewrite preserves coverage publication",
             CHECK(coverage_bytes() == before);
             CHECK(layer->segments_generation() == generation);
         }
-        auto layer = co_await format::SparseRwLayer::open(path, vsize);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
         std::vector<uint8_t> actual(5 * 512);
         const auto read = co_await layer->pread(actual.data(), actual.size(), offset - 512);
         REQUIRE(read == static_cast<ssize_t>(actual.size()));
@@ -793,7 +799,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 const ssize_t written =
                     co_await layer->pwrite(data.data(), data.size(), 512);
                 REQUIRE(written == static_cast<ssize_t>(data.size()));
@@ -810,7 +816,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
             bool threw = false;
             try {
                 auto reopened =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)reopened;
             } catch (const std::exception& e) {
                 threw = true;
@@ -828,7 +834,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)layer;
             }
             REQUIRE(::unlink(path.c_str()) == 0);
@@ -840,7 +846,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
             bool threw = false;
             try {
                 auto reopened =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)reopened;
             } catch (const std::exception& e) {
                 threw = true;
@@ -860,7 +866,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 const ssize_t written =
                     co_await layer->pwrite(data.data(), data.size(), 8 * 512);
                 REQUIRE(written == static_cast<ssize_t>(data.size()));
@@ -890,7 +896,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
             REQUIRE(::rename(replacement.c_str(), path.c_str()) == 0);
 
             auto reopened =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             std::vector<uint8_t> actual(data.size());
             const ssize_t read =
                 co_await reopened->pread(actual.data(), actual.size(), 8 * 512);
@@ -910,7 +916,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)layer;
             }
 
@@ -939,7 +945,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
 
             {
                 auto reopened =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)reopened;
             }
             // Keep the old inode referenced so unlink/recreate cannot reuse
@@ -956,7 +962,7 @@ TEST_CASE("format: sparse coverage rejects corruption and stale identity",
             bool threw = false;
             try {
                 auto reopened =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)reopened;
             } catch (const std::exception& e) {
                 threw = true;
@@ -984,7 +990,7 @@ TEST_CASE("format: sparse coverage falls back from an invalid inactive slot",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             ssize_t written =
                 co_await layer->pwrite(first.data(), first.size(), 512);
             REQUIRE(written == static_cast<ssize_t>(first.size()));
@@ -1046,7 +1052,7 @@ TEST_CASE("format: sparse coverage falls back from an invalid inactive slot",
         std::unique_ptr<format::SparseRwLayer> reopened;
         try {
             reopened =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         } catch (const std::exception& e) {
             REQUIRE(expect_conflict);
             REQUIRE(std::string(e.what()).find("generation conflicts") !=
@@ -1080,7 +1086,7 @@ TEST_CASE("format: sparse multi-page coverage failure is retryable",
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto layer = co_await format::SparseRwLayer::open(path, vsize);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             int expected_error = -EIO;
             SECTION("second page I/O fails before publication") {
                 format::SparseRwLayerTestAccess::fail_coverage_page(*layer, 1);
@@ -1104,7 +1110,7 @@ TEST_CASE("format: sparse multi-page coverage failure is retryable",
         }
 
         {
-            auto reopened = co_await format::SparseRwLayer::open(path, vsize);
+            auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             REQUIRE(reopened->segments().size() == 1);
             REQUIRE(reopened->segments()[0].offset == first_sector);
             REQUIRE(reopened->segments()[0].length == 1);
@@ -1113,7 +1119,7 @@ TEST_CASE("format: sparse multi-page coverage failure is retryable",
             REQUIRE(retried == static_cast<ssize_t>(data.size()));
         }
 
-        auto reopened = co_await format::SparseRwLayer::open(path, vsize);
+        auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
         REQUIRE(reopened->segments().size() == 1);
         REQUIRE(reopened->segments()[0].offset == first_sector);
         REQUIRE(reopened->segments()[0].length == 2);
@@ -1138,7 +1144,7 @@ TEST_CASE("format: sparse new coverage page allocates before commit",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             format::SparseRwLayerTestAccess::fail_coverage_map_prepare(
                 *layer, 0);
             const ssize_t written =
@@ -1158,7 +1164,7 @@ TEST_CASE("format: sparse new coverage page allocates before commit",
         REQUIRE(::close(coverage_fd) == 0);
 
         auto reopened =
-            co_await format::SparseRwLayer::open(path, 512 * 32);
+            co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         REQUIRE(reopened->segments().empty());
         const ssize_t retried =
             co_await reopened->pwrite(data.data(), data.size(), 512);
@@ -1178,7 +1184,7 @@ TEST_CASE("format: sparse multi-page zero coverage failure is retryable",
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto layer = co_await format::SparseRwLayer::open(path, vsize);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             format::SparseRwLayerTestAccess::fail_coverage_page(*layer, 1);
             const int discarded =
                 co_await layer->discard(first_sector * 512, 2 * 512);
@@ -1190,7 +1196,7 @@ TEST_CASE("format: sparse multi-page zero coverage failure is retryable",
         }
 
         {
-            auto reopened = co_await format::SparseRwLayer::open(path, vsize);
+            auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             REQUIRE(reopened->segments().size() == 1);
             REQUIRE(reopened->segments()[0].offset == first_sector);
             REQUIRE(reopened->segments()[0].length == 1);
@@ -1200,7 +1206,7 @@ TEST_CASE("format: sparse multi-page zero coverage failure is retryable",
             REQUIRE(retried == 0);
         }
 
-        auto reopened = co_await format::SparseRwLayer::open(path, vsize);
+        auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
         REQUIRE(reopened->segments().size() == 1);
         REQUIRE(reopened->segments()[0].offset == first_sector);
         REQUIRE(reopened->segments()[0].length == 2);
@@ -1229,7 +1235,7 @@ TEST_CASE("format: sparse recovered ZERO stays coherent after partial write fail
     make_lsmt_lower(dir.str(), "lower", std::vector<uint8_t>(vsize, 0x5a), &lower);
     if (stale_sidecar) {
         const int setup = test::run_coro([&]() -> elio::coro::task<int> {
-            auto top = co_await format::SparseRwLayer::open(path, vsize);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             co_return co_await top->discard(0, 512);
         });
         REQUIRE(setup == 0);
@@ -1248,7 +1254,7 @@ TEST_CASE("format: sparse recovered ZERO stays coherent after partial write fail
             source::BlobSourcePtr blob = std::move(local);
             std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
             lowers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
-            auto top = co_await format::SparseRwLayer::open(path, vsize);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             co_return co_await format::MergedWritable::open(std::move(lowers), std::move(top));
         };
         std::vector<uint8_t> live(4 * 512);
@@ -1309,7 +1315,7 @@ TEST_CASE("format: sparse DATA view follows committed zero-mask namespace",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             const int discarded = co_await layer->discard(8 * 512, 512);
             REQUIRE(discarded == 0);
             REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
@@ -1328,7 +1334,7 @@ TEST_CASE("format: sparse DATA view follows committed zero-mask namespace",
             REQUIRE(::access((path + ".zeroes").c_str(), F_OK) != 0);
         }
         auto reopened =
-            co_await format::SparseRwLayer::open(path, 512 * 32);
+            co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         std::vector<uint8_t> actual(512);
         const ssize_t read =
             co_await reopened->pread(actual.data(), actual.size(), 8 * 512);
@@ -1348,7 +1354,7 @@ TEST_CASE("format: sparse grown tail data coverage survives reopen",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             const int grown = co_await elio::spawn_blocking(
                 [&] { return layer->grow(512 * 64); });
             REQUIRE(grown == 0);
@@ -1357,7 +1363,7 @@ TEST_CASE("format: sparse grown tail data coverage survives reopen",
             REQUIRE(written == static_cast<ssize_t>(data.size()));
         }
         auto reopened =
-            co_await format::SparseRwLayer::open(path, 512 * 32);
+            co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         REQUIRE(reopened->virtual_size() == 512 * 64);
         REQUIRE(reopened->segments().size() == 1);
         REQUIRE(reopened->segments()[0].offset == 63);
@@ -1388,7 +1394,7 @@ TEST_CASE("format: sparse legacy coverage imports zero masks once",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             REQUIRE(::access((path + ".coverage").c_str(), F_OK) == 0);
             REQUIRE(layer->segments().size() == 3);
             REQUIRE_FALSE(layer->segments()[0].zeroed);
@@ -1396,7 +1402,7 @@ TEST_CASE("format: sparse legacy coverage imports zero masks once",
             REQUIRE_FALSE(layer->segments()[2].zeroed);
         }
         auto reopened =
-            co_await format::SparseRwLayer::open(path, 512 * 32);
+            co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         REQUIRE(reopened->segments().size() == 3);
         REQUIRE(reopened->segments()[1].offset == 10);
         REQUIRE(reopened->segments()[1].length == 4);
@@ -1421,7 +1427,7 @@ TEST_CASE("format: sparse coverage install state recovers or fails closed",
             bool threw = false;
             try {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)layer;
             } catch (const obd::error& e) {
                 threw = true;
@@ -1437,7 +1443,7 @@ TEST_CASE("format: sparse coverage install state recovers or fails closed",
             REQUIRE(BackingInode(tmp).descriptors() == 0);
 
             auto recovered =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             REQUIRE(recovered->segments().empty());
             REQUIRE(::access((path + ".coverage").c_str(), F_OK) == 0);
             REQUIRE(::access(tmp.c_str(), F_OK) != 0);
@@ -1451,13 +1457,13 @@ TEST_CASE("format: sparse coverage install state recovers or fails closed",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)layer;
             }
             REQUIRE(::rename((path + ".coverage").c_str(),
                              (path + ".coverage.tmp").c_str()) == 0);
             auto reopened =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             REQUIRE(reopened->segments().empty());
             REQUIRE(::access((path + ".coverage").c_str(), F_OK) == 0);
             REQUIRE(::access((path + ".coverage.tmp").c_str(), F_OK) != 0);
@@ -1472,7 +1478,7 @@ TEST_CASE("format: sparse coverage install state recovers or fails closed",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)layer;
             }
             const std::string tmp = path + ".coverage.tmp";
@@ -1503,7 +1509,7 @@ TEST_CASE("format: sparse coverage install state recovers or fails closed",
             REQUIRE(::rename(replacement.c_str(), path.c_str()) == 0);
 
             auto recovered =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             REQUIRE(recovered->segments().empty());
             REQUIRE(::access((path + ".coverage").c_str(), F_OK) == 0);
             REQUIRE(::access(tmp.c_str(), F_OK) != 0);
@@ -1518,14 +1524,14 @@ TEST_CASE("format: sparse coverage install state recovers or fails closed",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)layer;
             }
             REQUIRE(::unlink((path + ".coverage").c_str()) == 0);
             bool threw = false;
             try {
                 auto reopened =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)reopened;
             } catch (const std::exception& e) {
                 threw = true;
@@ -1543,7 +1549,7 @@ TEST_CASE("format: sparse coverage install state recovers or fails closed",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)layer;
             }
             const std::string tmp = path + ".coverage.tmp";
@@ -1556,7 +1562,7 @@ TEST_CASE("format: sparse coverage install state recovers or fails closed",
             bool threw = false;
             try {
                 auto reopened =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)reopened;
             } catch (const std::exception& e) {
                 threw = true;
@@ -1580,7 +1586,7 @@ TEST_CASE("format: sparse interrupted import retains legacy DATA pages",
     const auto original = test::pattern_bytes(page_bytes + 4096, 14401);
     const std::string path = test::write_file(dir / "legacy-import.sparse", original);
     const int prepared = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, original.size());
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, original.size());
         co_return 0;
     });
     REQUIRE(prepared == 0);
@@ -1608,7 +1614,7 @@ TEST_CASE("format: sparse interrupted import retains legacy DATA pages",
         REQUIRE((errno == ENODATA || errno == ENOTSUP || errno == EOPNOTSUPP));
     REQUIRE(::rename((path + ".coverage").c_str(), (path + ".coverage.tmp").c_str()) == 0);
     const int recovered = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, original.size());
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, original.size());
         std::vector<uint8_t> tail(4096);
         const auto read = co_await layer->pread(tail.data(), tail.size(), page_bytes);
         CHECK(read == static_cast<ssize_t>(tail.size()));
@@ -1626,7 +1632,7 @@ TEST_CASE("format: sparse recovered FLUSH synchronizes prior process coverage",
     REQUIRE(WIFEXITED(child));
     REQUIRE(WEXITSTATUS(child) == 0);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         const int first = co_await format::SparseRwLayerTestAccess::
             flush_without_coverage_descriptor(*layer);
         const int retried = co_await layer->flush();
@@ -1653,7 +1659,7 @@ TEST_CASE("format: sparse legacy import survives process interruption",
     REQUIRE(::access((path + ".coverage.tmp").c_str(), F_OK) == 0);
     REQUIRE(::access((path + ".coverage").c_str(), F_OK) != 0);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, expected.size());
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, expected.size());
         std::vector<uint8_t> actual(4096);
         for (const uint64_t offset : {uint64_t{0}, page_bytes}) {
             const auto read = co_await layer->pread(actual.data(), actual.size(), offset);
@@ -1686,7 +1692,7 @@ TEST_CASE("format: sparse interrupted fresh creation preserves lower sectors",
     REQUIRE(WIFEXITED(child));
     REQUIRE(WEXITSTATUS(child) == 87);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto top = co_await format::SparseRwLayer::open(path, expected.size());
+        auto top = co_await format::SparseRwLayer::open_legacy_for_test(path, expected.size());
         CHECK(top->segments().empty());
         auto local = co_await source::LocalFileSource::open(lower);
         source::BlobSourcePtr blob = std::move(local);
@@ -1717,7 +1723,7 @@ TEST_CASE("format: sparse legacy growth leaves new sectors inherited",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         for (int attempt = 0; attempt < 2; ++attempt) {
             INFO("open attempt: " << attempt);
-            auto top = co_await format::SparseRwLayer::open(path, vsize);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             REQUIRE(top->segments().size() == 1);
             CHECK(top->segments()[0].offset == 0);
             CHECK(top->segments()[0].length == 1);
@@ -1796,7 +1802,7 @@ TEST_CASE("format: merged sparse allocation failure preserves committed prefix",
             source::BlobSourcePtr blob = std::move(local);
             std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
             lowers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
-            auto top = co_await format::SparseRwLayer::open(path, vsize);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(path, vsize);
             co_return co_await format::MergedWritable::open(std::move(lowers), std::move(top));
         };
         {
@@ -1835,7 +1841,7 @@ TEST_CASE("format: sparse unmarked temporary rejects replacement inode",
     TempDir dir;
     const std::string path = dir / "unmarked-original.sparse";
     const int prepared = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         co_return 0;
     });
     REQUIRE(prepared == 0);
@@ -1854,7 +1860,7 @@ TEST_CASE("format: sparse unmarked temporary rejects replacement inode",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         bool rejected = false;
         try {
-            auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             (void)layer;
         } catch (const format_error&) { rejected = true; }
         CHECK(rejected);
@@ -1874,14 +1880,14 @@ TEST_CASE("format: sparse coverage rejects data truncation without cleanup",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)layer;
             }
             REQUIRE(::truncate(path.c_str(), 0) == 0);
             bool threw = false;
             try {
                 auto reopened =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)reopened;
             } catch (const std::exception& e) {
                 threw = true;
@@ -1901,7 +1907,7 @@ TEST_CASE("format: sparse coverage rejects data truncation without cleanup",
         const int rc = test::run_coro([&]() -> elio::coro::task<int> {
             {
                 auto layer =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 const ssize_t written =
                     co_await layer->pwrite(data.data(), data.size(), 8 * 512);
                 REQUIRE(written == 512);
@@ -1922,7 +1928,7 @@ TEST_CASE("format: sparse coverage rejects data truncation without cleanup",
             bool threw = false;
             try {
                 auto reopened =
-                    co_await format::SparseRwLayer::open(path, 512 * 32);
+                    co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
                 (void)reopened;
             } catch (const std::exception& e) {
                 threw = true;
@@ -1947,7 +1953,7 @@ TEST_CASE("format: sparse no-xattr fallback cannot detect sidecar deletion",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             const ssize_t written =
                 co_await layer->pwrite(data.data(), data.size(), 8 * 512);
             REQUIRE(written == 512);
@@ -1975,7 +1981,7 @@ TEST_CASE("format: sparse no-xattr fallback cannot detect sidecar deletion",
         // that distinguishes this loss from a genuine v1 upper. Migration is
         // therefore intentionally attempted and recreates the sidecar.
         auto reopened =
-            co_await format::SparseRwLayer::open(path, 512 * 32);
+            co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         REQUIRE(::access(coverage.c_str(), F_OK) == 0);
         REQUIRE_FALSE(reopened->segments().empty());
         co_return 0;
@@ -1989,7 +1995,7 @@ TEST_CASE("format: sparse open blocking callable owns its inputs",
     const std::string path = dir / "destroyed-open.sparse";
     auto state = std::make_shared<std::atomic<int>>(0);
     format::SparseRwLayerTestAccess::park_open(state);
-    auto pending = format::SparseRwLayer::open(path, 512 * 32);
+    auto pending = format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
     auto handle =
         elio::coro::detail::task_access::release(std::move(pending));
     handle.resume();
@@ -2948,7 +2954,7 @@ TEST_CASE("format: sparse flush retains an already published discard mask",
     TempDir dir;
     const std::string path = dir / "upper.sparse";
     const int run_result_1 = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 32768);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 32768);
         const auto operation_result_1 = co_await layer->discard(0, 512);
         REQUIRE(operation_result_1 == 0);
         CoverageTestFd published(::open((path + ".zeroes").c_str(), O_RDONLY | O_CLOEXEC));
@@ -2962,7 +2968,7 @@ TEST_CASE("format: sparse flush retains an already published discard mask",
         REQUIRE(after.st_dev == before.st_dev);
         REQUIRE(after.st_ino == before.st_ino);
         layer.reset();
-        layer = co_await format::SparseRwLayer::open(path, 32768);
+        layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 32768);
         REQUIRE(layer->segments().size() == 1);
         REQUIRE(layer->segments()[0].zeroed);
         REQUIRE(layer->segments()[0].offset == 0);
@@ -2977,7 +2983,7 @@ TEST_CASE("format: sparse flush retries a later failed mask publication",
     TempDir dir;
     const std::string path = dir / "upper.sparse";
     const int run_result_2 = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 32768);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 32768);
         const auto operation_result_3 = co_await layer->discard(0, 512);
         REQUIRE(operation_result_3 == 0);
         // A previously published generation must not suppress publication of
@@ -2997,7 +3003,7 @@ TEST_CASE("format: sparse flush retries a later failed mask publication",
                 static_cast<ssize_t>(actual.size()));
         REQUIRE(actual == expected);
         layer.reset();
-        layer = co_await format::SparseRwLayer::open(path, 32768);
+        layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 32768);
         REQUIRE(layer->segments().size() == 1);
         REQUIRE(layer->segments()[0].zeroed);
         REQUIRE(layer->segments()[0].length == 2);
@@ -3011,7 +3017,7 @@ TEST_CASE("format: sparse grow mask dirsync failure retains flush retry",
     TempDir dir;
     const std::string path = dir / "upper.sparse";
     const int run_result_3 = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 32768);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 32768);
         const auto operation_result_6 = co_await layer->discard(0, 512);
         REQUIRE(operation_result_6 == 0);
         format::SparseRwLayerTestAccess::fail_zero_mask_dirsync_after_commit(*layer);
@@ -3032,7 +3038,7 @@ TEST_CASE("format: sparse grow mask dirsync failure retains flush retry",
         REQUIRE(operation_result_10 == 0);
         REQUIRE(sparse_zero_mask_vsize(path) == 65536);
         layer.reset();
-        layer = co_await format::SparseRwLayer::open(path, 32768);
+        layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 32768);
         REQUIRE(layer->virtual_size() == 65536);
         REQUIRE(layer->segments().size() == 1);
         REQUIRE(layer->segments()[0].zeroed);
@@ -3050,7 +3056,7 @@ TEST_CASE("format: sparse layer discard keeps a durable zero mask",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 64);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
             ssize_t r =
                 co_await layer->pwrite(a.data(), a.size(), 8 * 512);
             REQUIRE(r == static_cast<ssize_t>(a.size()));
@@ -3086,7 +3092,7 @@ TEST_CASE("format: sparse layer discard keeps a durable zero mask",
         // accepting the older sidecar header.
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 64);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
             REQUIRE(layer->virtual_size() == 512 * 96);
             std::vector<uint8_t> buf(512 * 8);
             ssize_t r =
@@ -3110,14 +3116,14 @@ TEST_CASE("format: sparse layer reopen accepts a published grown zero mask",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 64);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
             REQUIRE(layer->virtual_size() == 512 * 64);
         }
         REQUIRE(::truncate(path.c_str(), 512 * 96) == 0);
         write_sparse_zero_mask(path, 512 * 96, {{10, 4}});
 
         auto reopened =
-            co_await format::SparseRwLayer::open(path, 512 * 64);
+            co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
         REQUIRE(reopened->virtual_size() == 512 * 96);
         REQUIRE(reopened->segments().size() == 1);
         REQUIRE(reopened->segments()[0].offset == 10);
@@ -3134,7 +3140,7 @@ TEST_CASE("format: sparse layer checkpoint persists a dirty zero mask",
     const std::string path = dir / "upper.sparse";
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         const int dr = co_await layer->discard(8 * 512, 4 * 512);
         REQUIRE(dr == 0);
         REQUIRE(::access((path + ".zeroes").c_str(), F_OK) == 0);
@@ -3153,7 +3159,7 @@ TEST_CASE("format: sparse layer checkpoint persists a dirty zero mask",
 
         // Checkpoint preserves ownership until this drained instance closes.
         layer.reset();
-        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         REQUIRE(reopened->virtual_size() == 512 * 64);
         REQUIRE(reopened->segments().size() == 1);
         REQUIRE(reopened->segments()[0].offset == 8);
@@ -3170,7 +3176,7 @@ TEST_CASE("format: sparse layer checkpoint failure can retry", "[format]") {
     const auto data = sectors_pattern(0, 1, 1207);
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         const int dr = co_await layer->discard(8 * 512, 4 * 512);
         REQUIRE(dr == 0);
         // Require a new mask publication for the grown capacity. A completed
@@ -3203,7 +3209,7 @@ TEST_CASE("format: sparse layer checkpoint is terminal", "[format]") {
     const auto data = sectors_pattern(0, 4, 1206);
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         const int cr = co_await layer->checkpoint();
         REQUIRE(cr == 0);
 
@@ -3230,7 +3236,7 @@ TEST_CASE("format: sparse layer grow republishes zero mask size",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 32);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             const int dr = co_await layer->discard(8 * 512, 4 * 512);
             REQUIRE(dr == 0);
             REQUIRE(sparse_zero_mask_vsize(path) == 512 * 32);
@@ -3245,7 +3251,7 @@ TEST_CASE("format: sparse layer grow republishes zero mask size",
         }
 
         REQUIRE(sparse_zero_mask_vsize(path) == 512 * 96);
-        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         REQUIRE(reopened->virtual_size() == 512 * 96);
         REQUIRE(reopened->segments().size() == 1);
         REQUIRE(reopened->segments()[0].offset == 8);
@@ -3265,7 +3271,7 @@ TEST_CASE("format: sparse zero mask overlays legacy extent import",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 64);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
             const ssize_t r =
                 co_await layer->pwrite(live.data(), live.size(), 8 * 512);
             REQUIRE(r == static_cast<ssize_t>(live.size()));
@@ -3275,7 +3281,7 @@ TEST_CASE("format: sparse zero mask overlays legacy extent import",
 
         write_sparse_zero_mask(path, 512 * 64, {{10, 4}});
 
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 64);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
         REQUIRE(layer->segments().size() == 3);
         REQUIRE(layer->segments()[0].offset == 8);
         REQUIRE(layer->segments()[0].length == 2);
@@ -3309,7 +3315,7 @@ TEST_CASE("format: sparse zero mask sidecar preserves grown size",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 96);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 96);
             const ssize_t r =
                 co_await layer->pwrite(live.data(), live.size(), 8 * 512);
             REQUIRE(r == static_cast<ssize_t>(live.size()));
@@ -3321,7 +3327,7 @@ TEST_CASE("format: sparse zero mask sidecar preserves grown size",
 
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 64);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
             REQUIRE(layer->virtual_size() == 512 * 96);
             REQUIRE(layer->segments().size() == 4);
             REQUIRE(layer->segments()[0].offset == 8);
@@ -3349,7 +3355,7 @@ TEST_CASE("format: sparse zero mask sidecar preserves grown size",
             REQUIRE(frc == 0);
         }
 
-        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 64);
+        auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
         REQUIRE(reopened->virtual_size() == 512 * 96);
         REQUIRE(reopened->segments().size() == 4);
         REQUIRE(reopened->segments()[1].offset == 10);
@@ -3369,7 +3375,7 @@ TEST_CASE("format: sparse zero mask writer rejects oversized vsize",
     const std::string path = dir / "upper.sparse";
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 64);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
         bytes::segment_mapping z;
         z.offset = 8;
         z.length = 1;
@@ -3427,7 +3433,7 @@ TEST_CASE("format: sparse zero mask sidecar rejects malformed metadata",
                                        mutable -> elio::coro::task<int> {
         {
             auto layer =
-                co_await format::SparseRwLayer::open(path, 512 * 64);
+                co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
             REQUIRE(layer->virtual_size() == 512 * 64);
         }
 
@@ -3489,7 +3495,7 @@ TEST_CASE("format: fresh sparse layer ignores stale zero mask sidecar",
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 32);
             const int dr = co_await top->discard(8 * 512, 8 * 512);
             REQUIRE(dr == 0);
             const int frc = co_await top->flush();
@@ -3504,7 +3510,7 @@ TEST_CASE("format: fresh sparse layer ignores stale zero mask sidecar",
         auto s = co_await source::LocalFileSource::open(lower_lsmt);
         source::BlobSourcePtr b = std::move(s);
         layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
-        auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+        auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 32);
         REQUIRE(::access((upper + ".zeroes").c_str(), F_OK) != 0);
         auto merged = co_await format::MergedWritable::open(
             std::move(layers), std::move(top));
@@ -3568,7 +3574,7 @@ TEST_CASE("format: merged writable sparse discard masks the lower layer",
             auto s = co_await source::LocalFileSource::open(lower_lsmt);
             source::BlobSourcePtr b = std::move(s);
             layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
-            auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 32);
             co_return co_await format::MergedWritable::open(
                 std::move(layers), std::move(top));
         };
@@ -3640,7 +3646,7 @@ TEST_CASE("format: merged writable sparse discard survives reopen without flush"
             auto s = co_await source::LocalFileSource::open(lower_lsmt);
             source::BlobSourcePtr b = std::move(s);
             layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
-            auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 32);
             co_return co_await format::MergedWritable::open(
                 std::move(layers), std::move(top));
         };
@@ -3677,7 +3683,7 @@ TEST_CASE("format: sparse write retries pending zero-mask removal before later w
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         const std::string sidecar = path + ".zeroes";
         {
-            auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             const int dr = co_await layer->discard(8 * 512, 8 * 512);
             REQUIRE(dr == 0);
             const int initial_flush = co_await layer->flush();
@@ -3703,7 +3709,7 @@ TEST_CASE("format: sparse write retries pending zero-mask removal before later w
             REQUIRE(final_flush == 0);
         }
 
-        auto reopened = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto reopened = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         std::vector<uint8_t> first_buf(first.size());
         ssize_t r =
             co_await reopened->pread(first_buf.data(), first_buf.size(), 8 * 512);
@@ -3730,7 +3736,7 @@ TEST_CASE("format: sparse grow retries pending zero-mask removal",
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         const std::string sidecar = path + ".zeroes";
         {
-            auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+            auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
             const int dr = co_await layer->discard(8 * 512, 8 * 512);
             REQUIRE(dr == 0);
             const int initial_flush = co_await layer->flush();
@@ -3755,7 +3761,7 @@ TEST_CASE("format: sparse grow retries pending zero-mask removal",
         }
 
         auto reopened =
-            co_await format::SparseRwLayer::open(path, 512 * 32);
+            co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         REQUIRE(reopened->virtual_size() == 512 * 64);
         std::vector<uint8_t> actual(data.size());
         const ssize_t read = co_await reopened->pread(
@@ -3786,7 +3792,7 @@ TEST_CASE("format: merged writable rebuilds after retrying sparse sidecar transi
         auto source = co_await source::LocalFileSource::open(lower_lsmt);
         source::BlobSourcePtr base = std::move(source);
         layers.push_back(co_await format::LsmtLayer::open(std::move(base)));
-        auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+        auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 32);
         auto merged = co_await format::MergedWritable::open(
             std::move(layers), std::move(top));
 
@@ -3845,7 +3851,7 @@ TEST_CASE("format: merged writable sparse write over discard survives reopen wit
             auto s = co_await source::LocalFileSource::open(lower_lsmt);
             source::BlobSourcePtr b = std::move(s);
             layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
-            auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 32);
             co_return co_await format::MergedWritable::open(
                 std::move(layers), std::move(top));
         };
@@ -3888,7 +3894,7 @@ TEST_CASE("format: merged writable invalid index fails closed after sparse disca
         auto s = co_await source::LocalFileSource::open(lower_lsmt);
         source::BlobSourcePtr b = std::move(s);
         layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
-        auto top = co_await format::SparseRwLayer::open(upper, 512 * 32);
+        auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 32);
         auto merged = co_await format::MergedWritable::open(
             std::move(layers), std::move(top));
 
@@ -3912,7 +3918,7 @@ TEST_CASE("format: sparse grow rejects oversized zero-mask window",
         (bytes::segment_mapping::kInvalidOffset + 1) * 512;
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 32);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 32);
         const int dr = co_await layer->discard(8 * 512, 4 * 512);
         REQUIRE(dr == 0);
 
@@ -3938,7 +3944,7 @@ TEST_CASE("format: sparse grow preserves an unflushed discard mask on reopen",
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto top = co_await format::SparseRwLayer::open(upper, 512 * 64);
+            auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 64);
             const int dr = co_await top->discard(8 * 512, 8 * 512);
             REQUIRE(dr == 0);
             const int gr = co_await elio::spawn_blocking(
@@ -3951,7 +3957,7 @@ TEST_CASE("format: sparse grow preserves an unflushed discard mask on reopen",
         auto s = co_await source::LocalFileSource::open(lower_lsmt);
         source::BlobSourcePtr b = std::move(s);
         layers.push_back(co_await format::LsmtLayer::open(std::move(b)));
-        auto top = co_await format::SparseRwLayer::open(upper, 512 * 64);
+        auto top = co_await format::SparseRwLayer::open_legacy_for_test(upper, 512 * 64);
         auto merged = co_await format::MergedWritable::open(
             std::move(layers), std::move(top));
 
@@ -4248,7 +4254,7 @@ TEST_CASE("format: sparse layer grow extends the write window", "[format]") {
     const auto a = sectors_pattern(0, 16, 712);
     const auto b = sectors_pattern(64, 8, 713);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 64);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
         const ssize_t ra = co_await layer->pwrite(a.data(), a.size(), 0);
         REQUIRE(ra == static_cast<ssize_t>(a.size()));
         int g = co_await elio::spawn_blocking(
@@ -4280,7 +4286,7 @@ TEST_CASE("format: sparse layer direct grow gates reject overlaps",
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         auto data_layer =
-            co_await format::SparseRwLayer::open(data_path, 512 * 64);
+            co_await format::SparseRwLayer::open_legacy_for_test(data_path, 512 * 64);
         int gate =
             format::SparseRwLayerTestAccess::begin_data(*data_layer, 0, 512);
         REQUIRE(gate == 0);
@@ -4293,7 +4299,7 @@ TEST_CASE("format: sparse layer direct grow gates reject overlaps",
         REQUIRE(grow_retry == 0);
 
         auto flush_layer =
-            co_await format::SparseRwLayer::open(flush_path, 512 * 64);
+            co_await format::SparseRwLayer::open_legacy_for_test(flush_path, 512 * 64);
         bool already_checkpointed = true;
         gate = format::SparseRwLayerTestAccess::begin_flush(
             *flush_layer, &already_checkpointed);
@@ -4308,7 +4314,7 @@ TEST_CASE("format: sparse layer direct grow gates reject overlaps",
         REQUIRE(grow_retry == 0);
 
         auto checkpoint_layer =
-            co_await format::SparseRwLayer::open(checkpoint_path, 512 * 64);
+            co_await format::SparseRwLayer::open_legacy_for_test(checkpoint_path, 512 * 64);
         gate =
             format::SparseRwLayerTestAccess::begin_checkpoint(*checkpoint_layer);
         REQUIRE(gate == 0);
@@ -4331,7 +4337,7 @@ TEST_CASE("format: sparse layer grow rejects direct operation overlaps",
     const auto payload = sectors_pattern(0, 1, 718);
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto layer = co_await format::SparseRwLayer::open(path, 512 * 64);
+        auto layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
 
         int gate = format::SparseRwLayerTestAccess::begin_grow(*layer);
         REQUIRE(gate == 0);
@@ -4471,7 +4477,7 @@ TEST_CASE("format: merged writable sparse grow reads new top data",
     const auto payload = sectors_pattern(64, 8, 716);
 
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto top = co_await format::SparseRwLayer::open(path, 512 * 64);
+        auto top = co_await format::SparseRwLayer::open_legacy_for_test(path, 512 * 64);
         std::vector<std::unique_ptr<format::LsmtLayer>> none;
         auto merged =
             co_await format::MergedWritable::open(std::move(none),
@@ -5003,7 +5009,7 @@ TEST_CASE("format: writable mapped reads reject early file EOF", "[format]") {
         for (bool sparse : {false, true}) {
             const auto path = dir / (sparse ? "sparse-eof" : "lsmt-eof");
             std::unique_ptr<format::WritableLayer> layer;
-            if (sparse) layer = co_await format::SparseRwLayer::open(path, 4096);
+            if (sparse) layer = co_await format::SparseRwLayer::open_legacy_for_test(path, 4096);
             else layer = co_await format::LsmtRwLayer::create(path, 4096);
             const auto written = co_await layer->pwrite(input.data(), input.size(), 0);
             REQUIRE(written == 1024);
@@ -5039,7 +5045,7 @@ TEST_CASE("format: sparse ownership excludes ordinary and existing opens through
     const auto path = dir / "upper";
     const auto alias = dir / "alias";
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
-        auto owner = co_await format::SparseRwLayer::open(path, 4096);
+        auto owner = co_await format::SparseRwLayer::open_legacy_for_test(path, 4096);
         co_await elio::spawn_blocking([&] { std::filesystem::create_hard_link(path, alias); });
         for (const auto& candidate : {path, alias}) {
             for (bool existing : {false, true}) {
@@ -5049,7 +5055,7 @@ TEST_CASE("format: sparse ownership excludes ordinary and existing opens through
                     if (existing)
                         other = co_await format::SparseRwLayer::open_existing(candidate);
                     else
-                        other = co_await format::SparseRwLayer::open(candidate, 8192);
+                        other = co_await format::SparseRwLayer::open_legacy_for_test(candidate, 8192);
                 } catch (const error& e) {
                     rejected = true;
                     REQUIRE(e.errno_value() == EBUSY);
@@ -5086,7 +5092,7 @@ TEST_CASE("format: sparse existing open preserves persisted growth and exact own
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         std::vector<uint8_t> payload(512, 0xa7);
         {
-            auto source = co_await format::SparseRwLayer::open(path, 4096);
+            auto source = co_await format::SparseRwLayer::open_legacy_for_test(path, 4096);
             auto* active = source.get();
             const int grown = co_await elio::spawn_blocking([active] { return active->grow(8192); });
             REQUIRE(grown == 0);
@@ -5274,7 +5280,7 @@ TEST_CASE("format: sparse exports match across independent recovered write histo
             const auto path = dir / ("upper-" + std::to_string(history));
             const auto output = dir / ("delta-" + std::to_string(history));
             {
-                auto upper = co_await format::SparseRwLayer::open(path, 32 * 512);
+                auto upper = co_await format::SparseRwLayer::open_legacy_for_test(path, 32 * 512);
                 if (history == 1) {
                     const auto written = co_await upper->pwrite(stale.data(), stale.size(), 512);
                     REQUIRE(written == static_cast<ssize_t>(stale.size()));
@@ -5336,7 +5342,7 @@ TEST_CASE("format: sparse export transaction retains a reusable independent sour
             auto parent_source = co_await source::LocalFileSource::open(parent_path);
             auto parent = co_await format::LsmtLayer::open(std::move(parent_source));
             parent_uuid = parent->header().uuid;
-            auto upper = co_await format::SparseRwLayer::open(path, parent_bytes.size());
+            auto upper = co_await format::SparseRwLayer::open_legacy_for_test(path, parent_bytes.size());
             const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
             REQUIRE(written == 512);
             const auto discarded = co_await upper->discard(3 * 512, 512);
@@ -5400,7 +5406,7 @@ TEST_CASE("format: sparse export transaction rejects source aliases and active o
     const auto coverage_alias = dir / "coverage-alias";
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto owner = co_await format::SparseRwLayer::open(path, 4096);
+            auto owner = co_await format::SparseRwLayer::open_legacy_for_test(path, 4096);
             bool rejected = false;
             try { auto result = co_await format::SparseRwLayer::export_file(path, dir / "output"); }
             catch (const error& e) { rejected = true; REQUIRE(e.errno_value() == EBUSY); }
@@ -5443,7 +5449,7 @@ TEST_CASE("format: sparse export failures preserve source and retry publication"
             const auto payload = test::pattern_bytes(512, 1614);
             const int rc = test::run_coro([&]() -> elio::coro::task<int> {
                 {
-                    auto upper = co_await format::SparseRwLayer::open(path, 4096);
+                    auto upper = co_await format::SparseRwLayer::open_legacy_for_test(path, 4096);
                     const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
                     REQUIRE(written == 512);
                     const int zeroed = co_await upper->discard(3 * 512, 512);
@@ -5505,7 +5511,7 @@ TEST_CASE("cli: sparse export writes an independent delta and reports its digest
     const auto output = dir / "sealed";
     const auto payload = test::pattern_bytes(512, 1615);
     const int prepared = test::run_coro([&]() -> elio::coro::task<int> {
-        auto upper = co_await format::SparseRwLayer::open(path, 4096);
+        auto upper = co_await format::SparseRwLayer::open_legacy_for_test(path, 4096);
         const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
         REQUIRE(written == 512);
         const int flushed = co_await upper->checkpoint();
@@ -5599,7 +5605,7 @@ TEST_CASE("format: sparse export size override grows only the independent delta"
     const auto payload = test::pattern_bytes(512, 1614);
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto upper = co_await format::SparseRwLayer::open(path, 4096);
+            auto upper = co_await format::SparseRwLayer::open_legacy_for_test(path, 4096);
             const auto written = co_await upper->pwrite(payload.data(), payload.size(), 512);
             REQUIRE(written == 512);
             const int flushed = co_await upper->flush();
@@ -5703,7 +5709,7 @@ TEST_CASE("format: sparse export rejects damaged recovery metadata before public
     SECTION("replacement data inode") { damage = Damage::data_identity; }
     SECTION("truncated data inode") { damage = Damage::data_truncation; }
     const int prepared = test::run_coro([&]() -> elio::coro::task<int> {
-        auto upper = co_await format::SparseRwLayer::open(path, 8192);
+        auto upper = co_await format::SparseRwLayer::open_legacy_for_test(path, 8192);
         const auto payload = test::pattern_bytes(512, 1618);
         const auto written = co_await upper->pwrite(payload.data(), payload.size(), 4096);
         REQUIRE(written == 512);
@@ -5769,7 +5775,7 @@ TEST_CASE("format: sparse export resolves directory symlinks before parent trave
     const auto requested = local + "/link/../delta.lsmt";
     const int rc = test::run_coro([&]() -> elio::coro::task<int> {
         {
-            auto source = co_await format::SparseRwLayer::open(path, 4096);
+            auto source = co_await format::SparseRwLayer::open_legacy_for_test(path, 4096);
             const int flushed = co_await source->checkpoint();
             REQUIRE(flushed == 0);
         }
@@ -6267,4 +6273,610 @@ TEST_CASE("format: locality opt-in retains full repair after errors and exceptio
         co_return 0;
     });
     REQUIRE(rc == 0);
+}
+
+namespace {
+class CopyupViewTestLayer final : public format::WritableLayer,
+                                  public source::BlobSource {
+public:
+    int read_mode = 0;
+    unsigned published = 0;
+    unsigned mutation_entries = 0;
+    unsigned read_entries = 0;
+    bool park_reads = false;
+    bool fail_snapshot = false;
+    elio::sync::event entered;
+    elio::sync::event release;
+    CopyupViewTestLayer() {
+        bytes::segment_mapping data;
+        data.offset = 1; data.moffset = 1; data.length = 1;
+        mappings.push_back(data);
+        data.offset = 2; data.moffset = 0; data.zeroed = true;
+        mappings.push_back(data);
+    }
+    bool requires_current_view() const noexcept override { return true; }
+    elio::coro::task<ssize_t> pwrite(const void*, size_t, uint64_t) override {
+        co_return -EOPNOTSUPP;
+    }
+    elio::coro::task<ssize_t> pwrite_with_view(
+        const void* input, size_t count, uint64_t offset,
+        source::BlobSource& view) override {
+        ++mutation_entries;
+        std::array<uint8_t, 4096> next{};
+        const auto read = co_await view.pread(next.data(), next.size(), 0);
+        if (read < 0) co_return read;
+        if (read != 4096) co_return -EIO;
+        std::memcpy(next.data() + offset, input, count);
+        publish(next);
+        co_return static_cast<ssize_t>(count);
+    }
+    elio::coro::task<int> discard(uint64_t, uint64_t) override {
+        co_return -EOPNOTSUPP;
+    }
+    elio::coro::task<int> discard_with_view(uint64_t offset, uint64_t len,
+                                           source::BlobSource& view) override {
+        ++mutation_entries;
+        std::array<uint8_t, 4096> next{};
+        const auto read = co_await view.pread(next.data(), next.size(), 0);
+        if (read < 0) co_return static_cast<int>(read);
+        if (read != 4096) co_return -EIO;
+        std::memset(next.data() + offset, 0, len);
+        publish(next);
+        co_return 0;
+    }
+    elio::coro::task<ssize_t> pread(void* out, size_t count,
+                                    uint64_t offset) override {
+        ++read_entries;
+        entered.set();
+        if (park_reads) co_await release.wait();
+        if (read_mode == 1) co_return -EHOSTDOWN;
+        if (read_mode == 2) co_return 0;
+        if (read_mode == 3) co_return 256;
+        if (offset >= bytes_.size()) co_return 0;
+        count = std::min(count, bytes_.size() - static_cast<size_t>(offset));
+        std::memcpy(out, bytes_.data() + offset, count);
+        co_return static_cast<ssize_t>(count);
+    }
+    elio::coro::task<int> flush() override { co_return 0; }
+    elio::coro::task<int> checkpoint() override { co_return 0; }
+    int grow(uint64_t) override { return -EOPNOTSUPP; }
+    uint64_t virtual_size() const override { return 4096; }
+    uint64_t size() const noexcept override { return 4096; }
+    std::string_view label() const noexcept override { return "copyup-test"; }
+    const std::vector<bytes::segment_mapping>& segments() const override {
+        return mappings;
+    }
+    std::vector<bytes::segment_mapping> segments_snapshot() const override {
+        if (fail_snapshot) throw std::bad_alloc();
+        return mappings;
+    }
+    source::BlobSource& data_source() override { return *this; }
+private:
+    void publish(const std::array<uint8_t, 4096>& next) {
+        bytes::segment_mapping full;
+        full.length = 8;
+        mappings.assign(1, full);
+        bytes_ = next;
+        ++published;
+    }
+    std::array<uint8_t, 4096> bytes_ = [] {
+        std::array<uint8_t, 4096> data{};
+        data.fill(0xa4);
+        return data;
+    }();
+    std::vector<bytes::segment_mapping> mappings;
+};
+}
+
+TEST_CASE("format: mutation copyup view preserves lower data and upper zero",
+          "[format][copyup]") {
+    const bool discard = GENERATE(false, true);
+    TempDir dir;
+    auto expected = test::pattern_bytes(4096, 197);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", expected, &lower);
+    std::fill(expected.begin() + 512, expected.begin() + 1024, 0xa4);
+    std::fill(expected.begin() + 1024, expected.begin() + 1536, 0);
+    std::fill(expected.begin() + 2048, expected.begin() + 2560,
+              discard ? 0 : 0x31);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+        lowers.push_back(co_await format::LsmtLayer::open(
+            co_await source::LocalFileSource::open(lower)));
+        auto top = std::make_unique<CopyupViewTestLayer>();
+        auto* observed = top.get();
+        auto merged = co_await format::MergedWritable::open(
+            std::move(lowers), std::move(top));
+        if (discard) {
+            const int result = co_await merged->discard(2048, 512);
+            REQUIRE(result == 0);
+        } else {
+            std::array<uint8_t, 512> input{};
+            input.fill(0x31);
+            const auto result = co_await merged->pwrite(input.data(), input.size(), 2048);
+            REQUIRE(result == 512);
+        }
+        REQUIRE(observed->published == 1);
+        std::vector<uint8_t> actual(4096);
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == 4096);
+        REQUIRE(actual == expected);
+        REQUIRE(merged->merged_index().size() == 1);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: mutation copyup view rejects missing mapped bytes",
+          "[format][copyup]") {
+    const int mode = GENERATE(1, 2, 3);
+    const bool discard = GENERATE(false, true);
+    TempDir dir;
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", test::pattern_bytes(4096, 1971), &lower);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        std::vector<std::unique_ptr<format::LsmtLayer>> lowers;
+        lowers.push_back(co_await format::LsmtLayer::open(
+            co_await source::LocalFileSource::open(lower)));
+        auto top = std::make_unique<CopyupViewTestLayer>();
+        auto* observed = top.get();
+        observed->read_mode = mode;
+        auto merged = co_await format::MergedWritable::open(std::move(lowers), std::move(top));
+        const int expected = mode == 1 ? -EHOSTDOWN : -EIO;
+        if (discard) {
+            const int result = co_await merged->discard(2048, 512);
+            REQUIRE(result == expected);
+        } else {
+            std::array<uint8_t, 512> input{};
+            const auto result = co_await merged->pwrite(input.data(), input.size(), 2048);
+            REQUIRE(result == expected);
+        }
+        REQUIRE(observed->published == 0);
+        REQUIRE(observed->segments().size() == 2);
+        observed->read_mode = 0;
+        std::array<uint8_t, 512> retry{};
+        const auto retried = co_await merged->pwrite(retry.data(), retry.size(), 2048);
+        REQUIRE(retried == 512);
+        REQUIRE(observed->published == 1);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: mutation copyup view repairs invalid snapshots before entry",
+          "[format][copyup]") {
+    const bool discard = GENERATE(false, true);
+    const bool fail = GENERATE(false, true);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto top = std::make_unique<CopyupViewTestLayer>();
+        auto* observed = top.get();
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        format::MergedWritableTestAccess::invalidate_index(*merged);
+        observed->fail_snapshot = fail;
+        std::array<uint8_t, 512> input{};
+        ssize_t result;
+        if (discard) result = co_await merged->discard(2048, 512);
+        else result = co_await merged->pwrite(input.data(), input.size(), 2048);
+        REQUIRE(result == (fail ? -ENOMEM : discard ? 0 : 512));
+        REQUIRE(observed->mutation_entries == (fail ? 0 : 1));
+        REQUIRE(observed->published == (fail ? 0 : 1));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: suspended mutation copyup view excludes readers and writers",
+          "[format][copyup]") {
+    const int rc = elio::run([&]() -> elio::coro::task<int> {
+        auto top = std::make_unique<CopyupViewTestLayer>();
+        auto* observed = top.get();
+        observed->park_reads = true;
+        auto merged = co_await format::MergedWritable::open({}, std::move(top));
+        std::array<uint8_t, 512> input{}, actual{};
+        input.fill(0x31);
+        std::vector<elio::coro::join_handle<ssize_t>> tasks;
+        tasks.reserve(3);
+        std::vector<ssize_t> results;
+        results.reserve(3);
+        elio::sync::event reader_attempted, writer_attempted;
+        bool excluded = false;
+        int grow = 0;
+        std::exception_ptr failure;
+        try {
+            tasks.push_back(elio::spawn([&]() -> elio::coro::task<ssize_t> {
+                co_return co_await merged->pwrite(input.data(), input.size(), 2048);
+            }));
+            co_await observed->entered.wait();
+            tasks.push_back(elio::spawn([&]() -> elio::coro::task<ssize_t> {
+                reader_attempted.set();
+                co_return co_await merged->pread(actual.data(), actual.size(), 512);
+            }));
+            tasks.push_back(elio::spawn([&]() -> elio::coro::task<ssize_t> {
+                writer_attempted.set();
+                co_return co_await merged->discard(2048, 512);
+            }));
+            co_await reader_attempted.wait();
+            co_await writer_attempted.wait();
+            excluded = observed->mutation_entries == 1 && observed->read_entries == 1;
+            grow = co_await elio::spawn_blocking([&] { return merged->grow(8192); });
+        } catch (...) { failure = std::current_exception(); }
+        observed->release.set();
+        for (auto& task : tasks) {
+            try { results.push_back(co_await task); }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+            co_await task.wait_destroyed_async();
+        }
+        if (failure) std::rethrow_exception(failure);
+        REQUIRE(excluded);
+        REQUIRE(grow == -EBUSY);
+        REQUIRE(results == std::vector<ssize_t>{512, 512, 0});
+        REQUIRE(observed->published == 2);
+        REQUIRE(std::all_of(actual.begin(), actual.end(), [](auto b) { return b == 0xa4; }));
+        co_return 0;
+    }, {.num_threads = 1, .blocking_threads = 1});
+    REQUIRE(rc == 0);
+}
+
+namespace {
+elio::coro::task<std::unique_ptr<format::MergedWritable>> open_extent_merged(
+    const std::string& upper, const std::string& lower, uint64_t size) {
+    std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+    auto file = co_await source::LocalFileSource::open(lower);
+    source::BlobSourcePtr blob = std::move(file);
+    layers.push_back(co_await format::LsmtLayer::open(std::move(blob)));
+    auto top = co_await format::SparseRwLayer::open(upper, size);
+    co_return co_await format::MergedWritable::open(std::move(layers), std::move(top));
+}
+}
+
+TEST_CASE("format: extent sparse copyup preserves complete merged bytes without coverage",
+          "[format][sparse-extents]") {
+    TempDir dir;
+    auto expected = test::pattern_bytes(32768, 19701);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", expected, &lower);
+    const std::string upper = dir / "upper";
+    const auto input = test::pattern_bytes(4096, 19702);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto merged = co_await open_extent_merged(upper, lower, expected.size());
+            REQUIRE_FALSE(std::filesystem::exists(upper + ".coverage"));
+            auto written = co_await merged->pwrite(input.data(), 512, 512);
+            REQUIRE(written == 512);
+            std::memcpy(expected.data() + 512, input.data(), 512);
+            written = co_await merged->pwrite(input.data() + 512, 512, 1536);
+            REQUIRE(written == 512);
+            std::memcpy(expected.data() + 1536, input.data() + 512, 512);
+            // One unaligned request materializes both neighboring blocks.
+            written = co_await merged->pwrite(input.data(), 4096, 4096 + 512);
+            REQUIRE(written == 4096);
+            std::memcpy(expected.data() + 4096 + 512, input.data(), 4096);
+            auto discarded = co_await merged->discard(3 * 4096 + 512, 512);
+            REQUIRE(discarded == 0);
+            std::fill_n(expected.data() + 3 * 4096 + 512, 512, 0);
+            discarded = co_await merged->discard(4 * 4096, 4096);
+            REQUIRE(discarded == 0);
+            std::fill_n(expected.data() + 4 * 4096, 4096, 0);
+            written = co_await merged->pwrite(input.data(), 512, 4 * 4096 + 512);
+            REQUIRE(written == 512);
+            std::memcpy(expected.data() + 4 * 4096 + 512, input.data(), 512);
+            std::vector<uint8_t> actual(expected.size());
+            const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+            REQUIRE(read == static_cast<ssize_t>(actual.size()));
+            REQUIRE(actual == expected);
+            const auto index = merged->merged_index();
+            // First block's upper ownership includes its untouched neighbors.
+            const auto hit = std::find_if(index.begin(), index.end(), [](const auto& s) {
+                return s.offset == 0 && s.end() >= 8 && s.tag == 0 && !s.zeroed;
+            });
+            REQUIRE(hit != index.end());
+        }
+        // No flush/checkpoint; reconstruct through the live kernel cache.
+        auto merged = co_await open_extent_merged(upper, lower, expected.size());
+        REQUIRE_FALSE(std::filesystem::exists(upper + ".coverage"));
+        REQUIRE_FALSE(std::filesystem::exists(upper + ".zeroes"));
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+
+TEST_CASE("format: extent sparse child exit preserves copyup and zero neighbors",
+          "[format][sparse-extents]") {
+    TempDir dir;
+    auto expected = test::pattern_bytes(16384, 19721);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", expected, &lower);
+    const std::string upper = dir / "upper";
+    std::string operation;
+    int status = 0;
+    bool changed = true;
+    SECTION("completed write") { operation = "extent-write"; }
+    SECTION("completed partial zero") { operation = "extent-discard"; }
+    SECTION("before kernel write") { operation = "extent-stage-1"; status = 91; changed = false; }
+    SECTION("after kernel write before runtime publication") { operation = "extent-stage-2"; status = 92; }
+    const int child = run_sparse_crash_writer(upper, operation, expected.size(), 512, 512, lower);
+    REQUIRE(WIFEXITED(child));
+    REQUIRE(WEXITSTATUS(child) == status);
+    if (changed) std::fill_n(expected.data() + 512, 512, operation == "extent-discard" ? 0 : 0xa5);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto merged = co_await open_extent_merged(upper, lower, expected.size());
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        REQUIRE_FALSE(std::filesystem::exists(upper + ".coverage"));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+
+TEST_CASE("format: extent sparse rejects a file-limit partial materialization before writing",
+          "[format][sparse-extents]") {
+    TempDir dir;
+    auto expected = test::pattern_bytes(8192, 19741);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", expected, &lower);
+    const std::string upper = dir / "upper";
+    const auto payload = test::pattern_bytes(512, 19742);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto merged = co_await open_extent_merged(upper, lower, expected.size());
+        struct LimitRestore {
+            struct rlimit original {};
+            bool changed = false;
+            ~LimitRestore() { if (changed) (void)::setrlimit(RLIMIT_FSIZE, &original); }
+        } restore;
+        REQUIRE(::getrlimit(RLIMIT_FSIZE, &restore.original) == 0);
+        auto restricted = restore.original;
+        restricted.rlim_cur = 1024;
+        REQUIRE(::setrlimit(RLIMIT_FSIZE, &restricted) == 0);
+        restore.changed = true;
+        const auto rejected = co_await merged->pwrite(payload.data(), payload.size(), 512);
+        REQUIRE(::setrlimit(RLIMIT_FSIZE, &restore.original) == 0);
+        restore.changed = false;
+        REQUIRE(rejected == -EFBIG);
+        std::vector<uint8_t> actual(expected.size());
+        auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        auto written = co_await merged->pwrite(payload.data(), payload.size(), 512);
+        REQUIRE(written == 512);
+        const auto revision = merged->writable_top().segments_revision();
+        REQUIRE(revision.has_value());
+        written = co_await merged->pwrite(payload.data(), payload.size(), 1536);
+        REQUIRE(written == 512);
+        REQUIRE(merged->writable_top().segments_revision() == revision);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: extent sparse grow and export preserve the materialized view",
+          "[format][sparse-extents]") {
+    TempDir dir;
+    auto expected = test::pattern_bytes(8192, 19751);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", expected, &lower);
+    const std::string upper = dir / "upper";
+    const std::string delta = dir / "delta.lsmt";
+    const auto payload = test::pattern_bytes(512, 19752);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        {
+            auto merged = co_await open_extent_merged(upper, lower, expected.size());
+            const auto written = co_await merged->pwrite(payload.data(), payload.size(), 512);
+            REQUIRE(written == 512);
+            std::memcpy(expected.data() + 512, payload.data(), 512);
+            const auto discarded = co_await merged->discard(4096, 4096);
+            REQUIRE(discarded == 0);
+            std::fill_n(expected.data() + 4096, 4096, 0);
+            const auto grown = co_await elio::spawn_blocking([active = merged.get()] {
+                if (active->grow(8192 + 512) != -EINVAL) return -EIO;
+                return active->grow(16384);
+            });
+            REQUIRE(grown == 0);
+            expected.resize(16384, 0);
+            const auto flushed = co_await merged->flush();
+            REQUIRE(flushed == 0);
+        }
+        const auto exported = co_await format::SparseRwLayer::export_file(upper, delta);
+        REQUIRE(exported.size > 0);
+        REQUIRE_FALSE(std::filesystem::exists(upper + ".coverage"));
+        std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+        auto low_file = co_await source::LocalFileSource::open(lower);
+        source::BlobSourcePtr low = std::move(low_file);
+        layers.push_back(co_await format::LsmtLayer::open(std::move(low)));
+        auto delta_file = co_await source::LocalFileSource::open(delta);
+        source::BlobSourcePtr top = std::move(delta_file);
+        layers.push_back(co_await format::LsmtLayer::open(std::move(top)));
+        auto merged = co_await format::MergedLsmt::open(std::move(layers));
+        std::vector<uint8_t> actual(expected.size());
+        const auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+
+TEST_CASE("format: extent sparse preserves neighbors under actual allocation exhaustion",
+          "[format][sparse-extents]") {
+    const char* enabled = std::getenv("OBD_TEST_DISPOSABLE_SPARSE_FS");
+    if (!enabled || std::string_view(enabled) != "1")
+        SKIP("Requires an explicitly disposable small filesystem in a private VM");
+    TempDir dir;
+    struct statvfs fs {};
+    REQUIRE(::statvfs(dir.str().c_str(), &fs) == 0);
+    REQUIRE(static_cast<uint64_t>(fs.f_blocks) * fs.f_frsize < (uint64_t{2} << 30));
+    auto expected = test::pattern_bytes(8 * 1024 * 1024, 19761);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", expected, &lower);
+    const std::string upper = dir / "upper";
+    const std::string filler = dir / "space-reservation";
+    const auto payload = test::pattern_bytes(512, 19762);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto merged = co_await open_extent_merged(upper, lower, expected.size());
+        const auto zeroed = co_await merged->discard(4096, 4096);
+        REQUIRE(zeroed == 0);
+        std::fill_n(expected.begin() + 4096, 4096, 0);
+        // Reserve only this test's private mounted filesystem. A bounded final
+        // 4 KiB pass consumes the remainder after coarse allocation fails.
+        const int exhausted = co_await elio::spawn_blocking([&] {
+            const int fd = ::open(filler.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+            if (fd < 0) return -errno;
+            off_t offset = 0;
+            int status = 0;
+            for (off_t step : {off_t{1048576}, off_t{4096}}) {
+                for (;;) {
+                    if (offset >= (off_t{2} << 30)) { status = -EFBIG; break; }
+                    if (::fallocate(fd, 0, offset, step) == 0) { offset += step; continue; }
+                    status = errno == ENOSPC ? 0 : -errno;
+                    break;
+                }
+                if (status) break;
+            }
+            if (::close(fd) != 0 && !status) status = -errno;
+            return status;
+        });
+        REQUIRE(exhausted == 0);
+        // Filesystems may keep inode-specific/reserved capacity after the
+        // filler reaches ENOSPC. Consume it through actual copy-up requests.
+        uint64_t rejected_offset = UINT64_MAX;
+        for (uint64_t block = 0; block < expected.size() / 4096; ++block) {
+            if (block == 1) continue; // Reserved ZERO transition below.
+            const uint64_t target = block * 4096 + 512;
+            const auto written = co_await merged->pwrite(payload.data(), payload.size(), target);
+            if (written == -ENOSPC) { rejected_offset = target; break; }
+            REQUIRE(written == 512);
+            std::copy(payload.begin(), payload.end(), expected.begin() + static_cast<ptrdiff_t>(target));
+        }
+        REQUIRE(rejected_offset != UINT64_MAX);
+        std::vector<uint8_t> actual(expected.size());
+        auto read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        // ZERO already reserved a block. Its partial overwrite must either
+        // complete or retain the zero neighbors when space is exhausted.
+        const auto transition = co_await merged->pwrite(payload.data(), payload.size(), 4096 + 512);
+        REQUIRE((transition == 512 || transition == -ENOSPC));
+        if (transition == 512) std::copy(payload.begin(), payload.end(), expected.begin() + 4096 + 512);
+        read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        merged.reset();
+        merged = co_await open_extent_merged(upper, lower, expected.size());
+        read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        // Reclaim only our reservation and prove the failed first write retries.
+        const auto released = co_await elio::spawn_blocking([&] { return ::unlink(filler.c_str()); });
+        REQUIRE(released == 0);
+        const auto retry = co_await merged->pwrite(payload.data(), payload.size(), rejected_offset);
+        REQUIRE(retry == 512);
+        std::copy(payload.begin(), payload.end(), expected.begin() + static_cast<ptrdiff_t>(rejected_offset));
+        read = co_await merged->pread(actual.data(), actual.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(actual.size()));
+        REQUIRE(actual == expected);
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
+}
+
+TEST_CASE("format: extent sparse SIGKILL during writes preserves full block neighbors",
+          "[format][sparse-extents]") {
+    bool zero = false;
+    SECTION("first copyup over inherited data") {}
+    SECTION("partial overwrite over ZERO") { zero = true; }
+    TempDir dir;
+    constexpr size_t size = 2 * 1024 * 1024;
+    auto original = test::pattern_bytes(size, 19771);
+    std::string lower;
+    make_lsmt_lower(dir.str(), "lower", original, &lower);
+    bool saw_incomplete = false;
+    for (const useconds_t delay : {useconds_t{0}, useconds_t{100}, useconds_t{1000}}) {
+        const std::string upper = dir / ("upper-" + std::to_string(delay));
+        const int setup = test::run_coro([&]() -> elio::coro::task<int> {
+            auto merged = co_await open_extent_merged(upper, lower, size);
+            if (zero) {
+                const auto cleared = co_await merged->discard(0, size);
+                REQUIRE(cleared == 0);
+            }
+            co_return 0;
+        });
+        REQUIRE(setup == 0);
+        const std::string size_arg = std::to_string(size);
+        struct Child {
+            pid_t pid = -1;
+            ~Child() {
+                if (pid <= 0) return;
+                (void)::kill(pid, SIGKILL);
+                while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+            }
+        } child;
+        child.pid = ::fork();
+        REQUIRE(child.pid >= 0);
+        if (child.pid == 0) {
+            ::execl(OBD_TEST_SPARSE_CRASH_WRITER_BIN, OBD_TEST_SPARSE_CRASH_WRITER_BIN,
+                upper.c_str(), "extent-stress", size_arg.c_str(), "0", "512", lower.c_str(),
+                static_cast<char*>(nullptr));
+            ::_exit(127);
+        }
+        const auto progress = upper + ".progress";
+        struct stat st {};
+        bool started = false;
+        for (unsigned attempt = 0; attempt < 10000; ++attempt) {
+            if (::stat(progress.c_str(), &st) == 0 && st.st_size >= 8) { started = true; break; }
+            ::usleep(100);
+        }
+        REQUIRE(started);
+        if (delay) ::usleep(delay);
+        REQUIRE(::kill(child.pid, SIGKILL) == 0);
+        int status = 0;
+        pid_t waited;
+        do { waited = ::waitpid(child.pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        REQUIRE(waited == child.pid);
+        child.pid = -1;
+        REQUIRE(WIFSIGNALED(status));
+        REQUIRE(WTERMSIG(status) == SIGKILL);
+        REQUIRE(::stat(progress.c_str(), &st) == 0);
+        const auto acknowledged = static_cast<size_t>(st.st_size) / sizeof(uint64_t);
+        REQUIRE(acknowledged > 0);
+        REQUIRE(acknowledged <= size / 4096);
+        saw_incomplete |= acknowledged < size / 4096;
+        INFO("delay_us=" << delay << " acknowledged_blocks=" << acknowledged);
+        const int recovered = test::run_coro([&]() -> elio::coro::task<int> {
+            std::unique_ptr<format::MergedWritable> merged;
+            for (unsigned attempt = 0; attempt < 1000 && !merged; ++attempt) {
+                try { merged = co_await open_extent_merged(upper, lower, size); }
+                catch (const obd::error& e) { if (e.errno_value() != EBUSY) throw; }
+                // Reaping userspace does not prove io_uring has released its
+                // last file reference. Never bypass that still-active flock.
+                if (!merged) co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            REQUIRE(merged != nullptr);
+            std::vector<uint8_t> actual(size);
+            const auto n = co_await merged->pread(actual.data(), actual.size(), 0);
+            REQUIRE(n == static_cast<ssize_t>(actual.size()));
+            for (size_t block = 0; block < size / 4096; ++block) {
+                std::array<uint8_t, 4096> before {};
+                if (!zero) std::copy_n(original.data() + block * 4096, 4096, before.data());
+                auto after = before;
+                std::fill_n(after.data() + 512, 512, 0xa5);
+                const auto* got = actual.data() + block * 4096;
+                const bool old = std::memcmp(got, before.data(), 4096) == 0;
+                const bool updated = std::memcmp(got, after.data(), 4096) == 0;
+                if (block < acknowledged) REQUIRE(updated);
+                else if (block == acknowledged) REQUIRE((old || updated));
+                else REQUIRE(old);
+            }
+            co_return 0;
+        });
+        REQUIRE(recovered == 0);
+    }
+    REQUIRE(saw_incomplete);
 }

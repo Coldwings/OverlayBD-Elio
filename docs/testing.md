@@ -355,6 +355,11 @@ Every test, grouped by area, with the property it guards.
   base.
 - `format: zfile reader rejects a corrupted block digest` — a bit-flipped
   compressed block fails verification instead of returning bad data.
+The v2 coverage cases below construct legacy fixtures through the test-only
+`open_legacy_for_test` entrypoint. They preserve migration/export input validation;
+they are not the normal Sparse runtime format. Extent-format cases are listed
+under **Sparse extent ownership** below.
+
 - `format: sparse layer writes, reads and recovers extents` — the
   `SparseRwLayer` persists writes, reads them back, and rebuilds exact
   sector ownership from v2 coverage across a reopen (ADR-0024).
@@ -2517,3 +2522,60 @@ unchanged overwrites and discard/rewrite cycles with `cycles=1`. Compare matched
 baseline/candidate builds and fresh directories, reporting mapping counts and
 actual payload separately from virtual size. The range update still copies
 linear vectors and does not claim sublinear mutation cost.
+
+### Mutation-scoped copy-up view
+
+The `[copyup]` tests use an opt-in test layer to exercise the merged reader
+needed by issue #197. They preserve lower bytes, upper DATA and ZERO through a
+whole-block reconstruction; reject source errors, zero reads and positive short
+reads before publication; repair invalid indexes before mutation entry; and
+park a physical read across suspension while a public reader and second writer
+remain excluded. Grow returns `-EBUSY` during the held operation. These tests
+validate the merged-view boundary, not a new Sparse persistence format or
+filesystem crash atomicity.
+
+### Sparse extent ownership
+
+The `[sparse-extents]` cases exercise ADR-0037 through the ordinary Sparse opener:
+
+- `Sparse extent scan preserves unsynchronized data and holes` and
+  `Sparse extent scan rejects invalid backing geometry` validate recovery of writes made without prior FLUSH and reject invalid
+  capacity; recovery itself requests synchronized extent discovery.
+- `Sparse extent scan distinguishes cached zero-range writes from inherited holes`
+  verifies that recovery drains cached DATA within UNWRITTEN before
+  classification, without requiring a prior guest FLUSH. It
+  explicitly skips when the backing filesystem lacks ZERO_RANGE.
+- `format: extent sparse copyup preserves complete merged bytes without coverage`
+  checks nonzero neighbors, repeated small writes, cross-block writes, partial
+  and full zeroing, and reopen without `.coverage` or `.zeroes`.
+- `format: extent sparse child exit preserves copyup and zero neighbors` uses
+  `_exit` after completed requests and at the boundaries before kernel mutation
+  and after kernel completion but before runtime publication.
+- `format: extent sparse rejects a file-limit partial materialization before writing`
+  applies a real RLIMIT_FSIZE boundary, checks rejection before mutation, then
+  restores the limit and verifies retry plus unchanged DATA mapping revisions.
+- `format: extent sparse grow and export preserve the materialized view` checks
+  aligned growth, guest FLUSH, sidecar-free export and merged delta bytes.
+
+- `Sparse extent scan rejects inherited oversized allocation hints` validates
+  rejection on XFS and explicitly skips if the backing does not inherit hints.
+- `format: extent sparse preserves neighbors under actual allocation exhaustion`
+  requires `OBD_TEST_DISPOSABLE_SPARSE_FS=1` on a private filesystem below 2 GiB.
+  It reserves available space, reaches ENOSPC through actual upper writes,
+  verifies neighbors and ZERO transitions, reopens, releases its own reservation
+  and retries. Never enable this opt-in on a shared host mount.
+- `format: extent sparse SIGKILL during writes preserves full block neighbors`
+  interrupts a child writing through the public merged path, validates every
+  acknowledged block and every untouched neighbor, and permits either complete
+  old or new contents for the one unacknowledged operation. It waits boundedly
+  for in-flight kernel file references to release the old exclusive lock.
+- `integration: sparse ublk copyup flush discard and zeroes preserve neighbors`
+  exercises one and two real kernel queues, 512-byte direct requests, an
+  unaligned 4 KiB request, partial discard/write-zeroes, observed FLUSH requests,
+  and complete nonzero-lower byte comparison live and after reopening.
+
+These tests cover surviving-kernel process recovery, not host failure. Boundary
+hooks do not by themselves prove every instruction-level interruption inside a
+filesystem syscall. ext4/XFS validation must run the product tests with their
+fixture temporary directories on those actual filesystems; a test on the host's
+btrfs directory is not ext4/XFS evidence.

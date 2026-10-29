@@ -69,6 +69,7 @@ add_executable(obd_unit_tests
     unit/test_oci_layer_plan.cpp
     unit/test_image.cpp
     unit/test_writable.cpp
+    unit/test_sparse_extent_scan.cpp
     unit/test_cli.cpp
     unit/test_convert.cpp
     unit/test_child_spawn_owner.cpp

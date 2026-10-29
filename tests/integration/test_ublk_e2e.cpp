@@ -8,6 +8,9 @@
 #include "format/hybrid_rw.hpp"
 #include "format/lsmt_rw.hpp"
 #include "format/merged_writable.hpp"
+#include "format/sparse_rw.hpp"
+#include "format/writer.hpp"
+#include "source/local_file.hpp"
 
 #include "../support.hpp"
 #include "../ublk_prerequisites.hpp"
@@ -962,4 +965,88 @@ TEST_CASE("integration: LSMT ublk recovers persisted writes after server death",
     const uint16_t queues = GENERATE(1, 2);
     INFO("queues=" << queues);
     check_recovery(true, queues, false, true);
+}
+
+
+TEST_CASE("integration: sparse ublk copyup flush discard and zeroes preserve neighbors",
+          "[ublk][sparse-extents]") {
+    if (const auto reason = test::ublk_prerequisite_skip_reason(); !reason.empty())
+        SKIP(reason);
+    const uint16_t queues = GENERATE(1, 2);
+    INFO("queues=" << queues);
+    test::TempDir temporary;
+    const auto upper = temporary / "upper";
+    const auto lower = temporary / "lower.lsmt";
+    auto expected = test::pattern_bytes(65536, 19781);
+    const auto raw = test::write_file(temporary / "lower.raw", expected);
+    const int input = ::open(raw.c_str(), O_RDONLY | O_CLOEXEC);
+    REQUIRE(input >= 0);
+    try { format::write_lsmt_single_layer(input, expected.size(), lower); }
+    catch (...) { ::close(input); throw; }
+    REQUIRE(::close(input) == 0);
+    struct ResetCounts { ~ResetCounts() { ublk::count_requests_for_test(false); } } reset;
+    ublk::count_requests_for_test(true);
+    const int rc = test::run_coro([&]() -> elio::coro::task<int> {
+        auto open_merged = [&]() -> elio::coro::task<std::unique_ptr<format::MergedWritable>> {
+            auto file = co_await source::LocalFileSource::open(lower);
+            std::vector<std::unique_ptr<format::LsmtLayer>> layers;
+            layers.push_back(co_await format::LsmtLayer::open(std::move(file)));
+            auto top = co_await format::SparseRwLayer::open(upper, expected.size());
+            co_return co_await format::MergedWritable::open(std::move(layers), std::move(top));
+        };
+        auto merged = co_await open_merged();
+        ublk::DeviceParams params;
+        params.nr_queues = queues;
+        params.dev_sectors = expected.size() / 512;
+        params.read_only = false;
+        auto dev = co_await ublk::Device::create(params, std::move(merged));
+        std::unique_ptr<void, decltype(&std::free)> memory(std::aligned_alloc(4096, expected.size()), &std::free);
+        REQUIRE(memory != nullptr);
+        auto* bytes = static_cast<uint8_t*>(memory.get());
+        int fd = -1;
+        const int operations = co_await with_device_cleanup(dev, fd, [&]() -> elio::coro::task<int> {
+            fd = co_await bdev_io([&] { return ::open(dev->bdev_path().c_str(), O_RDWR | O_DIRECT); });
+            REQUIRE(fd >= 0);
+            int logical_sector = 0;
+            const int geometry = co_await bdev_io([&] { return ::ioctl(fd, BLKSSZGET, &logical_sector); });
+            REQUIRE(geometry == 0);
+            REQUIRE(logical_sector == 512);
+            struct Write { size_t count; uint64_t offset; uint8_t byte; };
+            for (const auto op : {Write{512, 512, 0xa1}, Write{512, 1536, 0xa2},
+                                  Write{4096, 4608, 0xa3}, Write{4096, 12288, 0xa4}}) {
+                std::fill_n(bytes, op.count, op.byte);
+                const auto written = co_await bdev_io([&] { return ::pwrite(fd, bytes, op.count, op.offset); });
+                REQUIRE(written == static_cast<ssize_t>(op.count));
+                std::fill_n(expected.begin() + static_cast<ptrdiff_t>(op.offset), op.count, op.byte);
+            }
+            const int first_flush = co_await bdev_io([&] { return ::fsync(fd); });
+            REQUIRE(first_flush == 0);
+            uint64_t discard[2] = {24576 + 512, 512}, zero[2] = {28672 + 512, 512};
+            const int discarded = co_await bdev_io([&] { return ::ioctl(fd, BLKDISCARD, discard); });
+            REQUIRE(discarded == 0);
+            const int zeroed = co_await bdev_io([&] { return ::ioctl(fd, BLKZEROOUT, zero); });
+            REQUIRE(zeroed == 0);
+            std::fill_n(expected.begin() + 24576 + 512, 512, 0);
+            std::fill_n(expected.begin() + 28672 + 512, 512, 0);
+            const int flushed = co_await bdev_io([&] { return ::fsync(fd); });
+            REQUIRE(flushed == 0);
+            const auto read = co_await bdev_io([&] { return ::pread(fd, bytes, expected.size(), 0); });
+            REQUIRE(read == static_cast<ssize_t>(expected.size()));
+            REQUIRE(std::equal(expected.begin(), expected.end(), bytes));
+            REQUIRE(ublk::request_count_for_test(UBLK_IO_OP_FLUSH) > 0);
+            REQUIRE(ublk::request_count_for_test(UBLK_IO_OP_DISCARD) > 0);
+            REQUIRE(ublk::request_count_for_test(UBLK_IO_OP_WRITE_ZEROES) > 0);
+            std::fprintf(stderr, "SPARSE_KERNEL queues=%u logical_sector=512 verified_bytes=%zu\n", queues, expected.size());
+            co_return 0;
+        });
+        REQUIRE(operations == 0);
+        auto reopened = co_await open_merged();
+        const auto read = co_await reopened->pread(bytes, expected.size(), 0);
+        REQUIRE(read == static_cast<ssize_t>(expected.size()));
+        REQUIRE(std::equal(expected.begin(), expected.end(), bytes));
+        REQUIRE_FALSE(std::filesystem::exists(upper + ".coverage"));
+        REQUIRE_FALSE(std::filesystem::exists(upper + ".zeroes"));
+        co_return 0;
+    });
+    REQUIRE(rc == 0);
 }

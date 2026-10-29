@@ -1,5 +1,6 @@
 // Sparse writable layer. See sparse_rw.hpp.
 #include "format/sparse_rw.hpp"
+#include "format/sparse_extent_scan.hpp"
 #include "format/sparse_export_plan.hpp"
 #include "format/sparse_export_output.hpp"
 #include "common/sha256.hpp"
@@ -17,12 +18,14 @@
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <optional>
@@ -39,6 +42,7 @@ namespace obd::format {
 #ifdef OBD_TEST_HOOKS
 std::shared_ptr<std::atomic<int>> SparseRwLayer::open_park_for_test_;
 std::atomic<int> SparseRwLayer::coverage_install_fail_stage_for_test_{0};
+std::atomic<int> SparseRwLayer::extent_exit_stage_for_test_{0};
 #endif
 
 namespace {
@@ -1222,9 +1226,9 @@ elio::coro::task<int> SparseRwLayer::publish_coverage_locked(
 
 std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
                                                         uint64_t vsize,
-                                                        bool existing_only) {
-    if (!existing_only && (vsize == 0 || vsize % kSector != 0)) {
-        throw error(EINVAL, "sparse layer vsize must be sector aligned");
+                                                        bool existing_only, bool use_extents) {
+    if (!existing_only && (vsize == 0 || vsize % (use_extents ? 4096 : kSector) != 0)) {
+        throw error(EINVAL, "sparse layer vsize has invalid alignment");
     }
     if (vsize > kMaxZeroMaskVsize) {
         throw error(EFBIG, "sparse layer vsize exceeds coverage limit");
@@ -1272,6 +1276,32 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
             throw error(EINVAL, "existing sparse layer has zero size: " + path);
         vsize = original_data_size;
     }
+    if (use_extents) {
+        // This is an unpublished format replacement. Do not silently interpret
+        // old development coverage artifacts as the new extent-owned format.
+        for (const auto& suffix : {".coverage", ".coverage.tmp", ".zeroes", ".zeroes.tmp"}) {
+            struct stat legacy {};
+            if (::lstat((path + suffix).c_str(), &legacy) == 0)
+                throw error(EOPNOTSUPP, "recreate legacy Sparse development upper before opening: " + path);
+            if (errno != ENOENT) throw_errno(errno, "cannot inspect Sparse upper artifacts");
+        }
+        validate_sparse_extent_backing(fd);
+        const uint64_t full_size = std::max(vsize, original_data_size);
+        if (!full_size || full_size % 4096)
+            throw error(EINVAL, "extent Sparse size must be 4 KiB aligned");
+        if (original_data_size != full_size &&
+            ::ftruncate(fd, static_cast<off_t>(full_size)) != 0)
+            throw_errno(errno, "cannot size extent Sparse upper");
+        auto layer = std::unique_ptr<SparseRwLayer>(new SparseRwLayer);
+        layer->vsize_.store(full_size, std::memory_order_release);
+        layer->data_path_ = path;
+        layer->fd_ = opened.release();
+        layer->segments_ = scan_sparse_extents(layer->fd_, full_size);
+        layer->extent_mode_ = true;
+        layer->ro_ = std::make_unique<SparseRwLayer::View>(
+            layer->fd_, layer->vsize_, "sparse-extents:" + path);
+        return layer;
+    }
     uint64_t effective_vsize = vsize;
     const std::string zero_mask_path = path + ".zeroes";
     effective_vsize = std::max(effective_vsize, original_data_size);
@@ -1290,6 +1320,7 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
     }
     auto layer = std::unique_ptr<SparseRwLayer>(new SparseRwLayer);
     layer->vsize_.store(effective_vsize, std::memory_order_release);
+    layer->data_path_ = path;
     layer->zero_mask_path_ = zero_mask_path;
     layer->coverage_path_ = path + ".coverage";
     layer->fd_ = opened.release();
@@ -1471,7 +1502,8 @@ std::unique_ptr<SparseRwLayer> SparseRwLayer::open_sync(std::string path,
     return layer;
 }
 
-elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
+#ifdef OBD_TEST_HOOKS
+elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open_legacy_for_test(
     const std::string& path, uint64_t vsize) {
 #ifdef OBD_TEST_HOOKS
     auto park = open_park_for_test_;
@@ -1504,10 +1536,18 @@ elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
     co_return std::move(layer);
 }
 
+#endif
+
 elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open_existing(
     std::string path) {
     auto job = [path = std::move(path)] {
-        return SparseRwLayer::open_sync(path, 0, true);
+        bool legacy = false;
+        for (const auto& suffix : {".coverage", ".coverage.tmp", ".zeroes", ".zeroes.tmp"}) {
+            struct stat st {};
+            if (::lstat((path + suffix).c_str(), &st) == 0) legacy = true;
+            else if (errno != ENOENT) throw_errno(errno, "cannot inspect Sparse export artifacts");
+        }
+        return SparseRwLayer::open_sync(path, 0, true, !legacy);
     };
     using Job = decltype(job);
     auto layer = co_await run_owned_blocking(new Job(std::move(job)));
@@ -1521,7 +1561,8 @@ elio::coro::task<SparseExportResult> SparseRwLayer::export_file(
         throw error(EINVAL, "sparse export: invalid pathname");
     auto source = co_await open_existing(source_path);
     if (virtual_size == 0) virtual_size = source->virtual_size();
-    if (virtual_size < source->virtual_size() || virtual_size % 512 != 0 ||
+    if (virtual_size < source->virtual_size() ||
+        virtual_size % (source->extent_mode_ ? 4096 : 512) != 0 ||
         virtual_size / 512 > bytes::segment_mapping::kMaxOffset)
         throw error(EINVAL, "sparse export: virtual size override must be aligned and grow-only");
     auto prepare = [&] {
@@ -1600,6 +1641,7 @@ SparseRwLayer::~SparseRwLayer() {
 
 std::vector<bytes::segment_mapping> SparseRwLayer::segments_snapshot() const {
     std::lock_guard lock(meta_mu_);
+    if (!extent_view_valid_) throw error(EIO, "Sparse extent view requires repair");
     return segments_;
 }
 
@@ -2022,6 +2064,18 @@ int SparseRwLayer::grow(uint64_t vsize) {
             if (armed) self->end_grow_op();
         }
     } reset{this};
+    if (extent_mode_) {
+        const uint64_t cur = virtual_size();
+        if (!vsize || vsize % 4096 || vsize < cur) return -EINVAL;
+        if (vsize > kMaxZeroMaskVsize) return -EFBIG;
+        if (vsize == cur) return 0;
+        if (::ftruncate(fd_, static_cast<off_t>(vsize)) != 0) return -errno;
+        vsize_.store(vsize, std::memory_order_release);
+        return 0;
+    }
+#ifndef OBD_TEST_HOOKS
+    return -EROFS;
+#endif
     int rc = 0;
     if (vsize == 0 || vsize % kSector != 0) rc = -EINVAL;
     const uint64_t cur = vsize_.load(std::memory_order_acquire);
@@ -2121,6 +2175,10 @@ int SparseRwLayer::grow(uint64_t vsize) {
 
 elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
                                                 uint64_t offset) {
+    if (extent_mode_) co_return co_await pwrite_with_view(buf, count, offset, *ro_);
+#ifndef OBD_TEST_HOOKS
+    co_return -EROFS;
+#else
     const int gate = begin_data_op(offset, count);
     if (gate != 0) co_return gate;
     ActiveOpGuard active(active_ops_, AdoptActiveOp{});
@@ -2242,10 +2300,15 @@ elio::coro::task<ssize_t> SparseRwLayer::pwrite(const void* buf, size_t count,
     } catch (const std::length_error&) {
         co_return -EFBIG;
     }
+#endif
 }
 
 elio::coro::task<ssize_t> SparseRwLayer::pread(void* buf, size_t count,
                                                uint64_t offset) {
+    {
+        std::lock_guard lock(meta_mu_);
+        if (!extent_view_valid_) co_return -EIO;
+    }
     if (offset % kSector != 0 || count % kSector != 0) co_return -EINVAL;
     const uint64_t cur_vsize = vsize_.load(std::memory_order_acquire);
     if (offset >= cur_vsize) co_return 0;
@@ -2299,6 +2362,10 @@ elio::coro::task<ssize_t> SparseRwLayer::pread(void* buf, size_t count,
 }
 
 elio::coro::task<int> SparseRwLayer::discard(uint64_t offset, uint64_t len) {
+    if (extent_mode_) co_return co_await discard_with_view(offset, len, *ro_);
+#ifndef OBD_TEST_HOOKS
+    co_return -EROFS;
+#else
     const int gate = begin_data_op(offset, len);
     if (gate != 0) co_return gate;
     ActiveOpGuard active(active_ops_, AdoptActiveOp{});
@@ -2383,6 +2450,7 @@ elio::coro::task<int> SparseRwLayer::discard(uint64_t offset, uint64_t len) {
     } catch (const std::length_error&) {
         co_return -EFBIG;
     }
+#endif
 }
 
 elio::coro::task<int> SparseRwLayer::flush() {
@@ -2397,6 +2465,14 @@ elio::coro::task<int> SparseRwLayer::flush() {
 }
 
 elio::coro::task<int> SparseRwLayer::flush_locked() {
+    if (extent_mode_) {
+        const auto synced = co_await elio::io::sync_file(fd_,
+            elio::io::file_sync_mode::data_and_metadata);
+        if (!synced) co_return -synced.error_value();
+        auto job = [this] { return fsync_parent_dir(data_path_); };
+        using Job = decltype(job);
+        co_return -(co_await run_owned_blocking(new Job(std::move(job))));
+    }
     std::vector<bytes::segment_mapping> zeroes;
     uint64_t generation = 0;
     uint64_t flush_vsize = 0;
@@ -2499,6 +2575,204 @@ elio::coro::task<int> SparseRwLayer::checkpoint() {
     end_checkpoint_op(rc == 0 ? Lifecycle::kCheckpointed : Lifecycle::kOpen);
     reset.armed = false;
     co_return rc;
+}
+
+
+std::optional<uint64_t> SparseRwLayer::segments_revision() const noexcept {
+    std::lock_guard lock(meta_mu_);
+    const uint64_t generation = segments_generation_.load(std::memory_order_acquire);
+    if (!extent_mode_ || !extent_view_valid_ || generation == UINT64_MAX) return std::nullopt;
+    return generation;
+}
+
+void SparseRwLayer::advance_extent_generation() {
+    const uint64_t generation = segments_generation_.load(std::memory_order_relaxed);
+    if (generation != UINT64_MAX)
+        segments_generation_.store(generation + 1, std::memory_order_release);
+}
+
+elio::coro::task<std::unique_ptr<SparseRwLayer>> SparseRwLayer::open(
+    const std::string& path, uint64_t vsize) {
+    auto job = [path = std::string(path), vsize] {
+        return open_sync(path, vsize, false, true);
+    };
+    using Job = decltype(job);
+    co_return co_await run_owned_blocking(new Job(std::move(job)));
+}
+
+elio::coro::task<int> SparseRwLayer::refresh_extents() {
+    try {
+        auto job = [this] { return scan_sparse_extents(fd_, virtual_size()); };
+        using Job = decltype(job);
+        auto next = co_await run_owned_blocking(new Job(std::move(job)));
+        std::lock_guard lock(meta_mu_);
+        segments_.swap(next);
+        extent_view_valid_ = true;
+        advance_extent_generation();
+        co_return 0;
+    } catch (const error& e) {
+        std::lock_guard lock(meta_mu_);
+        extent_view_valid_ = false;
+        co_return -e.errno_value();
+    } catch (const std::bad_alloc&) {
+        std::lock_guard lock(meta_mu_);
+        extent_view_valid_ = false;
+        co_return -ENOMEM;
+    }
+}
+
+elio::coro::task<ssize_t> SparseRwLayer::pwrite_with_view(
+    const void* buf, size_t count, uint64_t offset, source::BlobSource& view) {
+    if (!extent_mode_) {
+            co_return co_await pwrite(buf, count, offset);
+    }
+    co_return co_await write_extents(buf, count, offset, view, false);
+}
+
+elio::coro::task<int> SparseRwLayer::discard_with_view(
+    uint64_t offset, uint64_t len, source::BlobSource& view) {
+    if (!extent_mode_) {
+            co_return co_await discard(offset, len);
+    }
+    if (len > static_cast<uint64_t>(std::numeric_limits<ssize_t>::max())) co_return -EINVAL;
+    const auto result = co_await write_extents(nullptr, static_cast<size_t>(len), offset, view, true);
+    co_return result < 0 ? static_cast<int>(result) : 0;
+}
+
+elio::coro::task<ssize_t> SparseRwLayer::write_extents(
+    const void* buffer, size_t count, uint64_t offset, source::BlobSource& view, bool zero) {
+    const int gate = begin_data_op(offset, count);
+    if (gate != 0) co_return gate;
+    ActiveOpGuard active(active_ops_, AdoptActiveOp{});
+    if (!count || count > static_cast<size_t>(std::numeric_limits<ssize_t>::max()) ||
+        offset % kSector || count % kSector) co_return -EINVAL;
+    co_await op_mu_.lock();
+    SyncMutexGuard guard(op_mu_);
+    try {
+        // generic_write_checks can truncate a buffered request at RLIMIT_FSIZE.
+        // Reject that reachable short-write path before any block mutation.
+        struct rlimit limit {};
+        if (::getrlimit(RLIMIT_FSIZE, &limit) != 0) co_return -errno;
+        const uint64_t materialized_end = (offset + count + 4095) / 4096 * 4096;
+        if (limit.rlim_cur != RLIM_INFINITY && materialized_end > limit.rlim_cur)
+            co_return -EFBIG;
+        bool valid;
+        {
+            std::lock_guard lock(meta_mu_);
+            valid = extent_view_valid_;
+        }
+        if (!valid) {
+            const int repaired = co_await refresh_extents();
+            if (repaired != 0) co_return repaired;
+        }
+        bool unchanged_data = false;
+        {
+            std::lock_guard lock(meta_mu_);
+            unchanged_data = !zero && range_is_data(segments_, offset / kSector,
+                                                   (offset + count) / kSector);
+        }
+        if (unchanged_data) {
+            const auto write = co_await elio::io::pwrite_exactly(fd_,
+                std::span<const std::byte>(static_cast<const std::byte*>(buffer), count), offset);
+            if (write.error) co_return -write.error.value();
+            if (write.end != elio::io::transfer_end::complete) co_return -EIO;
+            co_return static_cast<ssize_t>(count);
+        }
+        struct Block {
+            std::unique_ptr<std::byte, decltype(&std::free)> storage{
+                static_cast<std::byte*>(std::aligned_alloc(4096, 4096)), &std::free};
+            std::byte* data() const { return storage.get(); }
+            constexpr size_t size() const { return 4096; }
+        } block;
+        if (!block.data()) co_return -ENOMEM;
+        const auto* input = static_cast<const std::byte*>(buffer);
+        size_t done = 0;
+        while (done < count) {
+            const uint64_t position = offset + done;
+            const uint64_t base = position / block.size() * block.size();
+            const size_t within = static_cast<size_t>(position - base);
+            const size_t n = std::min(count - done, block.size() - within);
+            const bool whole = within == 0 && n == block.size();
+            bool owned = false;
+            std::vector<bytes::segment_mapping> next;
+            {
+                std::lock_guard lock(meta_mu_);
+                uint64_t cursor = base / kSector;
+                for (const auto& s : segments_) {
+                    if (s.end() <= cursor) continue;
+                    if (s.offset > cursor) break;
+                    cursor = s.end();
+                    if (cursor >= (base + block.size()) / kSector) {
+                        owned = true;
+                        break;
+                    }
+                }
+                next = segments_;
+            }
+            const bool copyup = !whole && !owned;
+            const uint64_t write_offset = copyup ? base : position;
+            const size_t write_count = copyup ? block.size() : n;
+            if (copyup) {
+                const auto read = co_await view.pread(block.data(), block.size(), base);
+                if (read < 0) co_return read;
+                if (read != static_cast<ssize_t>(block.size())) co_return -EIO;
+            }
+            if (zero) std::fill_n(block.data() + (copyup ? within : 0), n, std::byte{});
+            else std::memcpy(block.data() + (copyup ? within : 0), input + done, n);
+            const uint64_t lo = write_offset / kSector;
+            const uint64_t hi = (write_offset + write_count) / kSector;
+            erase_range_from(next, lo, hi);
+            if (zero && whole) push_zero_range(next, lo, hi);
+            else insert_live_extent_into(next, lo, hi - lo);
+            // Prepare every allocating index change before modifying payload.
+            std::sort(next.begin(), next.end(), [](const auto& a, const auto& b) {
+                return a.offset < b.offset;
+            });
+            {
+                std::lock_guard lock(meta_mu_);
+                extent_view_valid_ = false;
+            }
+#ifdef OBD_TEST_HOOKS
+            if (extent_exit_stage_for_test_.load() == 1) ::_exit(91);
+#endif
+            int failure = 0;
+            bool allocated_zero = false;
+            if (zero && whole) {
+                const auto result = co_await elio::io::allocate_file_range(
+                    fd_, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, base, block.size());
+                if (result) allocated_zero = true;
+                else if (result.error_value() != EOPNOTSUPP && result.error_value() != ENOSYS)
+                    failure = -result.error_value();
+            }
+            if (!allocated_zero && !failure) {
+                const auto write = co_await elio::io::pwrite_exactly(
+                    fd_, std::span<const std::byte>(block.data(), write_count), write_offset);
+                if (write.error) failure = -write.error.value();
+                else if (write.end != elio::io::transfer_end::complete) failure = -EIO;
+            }
+            if (failure) {
+                // Preserve the kernel-observable prefix after an error. If the
+                // scan fails, future reads/index rebuilds fail closed.
+                (void)co_await refresh_extents();
+                co_return failure;
+            }
+#ifdef OBD_TEST_HOOKS
+            if (extent_exit_stage_for_test_.load() == 2) ::_exit(92);
+#endif
+            {
+                std::lock_guard lock(meta_mu_);
+                segments_.swap(next);
+                extent_view_valid_ = true;
+                advance_extent_generation();
+            }
+            done += n;
+        }
+        co_return static_cast<ssize_t>(count);
+    } catch (const error& e) {
+        co_return -e.errno_value();
+    } catch (const std::bad_alloc&) {
+        co_return -ENOMEM;
+    }
 }
 
 }  // namespace obd::format

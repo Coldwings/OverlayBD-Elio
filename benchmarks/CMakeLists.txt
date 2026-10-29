@@ -6,6 +6,10 @@ add_executable(obd-bench-writable writable.cpp)
 obd_target_warnings(obd-bench-writable)
 target_link_libraries(obd-bench-writable PRIVATE obd_core)
 
+add_executable(obd-bench-sparse-copyup sparse_copyup.cpp)
+obd_target_warnings(obd-bench-sparse-copyup)
+target_link_libraries(obd-bench-sparse-copyup PRIVATE obd_core)
+
 add_executable(obd-bench-hybrid-log hybrid_log.cpp)
 obd_target_warnings(obd-bench-hybrid-log)
 target_link_libraries(obd-bench-hybrid-log PRIVATE obd_core)

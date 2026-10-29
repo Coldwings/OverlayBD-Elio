@@ -44,7 +44,9 @@ std::unique_ptr<Output> Output::prepare(const std::string& source_path,
     output->target_ = target.filename().string();
     output->directory_fd_ = ::open(target.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (output->directory_fd_ < 0) throw_errno(errno, "sparse export: open destination directory");
+    if (data_fd < 0) throw error(EIO, "sparse export: data descriptor unavailable");
     for (const auto fd : {data_fd, coverage_fd}) {
+        if (fd < 0) continue;  // Extent format has no coverage descriptor.
         struct stat source_stat{};
         if (fd < 0 || ::fstat(fd, &source_stat) != 0)
             throw error(EIO, "sparse export: source descriptor unavailable");

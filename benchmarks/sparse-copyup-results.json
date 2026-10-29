@@ -1,0 +1,5346 @@
+{
+  "schema": 1,
+  "scope": "warm ordinary host files, one worker, QD1; zero or constant1000us perlower sourcecall; no realremote/bandwidth/scalabilityclaim",
+  "started_utc": "2026-10-29T08:28:55.077101+00:00",
+  "completed_utc": "2026-10-29T08:29:10.356632+00:00",
+  "environment": {
+    "kernel": {
+      "system": "Linux",
+      "release": "6.18.18.c1126-trim",
+      "version": "#1126 SMP PREEMPT_DYNAMIC Wed Sep 16 02:05:34 UTC 2026",
+      "machine": "x86_64",
+      "processor": ""
+    },
+    "filesystem": "btrfs",
+    "cpu_affinity": [
+      0
+    ],
+    "compiler": "c++ (Debian 12.2.0-14+deb12u1) 12.2.0"
+  },
+  "inputs": {
+    "coverage": {
+      "binary_sha256": "4112023aa33edb4bcad242bc856cd1c8d8f6bef674b41271a7796f1712289201",
+      "core_sha256": "861029fc8ffa85fc3ebada7ffbc99c97bacd6cf8e9328b25ee326f1314bb763f",
+      "head": "18ad26b6440ab94beefbd31b8e3fc62705838f78",
+      "harness_sha256": "fb6126b3c91e633713e6dce578950df44686bdb15ffe35a4b3ea2e2fe09b98fd"
+    },
+    "extents": {
+      "binary_sha256": "ba4acbfb88d935604813702b934bce60f2716c138571ebdfad8a87c9aa88c1af",
+      "core_sha256": "609f918eadbe664d1cc8cc615a33a96290d37d87447336fd2f21723f942ed646",
+      "head": "9232be531bd01812f8af2b8108c15476d83e0eaa",
+      "harness_sha256": "fb6126b3c91e633713e6dce578950df44686bdb15ffe35a4b3ea2e2fe09b98fd"
+    }
+  },
+  "summary": [
+    {
+      "delay_us": 0,
+      "phase": "first_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.046885,
+          "min": 0.046618,
+          "max": 0.04689
+        },
+        "sequence_p99_ms": {
+          "median": 0.064737,
+          "min": 0.061776,
+          "max": 0.068534
+        },
+        "wall_ms": {
+          "median": 12.227136,
+          "min": 11.959365,
+          "max": 12.3436
+        },
+        "requests_per_second": {
+          "median": 20937.037095195476,
+          "min": 20739.492530542142,
+          "max": 21405.818787201493
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 513,
+          "min": 513,
+          "max": 513
+        },
+        "allocated_upper_bytes": {
+          "median": 1064960,
+          "min": 1064960,
+          "max": 1064960
+        },
+        "cpu_us": {
+          "median": 18098
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.015147,
+          "min": 0.015065,
+          "max": 0.016215
+        },
+        "sequence_p99_ms": {
+          "median": 0.026574,
+          "min": 0.025136,
+          "max": 0.029775
+        },
+        "wall_ms": {
+          "median": 4.127984,
+          "min": 4.044457,
+          "max": 4.327597
+        },
+        "requests_per_second": {
+          "median": 62015.74424707073,
+          "min": 59155.230951495716,
+          "max": 63296.50679930581
+        },
+        "lower_calls": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "lower_requested_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "merged_fragments": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "allocated_upper_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "cpu_us": {
+          "median": 4307
+        }
+      },
+      "p50_change_percent": -67.69329209768583
+    },
+    {
+      "delay_us": 0,
+      "phase": "second_sector_same_block_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.047049,
+          "min": 0.046364,
+          "max": 0.049574
+        },
+        "sequence_p99_ms": {
+          "median": 0.066225,
+          "min": 0.063629,
+          "max": 0.070638
+        },
+        "wall_ms": {
+          "median": 12.464715,
+          "min": 12.418934,
+          "max": 12.918493
+        },
+        "requests_per_second": {
+          "median": 20537.97459468588,
+          "min": 19816.5529059775,
+          "max": 20613.685522445
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 513,
+          "min": 513,
+          "max": 513
+        },
+        "allocated_upper_bytes": {
+          "median": 1064960,
+          "min": 1064960,
+          "max": 1064960
+        },
+        "cpu_us": {
+          "median": 12562
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.009191,
+          "min": 0.008088,
+          "max": 0.009911
+        },
+        "sequence_p99_ms": {
+          "median": 0.010696,
+          "min": 0.008916,
+          "max": 0.016432
+        },
+        "wall_ms": {
+          "median": 2.415595,
+          "min": 2.121093,
+          "max": 2.704661
+        },
+        "requests_per_second": {
+          "median": 105978.03025755558,
+          "min": 94651.41842175415,
+          "max": 120692.49203123106
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "allocated_upper_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "cpu_us": {
+          "median": 6169
+        }
+      },
+      "p50_change_percent": -80.46504707857765
+    },
+    {
+      "delay_us": 0,
+      "phase": "overwrite_same_sector_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.01521,
+          "min": 0.014725,
+          "max": 0.018193
+        },
+        "sequence_p99_ms": {
+          "median": 0.021802,
+          "min": 0.020856,
+          "max": 0.030959
+        },
+        "wall_ms": {
+          "median": 4.033341,
+          "min": 3.866631,
+          "max": 4.743854
+        },
+        "requests_per_second": {
+          "median": 63470.95373289786,
+          "min": 53964.56130395244,
+          "max": 66207.50725890316
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 513,
+          "min": 513,
+          "max": 513
+        },
+        "allocated_upper_bytes": {
+          "median": 1064960,
+          "min": 1064960,
+          "max": 1064960
+        },
+        "cpu_us": {
+          "median": 4145
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.009161,
+          "min": 0.009142,
+          "max": 0.009246
+        },
+        "sequence_p99_ms": {
+          "median": 0.013844,
+          "min": 0.013674,
+          "max": 0.014121
+        },
+        "wall_ms": {
+          "median": 2.385512,
+          "min": 2.371155,
+          "max": 2.412517
+        },
+        "requests_per_second": {
+          "median": 107314.48846201571,
+          "min": 106113.24189632654,
+          "max": 107964.26214228931
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "allocated_upper_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "cpu_us": {
+          "median": 2488
+        }
+      },
+      "p50_change_percent": -39.769888231426684
+    },
+    {
+      "delay_us": 0,
+      "phase": "random_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.057087,
+          "min": 0.055702,
+          "max": 0.057155
+        },
+        "sequence_p99_ms": {
+          "median": 0.077474,
+          "min": 0.074647,
+          "max": 0.081813
+        },
+        "wall_ms": {
+          "median": 15.234483,
+          "min": 14.749298,
+          "max": 15.276376
+        },
+        "requests_per_second": {
+          "median": 16803.983436786137,
+          "min": 16757.901219503892,
+          "max": 17356.758267410423
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 1025,
+          "min": 1025,
+          "max": 1025
+        },
+        "allocated_upper_bytes": {
+          "median": 2113536,
+          "min": 2113536,
+          "max": 2113536
+        },
+        "cpu_us": {
+          "median": 15330
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.018807,
+          "min": 0.018794,
+          "max": 0.021517
+        },
+        "sequence_p99_ms": {
+          "median": 0.030475,
+          "min": 0.030331,
+          "max": 0.034051
+        },
+        "wall_ms": {
+          "median": 5.352972,
+          "min": 4.896351,
+          "max": 5.600849
+        },
+        "requests_per_second": {
+          "median": 47823.90044259525,
+          "min": 45707.356152611865,
+          "max": 52283.833409818864
+        },
+        "lower_calls": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "lower_requested_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "merged_fragments": {
+          "median": 380,
+          "min": 380,
+          "max": 380
+        },
+        "allocated_upper_bytes": {
+          "median": 2097152,
+          "min": 2097152,
+          "max": 2097152
+        },
+        "cpu_us": {
+          "median": 5447
+        }
+      },
+      "p50_change_percent": -67.05554679699407
+    },
+    {
+      "delay_us": 0,
+      "phase": "aligned_4096",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.061482,
+          "min": 0.058278,
+          "max": 0.062992
+        },
+        "sequence_p99_ms": {
+          "median": 0.084268,
+          "min": 0.083095,
+          "max": 0.0981
+        },
+        "wall_ms": {
+          "median": 16.043045,
+          "min": 15.488748,
+          "max": 16.596391
+        },
+        "requests_per_second": {
+          "median": 15957.070493787183,
+          "min": 15425.040299424134,
+          "max": 16528.1273864098
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 1027,
+          "min": 1027,
+          "max": 1027
+        },
+        "allocated_upper_bytes": {
+          "median": 3162112,
+          "min": 3162112,
+          "max": 3162112
+        },
+        "cpu_us": {
+          "median": 16149
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.019429,
+          "min": 0.01759,
+          "max": 0.019509
+        },
+        "sequence_p99_ms": {
+          "median": 0.028812,
+          "min": 0.027877,
+          "max": 0.03119
+        },
+        "wall_ms": {
+          "median": 5.116026,
+          "min": 4.82721,
+          "max": 5.134266
+        },
+        "requests_per_second": {
+          "median": 50038.8387392871,
+          "min": 49861.070696376075,
+          "max": 53032.704191448065
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 382,
+          "min": 382,
+          "max": 382
+        },
+        "allocated_upper_bytes": {
+          "median": 3145728,
+          "min": 3145728,
+          "max": 3145728
+        },
+        "cpu_us": {
+          "median": 5236
+        }
+      },
+      "p50_change_percent": -68.398880973293
+    },
+    {
+      "delay_us": 0,
+      "phase": "two_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.141411,
+          "min": 0.138401,
+          "max": 0.146772
+        },
+        "sequence_p99_ms": {
+          "median": 0.19947,
+          "min": 0.186916,
+          "max": 0.200785
+        },
+        "wall_ms": {
+          "median": 37.337606,
+          "min": 36.300172,
+          "max": 37.703997
+        },
+        "requests_per_second": {
+          "median": 13712.716342874259,
+          "min": 13579.462145618141,
+          "max": 14104.61636380125
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 2049,
+          "min": 2049,
+          "max": 2049
+        },
+        "allocated_upper_bytes": {
+          "median": 4210688,
+          "min": 4210688,
+          "max": 4210688
+        },
+        "cpu_us": {
+          "median": 37439
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.033385,
+          "min": 0.031185,
+          "max": 0.034211
+        },
+        "sequence_p99_ms": {
+          "median": 0.04502,
+          "min": 0.0435,
+          "max": 0.050708
+        },
+        "wall_ms": {
+          "median": 8.660725,
+          "min": 8.16417,
+          "max": 8.855986
+        },
+        "requests_per_second": {
+          "median": 59117.45263820293,
+          "min": 57814.00286766488,
+          "max": 62713.049826253
+        },
+        "lower_calls": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "lower_requested_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "merged_fragments": {
+          "median": 381,
+          "min": 381,
+          "max": 381
+        },
+        "allocated_upper_bytes": {
+          "median": 4194304,
+          "min": 4194304,
+          "max": 4194304
+        },
+        "cpu_us": {
+          "median": 8723
+        }
+      },
+      "p50_change_percent": -76.39151126857175
+    },
+    {
+      "delay_us": 0,
+      "phase": "warm_read_4096_after_two_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.005747,
+          "min": 0.00559,
+          "max": 0.005807
+        },
+        "sequence_p99_ms": {
+          "median": 0.00686,
+          "min": 0.006678,
+          "max": 0.009862
+        },
+        "wall_ms": {
+          "median": 5.960703,
+          "min": 5.856644,
+          "max": 6.03015
+        },
+        "requests_per_second": {
+          "median": 171791.81717324283,
+          "min": 169813.35456000266,
+          "max": 174844.15989771616
+        },
+        "lower_calls": {
+          "median": 2048,
+          "min": 2048,
+          "max": 2048
+        },
+        "lower_requested_bytes": {
+          "median": 3145728,
+          "min": 3145728,
+          "max": 3145728
+        },
+        "merged_fragments": {
+          "median": 2049,
+          "min": 2049,
+          "max": 2049
+        },
+        "allocated_upper_bytes": {
+          "median": 4210688,
+          "min": 4210688,
+          "max": 4210688
+        },
+        "cpu_us": {
+          "median": 6067
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.002167,
+          "min": 0.001744,
+          "max": 0.002495
+        },
+        "sequence_p99_ms": {
+          "median": 0.003702,
+          "min": 0.002172,
+          "max": 0.007523
+        },
+        "wall_ms": {
+          "median": 2.464803,
+          "min": 1.863423,
+          "max": 2.74031
+        },
+        "requests_per_second": {
+          "median": 415449.0237150799,
+          "min": 373680.3500333904,
+          "max": 549526.3286972416
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 381,
+          "min": 381,
+          "max": 381
+        },
+        "allocated_upper_bytes": {
+          "median": 4194304,
+          "min": 4194304,
+          "max": 4194304
+        },
+        "cpu_us": {
+          "median": 2560
+        }
+      },
+      "p50_change_percent": -62.29337045415
+    },
+    {
+      "delay_us": 1000,
+      "phase": "first_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.046867,
+          "min": 0.043586,
+          "max": 0.047159
+        },
+        "sequence_p99_ms": {
+          "median": 0.068349,
+          "min": 0.064978,
+          "max": 0.075902
+        },
+        "wall_ms": {
+          "median": 12.064017,
+          "min": 12.026932,
+          "max": 12.157748
+        },
+        "requests_per_second": {
+          "median": 21220.129248823174,
+          "min": 21056.53119311241,
+          "max": 21285.561438278688
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 513,
+          "min": 513,
+          "max": 513
+        },
+        "allocated_upper_bytes": {
+          "median": 1064960,
+          "min": 1064960,
+          "max": 1064960
+        },
+        "cpu_us": {
+          "median": 15875
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 1.097671,
+          "min": 1.086241,
+          "max": 1.100115
+        },
+        "sequence_p99_ms": {
+          "median": 3.711953,
+          "min": 3.702292,
+          "max": 4.016229
+        },
+        "wall_ms": {
+          "median": 305.092103,
+          "min": 302.758326,
+          "max": 306.918064
+        },
+        "requests_per_second": {
+          "median": 839.0908761083206,
+          "min": 834.0988362288118,
+          "max": 845.5589095838772
+        },
+        "lower_calls": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "lower_requested_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "merged_fragments": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "allocated_upper_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "cpu_us": {
+          "median": 25702
+        }
+      },
+      "p50_change_percent": 2242.097851366633
+    },
+    {
+      "delay_us": 1000,
+      "phase": "second_sector_same_block_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.04747,
+          "min": 0.047258,
+          "max": 0.049029
+        },
+        "sequence_p99_ms": {
+          "median": 0.069818,
+          "min": 0.06365,
+          "max": 0.071223
+        },
+        "wall_ms": {
+          "median": 12.731943,
+          "min": 12.550585,
+          "max": 12.745529
+        },
+        "requests_per_second": {
+          "median": 20106.907484584248,
+          "min": 20085.474679003124,
+          "max": 20397.45557677192
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 513,
+          "min": 513,
+          "max": 513
+        },
+        "allocated_upper_bytes": {
+          "median": 1064960,
+          "min": 1064960,
+          "max": 1064960
+        },
+        "cpu_us": {
+          "median": 12838
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.016536,
+          "min": 0.012978,
+          "max": 0.018424
+        },
+        "sequence_p99_ms": {
+          "median": 0.022255,
+          "min": 0.019173,
+          "max": 0.027257
+        },
+        "wall_ms": {
+          "median": 4.346205,
+          "min": 3.423966,
+          "max": 4.939246
+        },
+        "requests_per_second": {
+          "median": 58901.9615963812,
+          "min": 51829.773208299404,
+          "max": 74767.0975704782
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "allocated_upper_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "cpu_us": {
+          "median": 6196
+        }
+      },
+      "p50_change_percent": -65.16536760058985
+    },
+    {
+      "delay_us": 1000,
+      "phase": "overwrite_same_sector_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.016737,
+          "min": 0.015388,
+          "max": 0.018017
+        },
+        "sequence_p99_ms": {
+          "median": 0.021636,
+          "min": 0.02137,
+          "max": 0.023249
+        },
+        "wall_ms": {
+          "median": 4.623356,
+          "min": 4.095734,
+          "max": 4.713749
+        },
+        "requests_per_second": {
+          "median": 55371.033508992165,
+          "min": 54309.21332468063,
+          "max": 62504.05910149438
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 513,
+          "min": 513,
+          "max": 513
+        },
+        "allocated_upper_bytes": {
+          "median": 1064960,
+          "min": 1064960,
+          "max": 1064960
+        },
+        "cpu_us": {
+          "median": 4503
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.010025,
+          "min": 0.00871,
+          "max": 0.010638
+        },
+        "sequence_p99_ms": {
+          "median": 0.017672,
+          "min": 0.011319,
+          "max": 0.022951
+        },
+        "wall_ms": {
+          "median": 2.81379,
+          "min": 2.346105,
+          "max": 3.243986
+        },
+        "requests_per_second": {
+          "median": 90980.49250299418,
+          "min": 78915.26042344203,
+          "max": 109117.02587906338
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "allocated_upper_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "cpu_us": {
+          "median": 2923
+        }
+      },
+      "p50_change_percent": -40.10276632610385
+    },
+    {
+      "delay_us": 1000,
+      "phase": "random_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.057333,
+          "min": 0.055343,
+          "max": 0.061042
+        },
+        "sequence_p99_ms": {
+          "median": 0.080708,
+          "min": 0.07359,
+          "max": 0.081452
+        },
+        "wall_ms": {
+          "median": 14.791696,
+          "min": 14.789207,
+          "max": 15.654724
+        },
+        "requests_per_second": {
+          "median": 17307.007932018074,
+          "min": 16352.891306164196,
+          "max": 17309.92067390767
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 1025,
+          "min": 1025,
+          "max": 1025
+        },
+        "allocated_upper_bytes": {
+          "median": 2113536,
+          "min": 2113536,
+          "max": 2113536
+        },
+        "cpu_us": {
+          "median": 14896
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 1.104839,
+          "min": 1.102476,
+          "max": 1.112897
+        },
+        "sequence_p99_ms": {
+          "median": 2.888137,
+          "min": 1.76829,
+          "max": 3.947638
+        },
+        "wall_ms": {
+          "median": 298.988295,
+          "min": 294.885857,
+          "max": 303.442261
+        },
+        "requests_per_second": {
+          "median": 856.2208095805222,
+          "min": 843.6530862785788,
+          "max": 868.1325127098246
+        },
+        "lower_calls": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "lower_requested_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "merged_fragments": {
+          "median": 380,
+          "min": 380,
+          "max": 380
+        },
+        "allocated_upper_bytes": {
+          "median": 2097152,
+          "min": 2097152,
+          "max": 2097152
+        },
+        "cpu_us": {
+          "median": 28372
+        }
+      },
+      "p50_change_percent": 1827.0559712556467
+    },
+    {
+      "delay_us": 1000,
+      "phase": "aligned_4096",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.062463,
+          "min": 0.06136,
+          "max": 0.064209
+        },
+        "sequence_p99_ms": {
+          "median": 0.084556,
+          "min": 0.083766,
+          "max": 0.086458
+        },
+        "wall_ms": {
+          "median": 16.25979,
+          "min": 16.02186,
+          "max": 16.279398
+        },
+        "requests_per_second": {
+          "median": 15744.360782027321,
+          "min": 15725.397216776688,
+          "max": 15978.169825475943
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 1027,
+          "min": 1027,
+          "max": 1027
+        },
+        "allocated_upper_bytes": {
+          "median": 3162112,
+          "min": 3162112,
+          "max": 3162112
+        },
+        "cpu_us": {
+          "median": 16358
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.034645,
+          "min": 0.025849,
+          "max": 0.036981
+        },
+        "sequence_p99_ms": {
+          "median": 0.054991,
+          "min": 0.046952,
+          "max": 0.071516
+        },
+        "wall_ms": {
+          "median": 9.28601,
+          "min": 6.967686,
+          "max": 9.58882
+        },
+        "requests_per_second": {
+          "median": 27568.35282322548,
+          "min": 26697.75843117297,
+          "max": 36741.03568961059
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 382,
+          "min": 382,
+          "max": 382
+        },
+        "allocated_upper_bytes": {
+          "median": 3145728,
+          "min": 3145728,
+          "max": 3145728
+        },
+        "cpu_us": {
+          "median": 9490
+        }
+      },
+      "p50_change_percent": -44.535164817571996
+    },
+    {
+      "delay_us": 1000,
+      "phase": "two_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 0.143089,
+          "min": 0.142598,
+          "max": 0.144955
+        },
+        "sequence_p99_ms": {
+          "median": 0.189448,
+          "min": 0.187256,
+          "max": 0.214664
+        },
+        "wall_ms": {
+          "median": 37.244078,
+          "min": 37.158285,
+          "max": 37.502336
+        },
+        "requests_per_second": {
+          "median": 13747.151963326894,
+          "min": 13652.482874666794,
+          "max": 13778.892109794626
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 2049,
+          "min": 2049,
+          "max": 2049
+        },
+        "allocated_upper_bytes": {
+          "median": 4210688,
+          "min": 4210688,
+          "max": 4210688
+        },
+        "cpu_us": {
+          "median": 37309
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 1.150341,
+          "min": 1.133143,
+          "max": 1.164087
+        },
+        "sequence_p99_ms": {
+          "median": 3.595765,
+          "min": 3.457519,
+          "max": 3.651706
+        },
+        "wall_ms": {
+          "median": 315.527541,
+          "min": 310.837067,
+          "max": 320.759813
+        },
+        "requests_per_second": {
+          "median": 1622.679270333489,
+          "min": 1596.2099341914754,
+          "max": 1647.165201182393
+        },
+        "lower_calls": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "lower_requested_bytes": {
+          "median": 1048576,
+          "min": 1048576,
+          "max": 1048576
+        },
+        "merged_fragments": {
+          "median": 381,
+          "min": 381,
+          "max": 381
+        },
+        "allocated_upper_bytes": {
+          "median": 4194304,
+          "min": 4194304,
+          "max": 4194304
+        },
+        "cpu_us": {
+          "median": 38534
+        }
+      },
+      "p50_change_percent": 703.9339152555403
+    },
+    {
+      "delay_us": 1000,
+      "phase": "warm_read_4096_after_two_512",
+      "coverage": {
+        "sequence_p50_ms": {
+          "median": 2.092545,
+          "min": 2.09029,
+          "max": 2.09538
+        },
+        "sequence_p99_ms": {
+          "median": 5.172456,
+          "min": 5.041828,
+          "max": 5.186175
+        },
+        "wall_ms": {
+          "median": 2287.261458,
+          "min": 2276.628299,
+          "max": 2290.212442
+        },
+        "requests_per_second": {
+          "median": 447.6969593565372,
+          "min": 447.12009297520007,
+          "max": 449.7879607530961
+        },
+        "lower_calls": {
+          "median": 2048,
+          "min": 2048,
+          "max": 2048
+        },
+        "lower_requested_bytes": {
+          "median": 3145728,
+          "min": 3145728,
+          "max": 3145728
+        },
+        "merged_fragments": {
+          "median": 2049,
+          "min": 2049,
+          "max": 2049
+        },
+        "allocated_upper_bytes": {
+          "median": 4210688,
+          "min": 4210688,
+          "max": 4210688
+        },
+        "cpu_us": {
+          "median": 87568
+        }
+      },
+      "extents": {
+        "sequence_p50_ms": {
+          "median": 0.004221,
+          "min": 0.004012,
+          "max": 0.004497
+        },
+        "sequence_p99_ms": {
+          "median": 0.006275,
+          "min": 0.005077,
+          "max": 0.006431
+        },
+        "wall_ms": {
+          "median": 4.447772,
+          "min": 4.272772,
+          "max": 4.689374
+        },
+        "requests_per_second": {
+          "median": 230227.6285744863,
+          "min": 218366.03350468527,
+          "max": 239657.06571752485
+        },
+        "lower_calls": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "lower_requested_bytes": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "merged_fragments": {
+          "median": 381,
+          "min": 381,
+          "max": 381
+        },
+        "allocated_upper_bytes": {
+          "median": 4194304,
+          "min": 4194304,
+          "max": 4194304
+        },
+        "cpu_us": {
+          "median": 4646
+        }
+      },
+      "p50_change_percent": -99.79828390787296
+    }
+  ],
+  "trials": [
+    {
+      "name": "coverage-delay0-trial0",
+      "variant": "coverage",
+      "delay_us": 0,
+      "trial": 0,
+      "report_sha256": "b53e0e561e5d014d19797dca8715e592ac46010fb1317beb6f02f2f58ae5ef25",
+      "log_sha256": "76ec394ca08edcf039ab1c269db2c2f46f0c53c92c299c1d2a87bf273913a10c",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4210688,
+          "cancelled_write_bytes": 0,
+          "rchar": 7366444,
+          "read_bytes": 0,
+          "syscr": 69,
+          "syscw": 31,
+          "system_us": 80675,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            },
+            "upper.coverage": {
+              "allocated": 16384,
+              "size": 12416
+            }
+          },
+          "user_us": 125046,
+          "wchar": 14700696,
+          "write_bytes": 19132416
+        },
+        "flush_after_reopen_ms": 56.070017,
+        "lower_delay_us": 0,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "first_512",
+            "requests_per_second": 20937.037095195476,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3317,
+              "user_us": 13481,
+              "wchar": 8,
+              "write_bytes": 1060864
+            },
+            "sequence_p50_ms": 0.046885,
+            "sequence_p99_ms": 0.068534,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.227136
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 20613.685522445,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 4035,
+              "user_us": 8494,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.047049,
+            "sequence_p99_ms": 0.066225,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.418934
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 63470.95373289786,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3948,
+              "user_us": 197,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.01521,
+            "sequence_p99_ms": 0.020856,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 4.033341
+          },
+          {
+            "allocated_upper_bytes": 2113536,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1025,
+            "name": "random_512",
+            "requests_per_second": 16757.901219503892,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 7849,
+              "user_us": 7548,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.057087,
+            "sequence_p99_ms": 0.077474,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 15.276376
+          },
+          {
+            "allocated_upper_bytes": 3162112,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1027,
+            "name": "aligned_4096",
+            "requests_per_second": 16528.1273864098,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 28,
+              "user_us": 15569,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.058278,
+            "sequence_p99_ms": 0.083095,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 15.488748
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2049,
+            "name": "two_512",
+            "requests_per_second": 13712.716342874259,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 15190,
+              "user_us": 22249,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.141411,
+            "sequence_p99_ms": 0.19947,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 37.337606
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 2048,
+            "lower_requested_bytes": 3145728,
+            "merged_fragments": 2049,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 169813.35456000266,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3358,
+              "user_us": 2781,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.005807,
+            "sequence_p99_ms": 0.00686,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 6.03015
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 0.270101
+      }
+    },
+    {
+      "name": "extents-delay0-trial0",
+      "variant": "extents",
+      "delay_us": 0,
+      "trial": 0,
+      "report_sha256": "7b9ad159ce6038055207696797a4bb3cd2651cb30c689a05b73342726b2703f4",
+      "log_sha256": "a5705aa6b26ce0e840a712064be78a4c4b4e9a9b28c2076d73e242b7dc3ef59b",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4194304,
+          "cancelled_write_bytes": 0,
+          "rchar": 7349932,
+          "read_bytes": 0,
+          "syscr": 65,
+          "syscw": 29,
+          "system_us": 67232,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            }
+          },
+          "user_us": 56027,
+          "wchar": 14692504,
+          "write_bytes": 19050496
+        },
+        "flush_after_reopen_ms": 24.102205,
+        "lower_delay_us": 0,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 2,
+            "name": "first_512",
+            "requests_per_second": 62015.74424707073,
+            "resources_delta": {
+              "rchar": 112,
+              "read_bytes": 0,
+              "syscr": 2,
+              "syscw": 0,
+              "system_us": 165,
+              "user_us": 4142,
+              "wchar": 0,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.015147,
+            "sequence_p99_ms": 0.029775,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.127984
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 94651.41842175415,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 608,
+              "user_us": 5791,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.009911,
+            "sequence_p99_ms": 0.016432,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.704661
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 107314.48846201571,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2488,
+              "user_us": 0,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.009246,
+            "sequence_p99_ms": 0.013844,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.385512
+          },
+          {
+            "allocated_upper_bytes": 2097152,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 380,
+            "name": "random_512",
+            "requests_per_second": 47823.90044259525,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 5447,
+              "user_us": 0,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.018807,
+            "sequence_p99_ms": 0.034051,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 5.352972
+          },
+          {
+            "allocated_upper_bytes": 3145728,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 382,
+            "name": "aligned_4096",
+            "requests_per_second": 50038.8387392871,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2843,
+              "user_us": 2393,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.019509,
+            "sequence_p99_ms": 0.028812,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 5.116026
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 381,
+            "name": "two_512",
+            "requests_per_second": 57814.00286766488,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 7909,
+              "user_us": 1046,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.034211,
+            "sequence_p99_ms": 0.04502,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 8.855986
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 381,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 373680.3500333904,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 897,
+              "user_us": 1905,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.002495,
+            "sequence_p99_ms": 0.003702,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.74031
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 48.463672
+      }
+    },
+    {
+      "name": "extents-delay0-trial1",
+      "variant": "extents",
+      "delay_us": 0,
+      "trial": 1,
+      "report_sha256": "37a44df3afa1cc2a30ab448d9bc4f21c3e562ec66a25413fce6dff6be61cd4a4",
+      "log_sha256": "7a42e98280ddfbeae71b3f4710ee4340618951cb6f8ebe8fd8414354d12d90cc",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4194304,
+          "cancelled_write_bytes": 0,
+          "rchar": 7349932,
+          "read_bytes": 0,
+          "syscr": 65,
+          "syscw": 29,
+          "system_us": 68793,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            }
+          },
+          "user_us": 45862,
+          "wchar": 14692504,
+          "write_bytes": 19034112
+        },
+        "flush_after_reopen_ms": 24.241973,
+        "lower_delay_us": 0,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 2,
+            "name": "first_512",
+            "requests_per_second": 59155.230951495716,
+            "resources_delta": {
+              "rchar": 112,
+              "read_bytes": 0,
+              "syscr": 2,
+              "syscw": 0,
+              "system_us": 226,
+              "user_us": 4266,
+              "wchar": 0,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.016215,
+            "sequence_p99_ms": 0.026574,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.327597
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 120692.49203123106,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 487,
+              "user_us": 5224,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.008088,
+            "sequence_p99_ms": 0.008916,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.121093
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 106113.24189632654,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2504,
+              "user_us": 0,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.009161,
+            "sequence_p99_ms": 0.014121,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.412517
+          },
+          {
+            "allocated_upper_bytes": 2097152,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 380,
+            "name": "random_512",
+            "requests_per_second": 52283.833409818864,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2823,
+              "user_us": 2169,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.018794,
+            "sequence_p99_ms": 0.030475,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.896351
+          },
+          {
+            "allocated_upper_bytes": 3145728,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 382,
+            "name": "aligned_4096",
+            "requests_per_second": 49861.070696376075,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 5256,
+              "user_us": 0,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.019429,
+            "sequence_p99_ms": 0.03119,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 5.134266
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 381,
+            "name": "two_512",
+            "requests_per_second": 59117.45263820293,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 8283,
+              "user_us": 440,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.033385,
+            "sequence_p99_ms": 0.050708,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 8.660725
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 381,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 549526.3286972416,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 0,
+              "user_us": 1984,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.001744,
+            "sequence_p99_ms": 0.002172,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 1.863423
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 49.018474
+      }
+    },
+    {
+      "name": "coverage-delay0-trial1",
+      "variant": "coverage",
+      "delay_us": 0,
+      "trial": 1,
+      "report_sha256": "3a06caf4b5d2507c99a79296d59b78e14493532832f53fe5cb4b5532db595e8b",
+      "log_sha256": "41be8bf7ede2aa4f31e63a7f996ad29ef3b0fb2510b82fc4eba5e0bc324d314e",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4210688,
+          "cancelled_write_bytes": 0,
+          "rchar": 7366444,
+          "read_bytes": 0,
+          "syscr": 69,
+          "syscw": 31,
+          "system_us": 80864,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            },
+            "upper.coverage": {
+              "allocated": 16384,
+              "size": 12416
+            }
+          },
+          "user_us": 121296,
+          "wchar": 14700696,
+          "write_bytes": 19214336
+        },
+        "flush_after_reopen_ms": 55.606571,
+        "lower_delay_us": 0,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "first_512",
+            "requests_per_second": 20739.492530542142,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3955,
+              "user_us": 15209,
+              "wchar": 8,
+              "write_bytes": 1060864
+            },
+            "sequence_p50_ms": 0.04689,
+            "sequence_p99_ms": 0.064737,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.3436
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 19816.5529059775,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 4432,
+              "user_us": 8598,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.049574,
+            "sequence_p99_ms": 0.070638,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.918493
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 53964.56130395244,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 373,
+              "user_us": 4491,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.018193,
+            "sequence_p99_ms": 0.030959,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 4.743854
+          },
+          {
+            "allocated_upper_bytes": 2113536,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1025,
+            "name": "random_512",
+            "requests_per_second": 17356.758267410423,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3948,
+              "user_us": 10912,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.055702,
+            "sequence_p99_ms": 0.074647,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 14.749298
+          },
+          {
+            "allocated_upper_bytes": 3162112,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1027,
+            "name": "aligned_4096",
+            "requests_per_second": 15425.040299424134,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 8216,
+              "user_us": 8412,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.062992,
+            "sequence_p99_ms": 0.0981,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 16.596391
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2049,
+            "name": "two_512",
+            "requests_per_second": 14104.61636380125,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 12153,
+              "user_us": 24211,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.138401,
+            "sequence_p99_ms": 0.186916,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 36.300172
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 2048,
+            "lower_requested_bytes": 3145728,
+            "merged_fragments": 2049,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 174844.15989771616,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3256,
+              "user_us": 2735,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.00559,
+            "sequence_p99_ms": 0.009862,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 5.856644
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 0.376178
+      }
+    },
+    {
+      "name": "coverage-delay0-trial2",
+      "variant": "coverage",
+      "delay_us": 0,
+      "trial": 2,
+      "report_sha256": "9b125f0614c187f6b32f17b092feb695cffa64a8089e41723ed9dabc36a4e9b4",
+      "log_sha256": "233495a84519e15934a2d9fc5ec3a8bb5b07039a222f7c8247498f7484364f43",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4210688,
+          "cancelled_write_bytes": 0,
+          "rchar": 7366444,
+          "read_bytes": 0,
+          "syscr": 69,
+          "syscw": 31,
+          "system_us": 100318,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            },
+            "upper.coverage": {
+              "allocated": 16384,
+              "size": 12416
+            }
+          },
+          "user_us": 104331,
+          "wchar": 14700696,
+          "write_bytes": 19214336
+        },
+        "flush_after_reopen_ms": 55.184994,
+        "lower_delay_us": 0,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "first_512",
+            "requests_per_second": 21405.818787201493,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 9049,
+              "user_us": 9049,
+              "wchar": 8,
+              "write_bytes": 1060864
+            },
+            "sequence_p50_ms": 0.046618,
+            "sequence_p99_ms": 0.061776,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 11.959365
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 20537.97459468588,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 4251,
+              "user_us": 8311,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.046364,
+            "sequence_p99_ms": 0.063629,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.464715
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 66207.50725890316,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 0,
+              "user_us": 3981,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.014725,
+            "sequence_p99_ms": 0.021802,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 3.866631
+          },
+          {
+            "allocated_upper_bytes": 2113536,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1025,
+            "name": "random_512",
+            "requests_per_second": 16803.983436786137,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 11892,
+              "user_us": 3438,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.057155,
+            "sequence_p99_ms": 0.081813,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 15.234483
+          },
+          {
+            "allocated_upper_bytes": 3162112,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1027,
+            "name": "aligned_4096",
+            "requests_per_second": 15957.070493787183,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 85,
+              "user_us": 16064,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.061482,
+            "sequence_p99_ms": 0.084268,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 16.043045
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2049,
+            "name": "two_512",
+            "requests_per_second": 13579.462145618141,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 12669,
+              "user_us": 25058,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.146772,
+            "sequence_p99_ms": 0.200785,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 37.703997
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 2048,
+            "lower_requested_bytes": 3145728,
+            "merged_fragments": 2049,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 171791.81717324283,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 6067,
+              "user_us": 0,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.005747,
+            "sequence_p99_ms": 0.006678,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 5.960703
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 0.339306
+      }
+    },
+    {
+      "name": "extents-delay0-trial2",
+      "variant": "extents",
+      "delay_us": 0,
+      "trial": 2,
+      "report_sha256": "7350fd572aa8befef226302fede247e0ab8b721bb3f15669b824238840db32f6",
+      "log_sha256": "8f0c22d33e65711cedfab7b906ff7e353c20533416515ede1a5ab31de6233143",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4194304,
+          "cancelled_write_bytes": 0,
+          "rchar": 7349932,
+          "read_bytes": 0,
+          "syscr": 65,
+          "syscw": 29,
+          "system_us": 58053,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            }
+          },
+          "user_us": 69664,
+          "wchar": 14692504,
+          "write_bytes": 19050496
+        },
+        "flush_after_reopen_ms": 29.933747,
+        "lower_delay_us": 0,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 2,
+            "name": "first_512",
+            "requests_per_second": 63296.50679930581,
+            "resources_delta": {
+              "rchar": 112,
+              "read_bytes": 0,
+              "syscr": 2,
+              "syscw": 0,
+              "system_us": 3815,
+              "user_us": 374,
+              "wchar": 0,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.015065,
+            "sequence_p99_ms": 0.025136,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.044457
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 105978.03025755558,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 767,
+              "user_us": 5402,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.009191,
+            "sequence_p99_ms": 0.010696,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.415595
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 107964.26214228931,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2478,
+              "user_us": 0,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.009142,
+            "sequence_p99_ms": 0.013674,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.371155
+          },
+          {
+            "allocated_upper_bytes": 2097152,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 380,
+            "name": "random_512",
+            "requests_per_second": 45707.356152611865,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3041,
+              "user_us": 2659,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.021517,
+            "sequence_p99_ms": 0.030331,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 5.600849
+          },
+          {
+            "allocated_upper_bytes": 3145728,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 382,
+            "name": "aligned_4096",
+            "requests_per_second": 53032.704191448065,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2705,
+              "user_us": 2223,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.01759,
+            "sequence_p99_ms": 0.027877,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.82721
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 381,
+            "name": "two_512",
+            "requests_per_second": 62713.049826253,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 130,
+              "user_us": 8143,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.031185,
+            "sequence_p99_ms": 0.0435,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 8.16417
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 381,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 415449.0237150799,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 0,
+              "user_us": 2560,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.002167,
+            "sequence_p99_ms": 0.007523,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.464803
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 69.020598
+      }
+    },
+    {
+      "name": "coverage-delay1000-trial0",
+      "variant": "coverage",
+      "delay_us": 1000,
+      "trial": 0,
+      "report_sha256": "c69829880a7b4f68f4e5c6be097b1fd61bf76a0b1bf6d875e4c78fc2605b6776",
+      "log_sha256": "f34397e3ab1c16292f3bf9b14ddee70180a3fcda4fc305d52c7784546cde3d42",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4210688,
+          "cancelled_write_bytes": 0,
+          "rchar": 7366444,
+          "read_bytes": 0,
+          "syscr": 69,
+          "syscw": 31,
+          "system_us": 154965,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            },
+            "upper.coverage": {
+              "allocated": 16384,
+              "size": 12416
+            }
+          },
+          "user_us": 147217,
+          "wchar": 14700696,
+          "write_bytes": 19214336
+        },
+        "flush_after_reopen_ms": 66.863979,
+        "lower_delay_us": 1000,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "first_512",
+            "requests_per_second": 21285.561438278688,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 6803,
+              "user_us": 10336,
+              "wchar": 8,
+              "write_bytes": 1060864
+            },
+            "sequence_p50_ms": 0.043586,
+            "sequence_p99_ms": 0.075902,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.026932
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 20085.474679003124,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 6652,
+              "user_us": 6186,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.047258,
+            "sequence_p99_ms": 0.071223,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.745529
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 54309.21332468063,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 417,
+              "user_us": 4395,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.018017,
+            "sequence_p99_ms": 0.023249,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 4.713749
+          },
+          {
+            "allocated_upper_bytes": 2113536,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1025,
+            "name": "random_512",
+            "requests_per_second": 17307.007932018074,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 11670,
+              "user_us": 3165,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.057333,
+            "sequence_p99_ms": 0.081452,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 14.791696
+          },
+          {
+            "allocated_upper_bytes": 3162112,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1027,
+            "name": "aligned_4096",
+            "requests_per_second": 15744.360782027321,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 8163,
+              "user_us": 8195,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.06136,
+            "sequence_p99_ms": 0.083766,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 16.25979
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2049,
+            "name": "two_512",
+            "requests_per_second": 13652.482874666794,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 20791,
+              "user_us": 16816,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.143089,
+            "sequence_p99_ms": 0.214664,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 37.502336
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 2048,
+            "lower_requested_bytes": 3145728,
+            "merged_fragments": 2049,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 449.7879607530961,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 37843,
+              "user_us": 49216,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 2.09029,
+            "sequence_p99_ms": 5.186175,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 2276.628299
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 0.536189
+      }
+    },
+    {
+      "name": "extents-delay1000-trial0",
+      "variant": "extents",
+      "delay_us": 1000,
+      "trial": 0,
+      "report_sha256": "310bf7c454617e4745b822ff3231d00f63ee4383a6a7024204d985a4163f4158",
+      "log_sha256": "2726cb7867398114a7df6999a8589aa73f5b7eee47ebe4722892d00e8a7daf61",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4194304,
+          "cancelled_write_bytes": 0,
+          "rchar": 7349932,
+          "read_bytes": 0,
+          "syscr": 65,
+          "syscw": 29,
+          "system_us": 114000,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            }
+          },
+          "user_us": 106138,
+          "wchar": 14692504,
+          "write_bytes": 19066880
+        },
+        "flush_after_reopen_ms": 25.115609,
+        "lower_delay_us": 1000,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 2,
+            "name": "first_512",
+            "requests_per_second": 834.0988362288118,
+            "resources_delta": {
+              "rchar": 112,
+              "read_bytes": 0,
+              "syscr": 2,
+              "syscw": 0,
+              "system_us": 18193,
+              "user_us": 7509,
+              "wchar": 0,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.097671,
+            "sequence_p99_ms": 4.016229,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 306.918064
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 74767.0975704782,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 1507,
+              "user_us": 4689,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.012978,
+            "sequence_p99_ms": 0.019173,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 3.423966
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 90980.49250299418,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 0,
+              "user_us": 2923,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.010025,
+            "sequence_p99_ms": 0.017672,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.81379
+          },
+          {
+            "allocated_upper_bytes": 2097152,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 380,
+            "name": "random_512",
+            "requests_per_second": 856.2208095805222,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 10786,
+              "user_us": 17586,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.102476,
+            "sequence_p99_ms": 2.888137,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 298.988295
+          },
+          {
+            "allocated_upper_bytes": 3145728,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 382,
+            "name": "aligned_4096",
+            "requests_per_second": 36741.03568961059,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3566,
+              "user_us": 3570,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.025849,
+            "sequence_p99_ms": 0.046952,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 6.967686
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 381,
+            "name": "two_512",
+            "requests_per_second": 1596.2099341914754,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 12211,
+              "user_us": 27800,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.164087,
+            "sequence_p99_ms": 3.651706,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 320.759813
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 381,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 239657.06571752485,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 256,
+              "user_us": 4192,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.004012,
+            "sequence_p99_ms": 0.005077,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.272772
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 53.941006
+      }
+    },
+    {
+      "name": "extents-delay1000-trial1",
+      "variant": "extents",
+      "delay_us": 1000,
+      "trial": 1,
+      "report_sha256": "14fd891caea64e4f11fd1b96a5299e31a3527b7aede661233614c4cb242fc542",
+      "log_sha256": "b60c0e11efbcac7ac8ee63e81e9b9fa5257227d7781d3fdc0941cc438254992f",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4194304,
+          "cancelled_write_bytes": 0,
+          "rchar": 7349932,
+          "read_bytes": 0,
+          "syscr": 65,
+          "syscw": 29,
+          "system_us": 130356,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            }
+          },
+          "user_us": 94804,
+          "wchar": 14692504,
+          "write_bytes": 19083264
+        },
+        "flush_after_reopen_ms": 34.968091,
+        "lower_delay_us": 1000,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 2,
+            "name": "first_512",
+            "requests_per_second": 845.5589095838772,
+            "resources_delta": {
+              "rchar": 112,
+              "read_bytes": 0,
+              "syscr": 2,
+              "syscw": 0,
+              "system_us": 12325,
+              "user_us": 13891,
+              "wchar": 0,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.100115,
+            "sequence_p99_ms": 3.702292,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 302.758326
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 51829.773208299404,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3174,
+              "user_us": 3114,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.018424,
+            "sequence_p99_ms": 0.027257,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.939246
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 109117.02587906338,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2437,
+              "user_us": 0,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.00871,
+            "sequence_p99_ms": 0.011319,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 2.346105
+          },
+          {
+            "allocated_upper_bytes": 2097152,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 380,
+            "name": "random_512",
+            "requests_per_second": 843.6530862785788,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 27303,
+              "user_us": 2035,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.112897,
+            "sequence_p99_ms": 3.947638,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 303.442261
+          },
+          {
+            "allocated_upper_bytes": 3145728,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 382,
+            "name": "aligned_4096",
+            "requests_per_second": 26697.75843117297,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 1363,
+              "user_us": 8359,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.036981,
+            "sequence_p99_ms": 0.071516,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 9.58882
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 381,
+            "name": "two_512",
+            "requests_per_second": 1622.679270333489,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 23453,
+              "user_us": 15081,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.150341,
+            "sequence_p99_ms": 3.457519,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 315.527541
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 381,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 218366.03350468527,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 0,
+              "user_us": 4882,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.004497,
+            "sequence_p99_ms": 0.006275,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.689374
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 56.05137
+      }
+    },
+    {
+      "name": "coverage-delay1000-trial1",
+      "variant": "coverage",
+      "delay_us": 1000,
+      "trial": 1,
+      "report_sha256": "57eb47e453cf903cee1cc41b325222ae48ea5a1dc9827ecba5195d702da267f0",
+      "log_sha256": "3629092d20449f69a66818f0ba00241c51055908b68a3066e272298946210911",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4210688,
+          "cancelled_write_bytes": 0,
+          "rchar": 7366444,
+          "read_bytes": 0,
+          "syscr": 69,
+          "syscw": 31,
+          "system_us": 152625,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            },
+            "upper.coverage": {
+              "allocated": 16384,
+              "size": 12416
+            }
+          },
+          "user_us": 137735,
+          "wchar": 14700696,
+          "write_bytes": 19247104
+        },
+        "flush_after_reopen_ms": 133.904195,
+        "lower_delay_us": 1000,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "first_512",
+            "requests_per_second": 21056.53119311241,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3249,
+              "user_us": 10541,
+              "wchar": 8,
+              "write_bytes": 1060864
+            },
+            "sequence_p50_ms": 0.047159,
+            "sequence_p99_ms": 0.064978,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.157748
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 20397.45557677192,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 8058,
+              "user_us": 4606,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.049029,
+            "sequence_p99_ms": 0.06365,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.550585
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 55371.033508992165,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 249,
+              "user_us": 4254,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.016737,
+            "sequence_p99_ms": 0.021636,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 4.623356
+          },
+          {
+            "allocated_upper_bytes": 2113536,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1025,
+            "name": "random_512",
+            "requests_per_second": 16352.891306164196,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 15764,
+              "user_us": 0,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.061042,
+            "sequence_p99_ms": 0.07359,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 15.654724
+          },
+          {
+            "allocated_upper_bytes": 3162112,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1027,
+            "name": "aligned_4096",
+            "requests_per_second": 15725.397216776688,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 8396,
+              "user_us": 7994,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.064209,
+            "sequence_p99_ms": 0.084556,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 16.279398
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2049,
+            "name": "two_512",
+            "requests_per_second": 13747.151963326894,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 12886,
+              "user_us": 24423,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.142598,
+            "sequence_p99_ms": 0.189448,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 37.244078
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 2048,
+            "lower_requested_bytes": 3145728,
+            "merged_fragments": 2049,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 447.6969593565372,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 42723,
+              "user_us": 44845,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 2.092545,
+            "sequence_p99_ms": 5.041828,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 2287.261458
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 1.030166
+      }
+    },
+    {
+      "name": "coverage-delay1000-trial2",
+      "variant": "coverage",
+      "delay_us": 1000,
+      "trial": 2,
+      "report_sha256": "3f2c37e46c93d248ba937272f3044a642826e7ced47dfc2d8c803c850592c390",
+      "log_sha256": "814a2a561018e6700cc04a29859203b8140ed0c1f46f7702694a6152ba022207",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4210688,
+          "cancelled_write_bytes": 0,
+          "rchar": 7366444,
+          "read_bytes": 0,
+          "syscr": 69,
+          "syscw": 31,
+          "system_us": 154829,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            },
+            "upper.coverage": {
+              "allocated": 16384,
+              "size": 12416
+            }
+          },
+          "user_us": 145982,
+          "wchar": 14700696,
+          "write_bytes": 19230720
+        },
+        "flush_after_reopen_ms": 125.835121,
+        "lower_delay_us": 1000,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "first_512",
+            "requests_per_second": 21220.129248823174,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 7889,
+              "user_us": 7986,
+              "wchar": 8,
+              "write_bytes": 1060864
+            },
+            "sequence_p50_ms": 0.046867,
+            "sequence_p99_ms": 0.068349,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.064017
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 20106.907484584248,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 8255,
+              "user_us": 4593,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.04747,
+            "sequence_p99_ms": 0.069818,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 12.731943
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 62504.05910149438,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 115,
+              "user_us": 4082,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.015388,
+            "sequence_p99_ms": 0.02137,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 4.095734
+          },
+          {
+            "allocated_upper_bytes": 2113536,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1025,
+            "name": "random_512",
+            "requests_per_second": 17309.92067390767,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 11494,
+              "user_us": 3402,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.055343,
+            "sequence_p99_ms": 0.080708,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 14.789207
+          },
+          {
+            "allocated_upper_bytes": 3162112,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1027,
+            "name": "aligned_4096",
+            "requests_per_second": 15978.169825475943,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 4132,
+              "user_us": 11979,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.062463,
+            "sequence_p99_ms": 0.086458,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 16.02186
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2049,
+            "name": "two_512",
+            "requests_per_second": 13778.892109794626,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 20446,
+              "user_us": 16850,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.144955,
+            "sequence_p99_ms": 0.187256,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 37.158285
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 2048,
+            "lower_requested_bytes": 3145728,
+            "merged_fragments": 2049,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 447.12009297520007,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 47192,
+              "user_us": 40443,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 2.09538,
+            "sequence_p99_ms": 5.172456,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 2290.212442
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 0.399823
+      }
+    },
+    {
+      "name": "extents-delay1000-trial2",
+      "variant": "extents",
+      "delay_us": 1000,
+      "trial": 2,
+      "report_sha256": "9e11bc0671fdb0456a16cf677102f071e70cc633f5e6306f54a8e3352026a08c",
+      "log_sha256": "ee2b870ac43820889d99b79c77168967b517f18cb92860c1ec3ecd03d450af5c",
+      "result": {
+        "final": {
+          "allocated_upper_bytes": 4194304,
+          "cancelled_write_bytes": 0,
+          "rchar": 7349932,
+          "read_bytes": 0,
+          "syscr": 65,
+          "syscw": 29,
+          "system_us": 140959,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            }
+          },
+          "user_us": 72384,
+          "wchar": 14692504,
+          "write_bytes": 19066880
+        },
+        "flush_after_reopen_ms": 24.485165,
+        "lower_delay_us": 1000,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 2,
+            "name": "first_512",
+            "requests_per_second": 839.0908761083206,
+            "resources_delta": {
+              "rchar": 112,
+              "read_bytes": 0,
+              "syscr": 2,
+              "syscw": 0,
+              "system_us": 18857,
+              "user_us": 5668,
+              "wchar": 0,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.086241,
+            "sequence_p99_ms": 3.711953,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 305.092103
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 58901.9615963812,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2761,
+              "user_us": 2923,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.016536,
+            "sequence_p99_ms": 0.022255,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.346205
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 78915.26042344203,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 1463,
+              "user_us": 1881,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.010638,
+            "sequence_p99_ms": 0.022951,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 3.243986
+          },
+          {
+            "allocated_upper_bytes": 2097152,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 380,
+            "name": "random_512",
+            "requests_per_second": 868.1325127098246,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 23058,
+              "user_us": 5172,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.104839,
+            "sequence_p99_ms": 1.76829,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 294.885857
+          },
+          {
+            "allocated_upper_bytes": 3145728,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 382,
+            "name": "aligned_4096",
+            "requests_per_second": 27568.35282322548,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 9106,
+              "user_us": 384,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.034645,
+            "sequence_p99_ms": 0.054991,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 9.28601
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": null,
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 381,
+            "name": "two_512",
+            "requests_per_second": 1647.165201182393,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 19540,
+              "user_us": 15711,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 1.133143,
+            "sequence_p99_ms": 3.595765,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 310.837067
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": null,
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 381,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 230227.6285744863,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 4351,
+              "user_us": 295,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.004221,
+            "sequence_p99_ms": 0.006431,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.447772
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": false,
+        "unflushed_same_process_close_reopen_ms": 62.26351
+      }
+    }
+  ],
+  "traffic": {
+    "coverage": {
+      "binary_sha256": "90605549b7e029a349f681b216b3f38a6e11d3d425360c10c94c556c5fa655de",
+      "harness_sha256": "fb6126b3c91e633713e6dce578950df44686bdb15ffe35a4b3ea2e2fe09b98fd",
+      "report": {
+        "final": {
+          "allocated_upper_bytes": 4210688,
+          "cancelled_write_bytes": 0,
+          "rchar": 7366444,
+          "read_bytes": 0,
+          "syscr": 69,
+          "syscw": 31,
+          "system_us": 209991,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            },
+            "upper.coverage": {
+              "allocated": 16384,
+              "size": 12416
+            }
+          },
+          "user_us": 100621,
+          "wchar": 14700696,
+          "write_bytes": 19132416
+        },
+        "flush_after_reopen_ms": 169.630213,
+        "lower_delay_us": 0,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1067008,
+                "write_requests": 768
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 131072,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "first_512",
+            "requests_per_second": 5941.143918525566,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 34993,
+              "user_us": 6883,
+              "wchar": 8,
+              "write_bytes": 1060864
+            },
+            "sequence_p50_ms": 0.15341,
+            "sequence_p99_ms": 0.378833,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 43.089345
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1067008,
+                "write_requests": 768
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 131072,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 14020.760254912757,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 14993,
+              "user_us": 3035,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.068672,
+            "sequence_p99_ms": 0.109179,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 18.258639
+          },
+          {
+            "allocated_upper_bytes": 1064960,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 131072,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 513,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 42058.50765571628,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 2439,
+              "user_us": 3740,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.021695,
+            "sequence_p99_ms": 0.060149,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 6.086759
+          },
+          {
+            "allocated_upper_bytes": 2113536,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1067008,
+                "write_requests": 768
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 131072,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1025,
+            "name": "random_512",
+            "requests_per_second": 11257.570441278733,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 6354,
+              "user_us": 16057,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.080943,
+            "sequence_p99_ms": 0.157289,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 22.740253
+          },
+          {
+            "allocated_upper_bytes": 3162112,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1067008,
+                "write_requests": 768
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1048576,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 1027,
+            "name": "aligned_4096",
+            "requests_per_second": 10398.590990920731,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 19273,
+              "user_us": 5215,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.083426,
+            "sequence_p99_ms": 0.195209,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 24.61872
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 2134016,
+                "write_requests": 1536
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 262144,
+                "write_requests": 512
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2049,
+            "name": "two_512",
+            "requests_per_second": 7584.435056467601,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 37062,
+              "user_us": 27487,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.234118,
+            "sequence_p99_ms": 0.491514,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 67.506676
+          },
+          {
+            "allocated_upper_bytes": 4210688,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 3145728,
+                "read_requests": 2048,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 1048576,
+                "read_requests": 2048,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              }
+            },
+            "lower_calls": 2048,
+            "lower_requested_bytes": 3145728,
+            "merged_fragments": 2049,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 56462.9823394378,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 13667,
+              "user_us": 4640,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.017532,
+            "sequence_p99_ms": 0.026795,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              },
+              "upper.coverage": {
+                "allocated": 16384,
+                "size": 12416
+              }
+            },
+            "wall_ms": 18.135776
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": true,
+        "unflushed_same_process_close_reopen_ms": 0.359767
+      }
+    },
+    "extents": {
+      "binary_sha256": "cc8ca80f2549bd023717d6313f7d2014641ea59d0742c0f7a2deb80958a5f010",
+      "harness_sha256": "fb6126b3c91e633713e6dce578950df44686bdb15ffe35a4b3ea2e2fe09b98fd",
+      "report": {
+        "final": {
+          "allocated_upper_bytes": 4194304,
+          "cancelled_write_bytes": 0,
+          "rchar": 7349940,
+          "read_bytes": 0,
+          "syscr": 66,
+          "syscw": 30,
+          "system_us": 105344,
+          "upper_files": {
+            "upper": {
+              "allocated": 4194304,
+              "size": 7340032
+            }
+          },
+          "user_us": 40517,
+          "wchar": 14692512,
+          "write_bytes": 19050496
+        },
+        "flush_after_reopen_ms": 25.262027,
+        "lower_delay_us": 0,
+        "measurement": "phase CPU and proc/self/io deltas include sampling overhead; per-sequence timer includes model bookkeeping; two_512 has two writes per sequence; full verification outside timers warms following reads; unflushed same-process reopen includes recovery writeback; final flush follows that writeback; st_blocks snapshots before FLUSH may reflect delayed allocation; proc syscall counters do not count io_uring payload requests",
+        "phases": [
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 1048576,
+                "read_requests": 256,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1048576,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 2,
+            "name": "first_512",
+            "requests_per_second": 44257.73978834773,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 1047,
+              "user_us": 4841,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.021581,
+            "sequence_p99_ms": 0.035423,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 5.784299
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 131072,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "second_sector_same_block_512",
+            "requests_per_second": 61399.957403779554,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 4086,
+              "user_us": 190,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.01569,
+            "sequence_p99_ms": 0.023113,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 4.169384
+          },
+          {
+            "allocated_upper_bytes": 1048576,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 131072,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 2,
+            "name": "overwrite_same_sector_512",
+            "requests_per_second": 64770.78857676059,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3930,
+              "user_us": 9,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.013676,
+            "sequence_p99_ms": 0.049368,
+            "upper_files": {
+              "upper": {
+                "allocated": 1048576,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 3.952399
+          },
+          {
+            "allocated_upper_bytes": 2097152,
+            "guest_bytes": 131072,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 1048576,
+                "read_requests": 256,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1048576,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 380,
+            "name": "random_512",
+            "requests_per_second": 30521.929768085796,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 4651,
+              "user_us": 3790,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.033352,
+            "sequence_p99_ms": 0.046876,
+            "upper_files": {
+              "upper": {
+                "allocated": 2097152,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 8.387412
+          },
+          {
+            "allocated_upper_bytes": 3145728,
+            "guest_bytes": 1048576,
+            "guest_requests": 256,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1048576,
+                "write_requests": 256
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 382,
+            "name": "aligned_4096",
+            "requests_per_second": 36388.42080650102,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 3513,
+              "user_us": 3621,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.026717,
+            "sequence_p99_ms": 0.04464,
+            "upper_files": {
+              "upper": {
+                "allocated": 3145728,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 7.035205
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 262144,
+            "guest_requests": 512,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 1048576,
+                "read_requests": 256,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 1179648,
+                "write_requests": 512
+              }
+            },
+            "lower_calls": 256,
+            "lower_requested_bytes": 1048576,
+            "merged_fragments": 381,
+            "name": "two_512",
+            "requests_per_second": 33659.973131189414,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 11634,
+              "user_us": 3556,
+              "wchar": 8,
+              "write_bytes": 1048576
+            },
+            "sequence_p50_ms": 0.054323,
+            "sequence_p99_ms": 0.123618,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 15.210945
+          },
+          {
+            "allocated_upper_bytes": 4194304,
+            "guest_bytes": 4194304,
+            "guest_requests": 1024,
+            "io_requests": {
+              "lower_blob": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "ownership_metadata": {
+                "read_requested_bytes": 0,
+                "read_requests": 0,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              },
+              "upper_data": {
+                "read_requested_bytes": 4194304,
+                "read_requests": 1024,
+                "write_requested_bytes": 0,
+                "write_requests": 0
+              }
+            },
+            "lower_calls": 0,
+            "lower_requested_bytes": 0,
+            "merged_fragments": 381,
+            "name": "warm_read_4096_after_two_512",
+            "requests_per_second": 129828.15899233062,
+            "resources_delta": {
+              "rchar": 120,
+              "read_bytes": 0,
+              "syscr": 3,
+              "syscw": 1,
+              "system_us": 7950,
+              "user_us": 114,
+              "wchar": 8,
+              "write_bytes": 0
+            },
+            "sequence_p50_ms": 0.007518,
+            "sequence_p99_ms": 0.009312,
+            "upper_files": {
+              "upper": {
+                "allocated": 4194304,
+                "size": 7340032
+              }
+            },
+            "wall_ms": 7.887349
+          }
+        ],
+        "samples": 256,
+        "scope": "QD1, one worker, warm local lower; optional constant delay per payload source call; no real network or physical amplification claim",
+        "seed": 197,
+        "status": "passed",
+        "traffic_accounting_only": true,
+        "unflushed_same_process_close_reopen_ms": 65.296639
+      }
+    }
+  },
+  "traffic_scope": "separate regular-file one-worker QD1 zero-delay accounting; accepted requested bytes, not physical/completed bytes; timings excluded",
+  "interpretation": [
+    "Production timing uses OBD_BUILD_TESTS=OFF; traffic accounting uses separate test-enabled binaries and its timing/CPU values are excluded.",
+    "All phases verify the complete byte model outside timing. The read phase is verification-warmed.",
+    "Same-process unflushed close/reopen includes synchronized extent recovery, not fresh-process startup. Final FLUSH follows this recovery.",
+    "Accepted requested bytes include retries; they are not physical device traffic or filesystem metadata.",
+    "Subsequent code changes are limited to documentation and API comments; measured runtime implementation is the recorded candidate revision."
+  ]
+}

@@ -23,7 +23,7 @@ images built by upstream `overlaybd-*` tools load identically here:
   32 KiB per view) to narrow binary searches; small indexes search directly.
 - **Writable layers** (`writable.hpp`, `sparse_rw.hpp`, `lsmt_rw.hpp`, `hybrid_rw.hpp`,
   `merged_writable.hpp`) — the ADR-0008 writable top of an image stack:
-  `SparseRwLayer` (sparse data plus exact persisted coverage, ADR-0024),
+  `SparseRwLayer` (extent-owned sparse data with aligned copy-up, ADR-0037),
   `LsmtRwLayer` (unsealed
   data/index LSMT pair with in-place edit and seal compaction),
   `HybridRwLayer` (persisted mapping log and metadata-only seal, ADR-0026), and
@@ -768,8 +768,8 @@ durability point (ublk FLUSH). `discard` (ADR-0009) is the writable-root
 hook for masking a 512B-aligned range with zeroes in the merged device
 contract. The LSMT-RW
 implementation satisfies that contract by retaining zeroed segments; the
-sparse implementation punches holes and persists a sidecar zero map so
-reopen preserves the lower-layer mask. `checkpoint()` (ADR-0014) persists
+Sparse implementation preserves the lower-layer mask through ZERO extents
+or actual zero DATA, materializing partial blocks from the merged view. `checkpoint()` (ADR-0014) persists
 whatever on-disk state an offline seal needs, without sealing; it
 is called once by the device process on graceful shutdown after IO has
 drained and is terminal (no `pwrite`/`discard` may follow). `segments()` is
@@ -796,12 +796,22 @@ LSMT-RW opts in; sparse and Hybrid retain the default. This capability neither
 follows from an exact revision nor makes a failed mutation local. The merger
 checks complete top coverage of the successful interval before splicing it.
 
+`requires_current_view()` is an optional mutation interface, false by default.
+Opt-in layers receive `pwrite_with_view`/`discard_with_view` under the merged
+exclusive operation lock. The borrowed reader freezes the pre-mutation mapping,
+not its payload, and must not escape the awaited operation. Read required old
+bytes before overwriting them; do not hold a layer lock that the reader's
+`data_source().pread()` would reacquire. Mapped-source failures propagate and
+short mapped reads return `-EIO`; only actual holes and ZERO synthesize zeros.
+Public merged readers are excluded for opted-in mutations. Sparse opts in;
+other layers retain their existing dispatch. See ADR-0036 and ADR-0037.
+
 `grow(vsize)` (D3) extends the layer's write window to `vsize` bytes so
 `pwrite`/`discard` accept the new range. Grow-only: a request smaller
 than the current size returns `-EINVAL`; an equal request is an
 idempotent no-op (retried grows after a partial kernel failure land
 here). It is **BLOCKING** (header rewrite + fsync for LSMT, ftruncate +
-fdatasync for sparse) — run it off an Elio worker via
+file sizing for sparse) — run it off an Elio worker via
 `elio::spawn_blocking`, as the device resize executor does
 (docs/supervisor.md). LSMT direct concurrent `grow()`/`checkpoint()`/`seal()`
 calls are rejected with `-EBUSY`. Sparse direct `grow()` also
@@ -828,17 +838,11 @@ public:
 };
 ```
 
-A sparse data file whose live DATA sectors form identity mappings
-(`moffset == offset`) plus ZERO mappings for discarded ranges. `open`
-requires `vsize` to be a non-zero multiple of 512 (throws
-`obd::error(EINVAL)` otherwise), first opens an existing inode and otherwise
-creates one with `O_CREAT | O_EXCL`, and sizes it to the maximum of the supplied
-`vsize` and the current sparse file length. A valid `<path>.zeroes`
-sidecar may declare that same trusted size or any smaller sector-aligned
-size; sidecars that declare a larger size are rejected as corrupted. This
-preserves online-grown uppers when the data file or caller-supplied size
-already records the grown window without allowing sidecar metadata alone to
-expand the device.
+A sparse data file whose DATA sectors form identity mappings (`moffset ==
+offset`) plus ZERO mappings. `open` requires a positive 4 KiB-aligned virtual
+size, opens or exclusively creates the inode, and preserves the larger of the
+requested and existing size. The backing file covers the full size before I/O.
+Legacy sidecars cannot independently expand the trusted virtual window.
 
 Both entrypoints require a regular file and hold a nonblocking exclusive
 advisory inode lock before metadata recovery or growth, until layer destruction.
@@ -849,10 +853,10 @@ and metadata names stable while owned (ADR-0027).
 
 `open_existing(path)` never creates a missing data file and never grows it.
 It derives capacity from the opened descriptor, rejects empty/invalid files,
-and uses the same exact coverage and compatibility-mask recovery rules.
-Recovery may repair or import metadata; this is not a read-only open. Closing
-its instance permits normal read-write reopen. This source-admission API does
-not by itself provide the sparse export operator workflow tracked in #161.
+and uses extent recovery for current-format files. The pre-existing offline
+reader recognizes legacy sidecars for development-artifact export only; it
+does not enable legacy runtime writes. Recovery is not a read-only file open
+because synchronized extent discovery can write back buffered data.
 
 The internal `sparse_export_detail` staging writer validates sorted exact
 ownership, combines adjacent same-state ranges before canonical 16,383-sector
@@ -881,15 +885,75 @@ paths and the destination directory stable against external replacement during
 export. The offline command is `obd-export-sparse`; eligible supervisor devices
 use `obdctl commit` after the stop/reap boundary (ADR-0027).
 
-New uppers persist exact 512-byte INHERIT, DATA, and ZERO ownership in
-`<path>.coverage` (ADR-0024). A sparse two-bit map page describes 8 MiB and
-has two 4160-byte generation slots; CRC and a commit word let reopen select
-the newest complete slot and fall back to the other slot after an interrupted
-update. Invalid headers, recognized committed pages without a valid rollback,
-identity mismatches, invalid states, and size errors stop open. A
-random ID stored in a user xattr binds coverage to the data file and is the
-primary identity even if the inode changes; filesystems without user xattrs
-use the weaker device+inode fallback documented by ADR-0024.
+#### Extent-owned Sparse format (ADR-0037)
+
+Current uppers are full-sized sparse files with 4 KiB-aligned capacity. No
+xattr, format marker, ownership bitmap or recovery journal is created or
+required. This is an unpublished format replacement; old development uppers
+must be recreated rather than automatically migrated.
+
+Recovery's first FIEMAP batch uses `FIEMAP_FLAG_SYNC` to drain buffered data
+before classifying extents. Later batches enumerate under the same exclusive,
+drained ownership and do not repeat synchronization. Holes inherit lower
+bytes, initialized extents represent DATA, and remaining UNWRITTEN extents
+represent ZERO. Query/writeback failures stop recovery; no unsynchronized
+fallback may guess ownership. This is recovery-time host-file writeback, not
+per-write guest FLUSH. FIEMAP is required; ext4/XFS are the
+reference filesystems, and tmpfs without FIEMAP is outside deployment.
+After loading, reads use the in-memory interval index and successful mutations
+update that index directly. They do not query FIEMAP. A failed backend mutation
+that might have changed ownership can trigger a synchronized repair scan;
+failure to reconstruct a trustworthy view prevents further reads.
+The host page and filesystem allocation block must both be 4 KiB. An inode
+extent-size hint above 4 KiB or realtime allocation is rejected before writing: these policies can allocate unwritten neighbors that would mask
+unmodified lower data. This includes hints inherited from an XFS directory.
+
+A partial write touching inherited space reads the complete aligned 4 KiB block
+from the current merged view, overlays the request, and writes the whole block.
+A full aligned write needs no lower read. Already materialized DATA is updated
+in place without copying neighbors or changing the exact mapping revision.
+Guest I/O remains 512-byte addressable. A 4 KiB request at offset 512 spans two
+materialization blocks. No ordinary write grows the backing file.
+
+Buffered I/O is allowed. The implementation owns its page-aligned materialization buffer
+through completion and checks `RLIMIT_FSIZE` before a request could be truncated
+inside a block. Errors propagate; failed reconstruction does not publish
+invented zeros. An exceptional mutation with an unrepairable extent view makes
+snapshot/read recovery fail closed until the source is reopened. Merged readers
+are excluded throughout mutation and mapping publication. Ownership can expand
+beyond the guest interval, so Sparse retains full merged-index rebuilding for
+changed mappings; repeated DATA writes reuse the unchanged revision.
+
+Full-block discard uses ZERO_RANGE and records ZERO. If ZERO_RANGE is unavailable,
+a complete physical zero write provides equivalent read semantics. Partial-block
+discard preserves neighboring DATA/ZERO/lower bytes using the same materialization
+path. NOUNMAP uses ordinary zero DATA writes. Discard does not promise physical
+space reclamation: UNWRITTEN extents can reserve blocks, and zero writes can
+allocate storage. It never punches a masked block back to INHERIT.
+
+Recovery covers process exit with the host kernel and page cache alive. It does
+not cover host power loss or kernel crashes. Normal writes have no extra
+`fsync`/FLUSH for recovery. Guest FLUSH synchronizes the backing inode and its
+parent directory and propagates failures; checkpoint uses that boundary and
+ends mutation admission. Explicit aligned grow changes the file size before
+publishing the larger virtual window. ublk advertises volatile write caching;
+no native FUA support is advertised (see `docs/ublk.md`).
+
+#### Old development artifacts
+
+Normal `open` rejects old `.coverage`/`.zeroes` artifacts, including temporary
+files. Recreate those uppers; there is no automatic migration or downgrade.
+The existing `open_existing` offline reader can still export legacy coverage
+to a sealed LSMT delta without a lower chain. The old writer remains available
+only in test-enabled builds for baseline fixtures. Neither path adds metadata
+to normal extent-owned uppers.
+
+#### Legacy v2 coverage layout
+
+This historical layout is consumed only by the existing offline legacy reader. ADR-0024 records
+its publication protocol and identity rules. Keep all old artifacts together
+when using that reader. Corrupt headers, invalid state encodings, mismatched
+identity, and committed records without a valid rollback fail closed.
 
 The coverage artifact has this little-endian v2 layout:
 
@@ -924,184 +988,14 @@ or open fails. A damaged sole first-generation commit marker cannot be
 distinguished from interrupted first publication; arbitrary marker corruption
 is outside this detection guarantee.
 
-The snapshot-complete flag is set, with a refreshed header CRC, only after every
-initial imported page has been written. An incomplete unmarked temporary
-restarts legacy import. Before an xattr marker exists, temporary recovery checks
-device/inode; afterwards a matching marker permits marker-preserving inode
-replacement. Recovery synchronizes a complete temporary before installing its
-marker and treats reopened coverage as potentially dirty, so FLUSH after a
-process restart synchronizes it even without a new write.
-Recovered exact ZERO also marks the compatibility mask dirty: an interrupted
-discard may have committed ZERO before publishing `.zeroes`. Before a write
-removes such ZERO, the complete protective mask is republished. A later
-partial DATA publication can then retain the same ZERO view live and on reopen.
-
-For a pre-existing v1 file with no coverage sidecar, `open` performs a
-one-time `SEEK_DATA`/`SEEK_HOLE` import bounded by the original EOF, overlays
-`.zeroes`, then atomically
-publishes v2 coverage. The imported view preserves what v1 currently exposes;
-it cannot reconstruct original sub-block write intent. Once v2 exists,
-filesystem extents never broaden ownership. `.zeroes` is loaded after v2 and
-remains a protective ZERO-only overlay for migration and rolling
-compatibility. A `.zeroes` file recorded at an older, smaller vsize is dirty
-until the next durability boundary republishes its current size.
-
-Creation and migration write and sync `<path>.coverage.tmp`, validate every
-header and committed page, then expand the data file, install the data-inode
-identity xattr, and sync the data inode,
-then rename the sidecar and sync the parent directory. A marker with neither
-final coverage nor a valid temporary artifact fails closed. Existing
-zero-length inodes remain existing and cannot trigger stale-sidecar cleanup.
-The complete snapshot precedes expansion even on filesystems that allocate
-zero-filled bytes: interrupted fresh creation cannot import those bytes as
-guest DATA, and a legacy grow leaves its new tail inherited. A complete
-installing temporary may declare a virtual size beyond the pre-open EOF;
-all DATA sectors must still lie within that EOF. Authoritative final coverage
-also rejects an initial virtual size beyond EOF. On no-xattr filesystems,
-deletion of all coverage
-artifacts leaves no durable marker and is indistinguishable from a legacy v1
-upper; the implementation then attempts legacy import.
-
-`pwrite`/`pread` return `-EINVAL` on unaligned or out-of-`vsize` requests.
-Writes are split at the 14-bit segment-length cap, write backing bytes, then
-publish every affected coverage page before updating the in-memory index and
-returning success. Adjacent DATA extents coalesce without absorbing INHERIT
-sectors. Rewrites wholly inside existing DATA skip ownership publication and
-leave the mapping generation unchanged; backing bytes still participate in
-FLUSH. Pending ZERO-to-DATA transitions settle before this check. `discard`
-first publishes exact ZERO coverage and the protective
-compatibility mask in `<path>.zeroes`, then performs
-`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`. Punch-hole remains
-best-effort physical reclamation: coverage preserves zero reads if it is
-unsupported or fails.
-
-`pwrite`, `discard`, and `flush` serialize metadata updates so publication
-cannot overtake an earlier operation. A failure partway through a multi-page
-coverage update can leave the committed prefix visible; the request has not
-completed, the running index and reopen both expose that prefix, and
-USER_RECOVERY reissues the whole idempotent operation.
-Planning allocation failures in sparse `pwrite`/`discard` return `-ENOMEM`
-(or `-EFBIG` for an oversized container), including after an earlier piece
-commits. The merged view refreshes its index even on a negative result; if a
-top instead throws after publishing, it refreshes or invalidates the index
-before propagating the original exception.
-For each page, all vector/map allocation precedes the first slot write and the
-commit is followed only by a non-throwing runtime swap. When DATA replaces a
-legacy ZERO mask, the runtime retains that ZERO until `.zeroes` removal changes
-the namespace; a rename/unlink followed by directory-sync failure exposes the
-new DATA view while retaining dirty state for a later durability retry.
-`flush()` offloads blocking compatibility-sidecar work and preserves the
-existing zero-mask order: writes that remove ZERO sync data before removing
-`.zeroes`, while discard publishes ZERO before syncing a punched file. It
-then syncs exact coverage, so a successful guest FLUSH never makes DATA
-ownership durable ahead of its backing bytes. It returns 0 or `-errno`.
-
-Direct `grow()` calls are rejected with `-EBUSY` while
-`pwrite()`/`discard()`/`flush()` or `checkpoint()` is active, and those
-coroutine operations likewise reject a concurrently active grow with
-`-EBUSY`. `checkpoint()` uses the same flush core, then marks the sparse
-upper terminal: later `pwrite()`, `discard()`, `grow()`, and a second
-`checkpoint()` return `-EROFS`.
-
-On reopen, exact coverage is authoritative and `.zeroes` overlays only ZERO.
-Thus a 512-byte write inside a filesystem-reported 4 KiB extent does not hide
-the seven adjacent lower sectors, while a sub-block discard remains a
-top-layer zero mask independently of physical hole-punch granularity.
-A successful discard remembers which zero-mask generation it already published.
-The next FLUSH can reuse that unchanged publication while still synchronizing
-payload and exact coverage in the existing order. Failed publication, a newer
-mask generation, grow, and reopen do not acquire this in-memory shortcut.
-The persisted format and recovery precedence remain unchanged.
-
-Opening this format with a pre-v2 binary is unsafe because that binary ignores
-`.coverage` and reconstructs ownership from allocation extents. There is no
-in-place downgrade contract.
-
 #### Validated filesystem coordinates and costs
 
-The 2026-10-26 validation used a Linux `6.18.18.c1126-trim` guest with
-separate, newly formatted regular-file disks and no networking. ext4 and XFS
-used 4096-byte blocks, `noatime`, and their default allocation settings.
-
-| Filesystem coordinate | Identity | Observed validation |
-|---|---|---|
-| ext4 | user-xattr ID | 51 sparse/migration/merged cases, 35,730 assertions |
-| XFS | user-xattr ID | 51 sparse/migration/merged cases, 35,730 assertions |
-| VFAT, FAT16, 4096-byte clusters | device/inode fallback | eight bounded cases, 213 assertions; coverage header flags confirmed the weak binding |
-
-A separate fixture fed real `TagEngine` handlers WRITE_ZEROES with and
-without NOUNMAP, plus DISCARD, through `MergedWritable` into the sparse upper.
-On all three filesystems, completed requests followed by `_exit` without an
-upper FLUSH or destructors recovered ZERO/DATA/ZERO respectively and preserved
-every adjacent nonzero lower byte. Request inputs were scripted; this fixture
-did not register a kernel ublk device. A read-only data descriptor also forced
-physical reclamation to fail while preserving old backing bytes; logical ZERO
-still survived process exit.
-
-VFAT returned `EOPNOTSUPP` for user xattrs, FIEMAP, ZERO_RANGE, and punch-hole;
-actual zero writes and the NOUNMAP DATA path succeeded. The selected metadata
-design uses persisted ZERO for logical discard, replacing the physical-zero
-fallback proposed for extent-based recovery (ADR-0024). It does not depend on
-FIEMAP or ZERO_RANGE. VFAT is a bounded feature-absence fixture, subject to its
-file-size and allocation limits; this result establishes neither a
-production-capacity nor a cross-mount inode-identity guarantee.
-
-Both ext4 and XFS also passed six cases (137 assertions each) with only
-coverage-file `SEEK_DATA`/`SEEK_HOLE` calls forced to return `EINVAL`;
-legacy data-file discovery remained real. This verifies the full-scan fallback,
-without claiming those filesystems lack extent enumeration. On both reference
-filesystems, earlier FIEMAP probes widened a 512-byte DATA write to a written
-4096-byte extent after synchronization. A partial ZERO_RANGE and plain
-preallocation both produced UNWRITTEN extents. A genuine 4096-byte gap between
-two DATA extents remained a gap; the suspected gap-coalescing behavior did not
-reproduce. Other kernels, allocation hints, and power cuts were not validated
-by this matrix.
-
-A local public-API control compared the
-[pre-v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/96515944e0d3e0be48b95660aed568e0aa99ce6c)
-with the
-[v2 implementation](https://github.com/Coldwings/OverlayBD-Elio/tree/22b187bde3670021dc0ce0613cd59708320be93d).
-Both used test-enabled RelWithDebInfo builds on an Intel i3-N305, one Elio
-worker and one blocking thread, buffered files, 64 MiB, and 16,384 random
-4096-byte requests per trial. The same measurement program used each
-variant's actual headers, compiler options, and libraries. Three repetitions
-alternated variant order; observed peak API depth matched the requested depth.
-Values below are medians of the three per-trial results.
-
-| Operation / depth | CPU us/request, v1 → v2 | Mean API latency us, v1 → v2 |
-|---|---:|---:|
-| First write / 1 | 31.61 → 91.57 | 32.66 → 92.75 |
-| First write / 16 | 35.23 → 95.92 | 577.88 → 1559.98 |
-| DATA rewrite / 1 | 20.94 → 19.87 | 21.74 → 20.59 |
-| DATA rewrite / 16 | 20.90 → 21.79 | 354.34 → 356.99 |
-| Read / 1 | 2.03 → 2.13 | 2.00 → 2.10 |
-| Read / 16 | 1.66 → 1.66 | 26.41 → 26.42 |
-
-First-write publication remains a measured cost. Read/depth-16 CPU observations
-ranged from 1.58–1.68 us in v1 and 1.54–1.70 us in v2; these short, overlapping
-samples do not establish a stable improvement or regression. CPU includes
-coroutine dispatch and joins; final FLUSH and content checks were outside the
-timing window. Rewrite/read files were filled and flushed first, but residency,
-host load, and frequency were uncontrolled. These are source-API diagnostics,
-not ublk/fio latency or a device scaling claim.
-
-Fresh-process recovery controls used a 1 TiB sparse virtual device, one 4 KiB
-DATA block in each of 64/512/4096 distinct 8 MiB regions, with the same kernel
-remaining alive after preparation and FLUSH. Cache eviction was not requested
-and residency was not verified. All prepared DATA blocks were checked.
-
-| Touched regions | Open wall ms, v1 → v2 | Open CPU ms, v1 → v2 | Process RSS delta KiB, v1 → v2 |
-|---|---:|---:|---:|
-| 64 | 0.17 → 0.84 | 0.14 → 0.84 | 60 → 168 |
-| 512 | 0.68 → 4.99 | 0.65 → 5.03 | 172 → 252 |
-| 4096 | 10.32 → 40.91 | 10.29 → 40.99 | 400 → 900 |
-
-The coverage file's logical length was 1,090,523,136 bytes; allocated storage
-was 520/4108/32824 KiB respectively. RSS deltas include allocator/runtime
-effects and are not pure metadata residency. These recovery timings used
-allocated-range enumeration. Without metadata `SEEK_DATA`, recovery scans the
-entire logical coverage file and builds its candidate-page set by capacity;
-large-capacity fallback time and temporary memory were not benchmarked here.
+The [dated coverage baseline](../benchmarks/sparse-coverage-baseline.md) describes
+legacy v2 measurements, including its separate filesystem matrix. It does not
+validate the replacement's performance. The replacement's bounded comparison,
+including first-write lower-read dependence and slower synchronized reopening,
+is in [the Sparse copy-up report](../benchmarks/sparse-copyup.md). Functional
+process-recovery validation remains separate from those host-btrfs timings.
 
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 
@@ -1302,8 +1196,8 @@ plus a writable top layer, as one block source.
   success may use the same proven-local splice; failures still rebuild fully.
   With an LSMT-RW top, discarded ranges stay covered by zeroed segments and
   mask lower-layer data (matching upstream LSMT trim). With a sparse top,
-  discarded ranges publish a sidecar zero map before best-effort top-file
-  hole punching, preserving the same lower-layer mask semantics.
+  discarded ranges become ZERO extents or actual zero DATA; partial blocks
+  preserve neighboring merged bytes, retaining the same lower-layer mask semantics.
 - As a `source::WritableBlobSource`, this is the device root the ublk bridge
   dispatches WRITE/FLUSH/DISCARD/WRITE_ZEROES to; a read-only image root
   simply does not implement the interface and writes/discards get `-EROFS`.
@@ -1640,7 +1534,7 @@ writers and readers agree on the same bytes.
   the merged index is bottom/top/bottom with correct tags and that a clipped
   lower segment's `moffset` shifts by the clipped head. Guards gap-merge
   recursion and clipping arithmetic.
-- `format: sparse layer writes, reads and recovers extents` — write,
+- Legacy fixture test `format: sparse layer writes, reads and recovers extents` — write,
   partial rewrite (identity segments merge into one extent), unaligned-write
   rejection, holes-read-as-zero, then **reopen** and require the same
   exact coverage recovered from v2 metadata. Additional sparse-coverage tests
@@ -1784,10 +1678,9 @@ writers and readers agree on the same bytes.
   completed writes and ZERO mappings; old memory-only uppers without a valid
   checkpoint cannot reconstruct ownership. Preserve both artifacts when
   copying a stopped writable pair (ADR-0029).
-- **Legacy sparse migration freezes the v1 view.** A v1 file did not record
-  exact DATA intent, so its one-time extent import can retain an already
-  over-wide filesystem-block extent. All writes after v2 publication and all
-  fresh uppers recover exactly (ADR-0024).
+- **Old development Sparse uppers require recreation.** Normal opens reject
+  legacy coverage artifacts. No xattr marker or automatic migration is used.
+
 - **Changed snapshots still require linear copying.** Proven-local updates
   avoid a full merge, but copy the top snapshot and the unchanged prefix/suffix
   into a new contiguous immutable vector. This is not a persistent tree or a
@@ -1833,9 +1726,9 @@ Scheduler-facing writable-file transfers use Elio v0.6.0 positional helpers;
 format reads still map early EOF to `-EIO`. LSMT flush/checkpoint/seal and sparse
 open/flush/reclamation use Elio file operations, with native support or bounded
 blocking fallback. Borrowed descriptors and buffers remain alive until return.
-Sparse writes use `pwrite_some` so each completed full-sector prefix is indexed
-before the next transfer; this format-specific publication loop is intentional.
-Data-before-zero-mask and zero-mask-before-reclamation ordering stays explicit.
+Sparse materialization uses complete aligned buffered blocks and preserves
+borrowed merged-view lifetime. Recovery drains cached DATA before interpreting UNWRITTEN as ZERO;
+ordinary writes do not synchronize ownership sidecars.
 Atomic sidecar publication, directory sync, locked trace-start truncation and blocking grow/seal
 utilities remain synchronous transactions on their existing execution paths.
 

@@ -97,8 +97,8 @@ first: data already covered by the upper is overwritten in place;
 previously-uncovered ranges are copy-on-write — new data lands in the
 upper and shadows the sealed lowers, which are never mutated. The upper
 is either an in-place-edit unsealed LSMT file (`<dir>/overlaybd.rw`) or
-a sparse data file with exact sector coverage metadata
-(`<dir>/overlaybd.sparse` plus `.coverage`); see `docs/config.md`.
+an extent-owned sparse data file (`<dir>/overlaybd.sparse`) with aligned
+copy-up and no per-file format marker (ADR-0037); see `docs/config.md`.
 On a read-only device the root does not implement `WritableBlobSource`:
 `WRITE`, direct `DISCARD`, and direct `WRITE_ZEROES` return `-EROFS`, while
 read-only ublk params do not advertise discard/write-zeroes limits so the
@@ -179,8 +179,8 @@ ZFile (compressed, jump-table indexed) and LSMT (log-structured merge
 tree layers), plus `MergedLsmt`, which merges N sealed layers into one
 read-only block view with hole fall-through. Since ADR-0008 the module
 also hosts the writable layers: `LsmtRwLayer` (unsealed, in-place-edit
-LSMT with `seal()` compaction), `SparseRwLayer` (sparse data plus exact
-sector coverage),
+LSMT with `seal()` compaction), `SparseRwLayer` (extent-owned sparse data
+with merged-view copy-up),
 and `MergedWritable` (copy-on-write merge of a writable upper over
 sealed lowers). Header parsing is byte-exact against the upstream wire
 format; fixture writers exist only to produce test images. Any change
@@ -329,7 +329,7 @@ contracts above:
   (ADR-0010). Older kernels whose `ADD_DEV` call rejects the
   recovery flags with `EINVAL` degrade to a non-recoverable device at
   create time. Recovery reassembles the image
-  from restart-recoverable inputs: sealed lowers, Sparse coverage metadata,
+  from restart-recoverable inputs: sealed lowers, Sparse extents and cached DATA,
   and LSMT/Hybrid writable pairs. LSMT recovery reopens a valid pair or migrates
   a complete legacy checkpoint without truncation (ADR-0029).
 - **Prefetch** covers only the active populate paths: structural
@@ -349,8 +349,8 @@ contracts above:
   Read-only images do not advertise discard limits, so the kernel never
   issues discard/write-zeroes to them. Writable LSMT-RW uppers satisfy the
   ADR-0009 mask contract with zeroed segments. Sparse uppers satisfy the
-  same merged-view mask by publishing sidecar zero-mask metadata before
-  punching top-file holes.
+  same merged-view mask with UNWRITTEN zero ranges or physical zero DATA;
+  partial blocks retain their neighboring merged bytes (ADR-0037).
 - **LSMT-RW durability:** the upstream-compatible data/index pair recovers
   completed operations after process exit without a prior checkpoint
   (ADR-0029). Explicit FLUSH synchronizes storage; interrupted in-place writes

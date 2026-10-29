@@ -1,7 +1,7 @@
 // Writable layer interface (ADR-0008). A writable layer is the topmost
 // layer of an image stack. Implementations:
-//   * SparseRwLayer (sparse_rw.hpp) — a sparse data file with exact persisted
-//     sector coverage and identity segment mapping.
+//   * SparseRwLayer (sparse_rw.hpp) — extent-owned sparse data with aligned
+//     merged-view copy-up and identity segment mapping.
 //   * LsmtRwLayer   (lsmt_rw.hpp)   — an unsealed LSMT file with in-place
 //     edit: subranges covered by live segments overwrite their data blocks
 //     in place; uncovered or discarded (zeroed) subranges are appended.
@@ -32,6 +32,25 @@ public:
     virtual elio::coro::task<ssize_t> pwrite(const void* buf, size_t count,
                                              uint64_t offset) = 0;
 
+    /// Opt in to receiving the current merged view during mutations. The
+    /// borrowed reader is valid only until the awaited mutation completes;
+    /// implementations must not retain it or start detached reads. Its mapping
+    /// snapshot precedes this mutation, and mutations/readers are excluded.
+    /// Payload is not copied: read required old bytes before overwriting them.
+    /// Do not hold a layer lock that data_source().pread() would reacquire.
+    virtual bool requires_current_view() const noexcept { return false; }
+    virtual elio::coro::task<ssize_t> pwrite_with_view(
+        const void* buf, size_t count, uint64_t offset,
+        source::BlobSource& current_view) {
+        (void)current_view;
+        return pwrite(buf, count, offset);
+    }
+    virtual elio::coro::task<int> discard_with_view(
+        uint64_t offset, uint64_t len, source::BlobSource& current_view) {
+        (void)current_view;
+        return discard(offset, len);
+    }
+
     /// Reads through this layer alone; holes read as zeroes (fall-through
     /// to lower layers is the merger's job).
     virtual elio::coro::task<ssize_t> pread(void* buf, size_t count,
@@ -49,8 +68,8 @@ public:
     /// Persists whatever on-disk state an offline seal needs (ADR-0014),
     /// without sealing. Called once by the device process on graceful
     /// shutdown, after IO has drained; it is terminal — no pwrite/discard
-    /// may follow. Sparse layers use this hook to publish any dirty
-    /// discard zero-mask sidecar state. Returns 0 or a negative -errno.
+    /// may follow. Extent-owned Sparse synchronizes its backing inode and
+    /// parent directory. Returns 0 or a negative -errno.
     virtual elio::coro::task<int> checkpoint() = 0;
 
     virtual uint64_t virtual_size() const = 0;
@@ -58,7 +77,8 @@ public:
     /// D3 grow-only vsize extension: extends this layer's write window to
     /// `vsize` bytes so pwrite/discard accept the new range (the merged
     /// view's grow calls this before widening itself). Must be a positive
-    /// multiple of 512 and strictly larger than the current size (an
+    /// multiple of the layer's capacity alignment (512 bytes for LSMT/Hybrid,
+    /// 4 KiB for Sparse) and strictly larger than the current size (an
     /// equal request is an idempotent no-op — retried grows after a
     /// partial failure land here); smaller is a shrink and returns
     /// -EINVAL. For LsmtRwLayer this rewrites the on-disk declared-size

@@ -160,7 +160,7 @@ results before the handler restores its owner and publishes the generation:
 | `READ` | `BlobSource::pread` into the tag's IO buffer; short reads at EOF are **zero-filled** so the device always answers the full request; success result = requested length. A miss that reaches a remote source is admitted at the device's read admission funnel as the unconditional OnDemand class (ADR-0012 — the funnel lives in the source chain below, see `docs/source.md`). |
 | `WRITE` | If the root source is a `WritableBlobSource` (writable image, ADR-0008): `pwrite` from the tag's IO buffer; success result = requested length. Otherwise **-EROFS**. |
 | `FLUSH` | If writable root: `WritableBlobSource::flush()` (0 or -errno). Otherwise immediate **0** (read-only device, nothing to persist). |
-| `DISCARD` | If writable root: `WritableBlobSource::discard()`; writable uppers provide ADR-0009 mask-with-zeroes semantics. LSMT-RW records zeroed segments, while sparse uppers publish a protective sidecar zero map before best-effort hole punching. Success result = 0. Otherwise **-EROFS**. |
+| `DISCARD` | If writable root: `WritableBlobSource::discard()`; writable uppers provide ADR-0009 mask-with-zeroes semantics. LSMT-RW records zeroed segments, while Sparse uppers use UNWRITTEN zero ranges or actual zero DATA, preserving neighboring bytes in partial blocks. Success result = 0. Otherwise **-EROFS**. |
 | `WRITE_ZEROES` | If writable root: `discard()` — or, with `UBLK_IO_F_NOUNMAP`, a real write of zeroes (no deallocation). Otherwise **-EROFS**. |
 | `WRITE_SAME` | **-EOPNOTSUPP** (never advertised via params; rejected defensively). |
 | anything else | **-EOPNOTSUPP**. |
@@ -992,9 +992,12 @@ user namespace, and a loaded `ublk_drv` to actually execute).
 
 - **WRITE_SAME**: never advertised, defensively rejected.
 - **Recovery re-open data boundary**: `Device::attach` re-opens the image
-  from disk; an unsealed LSMT-RW upper loses its unsealed writes on
-  recovery while a sparse upper recovers completed sector ownership from
-  its exact coverage artifact (ADR-0010, ADR-0024).
+  from the surviving host kernel view. Current LSMT-RW pairs replay their
+  persisted mappings (ADR-0029); Sparse resolves extents and cached DATA
+  (ADR-0037). The Sparse design covers device-process exit, not host failure.
+  Params advertise `UBLK_ATTR_VOLATILE_CACHE` and do not advertise native FUA;
+  the block layer supplies the necessary FLUSH requests for that capability
+  declaration. Guest logical sectors remain 512 bytes.
 - **Single device per `Ctrl` instance**: the class remembers one added
   device; multi-device processes would need one `Ctrl` each.
 - **Startup deadline**: owner preparation and START/END retries share a

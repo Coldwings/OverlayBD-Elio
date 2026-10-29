@@ -145,7 +145,7 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0021](./0021-reuse-tag-handlers-on-the-bridge-worker.md) | Reuse tag handlers on their bridge worker | accepted |
 | [0022](./0022-retain-failed-startup-owners.md) | Retain failed startup owners until positive retirement | proposed |
 | [0023](./0023-own-ublk-ring-on-fixed-elio-worker.md) | Own each ublk ring on one fixed Elio worker | superseded by ADR-0032 |
-| [0024](./0024-exact-sparse-upper-coverage.md) | Persist exact sector coverage for sparse uppers | accepted |
+| [0024](./0024-exact-sparse-upper-coverage.md) | Persist exact sector coverage for sparse uppers | superseded by ADR-0037 |
 | [0025](./0025-configure-device-queue-and-worker-topology.md) | Resolve device queues and workers together before startup | accepted |
 | [0026](./0026-persist-interoperable-hybrid-uppers.md) | Persist interoperable Hybrid uppers without payload-copy sealing | superseded by ADR-0034 |
 | [0027](./0027-export-stable-sparse-deltas.md) | Export stable sparse ownership as an independent LSMT delta | accepted |
@@ -157,3 +157,5 @@ acceptable in current law — it is a pointer, not a narrative.
 | [0033](./0033-reuse-repeated-decoded-zfile-blocks.md) | Reuse repeatedly read decoded ZFile blocks | accepted |
 | [0034](./0034-allow-concurrent-hybrid-reads.md) | Allow concurrent Hybrid reads with exclusive mutation | accepted |
 | [0035](./0035-splice-local-writable-mappings.md) | Splice proven-local writable mapping changes | accepted |
+| [0036](./0036-provide-current-view-for-copyup.md) | Provide the current merged view during copy-up | accepted |
+| [0037](./0037-reconstruct-sparse-ownership-from-extents.md) | Reconstruct Sparse ownership from materialized extents | accepted |
