@@ -65,7 +65,7 @@ filesystem metadata, or setup/recovery synchronous I/O. Both accounting runs
 also pass the complete byte oracle. Every cell is **coverage / extents**, in
 bytes across that phase.
 
-| Operation | Upper payload bytes requested | Coverage metadata bytes requested | Lower payload bytes requested |
+| Operation | Upper payload write bytes requested | Coverage metadata write bytes requested | Lower payload read bytes requested |
 |---|---:|---:|---:|
 | First 512 B write | 131,072 / 1,048,576 | 1,067,008 / 0 | 0 / 1,048,576 |
 | Second sector in same block | 131,072 / 131,072 | 1,067,008 / 0 | 0 / 0 |
