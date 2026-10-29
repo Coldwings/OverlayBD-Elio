@@ -102,8 +102,9 @@ neighboring bytes for partial blocks. Its disk and full-sized backing file are
 4 KiB aligned; guest requests remain 512-byte addressable. Recovery assumes a
 surviving host kernel/page cache after device-process exit. Normal writes need
 no additional flush and no direct I/O. Guest FLUSH/checkpoint synchronize the
-backing inode and namespace. Legacy coverage and `.zeroes` are migration input;
-normal Sparse operation needs neither an ownership bitmap nor a recovery log.
+backing inode and namespace. Legacy coverage and `.zeroes` are supported only
+as offline-export input; recreate old development uppers for normal use.
+Normal Sparse operation needs no ownership bitmap, recovery log or format xattr.
 
 ## A9. DART is never on the required path
 

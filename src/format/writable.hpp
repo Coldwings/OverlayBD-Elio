@@ -68,8 +68,8 @@ public:
     /// Persists whatever on-disk state an offline seal needs (ADR-0014),
     /// without sealing. Called once by the device process on graceful
     /// shutdown, after IO has drained; it is terminal — no pwrite/discard
-    /// may follow. Sparse layers use this hook to publish any dirty
-    /// discard zero-mask sidecar state. Returns 0 or a negative -errno.
+    /// may follow. Extent-owned Sparse synchronizes its backing inode and
+    /// parent directory. Returns 0 or a negative -errno.
     virtual elio::coro::task<int> checkpoint() = 0;
 
     virtual uint64_t virtual_size() const = 0;
@@ -77,7 +77,8 @@ public:
     /// D3 grow-only vsize extension: extends this layer's write window to
     /// `vsize` bytes so pwrite/discard accept the new range (the merged
     /// view's grow calls this before widening itself). Must be a positive
-    /// multiple of 512 and strictly larger than the current size (an
+    /// multiple of the layer's capacity alignment (512 bytes for LSMT/Hybrid,
+    /// 4 KiB for Sparse) and strictly larger than the current size (an
     /// equal request is an idempotent no-op — retried grows after a
     /// partial failure land here); smaller is a shrink and returns
     /// -EINVAL. For LsmtRwLayer this rewrites the on-disk declared-size

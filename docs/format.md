@@ -992,8 +992,10 @@ is outside this detection guarantee.
 
 The [dated coverage baseline](../benchmarks/sparse-coverage-baseline.md) describes
 legacy v2 measurements, including its separate filesystem matrix. It does not
-validate the replacement's performance. The replacement validation and measured
-tradeoffs are tracked with issue #197 and its tests below.
+validate the replacement's performance. The replacement's bounded comparison,
+including first-write lower-read dependence and slower synchronized reopening,
+is in [the Sparse copy-up report](../benchmarks/sparse-copyup.md). Functional
+process-recovery validation remains separate from those host-btrfs timings.
 
 ### `src/format/lsmt_rw.hpp` — `LsmtRwLayer`
 

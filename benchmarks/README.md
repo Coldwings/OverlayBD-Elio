@@ -307,6 +307,9 @@ copy-up replacement in ADR-0037.
 
 ## Sparse copy-up comparison
 
+Measured results, complete trial data and the first-write/reopen regressions are
+in [sparse-copyup.md](./sparse-copyup.md).
+
 `obd-bench-sparse-copyup NEW_DIRECTORY REPORT SAMPLES LOWER_DELAY_US SEED`
 uses the same public `SparseRwLayer`/`MergedWritable` workload on both revisions.
 Build with `OBD_BUILD_BENCHMARKS=ON`, `OBD_BUILD_TESTS=OFF` for timing. The data

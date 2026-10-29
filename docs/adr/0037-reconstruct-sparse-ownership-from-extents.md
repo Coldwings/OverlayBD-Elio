@@ -109,6 +109,13 @@ First partial writes can require lower reads and amplify payload writes;
 already-owned writes and later reads can avoid coverage work and fragmentation.
 Remote-lower availability becomes relevant to first materialization.
 
+The [bounded comparison](../../benchmarks/sparse-copyup.md) records all twelve
+production timing runs and separate submitted-I/O accounting. It shows less
+coverage work/read fragmentation in the selected warm workload, but slower
+first writes with a delayed lower and slower synchronized reopen. Those costs
+are part of this decision; no general remote-performance or scalability claim
+is made. Functional ext4/XFS and kernel ublk validation are separate evidence.
+
 This decision does not assert that implementation or validation is complete.
 Acceptance requires verification of cache-aware extent reconstruction,
 interrupted buffered materialization and ZERO transitions.
