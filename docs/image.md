@@ -297,8 +297,8 @@ mode:
   missing);
 - `upper.type` — `"lsmt"` (default) → `<dir>/overlaybd.rw`, an
   in-place-edit LSMT layer (`LsmtRwLayer`); `"sparse"` →
-  `<dir>/overlaybd.sparse`, a sparse data file with an exact sector-coverage
-  sidecar (`SparseRwLayer`, ADR-0024);
+  `<dir>/overlaybd.sparse`, an extent-owned sparse file with aligned copy-up
+  (`SparseRwLayer`, ADR-0037);
 - the upper is sized to cover the whole image (the maximum of the lowers'
   virtual sizes); writes land in the upper, reads fall through (copy-on-write
   — the lowers are never modified);
@@ -1151,15 +1151,13 @@ single Range-capable blob. No external golden files.
   the authoritative size comes from the source at open time.
 - **Writable uppers are per-device and not sealed automatically.** LSMT
   data/index pairs recover completed ownership and grown capacity on reopen
-  (ADR-0029); Sparse uses its exact-coverage sidecar. Recovery never silently
+  (ADR-0029); Sparse resolves extents and cached DATA. Recovery never silently
   creates a missing LSMT pair. Valid legacy checkpoints migrate; memory-only
   legacy uppers cannot recover. Commit remains an explicit offline operation;
   registry write-back remains out of scope (ADR-0007).
-- **Legacy sparse uppers are imported once.** An upper without v2 coverage is
-  scanned with `SEEK_DATA`/`SEEK_HOLE`, overlaid with `.zeroes`, and frozen as
-  the currently observable view. Future reopen no longer depends on backing
-  extent granularity, but migration cannot recover sub-block intent v1 never
-  recorded (ADR-0024).
+- **Old development Sparse uppers require recreation.** Normal image opens
+  reject legacy sidecars. Current uppers recover directly from extents without
+  a format xattr or automatic migration (ADR-0037).
 - **One DART decision per open** — reachability is probed once at assembly;
   a proxy that appears later is not adopted until reopen, and a proxy that
   dies later degrades to per-request errors rather than re-fallback.

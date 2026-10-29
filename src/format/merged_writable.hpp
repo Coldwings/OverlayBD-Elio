@@ -61,6 +61,7 @@ public:
     }
 
 private:
+    class MutationView;
     MergedWritable() = default;
     friend struct MergedWritableTestAccess;
     int begin_data_op(uint64_t offset, uint64_t len);

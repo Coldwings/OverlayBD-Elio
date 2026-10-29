@@ -1954,9 +1954,11 @@ TEST_CASE("supervisor: sparse export preserves the opened parent and reusable so
         auto delta = co_await format::LsmtLayer::open(std::move(blob));
         REQUIRE(delta->header().parent_uuid == parent_uuid);
         REQUIRE(delta->virtual_size() == kFakeVsize * 2);
-        // Expanded capacity must not acquire ownership of inherited sectors.
+        // Copy-up owns complete blocks, including unchanged parent neighbors.
+        // Export's capacity override must not own anything beyond those blocks.
+        constexpr uint64_t owned_end = (kFakePayloadBytes + 512 + 4095) / 4096 * 4096;
         for (const auto& segment : delta->segments())
-            REQUIRE(segment.end() <= (kFakePayloadBytes + 512) / 512);
+            REQUIRE(segment.end() <= owned_end / 512);
         auto parent_blob = co_await source::LocalFileSource::open(parent_path);
         std::vector<std::unique_ptr<format::LsmtLayer>> layers;
         layers.push_back(co_await format::LsmtLayer::open(std::move(parent_blob)));

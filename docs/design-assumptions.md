@@ -82,8 +82,8 @@ the existing kernel queue geometry. The serving worker set remains fixed.
 
 A writable upper engages only when the per-image config names it
 (`upper.dir` non-empty); otherwise the device is read-only (ADR-0008). Two
-sanctioned types exist: `sparse` (sparse data file with exact persisted
-sector coverage, ADR-0024) and
+sanctioned base types exist: `sparse` (extent-owned sparse data with aligned
+4 KiB copy-up, ADR-0037) and
 `lsmt` (in-place-edit LSMT-RW that seals into a standard LSMT lower).
 Writes modify only the upper. LSMT-RW persists ownership in an upstream
 compatible data/index pair (ADR-0029), recovering completed operations after
@@ -97,10 +97,13 @@ The sparse source remains reusable; its raw file is never overwritten with LSMT.
 Discard's intended device contract is mask-with-zeroes semantics
 (ADR-0009): a discarded range should read back as zeroes rather than fall
 through to the lowers. LSMT-RW satisfies this by recording zeroed segments;
-sparse satisfies it by publishing ZERO in the exact coverage sidecar and the
-compatibility zero-mask sidecar before punching holes as best-effort space
-reclamation. `flush()`/`checkpoint()` sync backing data before exact coverage;
-the old `.zeroes` artifact remains a protective ZERO-only reopen overlay.
+Sparse satisfies it with UNWRITTEN zero ranges or physical zero DATA, preserving
+neighboring bytes for partial blocks. Its disk and full-sized backing file are
+4 KiB aligned; guest requests remain 512-byte addressable. Recovery assumes a
+surviving host kernel/page cache after device-process exit. Normal writes need
+no additional flush and no direct I/O. Guest FLUSH/checkpoint synchronize the
+backing inode and namespace. Legacy coverage and `.zeroes` are migration input;
+normal Sparse operation needs neither an ownership bitmap nor a recovery log.
 
 ## A9. DART is never on the required path
 

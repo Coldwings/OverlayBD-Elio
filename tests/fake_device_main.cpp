@@ -328,7 +328,7 @@ elio::coro::task<int> fake_body(
                     obd::test::pattern_bytes(kPayloadBytes, kPayloadSeed);
                 const auto written = co_await merged->pwrite(
                     payload.data(), payload.size(), 0);
-                const auto zeroed = co_await blank_top->discard(kPayloadBytes, 512);
+                const auto zeroed = co_await merged->discard(kPayloadBytes, 512);
                 if (written != static_cast<ssize_t>(payload.size()) || zeroed != 0)
                     throw std::runtime_error("sparse fixture payload write failed");
             } else if (img.writable()) {

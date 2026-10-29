@@ -255,7 +255,7 @@ empty `dir` keeps the device read-only.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `dir` | string | `""` | Directory holding the upper layer file; created if missing. Non-empty engages writable mode (`src/image/config.hpp::UpperConfig`). |
-| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` plus `<dir>/overlaybd.rw.index` (unsealed in-place-edit LSMT pair); `"sparse"` → `<dir>/overlaybd.sparse` plus exact `<dir>/overlaybd.sparse.coverage` metadata; `"hybrid"` → `<dir>/overlaybd.hybrid/{data,index}` (persisted mapping log and metadata-only seal, ADR-0026). **Any other value is rejected** with `EINVAL`. |
+| `type` | string | `"lsmt"` | Upper layer format: `"lsmt"` → `<dir>/overlaybd.rw` plus `<dir>/overlaybd.rw.index` (unsealed in-place-edit LSMT pair); `"sparse"` → `<dir>/overlaybd.sparse` with an inode format marker and extent ownership (ADR-0037; 4 KiB-aligned capacity); `"hybrid"` → `<dir>/overlaybd.hybrid/{data,index}` (persisted mapping log and metadata-only seal, ADR-0026). **Any other value is rejected** with `EINVAL`. |
 
 Durability note: the `lsmt` upper recovers completed operations from its
 upstream-compatible data/index pair after process exit (ADR-0029). Explicit
@@ -263,7 +263,7 @@ FLUSH synchronizes storage; interrupted writes may be partial. Both files must
 be retained. Missing or invalid metadata fails without recreating the upper.
 A valid legacy shutdown checkpoint is migrated before writable use; old
 memory-only uppers without a checkpoint cannot recover. Sparse commit exports
-a separate sealed LSMT delta after stop/reap and exact-coverage recovery,
+a separate sealed LSMT delta after stop/reap and ownership recovery,
 retaining the reusable source (ADR-0027).
 
 Hybrid is opt-in. Image assembly atomically creates an absent pair directory or

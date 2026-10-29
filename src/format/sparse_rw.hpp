@@ -1,9 +1,7 @@
-// Sparse writable layer: exact logical coverage forms the segment index,
-// with identity mapping for DATA (moffset == offset).
-// New uppers persist exact sector-granular DATA/ZERO ownership in a
-// checksummed coverage sidecar. SEEK_DATA/SEEK_HOLE is used only once when
-// importing an old upper that has no coverage sidecar; it is never used to
-// expand ownership after the v2 sidecar exists.
+// Sparse writable layer: aligned 4 KiB materialization makes filesystem
+// extents authoritative. Holes inherit; UNWRITTEN represents ZERO, with
+// buffered DATA drained before extent classification during recovery.
+// No xattr, sidecar ownership map or format marker is required.
 #pragma once
 
 #include "format/writable.hpp"
@@ -37,11 +35,25 @@ public:
     ~SparseRwLayer() override;
 
     /// Opens (creating if needed) `path` as a sparse file of `vsize` bytes.
-    /// Existing content is kept. V2 content is recovered from exact coverage
-    /// metadata; legacy content is imported once from SEEK_DATA/SEEK_HOLE and
-    /// the existing `.zeroes` sidecar.
+    /// Uses extent ownership directly, without a per-file format marker.
+    /// Legacy development sidecars are rejected; recreate those uppers.
+    /// Vsize must be 4 KiB aligned; external mutation is unsupported.
     static elio::coro::task<std::unique_ptr<SparseRwLayer>> open(
         const std::string& path, uint64_t vsize);
+
+#ifdef OBD_TEST_HOOKS
+    /// Construct legacy fixtures; unavailable in non-test builds.
+    static elio::coro::task<std::unique_ptr<SparseRwLayer>> open_legacy_for_test(
+        const std::string& path, uint64_t vsize);
+#endif
+    bool requires_current_view() const noexcept override {
+        return extent_mode_;
+    }
+    elio::coro::task<ssize_t> pwrite_with_view(
+        const void* buf, size_t count, uint64_t offset,
+        source::BlobSource& view) override;
+    elio::coro::task<int> discard_with_view(
+        uint64_t offset, uint64_t len, source::BlobSource& view) override;
 
     /// Recover an existing regular file at its persisted size without creating
     /// or growing it. All opens hold a nonblocking exclusive inode lock until
@@ -64,8 +76,8 @@ public:
                                     uint64_t offset) override;
     elio::coro::task<int> flush() override;
     elio::coro::task<int> discard(uint64_t offset, uint64_t len) override;
-    /// Persists dirty zero-mask metadata through the ordered data-file and
-    /// sidecar durability path shared with flush(). Ends writes on this instance
+    /// Synchronizes the backing inode and namespace through flush(). Legacy
+    /// export also synchronizes its compatibility metadata. Ends writes on this instance
     /// but retains its exclusive lock until destruction. Offline export_file()
     /// creates a separate sealed LSMT artifact after the current owner closes.
     elio::coro::task<int> checkpoint() override;
@@ -86,6 +98,7 @@ public:
     uint64_t segments_generation() const noexcept override {
         return segments_generation_.load(std::memory_order_acquire);
     }
+    std::optional<uint64_t> segments_revision() const noexcept override;
     source::BlobSource& data_source() override;
 
 private:
@@ -128,7 +141,8 @@ private:
     void load_zero_masks();
     static std::unique_ptr<SparseRwLayer> open_sync(std::string path,
                                                     uint64_t vsize,
-                                                    bool existing_only = false);
+                                                    bool existing_only = false,
+                                                    bool use_extents = false);
     void create_coverage_snapshot(bool legacy_import);
     void load_coverage(const std::string& artifact_path,
                        uint64_t data_size,
@@ -141,6 +155,15 @@ private:
         std::vector<bytes::segment_mapping> exact_next,
         std::vector<bytes::segment_mapping> next_zeroes);
     elio::coro::task<int> flush_locked();
+
+    elio::coro::task<ssize_t> write_extents(
+        const void* buf, size_t count, uint64_t offset,
+        source::BlobSource& view, bool zero);
+    elio::coro::task<int> refresh_extents();
+    void advance_extent_generation();
+    bool extent_mode_ = false;
+    bool extent_view_valid_ = true;
+    std::string data_path_;
 
     int fd_ = -1;                    // RW fd (writes + flushes)
     int coverage_fd_ = -1;           // exact sector ownership metadata
@@ -184,6 +207,7 @@ private:
     bool fail_zero_mask_dirsync_after_commit_for_test_ = false;
     static std::shared_ptr<std::atomic<int>> open_park_for_test_;
     static std::atomic<int> coverage_install_fail_stage_for_test_;
+    static std::atomic<int> extent_exit_stage_for_test_;
 #endif
 };
 

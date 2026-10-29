@@ -1,6 +1,6 @@
 # ADR-0024: Persist exact sector coverage for sparse uppers
 
-- Status: accepted
+- Status: superseded by ADR-0037
 - Date: 2026-10-22
 - Supersedes: none
 - Amends: ADR-0009 (replaces its sparse recovery mechanism while preserving

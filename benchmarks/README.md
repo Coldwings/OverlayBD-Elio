@@ -300,3 +300,36 @@ See [metadata layout measurements](metadata-layout.md) for the controlled
 conversion/startup study and its [numeric results](metadata-layout-results.json).
 These use production image assembly and inline structural warm-up, unlike the
 local-source fio controls above. They do not change the default layout.
+
+The [Sparse coverage baseline](./sparse-coverage-baseline.md) preserves dated
+legacy v2 measurements. It is not a performance result for the extent-owned
+copy-up replacement in ADR-0037.
+
+## Sparse copy-up comparison
+
+`obd-bench-sparse-copyup NEW_DIRECTORY REPORT SAMPLES LOWER_DELAY_US SEED`
+uses the same public `SparseRwLayer`/`MergedWritable` workload on both revisions.
+Build with `OBD_BUILD_BENCHMARKS=ON`, `OBD_BUILD_TESTS=OFF` for timing. The data
+directory and report must not exist. It measures first 512-byte writes, a second
+sector in the same block, same-sector overwrites, random distinct-block small
+writes, aligned writes, paired small writes, and verification-warmed reads.
+One worker and QD1 are fixed. A nonzero delay models constant latency per lower
+source call; it is not a real remote store or a bandwidth model.
+
+Full byte verification runs outside phase timers and warms subsequent reads.
+The reported unflushed close/reopen uses the same process; it includes extent
+reconstruction and any requested recovery writeback, but not process startup.
+The final FLUSH follows that recovery and is not a matched dirty-FLUSH workload.
+Allocated-byte phase snapshots can reflect delayed allocation; the final
+post-FLUSH footprint is the settled-file comparison. Neither is complete
+filesystem overhead or physical-device write amplification. `/proc/self/io`
+syscall counters do not count the submitted io_uring payload operations.
+
+For a separate traffic-accounting run, build with `OBD_BUILD_TESTS=ON` and append
+`--traffic` with `LOWER_DELAY_US=0`. This test-only backend adapter is restricted
+to the harness's single-worker, QD1, regular-file operations; it must not be used
+with network streams. It counts accepted read/write requests and requested
+bytes for upper data, coverage metadata and lower blobs, including retries.
+It excludes setup/recovery synchronous I/O, allocation/sync operations and
+filesystem metadata. No adapter timing or CPU result is production performance
+evidence; use the uninstrumented build for those comparisons.
