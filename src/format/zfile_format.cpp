@@ -57,6 +57,34 @@ HeaderTrailer HeaderTrailer::parse(const void* region) {
     return ht;
 }
 
+uint64_t HeaderTrailer::checked_raw_index_bytes(uint64_t trailer_offset) const {
+    const uint32_t block_size = opt.block_size;
+    if (block_size == 0 || block_size > 65536 ||
+        (block_size & (block_size - 1)) != 0) {
+        throw format_error("zfile: invalid block size");
+    }
+    const uint64_t expected_blocks = original_file_size / block_size +
+        (original_file_size % block_size != 0);
+    if (index_size != expected_blocks) {
+        throw format_error("zfile: index count does not match original size");
+    }
+    if (index_size > kMaxIndexSize) {
+        throw format_error("zfile: index size " +
+                           std::to_string(index_size) +
+                           " exceeds maximum");
+    }
+    const uint64_t index_bytes = index_size * sizeof(uint32_t);
+    if (index_offset < kSpace || index_offset > trailer_offset ||
+        index_bytes > trailer_offset - index_offset) {
+        throw format_error("zfile: invalid index bytes or size");
+    }
+    const size_t min_stored_size = 1 + (opt.verify ? sizeof(uint32_t) : 0);
+    if (expected_blocks > (index_offset - kSpace) / min_stored_size) {
+        throw format_error("zfile: insufficient data for advertised blocks");
+    }
+    return index_bytes;
+}
+
 void HeaderTrailer::serialize(void* region) const {
     uint8_t* b = static_cast<uint8_t*>(region);
     std::memset(region, 0, kSpace);
@@ -107,7 +135,7 @@ void JumpTable::build(const uint32_t* ibuf, size_t n, uint64_t offset_begin,
     deltas_.push_back(0);
     const uint32_t min_blksize = enable_crc ? sizeof(uint32_t) : 0;
     for (size_t i = 1; i < n + 1; i++) {
-        if (ibuf[i - 1] <= min_blksize) {
+        if (ibuf[i - 1] <= min_blksize || ibuf[i - 1] > kMaxStoredBlockSize) {
             throw format_error("zfile index entry " + std::to_string(i - 1) +
                                " has invalid compressed size " +
                                std::to_string(ibuf[i - 1]), EIO);

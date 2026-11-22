@@ -1,5 +1,6 @@
 // Unit tests: format module — golden wire-format bytes and round-trips
 // through the synchronous writers and the coroutine readers.
+#include "common/errors.hpp"
 #include "format/lsmt.hpp"
 #include "format/lsmt_format.hpp"
 #include "format/writer.hpp"
@@ -62,6 +63,30 @@ TEST_CASE("format: zfile header bytes match the OverlayBD wire format",
     REQUIRE(flags & (1u << format::zfile::kFlagShiftSealed));    // sealed
     REQUIRE(obd::bytes::load_u64_le(hdr + 56) == raw.size());    // vsize
     ::close(out_fd);
+}
+
+TEST_CASE("format: raw zfile index geometry covers the logical size", "[format][zfile]") {
+    format::zfile::HeaderTrailer metadata;
+    metadata.opt.block_size = 4096;
+    metadata.original_file_size = 4097;
+    metadata.index_offset = 1024;
+    metadata.index_size = 2;
+    REQUIRE(metadata.checked_raw_index_bytes(1032) == 8);
+    SECTION("partial final block needs its own entry") { metadata.index_size = 1; }
+    SECTION("surplus entries are rejected") { metadata.index_size = 3; }
+    SECTION("index begins beyond trailer") { metadata.index_offset = 1033; }
+    SECTION("index crosses trailer") { metadata.index_offset = 1025; }
+    SECTION("index starts in header") { metadata.index_offset = 0; }
+    REQUIRE_THROWS_AS(metadata.checked_raw_index_bytes(1032), obd::format_error);
+}
+
+TEST_CASE("format: zfile jump table bounds expanded stored blocks", "[format][zfile]") {
+    format::zfile::JumpTable table;
+    uint32_t length = format::zfile::kMaxStoredBlockSize;
+    REQUIRE_NOTHROW(table.build(&length, 1, 512, 65536, true));
+    REQUIRE(table[1] - table[0] == length);
+    ++length;
+    REQUIRE_THROWS_AS(table.build(&length, 1, 512, 65536, true), obd::format_error);
 }
 
 TEST_CASE("format: zfile round-trip reads back the original content",
@@ -588,6 +613,9 @@ TEST_CASE("format: zfile partial edges cross compressed read windows",
         // Random payload remains larger than one compressed window. Both
         // window reuse and partial/full decoding occur in the same request.
         const auto& jump = zfile->jump_table();
+        if (options.block_size == 65536) {
+            REQUIRE(jump[1] - jump[0] > options.block_size);
+        }
         REQUIRE(jump[jump.size() - 1] - jump[0] >
                 format::ZFileSource::kReadWindow);
         constexpr size_t offset = 512;

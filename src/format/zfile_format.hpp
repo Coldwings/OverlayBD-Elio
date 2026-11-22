@@ -46,6 +46,8 @@
 namespace obd::format::zfile {
 
 constexpr uint32_t kSpace = 512;         // header/trailer region size
+// Upstream allows a 64 KiB raw block plus codec expansion and CRC.
+constexpr uint32_t kMaxStoredBlockSize = 65536 + 512;
 constexpr uint32_t kHeaderSize = 96;     // HeaderTrailer::size field value
 constexpr uint64_t kMaxIndexSize = 1000000000ULL;  // MAX_ZFILE_INDEX_SIZE
 constexpr uint32_t kNoiWellKnownPrime = 100007;    // crc32c_salt seed
@@ -112,6 +114,7 @@ struct HeaderTrailer {
 
     /// Parses a 512-byte region. Throws obd::format_error on bad magic or
     /// bad size field. Does NOT verify the digest (see region_digest_ok).
+    uint64_t checked_raw_index_bytes(uint64_t trailer_offset) const;
     static HeaderTrailer parse(const void* region);
 
     /// Serializes into a 512-byte region: 96 payload bytes plus zero

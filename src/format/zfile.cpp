@@ -61,12 +61,11 @@ elio::coro::task<std::unique_ptr<ZFileSource>> ZFileSource::open(
 
     // --- trailer is authoritative unless the header was overwritten ---
     zfile::HeaderTrailer effective = ht;
-    uint64_t trailer_offset = 0;
+    const uint64_t trailer_offset = file_size - kSpace;
+    if (!ht.is_data_file()) {
+        throw format_error("zfile: unrecognized file type");
+    }
     if (!ht.is_header_overwrite()) {
-        if (!ht.is_data_file()) {
-            throw format_error("zfile: unrecognized file type");
-        }
-        trailer_offset = file_size - kSpace;
         uint8_t tregion[kSpace];
         r = co_await src->pread(tregion, kSpace, trailer_offset);
         if (r != static_cast<ssize_t>(kSpace)) {
@@ -77,19 +76,16 @@ elio::coro::task<std::unique_ptr<ZFileSource>> ZFileSource::open(
             throw format_error(
                 "zfile: trailer magic, type or sealedness doesn't match");
         }
+        if (!tht.region_digest_ok(tregion)) {
+            throw format_error("zfile: trailer digest verification failed");
+        }
         effective = tht;
     }
 
-    if (effective.index_size > zfile::kMaxIndexSize) {
-        throw format_error("zfile: index size " +
-                           std::to_string(effective.index_size) +
-                           " exceeds maximum");
+    if (effective.get_flag_bit(zfile::kFlagShiftIdxComp)) {
+        throw format_error("zfile: compressed indexes are not supported");
     }
-    const uint64_t index_bytes = effective.index_size * sizeof(uint32_t);
-    if (!ht.is_header_overwrite() &&
-        index_bytes > trailer_offset - effective.index_offset) {
-        throw format_error("zfile: invalid index bytes or size");
-    }
+    const uint64_t index_bytes = effective.checked_raw_index_bytes(trailer_offset);
     if (effective.opt.use_dict != 0 || effective.opt.dict_size != 0) {
         throw format_error("zfile: dictionary compression is not supported");
     }
@@ -114,8 +110,16 @@ elio::coro::task<std::unique_ptr<ZFileSource>> ZFileSource::open(
         }
     }
     std::vector<uint32_t> ibuf(effective.index_size);
+    uint64_t data_end = kSpace;
     for (uint64_t i = 0; i < effective.index_size; i++) {
         ibuf[i] = bytes::load_u32_le(raw_index.data() + i * 4);
+        if (ibuf[i] > effective.index_offset - data_end) {
+            throw format_error("zfile: compressed block exceeds data region");
+        }
+        data_end += ibuf[i];
+    }
+    if (data_end != effective.index_offset) {
+        throw format_error("zfile: compressed blocks do not fill data region");
     }
 
     auto z = std::unique_ptr<ZFileSource>(new ZFileSource());
