@@ -40,7 +40,7 @@ set(ELIO_ENABLE_HTTP ON CACHE BOOL "" FORCE)
 set(ELIO_ENABLE_HTTP2 OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(elio
     GIT_REPOSITORY https://github.com/Coldwings/Elio.git
-    GIT_TAG c662f33d7ce9e4871e990776ddc1dc44a03ac8f0)  # Elio v0.6.0
+    GIT_TAG ddbfb7f677cd96f2005b7ab595f6ca56e938b28f)  # Elio v0.7.0
 FetchContent_MakeAvailable(elio)
 
 FetchContent_Declare(nlohmann_json
