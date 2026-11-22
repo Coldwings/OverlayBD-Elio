@@ -61,20 +61,20 @@ elio::coro::task<void> send_command(elio::net::uds_stream& stream, const json& c
 // Read one byte at a time to leave the subsequent release outcome in the
 // socket, rather than accidentally consuming two records in the first read.
 elio::coro::task<json> read_line(elio::net::uds_stream& stream) {
+    std::string line;
     auto result = co_await elio::with_timeout(3s,
-        [&](elio::coro::cancel_token token) -> elio::coro::task<json> {
-            std::string line;
+        [&](elio::coro::cancel_token token) -> elio::coro::task<void> {
             char byte;
             while (line.size() < 8192) {
                 const auto r = co_await stream.read(&byte, 1, token);
                 if (r.result != 1) throw std::runtime_error("startup reply EOF");
-                if (byte == '\n') co_return json::parse(line);
+                if (byte == '\n') co_return;
                 line += byte;
             }
             throw std::runtime_error("oversized startup reply");
         });
     if (!result) throw std::runtime_error("startup reply timeout");
-    co_return std::move(*result);
+    co_return json::parse(line);
 }
 
 elio::coro::task<json> startup_exchange(const std::string& name, const json& command) {
