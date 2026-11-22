@@ -49,16 +49,12 @@ uint32_t prefix_crc(int fd, uint64_t bytes) {
     uint32_t crc = 0;
     for (uint64_t offset = lsmt::kSpace; offset < bytes;) {
         const size_t count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), bytes - offset));
-        size_t done = 0;
-        while (done < count) {
-            const auto result = ::pread(fd, buffer.data() + done, count - done,
-                                       static_cast<off_t>(offset + done));
-            if (result < 0 && errno == EINTR) continue;
-            if (result <= 0) throw_errno(result < 0 ? errno : EIO, "hybrid: read log state prefix");
-            done += static_cast<size_t>(result);
-        }
-        crc = crc32::crc32c_extend(buffer.data(), count, crc);
-        offset += count;
+        const auto result = ::pread(fd, buffer.data(), count, static_cast<off_t>(offset));
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) throw_errno(result < 0 ? errno : EIO, "hybrid: read log state prefix");
+        const auto read_bytes = static_cast<size_t>(result);
+        crc = crc32::crc32c_extend(buffer.data(), read_bytes, crc);
+        offset += read_bytes;
     }
     return crc;
 }
