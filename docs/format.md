@@ -1722,7 +1722,7 @@ original OCI blob's digest.
 
 ## Implementation notes
 
-Scheduler-facing writable-file transfers use Elio v0.6.0 positional helpers;
+Scheduler-facing writable-file transfers use Elio v0.7.0 positional helpers;
 format reads still map early EOF to `-EIO`. LSMT flush/checkpoint/seal and sparse
 open/flush/reclamation use Elio file operations, with native support or bounded
 blocking fallback. Borrowed descriptors and buffers remain alive until return.

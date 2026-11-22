@@ -1512,7 +1512,7 @@ device read-admission funnel and registry client.
 
 ## Implementation notes
 
-Positional local-file reads and committed LayerStore reads use Elio v0.6.0
+Positional local-file reads and committed LayerStore reads use Elio v0.7.0
 `pread_exactly` over borrowed spans. Elio advances offsets, splits oversized
 requests and preserves transfer progress. LocalFileSource returns a terminal
 error even after progress; LayerStore keeps its POSIX partial-return policy.
