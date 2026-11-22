@@ -67,7 +67,11 @@ Little-endian throughout (upstream `zfile.cpp` and
   copied back into the header), bit4 `calc_digest`, bit5 `index compressed`.
 - **Trailer-authoritative open**: unless the header carries
   `header_overwrite`, the trailer's fields are the effective ones; the
-  trailer must be a sealed data file.
+  trailer must be a sealed data file and pass its enabled digest check.
+  The reader checks that the raw index fits before the trailer, has one
+  entry per logical block (including a partial final block), and accounts
+  for every byte between the header and the index. Stored blocks may
+  include up to 512 bytes beyond 64 KiB for codec expansion and CRC.
 - **Index**: a u32 little-endian array of per-block compressed sizes
   (each including the trailing 4-byte CRC when `verify` is on). The in-memory
   **jump table** rebuilds absolute block offsets as partial group bases plus

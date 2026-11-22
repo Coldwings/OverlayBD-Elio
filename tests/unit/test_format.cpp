@@ -1,5 +1,7 @@
 // Unit tests: format module — golden wire-format bytes and round-trips
 // through the synchronous writers and the coroutine readers.
+#include "common/crc32c.hpp"
+#include "common/errors.hpp"
 #include "format/lsmt.hpp"
 #include "format/lsmt_format.hpp"
 #include "format/writer.hpp"
@@ -62,6 +64,86 @@ TEST_CASE("format: zfile header bytes match the OverlayBD wire format",
     REQUIRE(flags & (1u << format::zfile::kFlagShiftSealed));    // sealed
     REQUIRE(obd::bytes::load_u64_le(hdr + 56) == raw.size());    // vsize
     ::close(out_fd);
+}
+
+TEST_CASE("format: raw zfile index geometry covers the logical size", "[format][zfile]") {
+    format::zfile::HeaderTrailer metadata;
+    metadata.opt.block_size = 4096;
+    metadata.original_file_size = 4097;
+    metadata.index_offset = 1024;
+    metadata.index_size = 2;
+    REQUIRE(metadata.checked_raw_index_bytes(1032) == 8);
+    SECTION("partial final block needs its own entry") { metadata.index_size = 1; }
+    SECTION("surplus entries are rejected") { metadata.index_size = 3; }
+    SECTION("index begins beyond trailer") { metadata.index_offset = 1033; }
+    SECTION("index crosses trailer") { metadata.index_offset = 1025; }
+    SECTION("index starts in header") { metadata.index_offset = 0; }
+    REQUIRE_THROWS_AS(metadata.checked_raw_index_bytes(1032), obd::format_error);
+}
+
+TEST_CASE("format: zfile open validates the authoritative raw index", "[format][zfile]") {
+    namespace z = format::zfile;
+    // One literal-only LZ4 block encoding 'x', followed by its raw length.
+    constexpr size_t index_offset = z::kSpace + 2;
+    constexpr size_t trailer_offset = index_offset + sizeof(uint32_t);
+    bool overwrite = false;
+    SECTION("overwritten header") { overwrite = true; }
+    SECTION("authoritative trailer") {}
+    enum class Case { valid, digest, compressed, surplus, extent, data_end };
+    for (Case check : {Case::valid, Case::digest, Case::compressed,
+                       Case::surplus, Case::extent, Case::data_end}) {
+        CAPTURE(overwrite, static_cast<int>(check));
+        z::HeaderTrailer header;
+        header.set_flag_bit(z::kFlagShiftHeader);
+        header.set_flag_bit(z::kFlagShiftType);
+        header.set_flag_bit(z::kFlagShiftSealed);
+        if (overwrite) header.set_flag_bit(z::kFlagShiftHeaderOverwrite);
+        auto trailer = header;
+        trailer.clr_flag_bit(z::kFlagShiftHeader);
+        auto& active = overwrite ? header : trailer;
+        active.original_file_size = 1;
+        active.opt.verify = 0;
+        active.index_offset = index_offset;
+        active.index_size = 1;
+        if (check == Case::digest) active.set_flag_bit(z::kFlagShiftCalcDigest);
+        if (check == Case::compressed) active.set_flag_bit(z::kFlagShiftIdxComp);
+        if (check == Case::surplus) active.original_file_size = 0;
+        if (check == Case::extent) ++active.index_offset;
+        std::vector<uint8_t> file(trailer_offset + z::kSpace);
+        file[z::kSpace] = 0x10;
+        file[z::kSpace + 1] = 'x';
+        bytes::store_u32_le(file.data() + index_offset, check == Case::data_end ? 1 : 2);
+        active.index_crc = crc32::crc32c(file.data() + index_offset, sizeof(uint32_t));
+        header.serialize(file.data());
+        trailer.serialize(file.data() + trailer_offset);
+        if (check == Case::digest) {
+            auto* region = file.data() + (overwrite ? 0 : trailer_offset);
+            active.set_region_digest(region);
+            region[z::kSpace - 1] ^= 1;
+        }
+        const int result = test::run_coro([&]() -> elio::coro::task<int> {
+            try {
+                auto source = co_await format::ZFileSource::open(
+                    std::make_unique<test::VectorSource>(file), false);
+                if (check != Case::valid) co_return -1;
+                uint8_t value = 0;
+                const auto count = co_await source->pread(&value, 1, 0);
+                co_return count == 1 && value == 'x' ? 0 : -1;
+            } catch (const format_error&) {
+                co_return check == Case::valid ? -1 : 0;
+            }
+        });
+        REQUIRE(result == 0);
+    }
+}
+
+TEST_CASE("format: zfile jump table bounds expanded stored blocks", "[format][zfile]") {
+    format::zfile::JumpTable table;
+    uint32_t length = format::zfile::kMaxStoredBlockSize;
+    REQUIRE_NOTHROW(table.build(&length, 1, 512, 65536, true));
+    REQUIRE(table[1] - table[0] == length);
+    ++length;
+    REQUIRE_THROWS_AS(table.build(&length, 1, 512, 65536, true), obd::format_error);
 }
 
 TEST_CASE("format: zfile round-trip reads back the original content",
@@ -588,6 +670,9 @@ TEST_CASE("format: zfile partial edges cross compressed read windows",
         // Random payload remains larger than one compressed window. Both
         // window reuse and partial/full decoding occur in the same request.
         const auto& jump = zfile->jump_table();
+        if (options.block_size == 65536) {
+            REQUIRE(jump[1] - jump[0] > options.block_size);
+        }
         REQUIRE(jump[jump.size() - 1] - jump[0] >
                 format::ZFileSource::kReadWindow);
         constexpr size_t offset = 512;
