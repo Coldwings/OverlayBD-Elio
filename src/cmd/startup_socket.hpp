@@ -81,14 +81,15 @@ public:
                 // An idle listener observes finish within a bounded interval.
                 // No one-shot external cancellation can strand this acceptor
                 // if a cancellation observer throws during finalization.
+                // The structured timeout joins the accept before stream leaves scope.
+                std::optional<elio::net::uds_stream> stream;
                 auto accepted = co_await elio::with_timeout(std::chrono::milliseconds(100),
                     [&](elio::coro::cancel_token token)
-                        -> elio::coro::task<std::optional<elio::net::uds_stream>> {
-                        co_return co_await listener_.accept(std::move(token));
+                        -> elio::coro::task<void> {
+                        stream = co_await listener_.accept(std::move(token));
                     });
-                if (!accepted || !*accepted ||
+                if (!accepted || !stream ||
                     finished_.load(std::memory_order_acquire)) continue;
-                auto stream = std::move(*accepted);
                 ucred peer{};
                 socklen_t size = sizeof(peer);
                 if (::getsockopt(stream->fd(), SOL_SOCKET, SO_PEERCRED,
