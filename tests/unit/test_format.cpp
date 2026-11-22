@@ -80,6 +80,61 @@ TEST_CASE("format: raw zfile index geometry covers the logical size", "[format][
     REQUIRE_THROWS_AS(metadata.checked_raw_index_bytes(1032), obd::format_error);
 }
 
+TEST_CASE("format: zfile open validates the authoritative raw index", "[format][zfile]") {
+    namespace z = format::zfile;
+    // One literal-only LZ4 block encoding 'x', followed by its raw length.
+    constexpr size_t index_offset = z::kSpace + 2;
+    constexpr size_t trailer_offset = index_offset + sizeof(uint32_t);
+    bool overwrite = false;
+    SECTION("overwritten header") { overwrite = true; }
+    SECTION("authoritative trailer") {}
+    enum class Case { valid, digest, compressed, surplus, extent, data_end };
+    for (Case check : {Case::valid, Case::digest, Case::compressed,
+                       Case::surplus, Case::extent, Case::data_end}) {
+        CAPTURE(overwrite, static_cast<int>(check));
+        z::HeaderTrailer header;
+        header.set_flag_bit(z::kFlagShiftHeader);
+        header.set_flag_bit(z::kFlagShiftType);
+        header.set_flag_bit(z::kFlagShiftSealed);
+        if (overwrite) header.set_flag_bit(z::kFlagShiftHeaderOverwrite);
+        auto trailer = header;
+        trailer.clr_flag_bit(z::kFlagShiftHeader);
+        auto& active = overwrite ? header : trailer;
+        active.original_file_size = 1;
+        active.opt.verify = 0;
+        active.index_offset = index_offset;
+        active.index_size = 1;
+        if (check == Case::digest) active.set_flag_bit(z::kFlagShiftCalcDigest);
+        if (check == Case::compressed) active.set_flag_bit(z::kFlagShiftIdxComp);
+        if (check == Case::surplus) active.original_file_size = 0;
+        if (check == Case::extent) ++active.index_offset;
+        std::vector<uint8_t> file(trailer_offset + z::kSpace);
+        header.serialize(file.data());
+        trailer.serialize(file.data() + trailer_offset);
+        file[z::kSpace] = 0x10;
+        file[z::kSpace + 1] = 'x';
+        bytes::store_u32_le(file.data() + index_offset, check == Case::data_end ? 1 : 2);
+        if (check == Case::digest) {
+            auto* region = file.data() + (overwrite ? 0 : trailer_offset);
+            active.set_region_digest(region);
+            region[z::kSpace - 1] ^= 1;
+        }
+        const int result = test::run_coro([&]() -> elio::coro::task<int> {
+            try {
+                auto source = co_await format::ZFileSource::open(
+                    std::make_unique<test::VectorSource>(file), false);
+                if (check != Case::valid) co_return -1;
+                uint8_t value = 0;
+                const auto count = co_await source->pread(&value, 1, 0);
+                co_return count == 1 && value == 'x' ? 0 : -1;
+            } catch (const format_error&) {
+                co_return check == Case::valid ? -1 : 0;
+            }
+        });
+        REQUIRE(result == 0);
+    }
+}
+
 TEST_CASE("format: zfile jump table bounds expanded stored blocks", "[format][zfile]") {
     format::zfile::JumpTable table;
     uint32_t length = format::zfile::kMaxStoredBlockSize;
