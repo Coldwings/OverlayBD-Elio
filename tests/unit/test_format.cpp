@@ -1,5 +1,6 @@
 // Unit tests: format module — golden wire-format bytes and round-trips
 // through the synchronous writers and the coroutine readers.
+#include "common/crc32c.hpp"
 #include "common/errors.hpp"
 #include "format/lsmt.hpp"
 #include "format/lsmt_format.hpp"
@@ -109,11 +110,12 @@ TEST_CASE("format: zfile open validates the authoritative raw index", "[format][
         if (check == Case::surplus) active.original_file_size = 0;
         if (check == Case::extent) ++active.index_offset;
         std::vector<uint8_t> file(trailer_offset + z::kSpace);
-        header.serialize(file.data());
-        trailer.serialize(file.data() + trailer_offset);
         file[z::kSpace] = 0x10;
         file[z::kSpace + 1] = 'x';
         bytes::store_u32_le(file.data() + index_offset, check == Case::data_end ? 1 : 2);
+        active.index_crc = crc32::crc32c(file.data() + index_offset, sizeof(uint32_t));
+        header.serialize(file.data());
+        trailer.serialize(file.data() + trailer_offset);
         if (check == Case::digest) {
             auto* region = file.data() + (overwrite ? 0 : trailer_offset);
             active.set_region_digest(region);
