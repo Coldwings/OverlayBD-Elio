@@ -982,8 +982,11 @@ private:
                 co_return;
             }
             entry->child->try_reap();
-            if (!entry->child->reaped())
-                co_await entry->child->reaped_event().wait(monitor_cancel_.get_token());
+            if (!entry->child->reaped()) {
+                const auto result = co_await entry->child->reaped_event().wait(
+                    monitor_cancel_.get_token());
+                if (result != elio::coro::cancel_result::completed) co_return;
+            }
             if (monitor_cancel_.is_cancelled()) co_return;
             // Respawn in recovery mode: the kernel kept the ublk device
             // (created with UBLK_F_USER_RECOVERY), so the replacement
@@ -1328,7 +1331,7 @@ private:
             std::chrono::seconds(cfg_.ready_timeout_sec),
             [&child](elio::coro::cancel_token tok)
                 -> elio::coro::task<void> {
-                co_await child->ready_event().wait(std::move(tok));
+                (void)(co_await child->ready_event().wait(std::move(tok)));
             });
         const Child::Status st = child->status();
         if (!outcome) {
@@ -1407,7 +1410,7 @@ private:
         auto done = co_await elio::with_timeout(
             std::chrono::seconds(cfg_.stop_timeout_sec),
             [&child](elio::coro::cancel_token token) -> elio::coro::task<void> {
-                co_await child->reaped_event().wait(std::move(token));
+                (void)(co_await child->reaped_event().wait(std::move(token)));
             });
         if (done) co_return true;
         child->try_reap();
@@ -1419,7 +1422,7 @@ private:
         auto gone = co_await elio::with_timeout(
             std::chrono::seconds(2),
             [&child](elio::coro::cancel_token token) -> elio::coro::task<void> {
-                co_await child->reaped_event().wait(std::move(token));
+                (void)(co_await child->reaped_event().wait(std::move(token)));
             });
         if (!gone) {
             child->try_reap();
@@ -1724,7 +1727,7 @@ private:
                 command_timeout,
                 [&operation](elio::coro::cancel_token tok)
                     -> elio::coro::task<void> {
-                    co_await operation->waiter.wait(std::move(tok));
+                    (void)(co_await operation->waiter.wait(std::move(tok)));
                 });
             if (test_gate_) {
                 test_gate_->mark(got ? "command_wait_completed" : "command_wait_timeout");
